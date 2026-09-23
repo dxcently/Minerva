@@ -1,0 +1,169 @@
+/* Minerva activity panel + graph editor. Terminal green, square corners everywhere (incl. focus glow).
+   Rhythm: 8 / 12 / 16 px. Scoped to .minerva-workspace so WebUI styles (and Svelte Flow node chrome) stay untouched. */
+.minerva-workspace {
+  --wf-edge:#205b32; --wf-fill-solid:#051b0d; --wf-text:#b9d8bf; --wf-text-strong:#e3f4e7; --wf-chrome:#39ff6a; --wf-font-mono:monospace; --wf-text-muted:#769a7d;
+  --mw-line:#205b32; --mw-line-soft:#123a1f; --mw-bg:#04170b; --mw-bg-deep:#031108; --mw-bg-raised:#0b2614;
+  --mw-accent:#39ff6a; --mw-text:#dcefe0; --mw-muted:#8ba993; --mw-dim:#6f8f78; --mw-danger:#ffb3a7; --mw-danger-line:#6b2f24;
+  position:fixed; inset:0 0 0 auto; width:auto; z-index:40; background:var(--mw-bg); color:var(--mw-text);
+  border-left:1px solid var(--mw-line); display:flex; flex-direction:column; font:inherit; font-size:14px;
+}
+.minerva-workspace[hidden] { display:none; }
+.minerva-workspace *, #minerva-workspace-toggle { border-radius:0!important; box-sizing:border-box; }
+/* Square focus glow, never a rounded ring. */
+.minerva-workspace :focus-visible, #minerva-workspace-toggle:focus-visible {
+  outline:2px solid var(--mw-accent); outline-offset:1px; border-color:var(--mw-accent);
+}
+.minerva-workspace button:focus-visible, .minerva-workspace summary:focus-visible { background:#12341c; }
+
+/* ---- controls: one shared definition for buttons, inputs, selects, textareas ---- */
+.minerva-workspace button, .minerva-workspace select, .minerva-workspace input, .minerva-workspace textarea {
+  border:1px solid var(--mw-line); background:var(--mw-bg-deep); color:inherit; font:inherit;
+  padding:6px 10px; min-height:34px; max-width:100%;
+}
+.minerva-workspace button { display:inline-flex; align-items:center; justify-content:center; gap:6px; cursor:pointer; }
+.minerva-workspace button:hover, .minerva-workspace summary:hover { background:#12341c; border-color:var(--mw-accent); }
+.minerva-workspace button:disabled { opacity:.45; cursor:default; background:var(--mw-bg-deep); border-color:var(--mw-line-soft); }
+.minerva-workspace button:disabled:hover { background:var(--mw-bg-deep); border-color:var(--mw-line-soft); }
+.minerva-workspace .mw-icon-button { min-width:34px; padding:6px; }
+.minerva-workspace textarea { display:block; width:100%; font:12px/1.45 var(--wf-font-mono); tab-size:2; resize:vertical; }
+.minerva-workspace .mw-json { min-height:120px; }
+.minerva-workspace input[type=number] { max-width:120px; }
+.minerva-workspace progress { appearance:none; -webkit-appearance:none; border:1px solid var(--mw-line-soft); background:#12341c; height:6px; width:100%; }
+.minerva-workspace progress::-webkit-progress-bar { background:#12341c; }
+.minerva-workspace progress::-webkit-progress-value { background:var(--mw-accent); }
+.minerva-workspace progress::-moz-progress-bar { background:var(--mw-accent); }
+
+/* primary = Save / Run / submit; secondary = default; destructive = delete */
+.mw-btn-primary { background:#0e3a1c!important; border-color:var(--mw-accent)!important; color:var(--wf-text-strong)!important; }
+.mw-btn-primary:hover { background:#155026!important; }
+.mw-btn-danger { color:var(--mw-danger)!important; border-color:var(--mw-danger-line)!important; }
+.mw-btn-danger:hover, .mw-btn-danger:focus-visible { background:#3a1510!important; border-color:#ff8f7a!important; color:#ffd9d1!important; }
+
+.mw-actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+.mw-field { display:flex; flex-direction:column; gap:4px; font-size:12px; }
+.mw-field-label { color:var(--mw-muted); }
+.mw-field-hint { color:var(--mw-dim); font-size:11px; line-height:1.4; }
+.mw-note { color:var(--mw-muted); font-size:12px; line-height:1.45; }
+.mw-empty { border:1px dashed var(--mw-line); padding:12px; margin:12px 0; color:var(--mw-muted); font-size:13px; }
+.mw-empty p { margin:0 0 8px; }
+.mw-empty p:last-child { margin-bottom:0; }
+
+/* ---- panel chrome ---- */
+.minerva-workspace > header { display:flex; gap:8px; align-items:center; flex-wrap:nowrap; padding:8px 12px; min-height:52px; border-bottom:1px solid var(--mw-line); }
+.minerva-workspace > header b { flex:1; font-size:15px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.mw-tabs { display:flex; gap:4px; }
+.mw-tab { min-height:30px; padding:4px 10px; font-size:13px; }
+.mw-tab.mw-active { background:#12341c!important; border-color:var(--mw-accent)!important; color:var(--wf-text-strong)!important; }
+.minerva-workspace > .mw-message { margin:0; padding:8px 12px; font-size:12px; white-space:pre-wrap; border-bottom:1px solid var(--mw-line-soft); background:var(--mw-bg-deep); }
+.minerva-workspace > .mw-message:empty { display:none; }
+.mw-content { flex:1; min-height:0; overflow:auto; padding:12px; }
+.mw-content > h2 { font-size:15px; margin:0 0 8px; }
+.mw-content > h3 { font-size:13px; margin:12px 0 8px; }
+.mw-content p { margin:6px 0; }
+.mw-content pre { white-space:pre-wrap; overflow-wrap:anywhere; padding:10px; background:#020c05; margin:8px 0; font:12px/1.45 var(--wf-font-mono); }
+.mw-content section { padding:16px; border:1px solid var(--mw-line); margin:12px 0; }
+
+.mw-toolbar, .mw-palette { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:8px 12px; border-bottom:1px solid var(--mw-line); }
+.mw-toolbar select.mw-graph-select { flex:1 1 200px; min-width:150px; max-width:320px; margin-right:auto; min-height:36px; font-size:14px; }
+.mw-palette { padding:6px 12px; font-size:12px; }
+.mw-palette b { color:var(--mw-muted); margin-right:8px; }
+.mw-hint { color:var(--mw-dim); font-size:11px; padding:0 12px; margin:8px 0; }
+
+/* action menu: secondary/destructive graph actions behind one disclosure */
+.mw-menu { position:relative; }
+.mw-menu > summary { list-style:none; display:inline-flex; align-items:center; gap:6px; border:1px solid var(--mw-line); padding:6px 10px; min-height:34px; cursor:pointer; background:var(--mw-bg-deep); }
+.mw-menu > summary::-webkit-details-marker { display:none; }
+.mw-menu[open] { display:flex; flex-direction:column; align-items:stretch; border:1px solid var(--mw-accent); background:var(--mw-bg); z-index:5; }
+.mw-menu[open] > summary { border:0; border-bottom:1px solid var(--mw-line); }
+.mw-menu > .mw-menu-item { display:flex; width:100%; justify-content:flex-start; text-align:left; border:0; border-bottom:1px solid var(--mw-line-soft); padding:8px 12px; min-height:36px; background:transparent; }
+.mw-menu > .mw-menu-item:last-child { border-bottom:0; }
+
+/* collapsible folds: advanced JSON, run input, activity rows */
+.mw-fold { border:1px solid var(--mw-line); padding:8px 10px; margin:12px 0; }
+.mw-fold > summary { cursor:pointer; color:var(--mw-muted); font-size:12px; display:flex; align-items:center; min-height:32px; }
+.mw-fold[open] > summary { color:var(--mw-text); margin-bottom:8px; }
+.mw-fold > .mw-field { margin-top:8px; }
+.mw-quick { margin:0; border:1px solid var(--mw-line); }
+.mw-quick > summary { cursor:pointer; color:var(--mw-muted); font-size:12px; padding:6px 8px; min-height:32px; display:flex; align-items:center; }
+.mw-quick-fields { display:flex; flex-direction:column; gap:8px; padding:8px; }
+
+/* ---- full editor layout: canvas biggest, inspector on the right ---- */
+.minerva-workspace:not(.mw-editing) .mw-editor-only { display:none; }
+.minerva-workspace.mw-full { border:0; }
+.mw-full .mw-content { display:flex; flex-direction:column; overflow:hidden; padding:0; }
+.mw-editor-layout { display:grid; grid-template-columns:minmax(0,1fr) clamp(238px,24vw,340px); flex:1; min-height:0; }
+.mw-editor-center { min-width:0; min-height:0; display:flex; flex-direction:column; gap:8px; padding:12px; }
+.mw-canvas { position:relative; border:1px solid var(--mw-line); background:#05140b; height:44vh; min-height:240px; }
+.mw-editor-center .mw-canvas { flex:1; height:auto; min-height:260px; }
+.mw-canvas .svelte-flow__edge-label { padding:3px 6px; color:#c6e9ce; background:var(--mw-bg); border:1px solid var(--mw-line); font-size:11px; max-width:160px; }
+.mw-canvas .svelte-flow__edge-path { stroke:#39824b; }
+.mw-inspector-rail { overflow:auto; border-left:1px solid var(--mw-line); padding:12px; min-width:0; }
+.mw-inspector-rail h3 { font-size:13px; margin:12px 0 8px; }
+.mw-inspector-rail h3:first-child { margin-top:0; }
+.mw-inspector-rail input, .mw-inspector-rail select { width:100%; }
+.mw-properties { display:flex; flex-direction:column; gap:8px; }
+.mw-transitions { display:flex; flex-direction:column; gap:8px; }
+.mw-transition { display:flex; align-items:center; justify-content:space-between; gap:8px; border:1px solid var(--mw-line-soft); padding:4px 8px; font-size:12px; }
+.mw-transition p { margin:0; overflow-wrap:anywhere; }
+.mw-inspector > h3 { margin-top:12px; }
+
+/* ---- standing order ---- */
+.mw-orders { border:1px solid var(--mw-line); background:var(--mw-bg-raised); padding:12px; margin:0 0 12px; }
+.mw-orders h3 { margin:0 0 8px; font-size:13px; letter-spacing:.03em; text-transform:uppercase; color:var(--mw-muted); }
+.mw-orders textarea { min-height:56px; }
+.mw-order-status { margin:8px 0 0; font-size:12px; color:var(--mw-muted); line-height:1.45; }
+.mw-order-status:empty { display:none; }
+
+/* ---- decisions: one labelled bar per possible decision, chosen emphasized ---- */
+.mw-decision-now { margin:0 0 12px; padding:0 0 12px; border-bottom:1px solid var(--mw-line); }
+.mw-decision-now > h3 { font-size:13px; margin:0 0 8px; }
+.mw-decision-block { padding:8px 0; }
+.mw-decision-head { display:flex; align-items:baseline; justify-content:space-between; gap:8px; font-size:13px; margin-bottom:8px; }
+.mw-chosen { color:var(--mw-accent); }
+.mw-score { display:grid; grid-template-columns:1fr auto; gap:4px; font-size:12px; margin:6px 0; padding:4px 6px; border-left:2px solid transparent; }
+.mw-score-chosen { background:#0e2c18; border-left-color:var(--mw-accent); }
+.mw-score-label { overflow-wrap:anywhere; }
+.mw-score-value { color:var(--mw-muted); font-variant-numeric:tabular-nums; }
+.mw-score-chosen .mw-score-value { color:var(--wf-text-strong); }
+.mw-score progress { grid-column:1/-1; }
+
+/* ---- run status + run list ---- */
+.mw-live-status { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:0; padding:6px 12px; font-size:12px; border-bottom:1px solid var(--mw-line-soft); }
+.mw-live-detail { color:var(--mw-muted); }
+.mw-status { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--mw-line); padding:2px 6px; font-size:11px; letter-spacing:.04em; text-transform:uppercase; }
+.mw-status-running { border-color:var(--mw-accent); color:var(--wf-text-strong); }
+.mw-status-waiting { border-color:#b7e07a; color:#d6f0ab; }
+.mw-status-finished { color:var(--mw-muted); }
+.mw-status-stopped { color:#c9b98a; border-color:#5d5433; }
+.mw-status-failed { color:var(--mw-danger); border-color:var(--mw-danger-line); }
+.mw-status-none { color:var(--mw-dim); }
+.mw-runs { border-top:1px solid var(--mw-line); max-height:32vh; overflow:auto; }
+.mw-runs:empty { display:none; }
+.mw-runs > h3 { font-size:13px; margin:12px; }
+.mw-run { border-bottom:1px solid var(--mw-line-soft); padding:8px 12px; }
+.mw-run > summary { display:flex; align-items:center; gap:8px; justify-content:space-between; cursor:pointer; min-height:32px; }
+.mw-run-id { font:12px var(--wf-font-mono); overflow-wrap:anywhere; }
+.mw-run h4, .mw-escalation h4, .mw-order-list h4, .mw-hop-list h4 { font-size:12px; margin:12px 0 6px; color:var(--mw-muted); }
+.mw-order-list p, .mw-hop-list p { font:12px/1.45 var(--wf-font-mono); margin:4px 0; overflow-wrap:anywhere; }
+.mw-escalation { border:1px solid #b7e07a; padding:8px 10px; margin:8px 0; }
+
+/* ---- launcher ---- */
+#minerva-workspace-toggle { position:static; flex:none; color:inherit; background:transparent; border:0; padding:3px; margin-left:6px; cursor:pointer; display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; }
+#minerva-workspace-toggle[hidden] { display:none; }
+#minerva-workspace-toggle:hover, #minerva-workspace-toggle[aria-expanded="true"] { color:#39ff6a; background:#12341c; }
+body.minerva-panel-docked #chat-container { flex:none; margin-right:var(--mw-panel-reserve); width:var(--mw-chat-width); max-width:var(--mw-chat-width); }
+
+/* ---- narrow widths: stack the inspector under the canvas, never squeeze it to zero ---- */
+@media(max-width:1024px) { .mw-editor-layout { grid-template-columns:minmax(0,1fr) 260px; } .mw-toolbar, .mw-palette { gap:4px; } }
+@media(max-width:820px) {
+  .mw-editor-layout { display:flex; flex-direction:column; overflow:auto; }
+  .mw-editor-center { min-height:320px; padding:8px; }
+  .mw-editor-center .mw-canvas { min-height:260px; }
+  .mw-inspector-rail { border-left:0; border-top:1px solid var(--mw-line); padding:12px; overflow:visible; }
+}
+@media(max-width:640px) {
+  .minerva-workspace > header { flex-wrap:wrap; }
+  .minerva-workspace > header b { flex:1 1 100%; }
+  .mw-toolbar select.mw-graph-select { flex:1 1 100%; }
+}
+@media(prefers-reduced-motion:reduce) { .minerva-workspace * { transition:none!important; } }

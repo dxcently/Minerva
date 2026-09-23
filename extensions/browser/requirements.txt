@@ -1,0 +1,9 @@
+# extensions/browser's own venv -- see service.py's module docstring for the
+# three-line setup (python -m venv, install -r this file, playwright install
+# chromium --no-shell). Top-level pins only, tested together on this box;
+# transitive versions (pydantic, starlette, anyio, greenlet, pyee, click,
+# h11, typing_extensions, ...) resolve on their own and may drift slightly
+# over time without breaking this service's narrow use of any of them.
+playwright==1.63.0
+fastapi==0.141.1
+uvicorn==0.53.0

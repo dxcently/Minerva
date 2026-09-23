@@ -1,0 +1,42 @@
+// Registers as `browser_open`. See eidolon/docs/extensions.md for the
+// extension contract this rides on, and service.py's `_open` for what
+// actually runs.
+pub fn manifest() {
+    #{
+        name: "open",
+        description: "Navigate the one shared browser to a URL -- there is one browser and one page for the whole machine, so this changes what every browser_* call sees next, not just yours. Always follow it with browser_snapshot before clicking or typing anything: this call invalidates whatever refs an earlier snapshot handed out, the same as browser_click and browser_type do. Reach for this to start on a page or to jump straight to a known URL. Not for reading a URL you do not intend to click through or type into -- fetch is cheaper and does not tie up the one shared browser. An open with confine discards the shared browser's cookies -- it replaces the context, not just the page, so treat it as the start of a new session for the origins it lists.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "url": #{
+                    "type": "string",
+                    "description": "The URL to open, including scheme, e.g. \"https://example.com\".",
+                },
+                "timeout_s": #{
+                    "type": "integer",
+                    "description": "How long to wait for the page to finish loading. Default 30.",
+                },
+                "confine": #{
+                    "type": "array",
+                    "items": #{ "type": "string" },
+                    "description": "Confine the browser to these origins -- https://en.wikipedia.org, http://127.0.0.1:3000 -- until the next browser_open: a fresh context with no cookies, no downloads, and every request to any other origin aborted. A graph running under a warrant passes its warrant's origins here; see docs/design/unattended.md.",
+                },
+            },
+            "required": ["url"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let timeout_s = match input.get("timeout_s") {
+        Some(t) => t,
+        None => 30,
+    };
+    // Same idiom snapshot.rn's optional args already use: `confine` reaches
+    // the service only when the caller actually asked for it, so an
+    // ordinary open's wire shape is untouched.
+    let args = #{ "url": input.url, "timeout_s": timeout_s };
+    if let Some(c) = input.get("confine") { args.insert("confine", c); }
+    eidolon::service_call("open", args).await
+}

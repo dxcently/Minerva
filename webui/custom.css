@@ -1,0 +1,482 @@
+/* @import must precede every rule -- a proper terminal face, with local
+ * fallbacks if the CDN is unreachable (the UI itself never leaves the box). */
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
+
+/* Minerva -- Open WebUI skin: hacker-green mono terminal.
+ *
+ * Open WebUI's index.html requests /static/custom.css on every load; this
+ * file is the supported theming hook (empty by default). `hoot webui` /
+ * `hoot up` copy it into the installed package's two static dirs, so an
+ * open-webui upgrade that blanks them heals on the next launch. The source
+ * of truth is bonsai2\webui\custom.css.
+ *
+ * CSS can restyle anything it can reach -- color, shape, type, borders --
+ * but not the DOM itself (compiled Svelte). Corner ticks ride pseudo-
+ * elements on real nodes (.chat-user / .chat-assistant), same bracket
+ * grammar as the eidolon web page: two corners, never a frame.
+ */
+
+.dark {
+  /* the neutral ramp the whole UI is built on, retinted phosphor:
+   * near-black green-cast ground through pale green-white text */
+  --color-gray-50:  oklch(96% 0.030 150);
+  --color-gray-100: oklch(92% 0.040 150);
+  --color-gray-200: oklch(88% 0.045 150);
+  --color-gray-300: oklch(80% 0.050 150);
+  --color-gray-400: oklch(70% 0.055 150);
+  --color-gray-500: oklch(60% 0.055 151);
+  --color-gray-600: oklch(45% 0.050 152);
+  --color-gray-700: oklch(34% 0.045 153);
+  --color-gray-800: oklch(26% 0.038 154);
+  --color-gray-850: oklch(21% 0.032 155);
+  --color-gray-900: oklch(17% 0.026 156);
+  --color-gray-950: oklch(13% 0.020 157);
+}
+
+/* ─── terminal type: mono is the voice, not an accent ────────────────────── */
+.dark body,
+.dark .font-primary,
+.dark .font-sans,
+.dark input,
+.dark textarea,
+.dark button,
+.dark select {
+  font-family: "Share Tech Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+}
+
+/* ─── phosphor accents ──────────────────────────────────────────────────── */
+.dark a { color: #39ff6a; }
+.dark ::selection { background: rgba(57, 255, 106, 0.25); }
+.dark input::placeholder, .dark textarea::placeholder { color: rgba(120, 200, 140, 0.45); }
+
+.dark button:focus-visible {
+  outline: 1px solid rgba(57, 255, 106, 0.6);
+  outline-offset: 1px;
+}
+
+/* The composer already reads as focused -- it is the one place the cursor
+ * lives. A ring around the editable area inside the bordered container just
+ * drew a box in a box, so the text area carries no edge of its own and the
+ * caret does the work. Buttons keep their ring for keyboard navigation. */
+.dark #message-input-container textarea,
+.dark #message-input-container [contenteditable],
+.dark #message-input-container input {
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+}
+.dark #message-input-container { caret-color: #39ff6a; }
+
+.dark ::-webkit-scrollbar { width: 8px; height: 8px; }
+.dark ::-webkit-scrollbar-thumb { background: rgba(57, 255, 106, 0.22); border-radius: 0; }
+.dark ::-webkit-scrollbar-thumb:hover { background: #39ff6a; }
+.dark ::-webkit-scrollbar-track { background: transparent; }
+
+/* ─── shape: angular, not bubbly ────────────────────────────────────────── *
+ * Tailwind utility names are stable across builds even though file hashes
+ * are not. Radius collapses to near-square; .rounded-full survives so
+ * avatars stay round. */
+.dark .rounded-3xl, .dark .rounded-2xl, .dark .rounded-xl { border-radius: 0; }
+.dark .rounded-lg, .dark .rounded-md { border-radius: 0; }
+
+/* ─── the chats: edged, bordered, bracketed ─────────────────────────────── *
+ * Only the actual content gets a border. The first pass put edges on every
+ * child wrapper of a turn, which drew hollow rectangles around empty layout
+ * divs and doubled the margins -- so: the user's turn borders its BUBBLE
+ * (the element that carries the message background), and the assistant's
+ * turn borders the element holding rendered prose, found with :has(). */
+.dark .chat-user .rounded-3xl,
+.dark .chat-assistant > div > div:has(> .markdown-prose) {
+  position: relative;
+  border: 1px solid rgba(57, 255, 106, 0.20);
+  background: rgba(57, 255, 106, 0.035) !important;
+}
+/* the operator's side runs a shade hotter, like input echoed to the tty */
+.dark .chat-user .rounded-3xl {
+  border-color: rgba(57, 255, 106, 0.34);
+  background: rgba(57, 255, 106, 0.07) !important;
+}
+.dark .chat-assistant > div > div:has(> .markdown-prose) { padding: 0.55rem 0.85rem; }
+/* two corner ticks: top-left in, bottom-right out -- a bracket, not a frame */
+.dark .chat-user .rounded-3xl::before,
+.dark .chat-user .rounded-3xl::after,
+.dark .chat-assistant > div > div:has(> .markdown-prose)::before,
+.dark .chat-assistant > div > div:has(> .markdown-prose)::after {
+  content: "";
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border: 0 solid #39ff6a;
+  opacity: 0.8;
+  pointer-events: none;
+}
+.dark .chat-user .rounded-3xl::before,
+.dark .chat-assistant > div > div:has(> .markdown-prose)::before { top: -1px; left: -1px; border-width: 1px 0 0 1px; }
+.dark .chat-user .rounded-3xl::after,
+.dark .chat-assistant > div > div:has(> .markdown-prose)::after { bottom: -1px; right: -1px; border-width: 0 1px 1px 0; }
+
+/* ─── the icon row under each message: quiet until touched ──────────────── */
+.dark .chat-user button svg,
+.dark .chat-assistant button svg { transition: color .12s ease, filter .12s ease; }
+.dark .chat-user button:hover svg,
+.dark .chat-assistant button:hover svg {
+  color: #39ff6a;
+  filter: drop-shadow(0 0 4px rgba(57, 255, 106, 0.6));
+}
+
+/* the OI avatar plates (still the shipped PNG) go phosphor too; the tab
+ * favicon is the club owl, recolored green, served as /static/favicon.svg */
+.dark img[src*="favicon"] { filter: sepia(1) saturate(3) hue-rotate(80deg) brightness(0.95); }
+
+/* ─── icons: dinkie-icons (MIT), swapped in by mask ─────────────────────── *
+ * Open WebUI compiles ~250 icons as inline <svg> in its Svelte bundle, so
+ * there is no icon font to repoint and CSS cannot rewrite path data. What it
+ * CAN do: hide the shipped glyph and paint a mask in its place. The button
+ * keeps its size, hit box, aria-label and handler -- only the picture
+ * changes. Every icon is an inlined data URI, so nothing is fetched and the
+ * UI still works with the network unplugged.
+ *
+ * Icons: Dinkie Icons by atelierAnchor -- MIT.
+ *   https://github.com/atelier-anchor/dinkie-icons
+ * A pixel-grid set, which is why it suits this theme; image-rendering:
+ * pixelated keeps the grid crisp instead of smoothing it at render size.
+ *
+ * NOTE on viewBox: this set's "-small" variants declare an 8x8 viewBox but
+ * draw down to y=9, so rendering them as published clips their bottom row.
+ * The generator measures each body's real extent and widens the viewBox to
+ * fit. Regenerate with scratchpad/build-icons.py if icons are added.
+ *
+ * Only buttons with selectors VERIFIED present in the shipped bundle are
+ * swapped; buttons with no honest match keep their shipped icon on purpose.
+ */
+/* ---- dinkie-icons swaps (generated; see webui/README-icons.md) ---- */
+.dark #integration-menu-button svg,
+.dark #voice-input-button svg,
+.dark #model-valves-button svg,
+.dark #continue-response-button svg,
+.dark [id^="speak-button-"] svg,
+.dark [id^="info-"] svg,
+.dark .copy-response-button svg,
+.dark #chat-copy-button svg,
+.dark .edit-user-message-button svg,
+.dark #sidebar-search-button svg,
+.dark #sidebar-toggle-button svg,
+.dark #generate-title-button svg,
+.dark button[aria-label="Controls"] svg,
+.dark #save-temporary-chat-button svg,
+.dark #chat-artifacts-button svg,
+.dark #input-menu-button svg,
+.dark #sidebar-new-chat-button svg,
+.dark #new-chat-button svg,
+.dark .regenerate-response-button svg {
+  display: none;
+}
+.dark #integration-menu-button::before,
+.dark #voice-input-button::before,
+.dark #model-valves-button::before,
+.dark #continue-response-button::before,
+.dark [id^="speak-button-"]::before,
+.dark [id^="info-"]::before,
+.dark .copy-response-button::before,
+.dark #chat-copy-button::before,
+.dark .edit-user-message-button::before,
+.dark #sidebar-search-button::before,
+.dark #sidebar-toggle-button::before,
+.dark #generate-title-button::before,
+.dark button[aria-label="Controls"]::before,
+.dark #save-temporary-chat-button::before,
+.dark #chat-artifacts-button::before,
+.dark #input-menu-button::before,
+.dark #sidebar-new-chat-button::before,
+.dark #new-chat-button::before,
+.dark .regenerate-response-button::before {
+  content: "";
+  display: block;
+  width: 1.15rem;
+  height: 1.15rem;
+  background-color: currentColor;
+  -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+  -webkit-mask-position: center;  mask-position: center;
+  -webkit-mask-size: contain;     mask-size: contain;
+  image-rendering: pixelated;
+}
+/* tools / integrations -- dinkie-icons:jigsaw-puzzle-piece-small | CLIPPED 8x8 -> 8x9 */
+.dark #integration-menu-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%208%209%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M3%209h3V8h2V5H7V4h1V1H6V0H3v1H1v3h1v1H1v3h2Zm1-1V7H2V6h1V3H2V2h2V1h1v1h2v1H6v3h1v1H5v1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%208%209%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M3%209h3V8h2V5H7V4h1V1H6V0H3v1H1v3h1v1H1v3h2Zm1-1V7H2V6h1V3H2V2h2V1h1v1h2v1H6v3h1v1H5v1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* dictate -- dinkie-icons:mic-small | CLIPPED 8x8 -> 8x9 */
+.dark #voice-input-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%208%209%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M2%209h5V8H5V7h1V6H3v1h1v1H2Zm0-3h1V5H2ZM1%205h1V2H1Zm3%200h1V4H4ZM3%204h1V1H3Zm3%202h1V5H6ZM5%204h1V1H5Zm2%201h1V2H7ZM4%201h1V0H4Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%208%209%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M2%209h5V8H5V7h1V6H3v1h1v1H2Zm0-3h1V5H2ZM1%205h1V2H1Zm3%200h1V4H4ZM3%204h1V1H3Zm3%202h1V5H6ZM5%204h1V1H5Zm2%201h1V2H7ZM4%201h1V0H4Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* per-model valves -- dinkie-icons:adjustments-filled */
+.dark #model-valves-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M8%206h3V4H8Zm-7%206h1V8H1Zm4%200h1v-2H5ZM0%207h3V5H0Zm4%202h3V7H4ZM1%204h1V1H1Zm8%208h1V7H9ZM5%206h1V1H5Zm4-3h1V1H9Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M8%206h3V4H8Zm-7%206h1V8H1Zm4%200h1v-2H5ZM0%207h3V5H0Zm4%202h3V7H4ZM1%204h1V1H1Zm8%208h1V7H9ZM5%206h1V1H5Zm4-3h1V1H9Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* continue response -- dinkie-icons:right-black-triangle */
+.dark #continue-response-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%2010h1V9h1V8h1V7h1V6H7V5H6V4H5V3H4Zm-4%201h1V2H0Zm1%201h9v-1H1Zm9-1h1V2h-1ZM1%202h9V1H1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%2010h1V9h1V8h1V7h1V6H7V5H6V4H5V3H4Zm-4%201h1V2H0Zm1%201h9v-1H1Zm9-1h1V2h-1ZM1%202h9V1H1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* read aloud -- dinkie-icons:speaker-with-three-sound-waves */
+.dark [id^="speak-button-"]::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%2012h2V8h1V5H6V1H4v1h1v9H4Zm-2-2h1V9H2Zm1%201h1v-1H3ZM0%209h2V4H0Zm8%203h1v-1H8Zm-1-2h1V9H7ZM2%204h1V3H2Zm7%207h1v-1H9ZM3%203h1V2H3Zm5%206h1V4H8ZM7%204h1V3H7Zm3%206h1V3h-1ZM8%202h1V1H8Zm1%201h1V2H9Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%2012h2V8h1V5H6V1H4v1h1v9H4Zm-2-2h1V9H2Zm1%201h1v-1H3ZM0%209h2V4H0Zm8%203h1v-1H8Zm-1-2h1V9H7ZM2%204h1V3H2Zm7%207h1v-1H9ZM3%203h1V2H3Zm5%206h1V4H8ZM7%204h1V3H7Zm3%206h1V3h-1ZM8%202h1V1H8Zm1%201h1V2H9Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* generation info -- dinkie-icons:circled-information-source */
+.dark [id^="info-"]::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%209h3V8H6V5H4v1h1v2H4Zm-3%201h1V9H1Zm1%201h1v-1H2ZM0%209h1V4H0Zm3%203h5v-1H3Zm5-1h1v-1H8ZM1%204h1V3H1Zm8%206h1V9H9ZM2%203h1V2H2Zm3%201h1V3H5Zm5%205h1V4h-1ZM3%202h5V1H3Zm6%202h1V3H9ZM8%203h1V2H8Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%209h3V8H6V5H4v1h1v2H4Zm-3%201h1V9H1Zm1%201h1v-1H2ZM0%209h1V4H0Zm3%203h5v-1H3Zm5-1h1v-1H8ZM1%204h1V3H1Zm8%206h1V9H9ZM2%203h1V2H2Zm3%201h1V3H5Zm5%205h1V4h-1ZM3%202h5V1H3Zm6%202h1V3H9ZM8%203h1V2H8Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* copy response -- dinkie-icons:clipboard */
+.dark .copy-response-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%2012h5v-1H8V9h2v1h1V5H9V2H7V1H2v1H0v9h4Zm-3-2V3h1v1h5V3h1v2H4v1H2v1h2v1H2v1h2v1Zm4%201V6h5v2H7v3Zm4%200h1v-1H9ZM3%203V2h3v1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%2012h5v-1H8V9h2v1h1V5H9V2H7V1H2v1H0v9h4Zm-3-2V3h1v1h5V3h1v2H4v1H2v1h2v1H2v1h2v1Zm4%201V6h5v2H7v3Zm4%200h1v-1H9ZM3%203V2h3v1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* copy chat -- dinkie-icons:clipboard */
+.dark #chat-copy-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%2012h5v-1H8V9h2v1h1V5H9V2H7V1H2v1H0v9h4Zm-3-2V3h1v1h5V3h1v2H4v1H2v1h2v1H2v1h2v1Zm4%201V6h5v2H7v3Zm4%200h1v-1H9ZM3%203V2h3v1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%2012h5v-1H8V9h2v1h1V5H9V2H7V1H2v1H0v9h4Zm-3-2V3h1v1h5V3h1v2H4v1H2v1h2v1H2v1h2v1Zm4%201V6h5v2H7v3Zm4%200h1v-1H9ZM3%203V2h3v1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* edit message -- dinkie-icons:pencil */
+.dark .edit-user-message-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2012h5v-1h1v-1H5V9H4v2H2v-1H1V8h2V7H2V6H1v1H0Zm3-3h1V8H3Zm3%201h1V9H6ZM2%206h1V5H2Zm3%203h1V8H5ZM3%207h1V6H3Zm4%202h1V8H7ZM3%205h1V4H3Zm3%203h1V7H6ZM4%206h1V5H4Zm4%202h1V7H8ZM4%204h1V3H4Zm3%203h1V6H7ZM5%205h1V4H5Zm4%202h1V6H9ZM5%203h1V2H5Zm3%203h1V5H8ZM6%204h1V3H6Zm4%202h1V3h-1v1H9v1h1ZM7%203h1V2h1V1H6v1h1Zm2%200h1V2H9Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2012h5v-1h1v-1H5V9H4v2H2v-1H1V8h2V7H2V6H1v1H0Zm3-3h1V8H3Zm3%201h1V9H6ZM2%206h1V5H2Zm3%203h1V8H5ZM3%207h1V6H3Zm4%202h1V8H7ZM3%205h1V4H3Zm3%203h1V7H6ZM4%206h1V5H4Zm4%202h1V7H8ZM4%204h1V3H4Zm3%203h1V6H7ZM5%205h1V4H5Zm4%202h1V6H9ZM5%203h1V2H5Zm3%203h1V5H8ZM6%204h1V3H6Zm4%202h1V3h-1v1H9v1h1ZM7%203h1V2h1V1H6v1h1Zm2%200h1V2H9Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* search chats -- dinkie-icons:left-magnifying-glass-small | CLIPPED 8x8 -> 8x9 */
+.dark #sidebar-search-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%208%209%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M7%209h2V7H8v1H7ZM1%206h1V5H1Zm1%201h3V6H2ZM0%205h1V2H0Zm5%201h1V5H5Zm1%202h1V7h1V6H6ZM1%202h1V1H1Zm5%203h1V2H6ZM2%201h3V0H2Zm3%201h1V1H5Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%208%209%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M7%209h2V7H8v1H7ZM1%206h1V5H1Zm1%201h3V6H2ZM0%205h1V2H0Zm5%201h1V5H5Zm1%202h1V7h1V6H6ZM1%202h1V1H1Zm5%203h1V2H6ZM2%201h3V0H2Zm3%201h1V1H5Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* toggle sidebar -- dinkie-icons:menu */
+.dark #sidebar-toggle-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%203h11V2H0Zm0%208h11v-1H0Zm0-4h11V6H0Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%203h11V2H0Zm0%208h11v-1H0Zm0-4h11V6H0Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* generate title -- dinkie-icons:sparkles */
+.dark #generate-title-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M7%209h1V6H7Zm-4%203h1V9H3ZM1%209h2V8H1Zm2-1h1V6H3Zm1%201h2V8H4ZM1%205h1V3H1ZM0%203h1V2H0Zm2%200h1V2H2ZM1%202h1V1H1Zm3%203h2V4H4Zm2%201h1V5H6Zm2%200h1V5H8ZM6%204h1V3H6Zm2%200h1V3H8Zm1%201h2V4H9ZM7%203h1V1H7Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M7%209h1V6H7Zm-4%203h1V9H3ZM1%209h2V8H1Zm2-1h1V6H3Zm1%201h2V8H4ZM1%205h1V3H1ZM0%203h1V2H0Zm2%200h1V2H2ZM1%202h1V1H1Zm3%203h2V4H4Zm2%201h1V5H6Zm2%200h1V5H8ZM6%204h1V3H6Zm2%200h1V3H8Zm1%201h2V4H9ZM7%203h1V1H7Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* controls panel -- dinkie-icons:adjustments */
+.dark button[aria-label="Controls"]::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M9%2012h1V7h1V4h-1V1H9v3H8v3h1Zm-8%200h1V8h1V5H2V1H1v4H0v3h1Zm0-5V6h1v1Zm4%205h1v-2h1V7H6V1H5v6H4v3h1Zm0-3V8h1v1Zm4-3V5h1v1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M9%2012h1V7h1V4h-1V1H9v3H8v3h1Zm-8%200h1V8h1V5H2V1H1v4H0v3h1Zm0-5V6h1v1Zm4%205h1v-2h1V7H6V1H5v6H4v3h1Zm0-3V8h1v1Zm4-3V5h1v1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* save temporary chat -- dinkie-icons:floppy-disk */
+.dark #save-temporary-chat-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2012h11V3h-1v8H9V7H2v4H1V2h1v4h6V2h1V1H0Zm3-1V8h5v3Zm0-6V2h1v3Zm2%200V2h2v3Zm4-2h1V2H9Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2012h11V3h-1v8H9V7H2v4H1V2h1v4h6V2h1V1H0Zm3-1V8h5v3Zm0-6V2h1v3Zm2%200V2h2v3Zm4-2h1V2H9Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* artifacts -- dinkie-icons:cube */
+.dark #chat-artifacts-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%2012h3v-1H6V6h1V5H4v1h1v5H4Zm-2-1h2v-1H2Zm-2-1h2V9H1V4h1V3H0Zm7%201h2v-1H7ZM2%205h2V4H2Zm0-2h2V2H2Zm7%207h2V3H9v1h1v5H9ZM7%205h2V4H7ZM4%202h3V1H4Zm3%201h2V2H7Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%2012h3v-1H6V6h1V5H4v1h1v5H4Zm-2-1h2v-1H2Zm-2-1h2V9H1V4h1V3H0Zm7%201h2v-1H7ZM2%205h2V4H2Zm0-2h2V2H2Zm7%207h2V3H9v1h1v5H9ZM7%205h2V4H7ZM4%202h3V1H4Zm3%201h2V2H7Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* attach -- dinkie-icons:paperclip */
+.dark #input-menu-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M2%2011h1V3H2Zm1%201h4v-1H3Zm1-3h1V4H4Zm3%202h1V4H7ZM3%203h1V2H3Zm2%201h2V3H5Zm4%205h1V3H9ZM4%202h4V1H4Zm4%201h1V2H8Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M2%2011h1V3H2Zm1%201h4v-1H3Zm1-3h1V4H4Zm3%202h1V4H7ZM3%203h1V2H3Zm2%201h2V3H5Zm4%205h1V3H9ZM4%202h4V1H4Zm4%201h1V2H8Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* new chat (sidebar) -- dinkie-icons:memo */
+.dark #sidebar-new-chat-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2012h9v-1H1V2h7v1h1V1H0Zm2-2h2V9H2Zm0-2h2V7H2Zm3%202h3V9H7V8H6V7H5ZM2%206h3V5H2Zm6%203h1V8H8ZM6%207h1V6H6ZM2%204h5V3H2Zm7%204h1V7H9ZM7%206h1V5H7Zm3%201h1V5h-1ZM8%205h2V4H8Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2012h9v-1H1V2h7v1h1V1H0Zm2-2h2V9H2Zm0-2h2V7H2Zm3%202h3V9H7V8H6V7H5ZM2%206h3V5H2Zm6%203h1V8H8ZM6%207h1V6H6ZM2%204h5V3H2Zm7%204h1V7H9ZM7%206h1V5H7Zm3%201h1V5h-1ZM8%205h2V4H8Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* new chat -- dinkie-icons:memo */
+.dark #new-chat-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2012h9v-1H1V2h7v1h1V1H0Zm2-2h2V9H2Zm0-2h2V7H2Zm3%202h3V9H7V8H6V7H5ZM2%206h3V5H2Zm6%203h1V8H8ZM6%207h1V6H6ZM2%204h5V3H2Zm7%204h1V7H9ZM7%206h1V5H7Zm3%201h1V5h-1ZM8%205h2V4H8Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2012h9v-1H1V2h7v1h1V1H0Zm2-2h2V9H2Zm0-2h2V7H2Zm3%202h3V9H7V8H6V7H5ZM2%206h3V5H2Zm6%203h1V8H8ZM6%207h1V6H6ZM2%204h5V3H2Zm7%204h1V7H9ZM7%206h1V5H7Zm3%201h1V5h-1ZM8%205h2V4H8Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* regenerate -- dinkie-icons:repeat-arrow */
+.dark .regenerate-response-button::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M6%206h1V5h1V4H7V3H6v1H3v1h3Zm-6%205h1V2H0Zm1%201h9v-1H1Zm1-5h1V5H2Zm2%203h1V9h3V8H5V7H4v1H3v1h1Zm4-2h1V6H8Zm2%203h1V2h-1ZM1%202h9V1H1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M6%206h1V5h1V4H7V3H6v1H3v1h3Zm-6%205h1V2H0Zm1%201h9v-1H1Zm1-5h1V5H2Zm2%203h1V9h3V8H5V7H4v1H3v1h1Zm4-2h1V6H8Zm2%203h1V2h-1ZM1%202h9V1H1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+
+/* ─── composer: a prompt line, not a search pill ────────────────────────── */
+.dark #message-input-container {
+  border: 1px solid rgba(57, 255, 106, 0.35);
+  box-shadow: 0 0 28px -14px rgba(57, 255, 106, 0.55);
+}
+.dark #send-message-button { background: #1f9e46; }
+.dark #send-message-button:hover { background: #39ff6a; box-shadow: 0 0 12px rgba(57, 255, 106, 0.6); }
+
+/* ─── the chat window: inner edge + glow ────────────────────────────────── *
+ * A phosphor bloom hugging the inside edge of the pane, the way light pools
+ * at the edge of a CRT.
+ *
+ * The frame goes on the PANE, not on #messages-container. Two reasons:
+ *
+ * 1. #messages-container is the scroll container, and an absolutely
+ *    positioned ::after with inset:0 resolves against the *scrollable*
+ *    padding box -- the ring stretched to the full height of the transcript
+ *    and slid out of view with the messages. A border on the element's own
+ *    border box stays put, but --
+ * 2. #messages-container stops above the composer, so its frame stopped
+ *    there too, leaving the bottom of the window open.
+ *
+ * The composer is a sibling of #messages-container, so their shared parent is
+ * the whole window -- transcript and input together -- and `:has(> #id)` with
+ * a child combinator reaches exactly that one element and nothing above it.
+ * The frame now runs to the bottom edge.
+ *
+ * Two shadows: a tight one that draws the edge, and a wide, heavily negative
+ * one that reads as depth rather than a highlight. */
+.dark div:has(> #messages-container) {
+  border: 1px solid rgba(57, 255, 106, 0.22);
+  border-radius: 0;
+  box-shadow:
+    inset 0 0 26px -10px rgba(57, 255, 106, 0.30),
+    inset 0 0 90px -34px rgba(57, 255, 106, 0.55);
+}
+
+/* ─── sidebar nav: Notes / Workspace ────────────────────────────────────── *
+ * These two rows ship their icon in a slot the skin cannot reach by id, and
+ * they were rendering as bare labels. Anchor on the href instead -- it is the
+ * one stable hook on a compiled-Svelte nav -- and paint the glyph on the
+ * icon well itself, hiding whatever the app put there so the two can never
+ * double up.
+ *
+ * dinkie-icons: memo (Notes), briefcase (Workspace). */
+.dark a[href="/notes"] > div:first-child > svg,
+.dark a[href="/workspace"] > div:first-child > svg {
+  display: none;
+}
+.dark a[href="/notes"] > div:first-child,
+.dark a[href="/workspace"] > div:first-child {
+  width: 1.05rem;
+  height: 1.05rem;
+  background-color: currentColor;
+  -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+  -webkit-mask-position: center;  mask-position: center;
+  -webkit-mask-size: contain;     mask-size: contain;
+  image-rendering: pixelated;
+}
+.dark a[href="/notes"] > div:first-child {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2012h9v-1H1V2h7v1h1V1H0Zm2-2h2V9H2Zm0-2h2V7H2Zm3%202h3V9H7V8H6V7H5ZM2%206h3V5H2Zm6%203h1V8H8ZM6%207h1V6H6ZM2%204h5V3H2Zm7%204h1V7H9ZM7%206h1V5H7Zm3%201h1V5h-1ZM8%205h2V4H8Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2012h9v-1H1V2h7v1h1V1H0Zm2-2h2V9H2Zm0-2h2V7H2Zm3%202h3V9H7V8H6V7H5ZM2%206h3V5H2Zm6%203h1V8H8ZM6%207h1V6H6ZM2%204h5V3H2Zm7%204h1V7H9ZM7%206h1V5H7Zm3%201h1V5h-1ZM8%205h2V4H8Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+.dark a[href="/workspace"] > div:first-child {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2011h1V8h1V7H1V5h9v2H9v1h1v3h1V4H9V2H8V1H3v1H2v2H0Zm1%201h9v-1H1Zm3-2h3V9h2V8H2v1h2ZM3%204V3h5v1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2011h1V8h1V7H1V5h9v2H9v1h1v3h1V4H9V2H8V1H3v1H2v2H0Zm1%201h9v-1H1Zm3-2h3V9h2V8H2v1h2ZM3%204V3h5v1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+
+/* ─── sidebar nav: the three pages eidolon serves ───────────────────────── *
+ * `/ext`, `/auth` and `/jev` are not Open WebUI routes -- eidolon serves
+ * them on its own port and `loader.js` puts the rows in the nav, per the
+ * 2026-09-18 amendment ("loader.js may add DOM adjacent to a stable
+ * anchor"). So the href is absolute and `$=` is the match, not `=`:
+ * `http://127.0.0.1:8085/ext` has to hit the same rule a same-origin
+ * `/ext` would. Nothing Open WebUI renders as an <a> ends in any of the
+ * three -- its own `/auth` route is reached by `goto()`, never by an
+ * anchor, checked against the installed 0.11.3 bundle -- so this cannot
+ * collide; if a later version ever renders one, the cost is a lock glyph
+ * on a sign-in link and nothing more.
+ *
+ * DEVIATION from docs/design/pages.md §7.2, stated rather than silent:
+ * that block masks `> div:first-child` itself and gives it a 1.05rem box.
+ * The design was drawn against markup 0.11.3 does not render (which is
+ * what the amendment exists for). What it *does* render is an icon well
+ * that is `size-4` in the open sidebar and a 30px rounded hover target in
+ * the collapsed icon rail -- and sizing that well down to 1.05rem shrinks
+ * the rail's hover box. So the glyph goes on a `::before` instead, which
+ * leaves the well's own geometry alone and is the idiom the nineteen
+ * button swaps above already use.
+ *
+ * dinkie-icons: jigsaw-puzzle-piece-small (extensions -- byte-identical to
+ * the URI on #integration-menu-button above, because an extension IS a tool
+ * bundle and the skin should teach one glyph once), lock-filled
+ * (credentials), link-symbol (graphs -- a statechart is nodes joined).
+ *
+ * Inert when unmatched: no anchor, no rule, nothing broken. */
+.dark a[href$="/ext"] > div:first-child > svg,
+.dark a[href$="/auth"] > div:first-child > svg,
+.dark a[href$="/jev"] > div:first-child > svg {
+  display: none;
+}
+.dark a[href$="/ext"] > div:first-child::before,
+.dark a[href$="/auth"] > div:first-child::before,
+.dark a[href$="/jev"] > div:first-child::before {
+  content: "";
+  display: block;
+  width: 1rem;
+  height: 1rem;
+  background-color: currentColor;
+  -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+  -webkit-mask-position: center;  mask-position: center;
+  -webkit-mask-size: contain;     mask-size: contain;
+  image-rendering: pixelated;
+}
+/* extensions -- dinkie-icons:jigsaw-puzzle-piece-small | CLIPPED 8x8 -> 8x9 */
+.dark a[href$="/ext"] > div:first-child::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%208%209%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M3%209h3V8h2V5H7V4h1V1H6V0H3v1H1v3h1v1H1v3h2Zm1-1V7H2V6h1V3H2V2h2V1h1v1h2v1H6v3h1v1H5v1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%208%209%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M3%209h3V8h2V5H7V4h1V1H6V0H3v1H1v3h1v1H1v3h2Zm1-1V7H2V6h1V3H2V2h2V1h1v1h2v1H6v3h1v1H5v1Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* credentials -- dinkie-icons:lock-filled */
+.dark a[href$="/auth"] > div:first-child::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2012h11V6H9V2H8V1H3v1H2v4H0Zm9-1V7h1v4ZM4%206V3h3v3Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M0%2012h11V6H9V2H8V1H3v1H2v4H0Zm9-1V7h1v4ZM4%206V3h3v3Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+/* graphs -- dinkie-icons:link-symbol */
+.dark a[href$="/jev"] > div:first-child::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%207h1V6h1V5H5V4H4Zm-4%204h1V8H0Zm1%201h3v-1H1Zm3-1h1v-1H4ZM1%208h1V7H1Zm4%202h1V9H5ZM2%207h1V6H2Zm4%202h1V6H6v1H5v1h1Zm2-2h1V6H8ZM5%204h1V3H5Zm4%202h1V5H9ZM6%203h1V2H6Zm4%202h1V2h-1ZM7%202h3V1H7Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2012%2012%27%3E%3Cpath%20fill%3D%22currentColor%22%20d%3D%22M4%207h1V6h1V5H5V4H4Zm-4%204h1V8H0Zm1%201h3v-1H1Zm3-1h1v-1H4ZM1%208h1V7H1Zm4%202h1V9H5ZM2%207h1V6H2Zm4%202h1V6H6v1H5v1h1Zm2-2h1V6H8ZM5%204h1V3H5Zm4%202h1V5H9ZM6%203h1V2H6Zm4%202h1V2h-1ZM7%202h3V1H7Zm0%200%22%2F%3E%3C%2Fsvg%3E");
+}
+
+/* ─── sidebar: hairline edge ────────────────────────────────────────────── */
+.dark #sidebar { border-right: 1px solid rgba(57, 255, 106, 0.14); }
+
+/* ─── scanlines: texture, not content ───────────────────────────────────── */
+.dark body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2147483647;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(57, 255, 106, 0.015) 0px,
+    rgba(57, 255, 106, 0.015) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+}
+@media (prefers-reduced-motion: reduce) {
+  .dark body::after { background: none; }
+}
+
+/* Minerva uses square surfaces, including code headers and frame glow. */
+.dark [class*="rounded"],
+.dark pre, .dark code, .dark .code-block,
+.dark div:has(> pre), .dark div:has(> #messages-container) {
+  border-radius: 0 !important;
+}
+
+pre, code, .code-block, div:has(> pre) { border-radius: 0 !important; }
+[class*="rounded"], [class*="rounded"]::before, [class*="rounded"]::after,
+[data-tippy-root] .chat-user, [data-tippy-root] .chat-user::before, [data-tippy-root] .chat-user::after {
+  border-radius: 0 !important;
+}
+
+#hoot-serving-status {
+  padding: 5px 16px;
+  color: #85ac8e;
+  font: 11px/1.5 monospace;
+  letter-spacing: .04em;
+  border-bottom: 1px solid rgba(57,255,106,.16);
+  border-radius: 0;
+  flex-shrink: 0;
+}
+#hoot-serving-status[data-ready="true"] { color: #8ee7a2; }
+#hoot-serving-status[data-ready="false"] { color: #d2b579; }
+
+#minerva-credentials-panel { display: flex; flex-direction: column; gap: 12px; margin-top: 24px; }
+
+.minerva-credential-row { padding: 16px 0; border-bottom: 1px solid #164924; }
+.minerva-credential-row label { display: block; }
+.minerva-credential-row input { display: block; width: 100%; padding: 8px; margin: 8px 0; border: 1px solid #164924; border-radius: 0; background: transparent; }
+.minerva-credential-row button { padding: 6px 12px; margin: 8px 8px 0 0; border: 1px solid #164924; border-radius: 0; }
+.minerva-credential-row button:disabled { opacity: .5; }

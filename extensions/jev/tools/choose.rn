@@ -1,0 +1,33 @@
+// Registers as `jev_choose`. See eidolon/docs/extensions.md for the
+// extension contract this rides on -- the method name and the two fields
+// below are the whole of what crosses into jev/server.py's `_choose`.
+pub fn manifest() {
+    #{
+        name: "choose",
+        description: "Score a fixed list of options against a context in one forward pass -- no reasoning tokens, effectively instant. Reach for this instead of thinking a choice through yourself when the decision is really a pick among a small set you have already enumerated: which of these menu items to click, which queue a ticket belongs in, which of a handful of candidates to follow, which branch of a script to take next. You get a probability per option back, so it also works as a confidence check on a choice you already lean toward -- ask with the real options and see whether the top probability clears your bar. Not for open-ended judgment, ranking free text you have not already reduced to a short option list, or picking the options themselves -- that part is still yours.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "context": #{
+                    "type": "string",
+                    "description": "The situation or question the options answer, in plain text.",
+                },
+                "options": #{
+                    "type": "array",
+                    "items": #{ "type": "string" },
+                    "minItems": 2,
+                    "description": "At least two options to score, e.g. [\"refund\", \"sales\", \"technical support\"].",
+                },
+            },
+            "required": ["context", "options"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::service_call("choose", #{
+        "context": input.context,
+        "options": input.options,
+    }).await
+}

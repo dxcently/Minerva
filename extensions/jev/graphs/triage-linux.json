@@ -1,0 +1,170 @@
+{
+  "id": "triage-linux",
+  "version": "1",
+  "description": "On an unfamiliar Linux box: what it is, what it exposes, what is running, and what looks out of place, from a fixed menu of read-only commands.",
+  "initial": "investigate",
+  "context": { "notes": [], "tried": [], "flagged": [] },
+  "meta": {
+    "jev": {
+      "schema": 1,
+      "requires": [],
+      "defaults": { "floor": 0.5, "margin": 0.15, "visits": 8 },
+      "budget": { "steps": 40, "actions": 40, "wall_s": 600, "escalations": 10 },
+      "warrant": {
+        "tools": ["bash"],
+        "commands": [
+          "cat /etc/os-release",
+          "uname -a",
+          "hostname; uptime",
+          "who",
+          "ss -tulpn 2>/dev/null || netstat -tulpn",
+          "ss -tnp state established",
+          "ip -br addr",
+          "nft list ruleset 2>/dev/null || iptables -S",
+          "ps -eo comm,pid,user,pcpu,etime --sort=-pcpu | head -30"
+        ]
+      }
+    }
+  },
+  "on": { "ERROR": "recover" },
+  "states": {
+    "investigate": {
+      "description": "Three questions in order, each answered from its own menu.",
+      "initial": "identify",
+      "onDone": "report",
+      "states": {
+        "identify": {
+          "description": "What is this box?",
+          "exit": [ { "type": "assign", "params": { "tried": [] } } ],
+          "always": [
+            {
+              "guard": { "type": "entails", "params": {
+                "premise": "{{context.notes}}",
+                "hypothesis": "The operating system, its version and the hostname are all stated.",
+                "threshold": 0.7, "window": "tail", "max_chars": 1200 } },
+              "target": "network"
+            },
+            {
+              "guard": { "type": "count", "params": { "path": "context.tried", "gte": 3 } },
+              "target": "network"
+            }
+          ],
+          "meta": {
+            "choose": {
+              "from": { "menu": [
+                { "label": "os release", "command": "cat /etc/os-release" },
+                { "label": "kernel and arch", "command": "uname -a" },
+                { "label": "hostname and uptime", "command": "hostname; uptime" },
+                { "label": "who is logged in", "command": "who" }
+              ] },
+              "exclude": "{{context.tried}}",
+              "context": "Triage: identify the box.\nKnown:\n{{context.notes}}"
+            },
+            "ask": "Which command answers what this box is?"
+          },
+          "on": {
+            "PICK": { "actions": [
+              { "type": "push", "params": { "path": "tried", "value": "{{event.option.label}}" } },
+              { "type": "tool", "params": { "name": "bash",
+                  "input": { "command": "{{event.option.command}}", "timeout_s": 20 } } },
+              { "type": "push", "params": { "path": "notes", "value": "{{event.option.label}}: {{context.obs.text}}" } }
+            ] }
+          }
+        },
+        "network": {
+          "description": "What does it expose?",
+          "exit": [ { "type": "assign", "params": { "tried": [] } } ],
+          "always": [
+            {
+              "guard": { "type": "entails", "params": {
+                "premise": "{{context.obs.text}}",
+                "hypothesis": "The output lists the ports the machine is listening on.",
+                "threshold": 0.7, "max_chars": 1200 } },
+              "target": "processes"
+            },
+            {
+              "guard": { "type": "count", "params": { "path": "context.tried", "gte": 3 } },
+              "target": "processes"
+            }
+          ],
+          "meta": {
+            "choose": {
+              "from": { "menu": [
+                { "label": "listening sockets", "command": "ss -tulpn 2>/dev/null || netstat -tulpn" },
+                { "label": "established connections", "command": "ss -tnp state established" },
+                { "label": "interfaces", "command": "ip -br addr" },
+                { "label": "firewall rules", "command": "nft list ruleset 2>/dev/null || iptables -S" }
+              ] },
+              "exclude": "{{context.tried}}",
+              "context": "Triage: what the box exposes.\nKnown:\n{{context.notes}}"
+            },
+            "ask": "Which command shows what this box exposes?"
+          },
+          "on": {
+            "PICK": { "actions": [
+              { "type": "push", "params": { "path": "tried", "value": "{{event.option.label}}" } },
+              { "type": "tool", "params": { "name": "bash",
+                  "input": { "command": "{{event.option.command}}", "timeout_s": 20 } } },
+              { "type": "push", "params": { "path": "notes", "value": "{{event.option.label}}: {{context.obs.text}}" } }
+            ] }
+          }
+        },
+        "processes": {
+          "description": "What is running? One listing, then judge it.",
+          "entry": [
+            { "type": "tool", "params": { "name": "bash",
+                "input": { "command": "ps -eo comm,pid,user,pcpu,etime --sort=-pcpu | head -30", "timeout_s": 20 },
+                "expect": { "type": "matches", "params": { "path": "context.obs.text", "pattern": "^COMMAND\\s+PID\\s+USER" } } } },
+            { "type": "push", "params": { "path": "notes", "value": "processes: {{context.obs.text}}" } }
+          ],
+          "always": "judge"
+        },
+        "judge": {
+          "description": "Does any process look out of place?",
+          "meta": {
+            "choose": {
+              "from": { "lines": { "of": "context.obs.text", "skip": 1 } },
+              "also": [ { "label": "nothing looks wrong", "event": "CLEAN" } ],
+              "max": 32,
+              "context": "Triage: flag a process that does not belong on a server.\nKnown:\n{{context.notes}}"
+            },
+            "floor": 0.6,
+            "ask": "Which process looks out of place, if any?"
+          },
+          "on": {
+            "PICK": {
+              "target": "done",
+              "actions": [ { "type": "push", "params": { "path": "flagged", "value": "{{event.option.label}}" } } ]
+            },
+            "CLEAN": "done"
+          }
+        },
+        "done": { "type": "final" },
+        "hist": { "type": "history", "history": "shallow", "target": "identify" }
+      }
+    },
+    "recover": {
+      "description": "A command failed. Carry on where the investigation was, or stop.",
+      "entry": [ { "type": "push", "params": { "path": "notes", "value": "error: {{event.error}}" } } ],
+      "meta": {
+        "choose": { "from": "transitions", "context": "Triage: a command failed.\n{{event.error}}" },
+        "floor": 0.7,
+        "ask": "A command failed. Continue the investigation or stop?"
+      },
+      "on": {
+        "CONTINUE": { "target": "#triage-linux.investigate.hist", "description": "continue where it left off" },
+        "ABORT": { "target": "aborted", "description": "stop and report what is known" }
+      }
+    },
+    "report": {
+      "type": "final",
+      "description": "Triage complete.",
+      "output": { "notes": "{{context.notes}}", "flagged": "{{context.flagged}}" }
+    },
+    "aborted": {
+      "type": "final",
+      "description": "Stopped after a failure.",
+      "output": { "notes": "{{context.notes}}" }
+    }
+  }
+}

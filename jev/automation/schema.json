@@ -1,0 +1,321 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hoot:automation/1",
+  "title": "Hoot automation graph: an XState v5 subset",
+  "type": "object",
+  "required": ["id", "initial", "states", "meta"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+    "version": { "type": "string" },
+    "description": { "type": "string" },
+    "initial": { "$ref": "#/$defs/name" },
+    "context": { "type": "object" },
+    "states": { "$ref": "#/$defs/states" },
+    "on": { "$ref": "#/$defs/transitions" },
+    "meta": {
+      "type": "object",
+      "required": ["jev"],
+      "properties": {
+        "jev": { "$ref": "#/$defs/jev" },
+        "editor": { "type": "object" }
+      }
+    }
+  },
+  "$defs": {
+    "name": { "type": "string", "pattern": "^[a-z][a-zA-Z0-9_-]{0,63}$" },
+    "event": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,31}$" },
+    "template": { "type": "string" },
+    "path": { "type": "string", "pattern": "^(context|input|event|run|option)(\\.[A-Za-z0-9_-]+)*$", "description": "`option` is a fifth root, valid only inside choose.prefer; the loader (graph.py's _validate_guard) enforces that, not this pattern." },
+
+    "jev": {
+      "type": "object",
+      "required": ["schema"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": { "const": 1 },
+        "requires": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "input": { "type": "object", "description": "A JSON Schema for the run's input." },
+        "defaults": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "floor": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 },
+            "margin": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
+            "visits": { "type": "integer", "minimum": 1, "default": 20 },
+            "threshold": { "type": "number", "minimum": 0.34, "maximum": 1, "default": 0.6 },
+            "max": { "type": "integer", "minimum": 2, "default": 64 }
+          }
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "steps": { "type": "integer", "minimum": 1, "default": 50 },
+            "actions": { "type": "integer", "minimum": 1, "default": 100 },
+            "wall_s": { "type": "integer", "minimum": 1, "default": 600 },
+            "escalations": { "type": "integer", "minimum": 0, "default": 10 }
+          }
+        },
+        "warrant": {
+          "type": "object",
+          "required": ["tools"],
+          "additionalProperties": false,
+          "properties": {
+            "tools": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" } },
+            "origins": { "type": "array", "items": { "type": "string", "pattern": "^https?://[a-z0-9.\\-]+(:[0-9]+)?$" }, "default": [] },
+            "commands": { "type": "array", "items": { "type": "string" }, "default": [] }
+          }
+        }
+      }
+    },
+
+    "states": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z][a-zA-Z0-9_-]{0,63}$" },
+      "additionalProperties": { "$ref": "#/$defs/state" }
+    },
+
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["atomic", "compound", "final", "history"] },
+        "description": { "type": "string" },
+        "initial": { "$ref": "#/$defs/name" },
+        "states": { "$ref": "#/$defs/states" },
+        "history": { "const": "shallow" },
+        "target": { "type": "string" },
+        "entry": { "$ref": "#/$defs/actions" },
+        "exit": { "$ref": "#/$defs/actions" },
+        "always": { "$ref": "#/$defs/transitionOrList" },
+        "on": { "$ref": "#/$defs/transitions" },
+        "onDone": { "$ref": "#/$defs/transitionOrList" },
+        "output": { "type": "object" },
+        "meta": { "$ref": "#/$defs/stateMeta" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "final" } }, "required": ["type"] },
+          "then": { "properties": { "states": false, "initial": false, "on": false, "always": false, "onDone": false } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "history" } }, "required": ["type"] },
+          "then": {
+            "required": ["history"],
+            "properties": { "states": false, "on": false, "always": false, "entry": false, "exit": false, "meta": false }
+          }
+        },
+        {
+          "if": { "required": ["states"] },
+          "then": { "required": ["initial"] }
+        },
+        {
+          "if": { "required": ["output"] },
+          "then": { "required": ["type"], "properties": { "type": { "const": "final" } } }
+        }
+      ]
+    },
+
+    "stateMeta": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "choose": { "$ref": "#/$defs/choose" },
+        "floor": { "type": "number", "minimum": 0, "maximum": 1 },
+        "margin": { "type": "number", "minimum": 0, "maximum": 1 },
+        "visits": { "type": "integer", "minimum": 1 },
+        "ask": { "$ref": "#/$defs/template" },
+        "editor": { "type": "object" }
+      }
+    },
+
+    "choose": {
+      "type": "object",
+      "required": ["from"],
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "oneOf": [
+            { "const": "transitions" },
+            {
+              "type": "object", "required": ["refs"], "additionalProperties": false,
+              "properties": {
+                "refs": {
+                  "type": "object", "additionalProperties": false,
+                  "properties": {
+                    "of": { "$ref": "#/$defs/path", "default": "context.obs" },
+                    "roles": { "type": "array", "items": { "type": "string" }, "default": ["link", "button"] },
+                    "within": { "type": "string" },
+                    "named": { "type": "boolean", "default": true },
+                    "url": { "type": "string", "description": "A regular expression the option's snapshot url must match; an option with no url is dropped." }
+                  }
+                }
+              }
+            },
+            {
+              "type": "object", "required": ["menu"], "additionalProperties": false,
+              "properties": { "menu": { "$ref": "#/$defs/menu" } }
+            },
+            {
+              "type": "object", "required": ["lines"], "additionalProperties": false,
+              "properties": {
+                "lines": {
+                  "type": "object", "additionalProperties": false,
+                  "properties": {
+                    "of": { "$ref": "#/$defs/path", "default": "context.obs.text" },
+                    "skip": { "type": "integer", "minimum": 0, "default": 0 }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "also": { "$ref": "#/$defs/menu" },
+        "exclude": { "$ref": "#/$defs/template" },
+        "max": { "type": "integer", "minimum": 2 },
+        "context": { "$ref": "#/$defs/template" },
+        "label": { "$ref": "#/$defs/template" },
+        "prefer": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/guard" },
+          "description": "Guards tried in order, options in menu order, before the chooser is consulted -- the first (rule, option) pair that passes takes that option with source/verified \"rule\" and no floor is consulted. Each guard is evaluated with option.* (label, event, and the source's own data) added to the path roots."
+        }
+      }
+    },
+
+    "menu": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["label"],
+        "properties": {
+          "label": { "type": "string", "minLength": 1 },
+          "event": { "$ref": "#/$defs/event" }
+        },
+        "additionalProperties": true
+      }
+    },
+
+    "transitions": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[A-Z][A-Z0-9_]{0,31}$" },
+      "additionalProperties": { "$ref": "#/$defs/transitionOrList" }
+    },
+
+    "transitionOrList": {
+      "oneOf": [
+        { "type": "string" },
+        { "$ref": "#/$defs/transition" },
+        {
+          "type": "array", "minItems": 1,
+          "items": { "oneOf": [ { "type": "string" }, { "$ref": "#/$defs/transition" } ] }
+        }
+      ]
+    },
+
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": { "type": "string" },
+        "reenter": { "type": "boolean", "default": false },
+        "guard": { "$ref": "#/$defs/guard" },
+        "actions": { "$ref": "#/$defs/actions" },
+        "description": { "type": "string" },
+        "meta": { "type": "object" }
+      }
+    },
+
+    "nli": {
+      "type": "object",
+      "required": ["hypothesis"],
+      "additionalProperties": false,
+      "properties": {
+        "premise": { "$ref": "#/$defs/template", "default": "{{context.obs.text}}" },
+        "hypothesis": { "$ref": "#/$defs/template" },
+        "threshold": { "type": "number", "minimum": 0.34, "maximum": 1 },
+        "window": { "enum": ["head", "tail"], "default": "head" },
+        "max_chars": { "type": "integer", "minimum": 1, "default": 1500 }
+      }
+    },
+
+    "guard": {
+      "type": "object",
+      "required": ["type", "params"],
+      "additionalProperties": false,
+      "properties": { "type": { "type": "string" }, "params": { "type": "object" } },
+      "oneOf": [
+        { "properties": { "type": { "const": "equals" },
+            "params": { "type": "object", "required": ["path", "value"], "additionalProperties": false,
+              "properties": { "path": { "$ref": "#/$defs/path" }, "value": {},
+                "fold": { "type": "boolean", "default": false, "description": "Casefold and strip both sides before comparing, when both are strings." } } } } },
+        { "properties": { "type": { "const": "contains" },
+            "params": { "type": "object", "required": ["path", "value"], "additionalProperties": false,
+              "properties": { "path": { "$ref": "#/$defs/path" }, "value": { "$ref": "#/$defs/template" } } } } },
+        { "properties": { "type": { "const": "matches" },
+            "params": { "type": "object", "required": ["path", "pattern"], "additionalProperties": false,
+              "properties": { "path": { "$ref": "#/$defs/path" }, "pattern": { "type": "string" } } } } },
+        { "properties": { "type": { "const": "exists" },
+            "params": { "type": "object", "required": ["path"], "additionalProperties": false,
+              "properties": { "path": { "$ref": "#/$defs/path" } } } } },
+        { "properties": { "type": { "const": "count" },
+            "params": { "type": "object", "required": ["path"], "additionalProperties": false,
+              "properties": { "path": { "$ref": "#/$defs/path" },
+                "gte": { "type": "integer", "minimum": 0 }, "lte": { "type": "integer", "minimum": 0 } } } } },
+        { "properties": { "type": { "const": "entails" }, "params": { "$ref": "#/$defs/nli" } } },
+        { "properties": { "type": { "const": "contradicts" }, "params": { "$ref": "#/$defs/nli" } } },
+        { "properties": { "type": { "const": "not" },
+            "params": { "type": "object", "required": ["guard"], "additionalProperties": false,
+              "properties": { "guard": { "$ref": "#/$defs/guard" } } } } },
+        { "properties": { "type": { "const": "and" },
+            "params": { "type": "object", "required": ["guards"], "additionalProperties": false,
+              "properties": { "guards": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/guard" } } } } } },
+        { "properties": { "type": { "const": "or" },
+            "params": { "type": "object", "required": ["guards"], "additionalProperties": false,
+              "properties": { "guards": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/guard" } } } } } }
+      ]
+    },
+
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/action" }
+    },
+
+    "action": {
+      "type": "object",
+      "required": ["type", "params"],
+      "additionalProperties": false,
+      "properties": { "type": { "type": "string" }, "params": { "type": "object" } },
+      "oneOf": [
+        { "properties": { "type": { "const": "tool" },
+            "params": { "type": "object", "required": ["name"], "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+                "input": { "type": "object" },
+                "into": { "type": "string", "pattern": "^[a-z][A-Za-z0-9_]*$", "default": "obs" },
+                "timeout_s": { "type": "integer", "minimum": 1 },
+                "expect": { "$ref": "#/$defs/guard" } } } } },
+        { "properties": { "type": { "const": "capture" },
+            "params": { "type": "object", "required": ["path", "pattern", "into"], "additionalProperties": false,
+              "properties": {
+                "path": { "$ref": "#/$defs/path" },
+                "pattern": { "type": "string", "minLength": 1,
+                  "description": "Python regular expression searched with MULTILINE. The graph linter requires a named group and rejects patterns matching empty input." },
+                "into": { "type": "string", "pattern": "^[a-z][A-Za-z0-9_]*$" } } } } },
+        { "properties": { "type": { "const": "assign" },
+            "params": { "type": "object", "minProperties": 1 } } },
+        { "properties": { "type": { "const": "push" },
+            "params": { "type": "object", "required": ["path", "value"], "additionalProperties": false,
+              "properties": { "path": { "type": "string" }, "value": {} } } } },
+        { "properties": { "type": { "const": "inc" },
+            "params": { "type": "object", "required": ["path"], "additionalProperties": false,
+              "properties": { "path": { "type": "string" }, "by": { "type": "integer", "default": 1 } } } } }
+      ]
+    }
+  }
+}

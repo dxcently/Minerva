@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<!--
+  hoot — /auth, served by eidolon.
+
+  A STATIC MOCKUP. Every value is placeholder data; every control is inert.
+  This is the file `crates/web/assets/auth.html` becomes.
+
+  THE ONE RULE THIS PAGE EXISTS TO KEEP: a key is never in a URL, never in
+  argv, never in a log. Every form here is method="post" with exactly two
+  fields — the secret's NAME (not secret) and its VALUE — and there is no
+  GET on this page, or anywhere in eidolon, that returns a stored value.
+  The store has one door out, `SecretStore::external_value`, in Rust, for
+  the consumer that sets the header. This page is not that consumer.
+
+  Self-contained on purpose: no @import, no CDN, no font fetch, no script.
+
+  DOM CONTRACT — see docs/design/pages.md §5.
+    .cred[data-name]           one secret row
+    .cred[data-stored]         "true" | "false"
+    .cred[data-kind]           external | issued | tool
+    .login[data-name]          google | chatgpt
+    .login[data-state]         present | unusable
+    form.cred-form             method=post action=/api/secret/set, fields name+value
+    button[data-act]           replace | cancel | delete | recheck | login | copy | reveal
+-->
+<html lang="en" data-r-theme-variant="hoot">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>credentials · hoot</title>
+<style>
+/* ══ tokens ════════════════════════════════════════════════════════════════
+ * Identical to /ext. When these land in the tree this whole block is
+ * assets/styles/tokens.css + pages.css and neither page carries a copy.
+ */
+:root {
+  --wf-radius: 3px;
+  --wf-pad: 1rem;
+  --wf-font-mono: "Share Tech Mono", "Cascadia Mono", ui-monospace, "SF Mono",
+                  "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+}
+:root[data-r-theme-variant='hoot'] {
+  --wf-bg:          oklch(13% 0.020 157);
+  --wf-fill:        rgba(57, 255, 106, 0.035);
+  --wf-fill-solid:  oklch(17% 0.026 156);
+  --wf-inset:       rgba(57, 255, 106, 0.08);
+
+  --wf-chrome:      #39ff6a;
+  --wf-chrome-hi:   oklch(96% 0.030 150);
+  --wf-glow:        rgba(57, 255, 106, 0.55);
+  --wf-link-line:   rgba(57, 255, 106, 0.45);
+
+  --wf-text:        oklch(88% 0.045 150);
+  --wf-text-strong: oklch(96% 0.030 150);
+  --wf-text-muted:  oklch(70% 0.055 150);
+
+  --wf-edge:        rgba(57, 255, 106, 0.22);
+  --wf-edge-soft:   rgba(57, 255, 106, 0.14);
+  --wf-edge-tick:   rgba(57, 255, 106, 0.55);
+  --wf-edge-now:    #ff4d4d;
+
+  --wf-red:         #ff4d4d;
+  --wf-red-text:    #ff4d4d;
+  --wf-glow-now:    rgba(255, 77, 77, 0.75);
+
+  --wf-wash:        rgba(57, 255, 106, 0.05);
+  --wf-wash-hi:     rgba(57, 255, 106, 0.085);
+  --wf-wash-alt:    rgba(57, 255, 106, 0.035);
+
+  --wf-scroll:      rgba(57, 255, 106, 0.22);
+  --wf-scroll-hi:   #39ff6a;
+
+  --wf-font-sans:   var(--wf-font-mono);
+}
+
+/* ══ base ═════════════════════════════════════════════════════════════════ */
+*, *::before, *::after { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background-color: var(--wf-bg); color: var(--wf-text);
+  font-family: var(--wf-font-sans);
+}
+body::before {
+  content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background:
+    radial-gradient(1200px 520px at 68% -12%, var(--wf-wash-hi), transparent 70%),
+    radial-gradient(900px 400px at 8% 2%, var(--wf-wash-alt), transparent 70%),
+    radial-gradient(1100px 520px at 40% 108%, var(--wf-wash), transparent 72%);
+}
+body::after {
+  content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 60;
+  background: repeating-linear-gradient(to bottom,
+    rgba(57,255,106,.015) 0px, rgba(57,255,106,.015) 1px,
+    transparent 1px, transparent 3px);
+}
+@media (prefers-reduced-motion: reduce) {
+  body::after { background: none; }
+  *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+}
+.shell { position: relative; z-index: 1; }
+
+a:not(.btn):not([class*="wf-"]) {
+  color: var(--wf-chrome); text-decoration: none;
+  border-bottom: 1px solid var(--wf-link-line);
+  transition: color .15s ease, border-color .15s ease;
+}
+a:not(.btn):not([class*="wf-"]):hover,
+a:not(.btn):not([class*="wf-"]):focus-visible { color: var(--wf-chrome-hi); border-bottom-color: var(--wf-chrome-hi); }
+a[class*="wf-"] { text-decoration: none; }
+:where(a, button, input, select, summary, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--wf-chrome-hi); outline-offset: 2px; border-radius: var(--wf-radius);
+}
+* { scrollbar-color: var(--wf-scroll) transparent; scrollbar-width: thin; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: var(--wf-scroll); border-radius: var(--wf-radius); }
+*::-webkit-scrollbar-thumb:hover { background: var(--wf-scroll-hi); }
+
+button, input, select, textarea {
+  font: inherit; color: inherit; background: transparent;
+  border: 1px solid var(--wf-edge); border-radius: var(--wf-radius);
+}
+.btn {
+  font-family: var(--wf-font-mono); font-size: .75rem; font-weight: 700;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--wf-chrome);
+  padding: .35rem .9rem; cursor: pointer; white-space: nowrap;
+  transition: color .15s ease, border-color .15s ease, box-shadow .15s ease;
+}
+.btn:hover, .btn:focus-visible { color: var(--wf-chrome-hi); border-color: var(--wf-chrome-hi); }
+.btn[disabled] { opacity: .45; cursor: not-allowed; }
+.btn--quiet { color: var(--wf-text-muted); }
+.btn--quiet:hover, .btn--quiet:focus-visible { color: var(--wf-text-strong); border-color: var(--wf-edge); }
+.btn--now {
+  color: var(--wf-red-text); border-color: var(--wf-edge);
+  box-shadow: inset 3px 0 0 var(--wf-red); padding-left: calc(.9rem + 3px);
+}
+.btn--now:hover, .btn--now:focus-visible {
+  color: var(--wf-red-text); border-color: var(--wf-edge-now);
+  box-shadow: inset 3px 0 0 var(--wf-red), 0 0 22px -8px var(--wf-glow-now);
+}
+
+/* ══ type ═════════════════════════════════════════════════════════════════ */
+h1 {
+  font-family: var(--wf-font-mono); font-size: 2.375rem; font-weight: 600;
+  letter-spacing: .04em; line-height: 1.15; text-align: left; text-transform: uppercase;
+  color: var(--wf-text-strong); margin: .25rem 0 0; padding-bottom: .75rem; position: relative;
+}
+h1::after {
+  content: ""; position: absolute; left: 0; bottom: 0; width: 4.5rem; height: 1px;
+  background: var(--wf-chrome); box-shadow: 0 0 8px var(--wf-glow);
+}
+p, li { font-size: .9375rem; line-height: 1.6; text-align: left; color: var(--wf-text); margin: 0; }
+strong, b { color: var(--wf-text-strong); font-weight: 700; }
+code, pre, kbd, samp { font-family: var(--wf-font-mono); }
+pre {
+  border: 1px solid var(--wf-edge-soft); border-radius: var(--wf-radius);
+  font-size: .8125rem; line-height: 1.6; padding: .6rem .75rem; margin: 0;
+  overflow-x: auto; background: var(--wf-fill); color: var(--wf-text-strong);
+}
+:not(pre) > code { border-radius: var(--wf-radius); background: var(--wf-fill); padding: .1em .35em; font-size: .9em; }
+.wf-kicker {
+  font-family: var(--wf-font-mono); font-size: .6875rem; font-weight: 700;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--wf-text-muted);
+  margin: 0 0 .5rem; display: flex; align-items: center; gap: .5rem;
+}
+.wf-note { font-size: .8125rem; color: var(--wf-text-muted); margin: .6rem 0 0; line-height: 1.55; }
+
+/* ══ components ═══════════════════════════════════════════════════════════ */
+.wf-panel {
+  position: relative; display: block; padding: var(--wf-pad);
+  border: 1px solid var(--wf-edge); border-radius: var(--wf-radius);
+  background: var(--wf-fill); color: var(--wf-text);
+  transition: border-color .18s ease, box-shadow .18s ease;
+}
+.wf-panel::before, .wf-panel::after {
+  content: ""; position: absolute; width: 10px; height: 10px; pointer-events: none;
+  border-color: var(--wf-edge-tick); border-style: solid;
+}
+.wf-panel::before { top: -1px; left: -1px; border-width: 1px 0 0 1px; }
+.wf-panel::after  { bottom: -1px; right: -1px; border-width: 0 1px 1px 0; }
+.wf-panel--now {
+  border-color: var(--wf-edge);
+  box-shadow: inset 3px 0 0 var(--wf-red), 0 0 22px -8px var(--wf-glow-now);
+  padding-left: calc(var(--wf-pad) + 3px);
+}
+.wf-panel--now::before, .wf-panel--now::after { border-color: var(--wf-red-text); }
+
+/* ══ the page shell ═══════════════════════════════════════════════════════ */
+.shell {
+  display: grid; grid-template-rows: auto minmax(0, 1fr);
+  height: 100dvh; max-width: 78rem; margin: 0 auto; padding: 0 1.5rem;
+}
+.shell-head {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 2rem; flex-wrap: wrap; padding: 1.75rem 0 1.25rem;
+  border-bottom: 1px solid var(--wf-edge-soft);
+}
+.head-id { display: flex; align-items: center; gap: 1rem; }
+.head-id .wf-kicker { margin-bottom: .35rem; }
+.mark { width: 3.25rem; height: auto; flex: none; filter: drop-shadow(0 0 10px var(--wf-glow)); }
+.head-state { display: flex; align-items: flex-end; gap: 1.75rem; flex-wrap: wrap; padding-bottom: .4rem; }
+.head-state .wf-kicker { margin: 0 0 .3rem; }
+.stat { min-width: 5rem; }
+.stat b { font-family: var(--wf-font-mono); font-size: 1.125rem; color: var(--wf-text-strong); display: block; line-height: 1; }
+.stat b .of { color: var(--wf-text-muted); font-size: .8125rem; }
+
+.pagenav { display: flex; gap: .25rem; align-items: center; flex-wrap: wrap; }
+.pagenav a {
+  font-family: var(--wf-font-mono); font-size: .6875rem; font-weight: 700;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--wf-text-muted);
+  padding: .35rem .65rem; border: 1px solid transparent; border-radius: var(--wf-radius);
+}
+.pagenav a:hover, .pagenav a:focus-visible { color: var(--wf-chrome); border-color: var(--wf-edge-soft); }
+.pagenav a[aria-current="page"] { color: var(--wf-chrome); border-color: var(--wf-edge); background: var(--wf-fill); }
+
+.page { overflow-y: auto; overscroll-behavior: contain; padding: 1.25rem 0 3rem;
+        display: flex; flex-direction: column; gap: 1rem; }
+.path { font-family: var(--wf-font-mono); color: var(--wf-text); word-break: break-all; }
+
+/* ══ the custody statement — the page tells you its own rule ═════════════ */
+.custody {
+  border: 0; border-left: 2px solid var(--wf-chrome); border-radius: 0;
+  background: linear-gradient(90deg, var(--wf-wash), transparent 60%);
+  padding: .8rem 1rem;
+}
+.custody::before, .custody::after { content: none; }
+.custody p { font-size: .875rem; color: var(--wf-text); }
+.custody p + p { margin-top: .45rem; color: var(--wf-text-muted); font-size: .8125rem; }
+
+/* ══ group headings ═══════════════════════════════════════════════════════ */
+.group {
+  font-family: var(--wf-font-mono); font-size: .75rem; font-weight: 700;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--wf-text-muted);
+  margin: 1.25rem 0 0; padding-bottom: .4rem; border-bottom: 1px solid var(--wf-edge-soft);
+  display: flex; align-items: baseline; gap: .75rem;
+}
+.group .sub { font-weight: 400; letter-spacing: .04em; text-transform: none; color: var(--wf-text-muted); }
+.group:first-of-type { margin-top: .5rem; }
+
+/* ══ chips ════════════════════════════════════════════════════════════════ */
+.chip {
+  font-family: var(--wf-font-mono); font-size: .625rem; font-weight: 700;
+  letter-spacing: .12em; text-transform: uppercase; white-space: nowrap;
+  padding: .2rem .55rem; border: 1px solid var(--wf-edge-soft);
+  border-radius: var(--wf-radius); color: var(--wf-text-muted);
+}
+.chip[data-state="stored"], .chip[data-state="present"] {
+  color: var(--wf-chrome); border-color: var(--wf-edge); background: var(--wf-fill);
+}
+.chip[data-state="unusable"] { color: var(--wf-red-text); border-color: var(--wf-edge-now); }
+.chip[data-state="empty"] { border-style: dashed; }
+
+/* ══ a credential row ═════════════════════════════════════════════════════ */
+.cred-head { display: grid; grid-template-columns: 1fr auto; gap: .35rem 1rem; align-items: start; }
+.cred-name {
+  grid-column: 1; font-family: var(--wf-font-mono); font-size: 1.0625rem; font-weight: 700;
+  letter-spacing: .05em; color: var(--wf-text-strong); margin: 0;
+}
+.cred-unlocks { grid-column: 1; color: var(--wf-text-muted); font-size: .875rem; }
+.cred-unlocks b { color: var(--wf-text); font-weight: 400; }
+.cred-head .chip { grid-column: 2; grid-row: 1 / span 2; align-self: start; }
+.cred[data-stored="false"] .cred-name { color: var(--wf-text); }
+
+.cred-state {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .75rem;
+  margin-top: .85rem; padding-top: .75rem; border-top: 1px solid var(--wf-edge-soft);
+}
+.fact { font-family: var(--wf-font-mono); font-size: .8125rem; color: var(--wf-text-strong);
+        display: inline-flex; gap: .4rem; align-items: baseline; }
+.fact .wf-kicker { margin: 0; }
+.cred-state .spacer, .login-state .spacer { margin-left: auto; }
+.cred-line { width: 100%; font-size: .8125rem; color: var(--wf-text-muted); line-height: 1.55; }
+.cred-line--alarm { color: var(--wf-red-text); }
+
+/* ══ the one form ═════════════════════════════════════════════════════════
+ * One text field. No `username`, no provider picker, no "confirm the key".
+ * The server ignores any field that is not `name` or `value`, so a browser
+ * extension that helpfully adds one cannot smuggle it through.
+ */
+.cred-form {
+  margin-top: .85rem; padding-top: .75rem; border-top: 1px solid var(--wf-edge-soft);
+}
+.cred[data-stored="false"] .cred-form { border-top: 0; padding-top: 0; }
+.field { display: flex; gap: .5rem; align-items: stretch; flex-wrap: wrap; }
+.field input[type="password"], .field input[type="text"] {
+  flex: 1 1 18rem; min-width: 0; padding: .45rem .7rem;
+  font-family: var(--wf-font-mono); font-size: .875rem; letter-spacing: .08em;
+  background: var(--wf-fill-solid); color: var(--wf-text-strong);
+}
+.field input::placeholder { color: var(--wf-text-muted); letter-spacing: normal; }
+.field .btn { flex: none; }
+.cred-form .wf-kicker { margin-bottom: .4rem; }
+
+/* ══ an oauth login row ═══════════════════════════════════════════════════ */
+.login-state {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .75rem;
+  margin-top: .85rem; padding-top: .75rem; border-top: 1px solid var(--wf-edge-soft);
+}
+.runthis { margin-top: .85rem; padding-top: .75rem; border-top: 1px solid var(--wf-edge-soft); }
+.cmd { display: flex; gap: .5rem; align-items: stretch; }
+.cmd pre { flex: 1 1 auto; min-width: 0; color: var(--wf-chrome); }
+.cmd .btn { flex: none; }
+
+/* ══ confirm ══════════════════════════════════════════════════════════════ */
+dialog.confirm {
+  border: 1px solid var(--wf-edge); border-radius: var(--wf-radius);
+  background: var(--wf-fill-solid); color: var(--wf-text); padding: 1.5rem;
+  max-width: 38rem; box-shadow: 0 0 40px -12px var(--wf-glow-now);
+}
+dialog.confirm::backdrop { background: rgb(0 0 0 / .55); }
+dialog.confirm p { font-size: .9375rem; color: var(--wf-text-strong); margin: 0 0 1.25rem; }
+.confirm-row { display: flex; gap: .75rem; justify-content: flex-end; }
+
+.specimen { margin-top: 2.5rem; padding-top: 1.25rem; border-top: 1px dashed var(--wf-edge-soft); }
+.specimen > .wf-kicker { color: var(--wf-red-text); }
+.specimen > p { color: var(--wf-text-muted); font-size: .8125rem; margin-bottom: 1rem; }
+.specimen .stack { display: flex; flex-direction: column; gap: 1rem; }
+
+/* ══ 800px ════════════════════════════════════════════════════════════════ */
+@media screen and (max-width: 52rem) {
+  .shell { padding: 0 1rem; }
+  .shell-head { align-items: flex-start; gap: 1rem; }
+  .mark { width: 2.5rem; }
+  h1 { font-size: 1.75rem; }
+  .head-state { gap: 1.25rem; width: 100%; }
+  .cred-head { grid-template-columns: 1fr; }
+  .cred-head .chip { grid-column: 1; grid-row: auto; justify-self: start; margin-top: .35rem; }
+  .cred-state .spacer, .login-state .spacer { margin-left: 0; }
+  .field input[type="password"], .field input[type="text"] { flex: 1 1 100%; }
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <header class="shell-head">
+    <div class="head-id">
+      <svg class="mark" viewBox="-6 46 276 156" role="img" aria-label="FAU Cybersecurity Club">
+        <g fill="none" stroke-linecap="round" stroke-linejoin="round" transform="translate(0 36)">
+          <path fill="var(--wf-chrome)" fill-opacity=".09" fill-rule="evenodd"
+                d="M130 36 L110 30 L88 26 L2 58 L40 112 L130 158 L220 112 L258 58 L172 26 L150 30 Z
+                   M130 55 L98 48 L40 64 L67 101 L130 124 L193 101 L220 64 L162 48 Z"/>
+          <path fill="var(--wf-chrome)" fill-opacity=".14"
+                d="M130 55 L98 48 L40 64 L67 101 L130 124 L193 101 L220 64 L162 48 Z"/>
+          <path fill="var(--wf-text-strong)" fill-opacity=".13" d="M67 101 L130 124 L193 101 L130 132 Z"/>
+          <path stroke="var(--wf-chrome)" stroke-width="3" opacity=".85"
+                d="M130 36 L110 30 L88 26 L2 58 L40 112 L130 158 L220 112 L258 58 L172 26 L150 30 Z"/>
+          <path stroke="var(--wf-chrome)" stroke-width="2.5" opacity=".6"
+                d="M130 55 L98 48 L40 64 L67 101 L130 124 L193 101 L220 64 L162 48 Z"/>
+          <g stroke="var(--wf-chrome)" stroke-width="1.6" opacity=".32">
+            <path d="M130 36 L130 55"/><path d="M88 26 L98 48"/><path d="M2 58 L40 64"/>
+            <path d="M40 112 L67 101"/><path d="M220 112 L193 101"/><path d="M258 58 L220 64"/>
+            <path d="M172 26 L162 48"/>
+          </g>
+          <g stroke="var(--wf-chrome)" stroke-width="1.6" opacity=".4">
+            <path d="M67 101 L130 132"/><path d="M193 101 L130 132"/>
+          </g>
+          <path fill="var(--wf-chrome)" fill-opacity=".6" d="M130 82 L114 104 L130 162 L146 104 Z"/>
+          <path fill="var(--wf-text-strong)" fill-opacity=".28" d="M130 94 L121 105 L130 144 L139 105 Z"/>
+          <path fill="var(--wf-chrome)" fill-opacity=".16" d="M40 64 L123 82 L103 110 L59 88 Z"/>
+          <path fill="var(--wf-chrome)" fill-opacity=".16" d="M220 64 L137 82 L157 110 L201 88 Z"/>
+          <g stroke="var(--wf-chrome)" stroke-width="2.5" opacity=".9">
+            <path d="M40 64 L59 88 L103 110 L123 82"/><path d="M40 64 L63 69"/><path d="M123 82 L103 78"/>
+            <path d="M220 64 L201 88 L157 110 L137 82"/><path d="M220 64 L197 69"/><path d="M137 82 L157 78"/>
+          </g>
+          <path fill="var(--wf-text-strong)" fill-opacity=".92" d="M62 68.77 L112 79.61 L99 97 Z"/>
+          <path fill="var(--wf-text-strong)" fill-opacity=".92" d="M198 68.77 L148 79.61 L161 97 Z"/>
+          <g stroke="var(--wf-chrome)" stroke-width="1.2" opacity=".9">
+            <path fill="var(--wf-chrome)" fill-opacity=".42" d="M112 40 L130 52 L130 60 L112 48 Z"/>
+            <path fill="var(--wf-chrome)" fill-opacity=".20" d="M148 40 L130 52 L130 60 L148 48 Z"/>
+            <path fill="var(--wf-chrome)" fill-opacity=".42" d="M118 62 L130 71 L130 77 L118 68 Z"/>
+            <path fill="var(--wf-chrome)" fill-opacity=".20" d="M142 62 L130 71 L130 77 L142 68 Z"/>
+          </g>
+          <path fill="var(--wf-chrome)" fill-opacity=".34" stroke="var(--wf-chrome)" stroke-width="1.5"
+                d="M40 64 L63 58 L98 72 L130 82 Z"/>
+          <path fill="var(--wf-chrome)" fill-opacity=".34" stroke="var(--wf-chrome)" stroke-width="1.5"
+                d="M220 64 L197 58 L162 72 L130 82 Z"/>
+          <path fill="var(--wf-red)" fill-opacity=".95"
+                d="M130 82 L96 60 L52 44 L-2 14 L28 38 L6 44 L54 54 L98 72 L122 93 Z"/>
+          <path fill="var(--wf-red)" fill-opacity=".95"
+                d="M130 82 L164 60 L208 44 L262 14 L232 38 L254 44 L206 54 L162 72 L138 93 Z"/>
+        </g>
+      </svg>
+      <div>
+        <p class="wf-kicker">eidolon · credentials</p>
+        <h1>credentials</h1>
+      </div>
+    </div>
+
+    <div class="head-state">
+      <div class="stat">
+        <p class="wf-kicker">keys stored</p>
+        <b>2<span class="of"> / 5</span></b>
+      </div>
+      <div class="stat">
+        <p class="wf-kicker">logins</p>
+        <b>1<span class="of"> / 2</span></b>
+      </div>
+      <nav class="pagenav" aria-label="eidolon pages">
+        <a class="wf-nav" href="/">harness</a>
+        <a class="wf-nav" href="/ext">extensions</a>
+        <a class="wf-nav" href="/auth" aria-current="page">credentials</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="page">
+
+    <!-- The page states its own rule, because the operator is about to paste
+         a key into it and is owed the sentence before they do. -->
+    <section class="wf-panel custody">
+      <p>This page can say <b>whether</b> a key is here and when it was last written.
+         It cannot say what it is. Nothing on this page, and no route in eidolon,
+         returns a stored value.</p>
+      <p>A key goes in through a POST body and nowhere else &mdash; never a URL, never a
+         command line, never a log. The store's one door out is a Rust call, taken by the
+         one consumer that has to set a header. The other door is
+         <code>eidolon secret set NAME &lt; key.txt</code>, which reads stdin for the same reason.
+         Store: <span class="path">C:\Users\dxcen\AppData\Roaming\eidolon\secrets</span></p>
+    </section>
+
+    <!-- ══ API keys ═══════════════════════════════════════════════════════ -->
+    <h2 class="group">api keys <span class="sub">stored with <code>eidolon secret set</code></span></h2>
+
+    <!-- stored: the default state is a statement of fact, not a form -->
+    <article class="cred wf-panel" data-name="deepseek" data-stored="true" data-kind="external">
+      <div class="cred-head">
+        <h2 class="cred-name">deepseek</h2>
+        <p class="cred-unlocks">provider <code>deepseek</code> &mdash; <b>DeepSeek V4 Pro</b>, <b>DeepSeek Flash</b></p>
+        <span class="chip" data-state="stored">stored</span>
+      </div>
+      <div class="cred-state">
+        <span class="fact"><span class="wf-kicker">written</span>43 days ago</span>
+        <span class="fact"><span class="wf-kicker">kind</span>external</span>
+        <span class="fact"><span class="wf-kicker">service</span>api.deepseek.com</span>
+        <span class="spacer"></span>
+        <button class="btn" data-act="replace">replace</button>
+        <button class="btn btn--quiet" data-act="delete">delete</button>
+      </div>
+      <!-- the rotate form, revealed by REPLACE; see `ollama` below for it open -->
+      <form class="cred-form" method="post" action="/api/secret/set" hidden>
+        <input type="hidden" name="name" value="deepseek">
+        <div class="field">
+          <input type="password" name="value" autocomplete="off" spellcheck="false"
+                 autocapitalize="off" autocorrect="off" placeholder="paste the new key" required>
+          <button type="button" class="btn btn--quiet" data-act="reveal" aria-pressed="false">show</button>
+          <button type="submit" class="btn">rotate</button>
+        </div>
+      </form>
+    </article>
+
+    <!-- not stored: there is no fact to state, so the form IS the content -->
+    <article class="cred wf-panel" data-name="zai" data-stored="false" data-kind="external">
+      <div class="cred-head">
+        <h2 class="cred-name">zai</h2>
+        <p class="cred-unlocks">provider <code>zai</code> &mdash; <b>GLM 5.3</b>, <b>GLM 5.3 Flash</b></p>
+        <span class="chip" data-state="empty">not stored</span>
+      </div>
+      <form class="cred-form" method="post" action="/api/secret/set">
+        <input type="hidden" name="name" value="zai">
+        <p class="wf-kicker" id="l-zai">the key</p>
+        <div class="field">
+          <input type="password" name="value" aria-labelledby="l-zai" autocomplete="off" spellcheck="false"
+                 autocapitalize="off" autocorrect="off" placeholder="paste it here" required>
+          <button type="button" class="btn btn--quiet" data-act="reveal" aria-pressed="false">show</button>
+          <button type="submit" class="btn">store</button>
+        </div>
+        <p class="wf-note"><b>show</b> reveals only what you are typing right now. It cannot reveal
+          a stored key, because nothing here has one to reveal.</p>
+      </form>
+    </article>
+
+    <article class="cred wf-panel" data-name="openrouter" data-stored="false" data-kind="external">
+      <div class="cred-head">
+        <h2 class="cred-name">openrouter</h2>
+        <p class="cred-unlocks">provider <code>openrouter</code> &mdash; <b>whatever the account can reach</b>
+          (the model list is fetched live, so it is empty until this key is here)</p>
+        <span class="chip" data-state="empty">not stored</span>
+      </div>
+      <form class="cred-form" method="post" action="/api/secret/set">
+        <input type="hidden" name="name" value="openrouter">
+        <p class="wf-kicker" id="l-openrouter">the key</p>
+        <div class="field">
+          <input type="password" name="value" aria-labelledby="l-openrouter" autocomplete="off" spellcheck="false"
+                 autocapitalize="off" autocorrect="off" placeholder="paste it here" required>
+          <button type="button" class="btn btn--quiet" data-act="reveal" aria-pressed="false">show</button>
+          <button type="submit" class="btn">store</button>
+        </div>
+      </form>
+    </article>
+
+    <!-- stored, with REPLACE pressed: the rotate affordance, open -->
+    <article class="cred wf-panel" data-name="ollama" data-stored="true" data-kind="external">
+      <div class="cred-head">
+        <h2 class="cred-name">ollama</h2>
+        <p class="cred-unlocks">provider <code>ollama</code> &mdash; <b>DeepSeek V4.1 Flash</b>,
+          <b>DeepSeek V4 Pro</b>, <b>GLM 5.3</b>, hosted</p>
+        <span class="chip" data-state="stored">stored</span>
+      </div>
+      <div class="cred-state">
+        <span class="fact"><span class="wf-kicker">written</span>2 days ago</span>
+        <span class="fact"><span class="wf-kicker">kind</span>external</span>
+        <span class="fact"><span class="wf-kicker">service</span>ollama.com</span>
+        <span class="spacer"></span>
+        <button class="btn" data-act="cancel">cancel</button>
+        <button class="btn btn--quiet" data-act="delete">delete</button>
+      </div>
+      <form class="cred-form" method="post" action="/api/secret/set">
+        <input type="hidden" name="name" value="ollama">
+        <p class="wf-kicker" id="l-ollama">replace the stored key</p>
+        <div class="field">
+          <input type="password" name="value" aria-labelledby="l-ollama" autocomplete="off" spellcheck="false"
+                 autocapitalize="off" autocorrect="off" placeholder="paste the new key" required>
+          <button type="button" class="btn btn--quiet" data-act="reveal" aria-pressed="false">show</button>
+          <button type="submit" class="btn">rotate</button>
+        </div>
+        <p class="wf-note">Storing again <b>is</b> rotating: the old key is overwritten and stops being
+          used at once. There is no way to look at the old one first &mdash; if you are not sure you have
+          the new key in your clipboard, cancel.</p>
+      </form>
+    </article>
+
+    <!-- not a provider: the key IS the capability -->
+    <article class="cred wf-panel" data-name="brave_search" data-stored="false" data-kind="tool">
+      <div class="cred-head">
+        <h2 class="cred-name">brave_search</h2>
+        <p class="cred-unlocks">not a provider &mdash; the <b>search</b> tool. A session with no key here has
+          no search at all: the key <b>is</b> the capability, and the host puts it in a header the
+          script can never name.</p>
+        <span class="chip" data-state="empty">not stored</span>
+      </div>
+      <form class="cred-form" method="post" action="/api/secret/set">
+        <input type="hidden" name="name" value="brave_search">
+        <p class="wf-kicker" id="l-brave">the key</p>
+        <div class="field">
+          <input type="password" name="value" aria-labelledby="l-brave" autocomplete="off" spellcheck="false"
+                 autocapitalize="off" autocorrect="off" placeholder="paste it here" required>
+          <button type="button" class="btn btn--quiet" data-act="reveal" aria-pressed="false">show</button>
+          <button type="submit" class="btn">store</button>
+        </div>
+      </form>
+    </article>
+
+    <!-- ══ OAuth logins ═══════════════════════════════════════════════════ -->
+    <h2 class="group">oauth logins <span class="sub">interactive commands &mdash; this page reads their
+      credential files and never mints, refreshes or spawns</span></h2>
+
+    <!-- not logged in -->
+    <article class="login wf-panel" data-name="google" data-state="unusable">
+      <div class="cred-head">
+        <h2 class="cred-name">google</h2>
+        <p class="cred-unlocks">provider <code>antigravity</code> &mdash; <b>the Gemini surface</b>,
+          on a Google OAuth refresh token rather than a static key</p>
+        <span class="chip" data-state="empty">not logged in</span>
+      </div>
+      <div class="login-state">
+        <span class="fact"><span class="wf-kicker">file</span><span class="path">~/.config/eidolon/antigravity.json</span></span>
+        <span class="spacer"></span>
+        <button class="btn btn--quiet" data-act="recheck">recheck</button>
+        <p class="cred-line">not present. Nothing was read, nothing was minted &mdash; the file was
+          stat&rsquo;d and is not there.</p>
+      </div>
+      <div class="runthis">
+        <p class="wf-kicker">run this</p>
+        <div class="cmd">
+          <pre>eidolon google-login</pre>
+          <button class="btn btn--quiet" data-act="copy">copy</button>
+        </div>
+        <p class="wf-note">It binds a loopback listener, prints a consent URL, and waits for the browser
+          to come back to it. When it finishes, press <b>recheck</b>.
+          <br>The flow is a terminal command today &mdash; see <b>the open question</b> in
+          <code>docs/design/pages.md §6</code> for what it would take to drive it from here.</p>
+      </div>
+    </article>
+
+    <!-- logged in, access token expired — which is NOT an expired login -->
+    <article class="login wf-panel" data-name="chatgpt" data-state="present">
+      <div class="cred-head">
+        <h2 class="cred-name">chatgpt</h2>
+        <p class="cred-unlocks">provider <code>chatgpt</code> &mdash; <b>GPT-6 Astra</b>, <b>GPT-5.6 Sol</b>,
+          <b>GPT-5.6 Terra</b>, on the Codex allowance</p>
+        <span class="chip" data-state="present">logged in</span>
+      </div>
+      <div class="login-state">
+        <span class="fact"><span class="wf-kicker">file</span><span class="path">~/.config/eidolon/chatgpt.json</span></span>
+        <span class="fact"><span class="wf-kicker">account</span>user-4KqPz9</span>
+        <span class="fact"><span class="wf-kicker">access token</span>expired 2h ago</span>
+        <span class="spacer"></span>
+        <button class="btn btn--quiet" data-act="recheck">recheck</button>
+        <button class="btn btn--quiet" data-act="login">log in again</button>
+        <button class="btn btn--quiet" data-act="delete">sign out</button>
+        <p class="cred-line">An expired <b>access</b> token is not an expired login: the refresh token in
+          this file mints a new one on the next turn. The only real expiry is a refresh token that has been
+          revoked, and nothing local can know that &mdash; the first request to use it finds out. So this
+          page says the file is here and its shape is right, and stops there.</p>
+      </div>
+    </article>
+
+    <!-- ══ specimens ══════════════════════════════════════════════════════
+         Not part of this state. Delete this <section> when the page is
+         wired; keep the markup.                                          -->
+    <section class="specimen">
+      <p class="wf-kicker">specimen &middot; not part of the page</p>
+      <p>The three states this box's data does not reach: a credential file that is there and
+         wrong, a store entry the page did not put there, and the delete confirm.</p>
+
+      <div class="stack">
+
+        <article class="login wf-panel wf-panel--now" data-name="google" data-state="unusable">
+          <div class="cred-head">
+            <h2 class="cred-name">google</h2>
+            <p class="cred-unlocks">provider <code>antigravity</code></p>
+            <span class="chip" data-state="unusable">will not work</span>
+          </div>
+          <div class="login-state">
+            <span class="fact"><span class="wf-kicker">file</span><span class="path">~/.config/eidolon/antigravity.json</span></span>
+            <span class="fact"><span class="wf-kicker">problem</span>malformed</span>
+            <span class="spacer"></span>
+            <button class="btn btn--quiet" data-act="recheck">recheck</button>
+            <p class="cred-line cred-line--alarm">readable, non-empty, and has no <code>refresh_token</code>
+              &mdash; so nothing can be minted from it. Log in again; the file is overwritten atomically,
+              owner-only.</p>
+          </div>
+          <div class="runthis">
+            <p class="wf-kicker">run this</p>
+            <div class="cmd"><pre>eidolon google-login</pre><button class="btn btn--quiet" data-act="copy">copy</button></div>
+          </div>
+        </article>
+
+        <h2 class="group">also in the store <span class="sub">not one of the six; listed because
+          <code>eidolon secret list</code> would list it and the two must not disagree</span></h2>
+
+        <article class="cred wf-panel" data-name="hook_token" data-stored="true" data-kind="issued">
+          <div class="cred-head">
+            <h2 class="cred-name">hook_token</h2>
+            <p class="cred-unlocks">an <b>issued</b> token: the store generated it, handed it out once,
+              and kept only its SHA-256. There is nothing to read even with the keyfile.</p>
+            <span class="chip" data-state="stored">stored</span>
+          </div>
+          <div class="cred-state">
+            <span class="fact"><span class="wf-kicker">written</span>6 days ago</span>
+            <span class="fact"><span class="wf-kicker">kind</span>issued</span>
+            <span class="spacer"></span>
+            <button class="btn" data-act="replace" disabled>replace</button>
+            <button class="btn btn--quiet" data-act="delete">delete</button>
+            <p class="cred-line">An issued token is rotated by re-issuing it, not by pasting one in
+              &mdash; <code>secret set</code> refuses. The control is disabled rather than hidden so the
+              page says why.</p>
+          </div>
+        </article>
+
+        <dialog class="confirm" open>
+          <p class="wf-kicker">deleting a key</p>
+          <p>Deleting <b>brave_search</b> removes the <b>search</b> tool from every new session &mdash; the
+            key is the capability, so there is no degraded search, only none. The value cannot be
+            recovered from here or from anywhere; you will need the key again to put it back.</p>
+          <div class="confirm-row">
+            <button class="btn btn--now" data-act="delete">delete it</button>
+            <button class="btn btn--quiet" data-act="cancel">cancel</button>
+          </div>
+        </dialog>
+
+      </div>
+    </section>
+
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,452 @@
+url: https://en.wikipedia.org/wiki/Cat
+title: Cat - Wikipedia
+
+- generic [active] [ref=e1]:
+  - link "Jump to content" [ref=e2] [cursor=pointer]:
+    - /url: "#bodyContent"
+  - banner [ref=e4]:
+    - generic [ref=e5]:
+      - navigation "Site" [ref=e6]:
+        - generic "Main menu" [ref=e7]:
+          - button "Main menu" [ref=e8] [cursor=pointer]
+          - generic [ref=e11]: Main menu
+      - link [ref=e12] [cursor=pointer]:
+        - /url: /wiki/Main_Page
+        - generic [ref=e13]:
+          - img "Wikipedia" [ref=e14]
+          - img "The Free Encyclopedia" [ref=e15]
+    - generic [ref=e16]:
+      - search [ref=e17]:
+        - generic [ref=e20]:
+          - searchbox "Search Wikipedia" [ref=e23]
+          - button "Search" [ref=e25]
+      - navigation "Personal tools" [ref=e26]:
+        - list [ref=e30]:
+          - listitem [ref=e31]:
+            - link "Donate" [ref=e32] [cursor=pointer]:
+              - /url: https://donate.wikimedia.org/?wmf_source=donate&wmf_medium=sidebar&wmf_campaign=en.wikipedia.org&uselang=en
+          - listitem [ref=e33]:
+            - link "Create account" [ref=e34] [cursor=pointer]:
+              - /url: /w/index.php?title=Special:CreateAccount&returnto=Cat
+          - listitem [ref=e35]:
+            - link "Log in" [ref=e36] [cursor=pointer]:
+              - /url: /w/index.php?title=Special:UserLogin&returnto=Cat
+  - generic [ref=e38]:
+    - navigation "Contents" [ref=e42]:
+      - generic [ref=e44]:
+        - generic [ref=e45]:
+          - heading "Contents" [level=2] [ref=e46]
+          - button "Hide Contents" [ref=e47] [cursor=pointer]: hide
+        - list [ref=e48]:
+          - listitem [ref=e49]:
+            - link "(Top)" [ref=e50] [cursor=pointer]:
+              - /url: "#"
+          - listitem [ref=e52]:
+            - link "Etymology and naming" [ref=e53] [cursor=pointer]:
+              - /url: "#Etymology_and_naming"
+            - list
+          - listitem [ref=e55]:
+            - link "Taxonomy" [ref=e56] [cursor=pointer]:
+              - /url: "#Taxonomy"
+            - list
+          - listitem [ref=e58]:
+            - link "Evolution" [ref=e59] [cursor=pointer]:
+              - /url: "#Evolution"
+            - button "Toggle Evolution subsection" [ref=e61]
+            - list
+          - listitem [ref=e64]:
+            - link "Characteristics" [ref=e65] [cursor=pointer]:
+              - /url: "#Characteristics"
+            - button "Toggle Characteristics subsection" [ref=e67]
+            - list
+          - listitem [ref=e70]:
+            - link "Senses" [ref=e71] [cursor=pointer]:
+              - /url: "#Senses"
+            - button "Toggle Senses subsection" [ref=e73]
+            - list
+          - listitem [ref=e76]:
+            - link "Behavior" [ref=e77] [cursor=pointer]:
+              - /url: "#Behavior"
+            - button "Toggle Behavior subsection" [ref=e79]
+            - list
+          - listitem [ref=e82]:
+            - link "Lifespan and health" [ref=e83] [cursor=pointer]:
+              - /url: "#Lifespan_and_health"
+            - button "Toggle Lifespan and health subsection" [ref=e85]
+            - list
+          - listitem [ref=e88]:
+            - link "Health issues" [ref=e89] [cursor=pointer]:
+              - /url: "#Health_issues"
+            - list
+          - listitem [ref=e91]:
+            - link "Ecology" [ref=e92] [cursor=pointer]:
+              - /url: "#Ecology"
+            - button "Toggle Ecology subsection" [ref=e94]
+            - list
+          - listitem [ref=e97]:
+            - link "Interaction with humans" [ref=e98] [cursor=pointer]:
+              - /url: "#Interaction_with_humans"
+            - button "Toggle Interaction with humans subsection" [ref=e100]
+            - list
+          - listitem [ref=e103]:
+            - link "History and mythology" [ref=e104] [cursor=pointer]:
+              - /url: "#History_and_mythology"
+            - button "Toggle History and mythology subsection" [ref=e106]
+            - list
+          - listitem [ref=e109]:
+            - link "See also" [ref=e110] [cursor=pointer]:
+              - /url: "#See_also"
+            - list
+          - listitem [ref=e112]:
+            - link "Notes" [ref=e113] [cursor=pointer]:
+              - /url: "#Notes"
+            - list
+          - listitem [ref=e115]:
+            - link "References" [ref=e116] [cursor=pointer]:
+              - /url: "#References"
+            - list
+          - listitem [ref=e118]:
+            - link "External links" [ref=e119] [cursor=pointer]:
+              - /url: "#External_links"
+            - list
+    - main [ref=e122]:
+      - generic [ref=e123]:
+        - heading "Cat" [level=1] [ref=e124]
+        - generic [ref=e126]:
+          - button "278 languages" [ref=e127] [cursor=pointer]
+          - generic [ref=e130]: 278 languages
+      - generic [ref=e132]:
+        - navigation "Namespaces" [ref=e134]:
+          - list [ref=e137]:
+            - listitem [ref=e138]:
+              - link "Article" [ref=e139] [cursor=pointer]:
+                - /url: /wiki/Cat
+            - listitem [ref=e141]:
+              - link "Talk" [ref=e142] [cursor=pointer]:
+                - /url: /wiki/Talk:Cat
+        - generic [ref=e144]:
+          - navigation "Views" [ref=e145]:
+            - list [ref=e148]:
+              - listitem [ref=e149]:
+                - link "Read" [ref=e150] [cursor=pointer]:
+                  - /url: /wiki/Cat
+              - listitem [ref=e152]:
+                - link "View source" [ref=e153] [cursor=pointer]:
+                  - /url: /w/index.php?title=Cat&action=edit
+              - listitem [ref=e155]:
+                - link "View history" [ref=e156] [cursor=pointer]:
+                  - /url: /w/index.php?title=Cat&action=history
+          - navigation "Page tools" [ref=e158]:
+            - generic [ref=e159]:
+              - button "Tools" [ref=e160] [cursor=pointer]
+              - generic [ref=e163]: Tools
+      - navigation "Appearance" [ref=e166]:
+        - generic [ref=e168]:
+          - generic [ref=e169]:
+            - generic [ref=e170]: Appearance
+            - button "Hide Appearance" [ref=e171] [cursor=pointer]: hide
+          - generic [ref=e172]:
+            - generic [ref=e173]: Text
+            - list [ref=e175]:
+              - listitem [ref=e176]:
+                - generic [ref=e178]:
+                  - generic [ref=e179]:
+                    - radio "Small" [ref=e180]
+                    - generic [ref=e182]: Small
+                  - generic [ref=e184]:
+                    - radio "Standard" [checked] [ref=e185]
+                    - generic [ref=e187]: Standard
+                  - generic [ref=e189]:
+                    - radio "Large" [ref=e190]
+                    - generic [ref=e192]: Large
+          - generic [ref=e194]:
+            - generic [ref=e195]: Width
+            - list [ref=e197]:
+              - listitem [ref=e198]:
+                - generic [ref=e200]:
+                  - generic [ref=e201]:
+                    - radio "Standard" [checked] [ref=e202]
+                    - generic [ref=e204]: Standard
+                  - generic [ref=e206]:
+                    - radio "Wide" [ref=e207]
+                    - generic [ref=e209]: Wide
+          - generic [ref=e211]:
+            - generic [ref=e212]: Color
+            - list [ref=e214]:
+              - listitem [ref=e215]:
+                - generic [ref=e217]:
+                  - generic [ref=e218]:
+                    - radio "Automatic" [ref=e219]
+                    - generic [ref=e221]: Automatic
+                  - generic [ref=e223]:
+                    - radio "Light" [checked] [ref=e224]
+                    - generic [ref=e226]: Light
+                  - generic [ref=e228]:
+                    - radio "Dark" [ref=e229]
+                    - generic [ref=e231]: Dark
+      - generic "Cat" [ref=e233]:
+        - generic [ref=e234]:
+          - generic [ref=e235]:
+            - link [ref=e239] [cursor=pointer]:
+              - /url: https://en.wikipedia.org/wiki/Wikipedia:Good_articles*
+              - img "This is a good article. Click here for more information." [ref=e240]
+            - link [ref=e244] [cursor=pointer]:
+              - /url: https://en.wikipedia.org/wiki/Wikipedia:Protection_policy#semi
+              - img "Page semi-protected" [ref=e245]
+            - link [ref=e249] [cursor=pointer]:
+              - /url: https://en.wikipedia.org/wiki/File:En-Cat_(part_1).ogg
+              - img "Listen to this article" [ref=e250]
+          - generic [ref=e251]: From Wikipedia, the free encyclopedia
+        - generic [ref=e253]:
+          - generic [ref=e254]:
+            - note [ref=e255]:
+              - text: This article is about the species commonly kept as a pet. For the cat family, see
+              - link "Felidae" [ref=e256] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Felidae
+              - text: . For other uses, see
+              - link "Cat (disambiguation)" [ref=e257] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Cat_(disambiguation)
+              - text: .
+            - note [ref=e258]:
+              - text: "\"Cats\" redirects here. For other uses, see"
+              - link "Cats (disambiguation)" [ref=e259] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Cats_(disambiguation)
+              - text: .
+            - table [ref=e260]:
+              - rowgroup [ref=e261]:
+                - row [ref=e262]:
+                  - columnheader [ref=e263]:
+                    - text: Cat
+                    - generic [ref=e264]:
+                      - text: "Temporal range:"
+                      - generic [ref=e265]:
+                        - generic [ref=e266]:
+                          - text: 0.0095–0
+                          - link "Ma" [ref=e267] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Megaannum
+                        - generic [ref=e268]:
+                          - link "PreꞒ" [ref=e270] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Precambrian
+                          - link "Ꞓ" [ref=e272] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Cambrian
+                          - link "O" [ref=e274] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Ordovician
+                          - link "S" [ref=e276] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Silurian
+                          - link "D" [ref=e278] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Devonian
+                          - link "C" [ref=e280] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Carboniferous
+                          - link "P" [ref=e282] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Permian
+                          - link "T" [ref=e284] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Triassic
+                          - link "J" [ref=e286] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Jurassic
+                          - link "K" [ref=e288] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Cretaceous
+                          - link "Pg" [ref=e290] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Paleogene
+                          - link "N" [ref=e292] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Neogene
+                      - link "Holocene" [ref=e297] [cursor=pointer]:
+                        - /url: https://en.wikipedia.org/wiki/Holocene
+                      - text: to present (9,500 years ago)
+                - row [ref=e298]:
+                  - cell "Various types of cats" [ref=e299]:
+                    - generic [ref=e301]:
+                      - generic [ref=e302]:
+                        - link [ref=e306] [cursor=pointer]:
+                          - /url: https://en.wikipedia.org/wiki/File:Siam_lilacpoint.jpg
+                        - link [ref=e311] [cursor=pointer]:
+                          - /url: https://en.wikipedia.org/wiki/File:Sheba1.JPG
+                      - generic [ref=e313]:
+                        - link [ref=e317] [cursor=pointer]:
+                          - /url: https://en.wikipedia.org/wiki/File:Cat_August_2010-4.jpg
+                        - link [ref=e322] [cursor=pointer]:
+                          - /url: https://en.wikipedia.org/wiki/File:Felis_catus-cat_on_snow.jpg
+                      - generic [ref=e324]:
+                        - link [ref=e328] [cursor=pointer]:
+                          - /url: https://en.wikipedia.org/wiki/File:Gustav_chocolate.jpg
+                        - link [ref=e333] [cursor=pointer]:
+                          - /url: https://en.wikipedia.org/wiki/File:Orange_tabby_cat_sitting_on_fallen_leaves-Hisashi-01A.jpg
+                      - generic [ref=e335]: Various types of cats
+                - row [ref=e337]:
+                  - columnheader [ref=e338]:
+                    - link "Conservation status" [ref=e340] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Conservation_status
+                - row [ref=e341]:
+                  - cell "Domesticated" [ref=e342]
+                - row [ref=e344]:
+                  - columnheader [ref=e345]:
+                    - link "Scientific classification" [ref=e346] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Taxonomy_(biology)
+                    - link [ref=e349] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Template:Taxonomy/Felis
+                      - img "Edit this classification" [ref=e350]
+                - row [ref=e351]:
+                  - cell "Kingdom:" [ref=e352]
+                  - cell [ref=e353]:
+                    - link "Animalia" [ref=e354] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Animal
+                - row [ref=e355]:
+                  - cell "Phylum:" [ref=e356]
+                  - cell [ref=e357]:
+                    - link "Chordata" [ref=e358] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Chordate
+                - row [ref=e359]:
+                  - cell "Class:" [ref=e360]
+                  - cell [ref=e361]:
+                    - link "Mammalia" [ref=e362] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Mammal
+                - row [ref=e363]:
+                  - cell "Order:" [ref=e364]
+                  - cell [ref=e365]:
+                    - link "Carnivora" [ref=e366] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Carnivora
+                - row [ref=e367]:
+                  - cell "Family:" [ref=e368]
+                  - cell [ref=e369]:
+                    - link "Felidae" [ref=e370] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Felidae
+                - row [ref=e371]:
+                  - cell "Genus:" [ref=e372]
+                  - cell [ref=e373]:
+                    - link "Felis" [ref=e374] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Felis
+                - row [ref=e375]:
+                  - cell "Species:" [ref=e376]
+                  - cell [ref=e377]:
+                    - generic [ref=e380]:
+                      - text: F. catus
+                      - superscript [ref=e381]:
+                        - link "[1]" [ref=e382] [cursor=pointer]:
+                          - /url: "#cite_note-Linnaeus1758-1"
+                - row [ref=e384]:
+                  - columnheader [ref=e385]:
+                    - link "Binomial name" [ref=e386] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Binomial_nomenclature
+                - row [ref=e387]:
+                  - cell [ref=e388]:
+                    - generic [ref=e391]:
+                      - text: Felis catus
+                      - superscript [ref=e392]:
+                        - link "[1]" [ref=e393] [cursor=pointer]:
+                          - /url: "#cite_note-Linnaeus1758-1"
+                    - generic [ref=e395]:
+                      - link "Linnaeus" [ref=e396] [cursor=pointer]:
+                        - /url: https://en.wikipedia.org/wiki/Carl_Linnaeus
+                      - text: ","
+                      - link "1758" [ref=e397] [cursor=pointer]:
+                        - /url: https://en.wikipedia.org/wiki/10th_edition_of_Systema_Naturae
+                      - superscript [ref=e398]:
+                        - link "[2]" [ref=e399] [cursor=pointer]:
+                          - /url: "#cite_note-MSW3fc-2"
+                - row [ref=e401]:
+                  - columnheader [ref=e402]:
+                    - link "Synonyms" [ref=e403] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Synonym_(taxonomy)
+                - row [ref=e404]:
+                  - cell [ref=e405]:
+                    - list [ref=e406]:
+                      - listitem [ref=e407]:
+                        - text: Catus domesticus
+                        - generic [ref=e408]:
+                          - link "Erxleben" [ref=e409] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Johann_Christian_Polycarp_Erxleben
+                          - text: ", 1777"
+                        - superscript [ref=e410]:
+                          - link "[3]" [ref=e411] [cursor=pointer]:
+                            - /url: "#cite_note-Erxleben-3"
+                      - listitem [ref=e413]:
+                        - text: F. angorensis
+                        - generic [ref=e414]:
+                          - link "Gmelin" [ref=e415] [cursor=pointer]:
+                            - /url: https://en.wikipedia.org/wiki/Karl_Christian_Gmelin
+                          - text: ", 1788"
+                      - listitem [ref=e416]: F. vulgaris Fischer, 1829
+            - paragraph [ref=e417]:
+              - text: The cat (
+              - generic [ref=e418]: Felis catus
+              - text: ), also called domestic cat and house cat, is a small domesticated
+              - link "carnivorous" [ref=e419] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Carnivore
+              - text: mammal. It is a member of
+              - link "Felidae" [ref=e420] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Felidae
+              - text: ", the family of mammals in the"
+              - link "order" [ref=e421] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Order_(taxonomy)
+              - link "Carnivora" [ref=e422] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Carnivora
+              - text: also colloquially referred to as cats. An
+              - link "obligate carnivore" [ref=e423] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Obligate_carnivore
+              - text: ", requiring a predominantly meat-based diet, it has retractable"
+              - link "claws" [ref=e424] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Claw
+              - text: adapted to killing small prey species such as
+              - link "mice" [ref=e425] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Mice
+              - text: and
+              - link "rats" [ref=e426] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Rat
+              - text: . It has a strong, flexible body, quick
+              - link "reflexes" [ref=e427] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Reflex
+              - text: ", and sharp teeth, and its"
+              - link "night vision" [ref=e428] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Night_vision
+              - text: and
+              - link "sense of smell" [ref=e429] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Sense_of_smell
+              - text: are well developed. It is a
+              - link "social species" [ref=e430] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Social_species
+              - text: ", but a solitary hunter and a"
+              - link "crepuscular" [ref=e431] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Crepuscular
+              - link "predator" [ref=e432] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Predator
+              - text: .
+              - link "Cat communication" [ref=e433] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Cat_communication
+              - text: includes
+              - link "meowing" [ref=e434] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Meow
+              - text: ","
+              - link "purring" [ref=e435] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Purr
+              - text: ", trilling,"
+              - link "hissing" [ref=e436] [cursor=pointer]:
+                - /url: https://en.wiktionary.org/wiki/hiss
+              - text: ","
+              - link "growling" [ref=e437] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Growling
+              - text: ","
+              - link "grunting" [ref=e438] [cursor=pointer]:
+                - /url: https://en.wiktionary.org/wiki/grunt
+              - text: ","
+              - link "body language" [ref=e439] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Cat_body_language
+              - text: ", and"
+              - link "scent marking" [ref=e440] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Scent_rubbing
+              - text: . It can hear sounds too faint or too high in
+              - link "frequency" [ref=e441] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Frequency
+              - text: for human ears, such as those made by
+              - link "small mammals" [ref=e442] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Small_mammal
+              - text: . It secretes and perceives
+              - link "pheromones" [ref=e443] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Pheromone
+              - text: .
+              - link "Cat intelligence" [ref=e444] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Cat_intelligence
+              - text: is evident in its ability to adapt, learn through observation, and solve problems. The domestic cat is the only
+              - link "domesticated" [ref=e445] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Domestication
+              - link "species" [ref=e446] [cursor=pointer]:
+                - /url: https://en.wikipedia.org/wiki/Species
+              - text: of the family Felidae.

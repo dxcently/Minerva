@@ -1,0 +1,37 @@
+// Registers as `jev_stop`. See eidolon/docs/extensions.md for the extension
+// contract this rides on -- the method name and the two fields below are
+// the whole of what crosses into automation/run.py's `stop_run` (via
+// jev/server.py's `_automation_stop`). No act loop here, unlike run.rn and
+// resume.rn: stopping never leaves a request pending, so there is nothing
+// left to drive -- `automation.stop` answers with the run record directly
+// (docs/design/automation.md section 2's contract table groups `.stop`
+// with `.status`/`.runs`, not with `.step`/`.answer`'s `{request}`), which
+// is exactly what this tool hands back unchanged.
+pub fn manifest() {
+    #{
+        name: "stop",
+        description: "End a jev automation run outright, wherever it currently is -- mid-action, parked waiting on an answer, or already finished (a no-op then, not an error). Unlike jev_resume's own `stop` field, which only ever answers a run that is currently parked, this reaches a run at any point, the way abandoning it partway through would. Returns the run's record: `outcome: \"stopped\"`, the `reason` given, and how far it got (`active`, `counts`) -- not a further request, since stopping leaves none pending.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "run": #{
+                    "type": "string",
+                    "description": "The run id to stop.",
+                },
+                "reason": #{
+                    "type": "string",
+                    "description": "Why the run is being stopped, recorded on its record.",
+                },
+            },
+            "required": ["run", "reason"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::service_call("automation.stop", #{
+        "run": input.run,
+        "reason": input.reason,
+    }).await
+}

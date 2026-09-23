@@ -1,0 +1,50 @@
+// Registers as `browser_type`. See eidolon/docs/extensions.md for the
+// extension contract this rides on, and service.py's `_type` for what
+// actually runs.
+pub fn manifest() {
+    #{
+        name: "type",
+        description: "Type text into the element with this ref, taken from the most recent browser_snapshot, replacing whatever is already there. Set submit to press Enter afterward -- the common case for a search box or a single-field form. Same ref rule as browser_click: a ref not from the latest snapshot is refused by name, and this call invalidates the snapshot's refs whether or not submit is set, so follow it with browser_snapshot before using another ref.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "ref": #{
+                    "type": "string",
+                    "description": "A ref from the current browser_snapshot, e.g. \"e9\".",
+                },
+                "text": #{
+                    "type": "string",
+                    "description": "The text to type.",
+                },
+                "submit": #{
+                    "type": "boolean",
+                    "description": "Press Enter after typing. Default false.",
+                },
+            },
+            "required": ["ref", "text"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    // `input.ref` does not compile: `ref` is a reserved word in Rune's
+    // grammar (Rust's `ref` pattern-binding keyword), so plain field access
+    // on it is "Unsupported field access" at compile time -- see click.rn's
+    // matching comment, which hits the same thing. `.get("ref")` sidesteps
+    // it; a missing ref falls through as "", which service.py's own
+    // `_resolve_ref` already refuses by name.
+    let element_ref = match input.get("ref") {
+        Some(r) => r,
+        None => "",
+    };
+    let submit = match input.get("submit") {
+        Some(s) => s,
+        None => false,
+    };
+    eidolon::service_call("type", #{
+        "ref": element_ref,
+        "text": input.text,
+        "submit": submit,
+    }).await
+}

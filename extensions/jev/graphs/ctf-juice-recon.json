@@ -1,0 +1,96 @@
+{
+  "id": "ctf-juice-recon",
+  "version": "1",
+  "description": "Read-only reconnaissance of the local OWASP Juice Shop lab. No external hosts, credentials or exploitation.",
+  "initial": "headers",
+  "context": {
+    "notes": []
+  },
+  "meta": {
+    "jev": {
+      "schema": 1,
+      "budget": {
+        "steps": 10,
+        "actions": 4,
+        "wall_s": 90,
+        "escalations": 2
+      },
+      "warrant": {
+        "tools": [
+          "bash"
+        ],
+        "commands": [
+          "wsl.exe --distribution Ubuntu --exec curl --max-time 10 -fsS -I http://127.0.0.1:3001/",
+          "wsl.exe --distribution Ubuntu --exec curl --max-time 10 -fsS http://127.0.0.1:3001/robots.txt"
+        ]
+      }
+    }
+  },
+  "on": {
+    "ERROR": "failed"
+  },
+  "states": {
+    "headers": {
+      "description": "Inspect HTTP headers",
+      "entry": [
+        {
+          "type": "tool",
+          "params": {
+            "name": "bash",
+            "input": {
+              "command": "wsl.exe --distribution Ubuntu --exec curl --max-time 10 -fsS -I http://127.0.0.1:3001/",
+              "timeout_s": 15
+            },
+            "into": "obs"
+          }
+        },
+        {
+          "type": "push",
+          "params": {
+            "path": "notes",
+            "value": "{{context.obs.text}}"
+          }
+        }
+      ],
+      "always": "robots"
+    },
+    "robots": {
+      "description": "Read robots.txt for published paths",
+      "entry": [
+        {
+          "type": "tool",
+          "params": {
+            "name": "bash",
+            "input": {
+              "command": "wsl.exe --distribution Ubuntu --exec curl --max-time 10 -fsS http://127.0.0.1:3001/robots.txt",
+              "timeout_s": 15
+            },
+            "into": "obs"
+          }
+        },
+        {
+          "type": "push",
+          "params": {
+            "path": "notes",
+            "value": "{{context.obs.text}}"
+          }
+        }
+      ],
+      "always": "report"
+    },
+    "report": {
+      "type": "final",
+      "description": "Read-only lab evidence collected",
+      "output": {
+        "notes": "{{context.notes}}"
+      }
+    },
+    "failed": {
+      "type": "final",
+      "description": "Lab unavailable or a command failed",
+      "output": {
+        "error": "{{event.error}}"
+      }
+    }
+  }
+}

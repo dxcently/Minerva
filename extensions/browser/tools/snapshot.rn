@@ -1,0 +1,63 @@
+// Registers as `browser_snapshot`. See eidolon/docs/extensions.md for the
+// extension contract this rides on, and service.py's `_snapshot` for what
+// actually runs. This is the option-list source docs/design/automation.md
+// means by `choose.from: {refs: ...}` -- read that document's "The two
+// concrete cases" before changing this tool's shape.
+pub fn manifest() {
+    #{
+        name: "snapshot",
+        description: "An accessibility snapshot of the current page: every interactive and structurally meaningful element, nested by landmark, each carrying a stable ref like [ref=e7] that browser_click and browser_type accept. Call this after browser_open, and again after every browser_click or browser_type before using another ref -- a ref is only valid against the snapshot that produced it, and a stale one is refused by name rather than guessed at. Reach for this whenever you need to see the page well enough to act on it, especially to find the ref of something to click or type into. Not for reading prose -- browser_read returns the page's visible text without the structural markup, and is cheaper when you only want to read. On a large page, narrow with within and roles before reaching for depth -- they change what crosses back to you; depth only changes how deep the walk goes.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "timeout_s": #{
+                    "type": "integer",
+                    "description": "How long to wait for the snapshot to finish building before giving up. A large or complex page can take longer than you would expect to walk. Default 60.",
+                },
+                "depth": #{
+                    "type": "integer",
+                    "description": "Limit the tree to this many levels deep. Unset by default (the whole tree), which is what you want almost always; set this only if a snapshot of a specific page is timing out even at a generous timeout_s -- some real pages have a deeply nested structure that makes the full, unbounded tree far more expensive to build than the page itself suggests. A size knob, not a selectivity one -- on a page where most of the tree is one kind of node you don't want, within and roles narrow the answer itself instead of just how far down it goes.",
+                },
+                "within": #{
+                    "type": "string",
+                    "description": "Restrict the snapshot to the one element with this landmark role -- main, navigation, banner, contentinfo, complementary, search, region. The tree is rooted at that element and carries its refs; a page with no such element, or more than one, is refused by name. The first thing to reach for on a large page, before depth.",
+                },
+                "roles": #{
+                    "type": "array",
+                    "items": #{ "type": "string" },
+                    "description": "Keep only elements whose role is in this list, e.g. [\"link\"] -- the filtering happens here, before the result crosses back to you, so it also shrinks what you pay for rather than only what you read. Combine with within for e.g. just the links inside main: on a large article that is the difference between an answer that fits and one that is refused for its size. Unset by default (every role).",
+                },
+                "max": #{
+                    "type": "integer",
+                    "description": "Keep at most this many role-matching elements, in document order. Requires roles. A cap on how many come back, not a target to fill -- a page with fewer real matches than this is not an error.",
+                },
+                "section": #{
+                    "type": "string",
+                    "description": "Restrict a roles-filtered snapshot to the one section whose first heading has this exact text, e.g. \"See also\" or \"References\". Requires within and roles. A page with no such heading, or more than one, is refused by name.",
+                },
+            },
+        },
+    }
+}
+
+pub async fn call(input) {
+    let timeout_s = match input.get("timeout_s") {
+        Some(t) => t,
+        None => 60,
+    };
+    // One object mutated in place -- the idiom crates/tui/ui/default.rn's
+    // `vault_keys` (lines 570-572) already uses: a `#{}` binding takes
+    // `.insert()` with no `let mut` needed. `depth`, `within`, `roles`,
+    // `max` and `section` are each only ever on the wire when the caller
+    // actually asked for it, so service.py's own defaults (the whole
+    // tree, unscoped, unfiltered) are untouched by this tool's own
+    // default the way `timeout_s`'s is.
+    let args = #{ "timeout_s": timeout_s };
+    if let Some(d) = input.get("depth") { args.insert("depth", d); }
+    if let Some(w) = input.get("within") { args.insert("within", w); }
+    if let Some(r) = input.get("roles") { args.insert("roles", r); }
+    if let Some(m) = input.get("max") { args.insert("max", m); }
+    if let Some(s) = input.get("section") { args.insert("section", s); }
+    eidolon::service_call("snapshot", args).await
+}

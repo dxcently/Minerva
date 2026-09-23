@@ -1,0 +1,9 @@
+url: data:text/html,<html><head><title>Page B</title></head><body><main><h1>Page B</h1><a href='/b1'>B-link-one</a><br><a href='/b2'>B-link-two</a></main></body></html>
+title: Page B
+
+- main [ref=f3e2]:
+  - heading "Page B" [level=1] [ref=f3e3]
+  - link "B-link-one" [ref=f3e4] [cursor=pointer]:
+    - /url: /b1
+  - link "B-link-two" [ref=f3e5] [cursor=pointer]:
+    - /url: /b2

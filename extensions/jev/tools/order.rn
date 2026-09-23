@@ -1,0 +1,51 @@
+// Registers as `jev_order`. Queues a standing order on a run that already
+// exists -- an operator's guidance text the *next* chooser call folds into
+// its context as "Operator standing order: ...". See eidolon/docs/extensions.md
+// for the extension contract this rides on; the three fields below are the
+// whole of what crosses into automation/run.py's `Run.order` (via
+// jev/server.py's `_automation_order`).
+//
+// No act loop here, unlike run.rn and resume.rn: queueing an order decides
+// nothing and dispatches nothing -- it changes what the run's next choice
+// reads, not what the run does now. `automation.order` answers with
+// `{run, order}` (the entry as stored: `id`, `text`, `status`), which is
+// exactly what this tool hands back unchanged.
+//
+// `text` is required even though the empty string is valid (it clears the
+// standing order): the two are different statements, and a caller that
+// forgot the field should not silently clear an operator's order. `id` is
+// required too -- it is the idempotency key a retry repeats to get the same
+// order back rather than queueing a second one.
+pub fn manifest() {
+    #{
+        name: "order",
+        description: "Queue a standing order on an existing jev automation run: `text` (at most 2000 characters; the empty string clears the standing order instead) is prepended to the context of the run's *next* choice as \"Operator standing order: ...\". Queues nothing new: the run must already exist and still be live (a finished or stale run is refused -- this never starts a run), and a live park is left exactly as it is, because an order guides scoring rather than answering or restricting anything (`jev_stop` is the explicit way to end a run). Queueing a new order visibly supersedes any prior pending one. `id` is a nonempty idempotency key of at most 128 characters: repeating an id already queued returns that same order (whatever it has since become) instead of queueing a second one. Returns `{run, order}`, where `order` carries `id`, `text` and `status` (`pending` until the next choice consumes it, `applied` after, `superseded`/`cleared` for an order a newer one or a clear replaced).",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "run": #{
+                    "type": "string",
+                    "description": "The id of the run to queue the standing order on -- one that already exists (from jev_run or an earlier jev_resume), still live. A finished or stale run is refused; this never starts one.",
+                },
+                "text": #{
+                    "type": "string",
+                    "description": "The standing order, at most 2000 characters, prepended to the run's next chooser context as \"Operator standing order: ...\". The empty string clears the standing order instead of queueing one.",
+                },
+                "id": #{
+                    "type": "string",
+                    "description": "A nonempty idempotency key of at most 128 characters. Repeating an id already queued returns that same order rather than queueing a second one, so a retry after a dropped connection cannot double-queue.",
+                },
+            },
+            "required": ["run", "text", "id"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::service_call("automation.order", #{
+        "run": input.run,
+        "text": input.text,
+        "id": input.id,
+    }).await
+}

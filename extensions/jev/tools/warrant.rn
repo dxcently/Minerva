@@ -1,0 +1,28 @@
+// Registers as `jev_warrant`. docs/design/unattended.md section 2: the
+// warrant is a one-time, written, operator-approved envelope, not a
+// standing credential a script can request or widen -- this tool only ever
+// *reads* the block a graph's own author already wrote at
+// `meta.jev.warrant` (jev/automation/warrant.py's `canonical`, over
+// jev/server.py's `automation.warrant`), the same read-only shape
+// runs.rn/status.rn already have: no dispatch loop, plain pass-through of
+// `service_call`'s own String result.
+pub fn manifest() {
+    #{
+        name: "warrant",
+        description: "The warrant block a graph declares -- pass it verbatim as `warrant` to jev_run to run the graph unattended under it, and to jev_resume when answering its escalations. Read it before every jev_run: the block carries the graph's content hash and is refused if the graph has changed. A graph with no meta.jev.warrant has no block and runs attended, asking about every action its policy flags.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "graph": #{
+                    "description": "Which graph to read the warrant of: an id naming a file under extensions/jev/graphs/ (e.g. \"wiki-hop\", \"triage-linux\"), or a complete inline graph object for one that has not been saved there.",
+                },
+            },
+            "required": ["graph"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::service_call("automation.warrant", #{ "graph": input.graph }).await
+}

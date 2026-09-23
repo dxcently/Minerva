@@ -1,0 +1,88 @@
+// Registers as `jev_run`. The driver docs/design/automation.md section 2
+// requires and docs/Decisions.md's "The automation design is accepted;
+// eidolon::dispatch is its price" names by name: the jev service (Python,
+// jev/automation/run.py) interprets the graph and only ever *requests* an
+// action -- this script is the one place that actually dispatches one, so
+// every effect an automation graph causes goes through the same policy
+// gate and journal as a direct call, recorded as script-originated
+// (CallOrigin::Script; crates/rune/src/host.rs's `dispatch`).
+//
+// `eidolon::service_call` answers as a JSON-serialised String, not an
+// Object (`crates/tools/src/service.rs`'s `render`, confirmed directly
+// against source, not assumed) -- `json::from_string` unpacks each answer
+// before this script reads a field off it, and `json::to_string` packs the
+// final report back up before handing it back as this tool's own String
+// result (RUNE.md's "`call` returns a `String`, or `#{ content, is_error
+// }`" -- an arbitrary parsed Object is neither).
+pub fn manifest() {
+    #{
+        name: "run",
+        description: "Run a jev automation graph to completion, until it parks to ask a human or a model, or until it stops outright. A graph is a state machine (docs/design/automation.md) that observes, offers itself a menu built from the current state -- a page's links, a fixed list of commands, transitions out of the state itself -- scores it, dispatches whatever it picked, and folds the result back in as the next observation, repeating until it reaches a named outcome. Reach for this for a bounded, already-designed procedure that has a graph behind it -- following links toward a target Wikipedia article (\"wiki-hop\"), triaging an unfamiliar Linux box from a fixed menu of read-only commands (\"triage-linux\") -- never for open-ended work with no graph, and never as a way around asking first: every action the graph picks still goes through the same policy gate and journal as if you had dispatched it yourself; this tool only ever decides what to try next. Returns one of two shapes. If the run finished: the final report -- `outcome` (\"reached\" its named final state, \"exhausted\" a budget, \"stopped\" by jev_stop or a stop answer, or \"error\"), `final_state`, `output`, and the `path` of states it passed through. If the run parked instead -- no option cleared the confidence floor, or a menu came back empty with nothing to handle it -- an escalation (`kind: \"escalate\"`) naming `why` it paused, the `question` (when the graph asked one), `evidence`, and the `options` to pick from, if any; the run is suspended, not over. Answer it with jev_resume {run, pick: <index or label>} or {run, stop: <reason>}, or end it outright with jev_stop {run, reason} -- from any later call, possibly a different session, since a parked run outlives this one. Pass `warrant` -- the block jev_warrant returns for this graph -- to run it unattended: the gate asks once, about the run and its envelope, instead of about every action. Without it every flagged action asks.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "graph": #{
+                    "description": "Which graph to run: an id naming a file under extensions/jev/graphs/ (e.g. \"wiki-hop\", \"triage-linux\"), or a complete inline graph object for one that has not been saved there.",
+                },
+                "input": #{
+                    "type": "object",
+                    "description": "The run's starting values. wiki-hop needs {\"start\": ..., \"goal\": ...}; triage-linux needs none. See the graph's own meta.jev.input for what it requires.",
+                },
+                "warrant": #{
+                    "type": "object",
+                    "description": "The exact block jev_warrant {graph} returned for this graph -- pass it verbatim to run unattended, under a warrant: the gate asks once, about the run and its whole envelope, instead of about every flagged action. Omit to run attended, asking about each action as today.",
+                },
+            },
+            "required": ["graph"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let run_input = match input.get("input") {
+        Some(v) => v,
+        None => #{},
+    };
+
+    // A fully concrete Object at every point `service_call` sees it,
+    // built up with `insert` rather than a literal -- same idiom
+    // resume.rn already uses -- since whether `warrant` exists depends on
+    // whether the caller gave one.
+    let args = #{ "graph": input.graph, "input": run_input };
+    match input.get("warrant") {
+        Some(v) => { args.insert("warrant", v); },
+        None => {},
+    }
+
+    let started_text = eidolon::service_call("automation.start", args).await?;
+    let started = json::from_string(started_text)?;
+
+    let run_id = started.run;
+    let request = started.request;
+
+    while request.kind == "act" {
+        let tool = request.tool;
+        let tool_input = request.input;
+        let request_id = request.id;
+
+        // The one dispatch this whole package exists to gate behind a
+        // script: the jev service named the action, this line is the only
+        // place it actually happens.
+        let outcome = eidolon::dispatch(tool, tool_input).await;
+        let result = match outcome {
+            Ok(text) => #{ "text": text },
+            Err(message) => #{ "error": message },
+        };
+
+        let stepped_text = eidolon::service_call("automation.step", #{
+            "run": run_id.clone(),
+            "request": request_id,
+            "result": result,
+        }).await?;
+        let stepped = json::from_string(stepped_text)?;
+        request = stepped.request;
+    }
+
+    json::to_string(request)?
+}

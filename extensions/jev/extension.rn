@@ -1,0 +1,62 @@
+// jev: jevlike (a one-pass N-way chooser) and openjev (a Qwen3.5-4B NLI
+// cross-encoder) behind one service, as the tools `jev_choose` and
+// `jev_entail`. Neither is a causal LM, so neither has a llama.cpp/GGUF
+// path -- see jev/server.py's own header for the full why. They used to
+// fake an OpenAI chat surface instead; docs/Decisions.md settled that a
+// chooser in a chat model list "cannot be used anyway," so this is the
+// replacement: an eidolon extension, not a model.
+//
+// `jev_run` (tools/run.rn) is the third: docs/design/automation.md's graph
+// interpreter runs inside this same service (jev/automation/), reached
+// over the identical `automation.*` methods on `/call`, and dispatches
+// every action it picks through this script rather than itself -- see
+// run.rn's own header and docs/Decisions.md, "The automation design is
+// accepted; eidolon::dispatch is its price". `jev_resume`, `jev_stop` and
+// `jev_runs` (tools/resume.rn, stop.rn, runs.rn) round the driver out once
+// a run can outlive the tool call that started it: section 4's escalation
+// parks instead of ending the run, so something has to answer it later,
+// something has to be able to end it from wherever it is, and something
+// has to be able to list what is still live -- see run.py's own module
+// docstring for what "later" does and does not survive (a service
+// restart is not one of them).
+pub fn manifest() {
+    #{
+        name: "jev",
+        description: "jevlike (one-pass N-way chooser) and openjev (NLI cross-encoder) as jev_choose and jev_entail, plus jev_run/jev_resume/jev_stop/jev_runs to drive a jev automation graph end to end, parking and all, and jev_warrant to read a graph's declared warrant block for running it unattended, and jev_order to queue a standing order (`automation.order`) on a live run for the next chooser call to fold into its context",
+
+        service: #{
+            // The venv is the jevlike checkout's own, not this repo's --
+            // torch and transformers have no business in eidolon or
+            // bonsai2, so the interpreter is named by its full path rather
+            // than assumed to be on PATH. `-u`: unbuffered stdout, so the
+            // background log (what an operator sees when `ready_timeout_s`
+            // is blown, per eidolon/docs/extensions.md's "When it will not
+            // start") shows the real failure instead of whatever was still
+            // sitting in a pipe buffer.
+            //
+            // `cwd` walks up from this file (extensions/jev/) to the repo
+            // root and back down into jev/, because the service script
+            // itself lives at jev/server.py, not copied in here -- it is
+            // one file whether started by hand (`hoot jev`, historically)
+            // or adopted by this loader, and a copy under tools/ would rot
+            // the way the module docstring already warns jevlike itself
+            // would if vendored.
+            command: "'C:/Users/dxcen/Projects/cms-agent/models/jevlike/.venv/Scripts/python.exe' -u server.py",
+            cwd: "../../jev",
+            health: "/health",
+
+            // Health never loads a model (see server.py's `health()`) --
+            // it only proves the FastAPI process is up, which is Python
+            // cold start plus a fastapi/uvicorn import, no torch: measured
+            // on this box at ~1.3s. 30s leaves better than 20x headroom
+            // for a slow disk or a cold bytecode cache, without coming
+            // anywhere near what it would take to cover openjev's ~9 GB
+            // lazy load (~24s, also measured, and deliberately not paid
+            // here at all -- see the health comment for why that load
+            // must never gate readiness).
+            ready_timeout_s: 30,
+        },
+
+        tools: ["choose", "entail", "run", "resume", "order", "stop", "runs", "warrant"],
+    }
+}

@@ -1,0 +1,13 @@
+// No service, and no tools yet. Spawning a subagent is `Shim::summon` in the
+// shim's own process — a subagent is a chat in this harness, not a process of
+// its own — so the routes that do it belong in `crates/web`, where the process
+// is, and a service declared here would have nothing to run. What this
+// directory is for: the toggle (an enabled `subagent` is what turns the
+// harness's `/api/subagent*` routes on), the tier table's home, and the tools
+// an agent would call once spawning from a turn is ruled on.
+pub fn manifest() {
+    #{
+        name: "subagent",
+        description: "Child sessions for a task: spawn one, watch its trace, steer it mid-turn or cancel it. A role maps to a model tier, the parent's own model by default.",
+    }
+}

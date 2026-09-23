@@ -1,0 +1,113 @@
+// Registers as `jev_resume`. docs/design/automation.md section 4: "jev_resume
+// is the same loop entered through answer" -- this file is that: build the
+// `automation.answer` args from whichever of `pick`/`stop`/`by`/`note`/
+// `request` were actually given, built with `Object.insert` -- the same
+// incremental-build pattern `crates/tui/ui/default.rn`'s keymaps already
+// use, confirmed here rather
+// than assumed, per RUNE.md's own "trust the nearest script over a search
+// result"), then replicate run.rn's own act loop verbatim -- same dispatch,
+// same step, same reason nothing here calls it through a shared function:
+// there is nothing to share that is not three lines, and RUNE.md documents
+// no way to import one script's functions from another.
+pub fn manifest() {
+    #{
+        name: "resume",
+        description: "Answer a jev automation run that is parked waiting on a person or a model -- the same run a jev_run (or an earlier jev_resume) call returned an escalation for (`kind: \"escalate\"`). Give `pick` (the option's index, a number, or its label, a string -- read straight off that escalation's own `options` list; an answer outside the menu is rejected and the park is left exactly as it was) to take it, or `stop` (a reason) to end the run instead of answering -- exactly one of the two. `request` is optional: give the escalation payload's own `request` id and an id that is not the current one is refused with an explicit stale error, the live park untouched; omit it (every caller written before request ids existed) and the answer applies to whatever is parked, exactly as it did before. Once answered, drives the run onward exactly like jev_run does -- dispatching whatever it picks next, through the same policy gate and journal -- until it parks again, reaches a named outcome, or errors, and returns whichever of those it stopped at, in the same two result shapes jev_run itself returns (a final report, or a further escalation).",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "run": #{
+                    "type": "string",
+                    "description": "The run id a jev_run or an earlier jev_resume call returned.",
+                },
+                "request": #{
+                    "type": "string",
+                    "description": "The escalation's own `request` id (the `request` field of the escalation payload, echoed in its `answer` hint). Optional: given, it must match the escalation currently pending, or this call is refused as stale without changing the parked run; omitted, it is not checked.",
+                },
+                "pick": #{
+                    "description": "The option to take: its index (a number) or its label (a string), from the escalation's own `options` list. Exactly one of pick or stop is required.",
+                },
+                "stop": #{
+                    "type": "string",
+                    "description": "End the run instead of answering, with this reason. Exactly one of pick or stop is required.",
+                },
+                "by": #{
+                    "type": "string",
+                    "description": "Who is answering -- e.g. \"human\" or \"model\" -- recorded as the decision's source.",
+                },
+                "note": #{
+                    "type": "string",
+                    "description": "An optional free-text note about the answer.",
+                },
+                "warrant": #{
+                    "type": "object",
+                    "description": "Pass the warrant from the escalation you are answering.",
+                },
+            },
+            "required": ["run"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let run_id = input.run;
+
+    // A fully concrete Object at every point `service_call` sees it --
+    // never a field whose value is itself an `Option` -- built up with
+    // `insert` rather than a literal, since which fields exist depends on
+    // which of pick/stop/by/note were actually given.
+    let args = #{ "run": run_id.clone() };
+    match input.get("request") {
+        Some(v) => { args.insert("request", v); },
+        None => {},
+    }
+    match input.get("pick") {
+        Some(v) => { args.insert("pick", v); },
+        None => {},
+    }
+    match input.get("stop") {
+        Some(v) => { args.insert("stop", v); },
+        None => {},
+    }
+    match input.get("by") {
+        Some(v) => { args.insert("by", v); },
+        None => {},
+    }
+    match input.get("note") {
+        Some(v) => { args.insert("note", v); },
+        None => {},
+    }
+    match input.get("warrant") {
+        Some(v) => { args.insert("warrant", v); },
+        None => {},
+    }
+
+    let answered_text = eidolon::service_call("automation.answer", args).await?;
+    let answered = json::from_string(answered_text)?;
+    let request = answered.request;
+
+    while request.kind == "act" {
+        let tool = request.tool;
+        let tool_input = request.input;
+        let request_id = request.id;
+
+        // The one dispatch this whole package exists to gate behind a
+        // script -- see run.rn's own header.
+        let outcome = eidolon::dispatch(tool, tool_input).await;
+        let result = match outcome {
+            Ok(text) => #{ "text": text },
+            Err(message) => #{ "error": message },
+        };
+
+        let stepped_text = eidolon::service_call("automation.step", #{
+            "run": run_id.clone(),
+            "request": request_id,
+            "result": result,
+        }).await?;
+        let stepped = json::from_string(stepped_text)?;
+        request = stepped.request;
+    }
+
+    json::to_string(request)?
+}

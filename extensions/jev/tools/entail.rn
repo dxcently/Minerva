@@ -1,0 +1,33 @@
+// Registers as `jev_entail`. See eidolon/docs/extensions.md for the
+// extension contract this rides on -- the method name and the two fields
+// below are the whole of what crosses into jev/server.py's `_entail`.
+pub fn manifest() {
+    #{
+        name: "entail",
+        description: "Score whether a premise entails, contradicts, or is neutral toward each of one or more hypotheses, in one forward pass over a fine-tuned 4B-parameter NLI cross-encoder -- far more reliable than eyeballing it, and far cheaper than reasoning it out in text. Reach for this to check a guard condition (does this observation satisfy the goal state?), to fact-check a candidate answer against a reference, or to decide whether the last tool result actually supports or refutes a claim before you act on it or report it. Give it the plainest possible statement of each: it scores the two strings against each other, not the surrounding conversation. Not for anything where the premise itself is still in question, or where the answer needs more than a three-way contradiction/entailment/neutral call. The first call after the service starts loads the ~9 GB model and can take twenty seconds or more; every call after that is ordinary tool speed -- a slow first answer here is expected, not a stall to retry or abandon.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "premise": #{
+                    "type": "string",
+                    "description": "The statement taken as true, that each hypothesis is checked against.",
+                },
+                "hypotheses": #{
+                    "type": "array",
+                    "items": #{ "type": "string" },
+                    "minItems": 1,
+                    "description": "One or more claims to score against the premise.",
+                },
+            },
+            "required": ["premise", "hypotheses"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::service_call("entail", #{
+        "premise": input.premise,
+        "hypotheses": input.hypotheses,
+    }).await
+}

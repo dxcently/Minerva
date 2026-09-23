@@ -1,0 +1,72 @@
+# jev/tests/fixtures/wiki/cat_citations_excerpt.txt
+#
+# Three real, contiguous, byte-for-byte slices of cat_full_capture.txt's
+# citation section, chosen because this is where Playwright's single-quoted
+# 'role "name" [attrs]': text line shape actually occurs on the real page --
+# see a11y.py's module docstring for why. Comment lines (this one included)
+# never start with '- ', so parse_refs ignores them exactly like ordinary
+# prose; they are not tree syntax and are neither a record nor a skip.
+# Each block is self-contained (its own local parent, no reconstructed
+# ancestry back to <main>) -- these lines are not claimed to form one page.
+#
+# --- block 1: source lines 1390-1419 -- inline-quoted-text-value form,
+# 'generic "Page / location: N" [ref=...]': ": N" (role=generic, a colon
+# in the name, the trailing value itself double-quoted since it starts
+# with ':') ---
+                - text: (humans have 12); seven
+                - link "lumbar vertebrae" [ref=e1093] [cursor=pointer]:
+                  - /url: https://en.wikipedia.org/wiki/Lumbar_vertebrae
+                - text: (humans have five); three
+                - link "sacral vertebrae" [ref=e1094] [cursor=pointer]:
+                  - /url: https://en.wikipedia.org/wiki/Sacrum
+                - text: (as do most mammals, but humans have five); and a variable number of
+                - link "caudal vertebrae" [ref=e1095] [cursor=pointer]:
+                  - /url: https://en.wikipedia.org/wiki/Caudal_vertebrae
+                - text: in the tail (humans have only three to five vestigial caudal vertebrae, fused into an internal
+                - link "coccyx" [ref=e1096] [cursor=pointer]:
+                  - /url: https://en.wikipedia.org/wiki/Coccyx
+                - text: ).
+                - superscript [ref=e1097]:
+                  - link "[57]" [ref=e1098] [cursor=pointer]:
+                    - /url: "#cite_note-Walker-58"
+                - superscript [ref=e1100]:
+                  - 'generic "Page / location: 11" [ref=e1101]': ": 11"
+                - text: The extra lumbar and thoracic vertebrae account for the cat's spinal mobility and flexibility. Attached to the spine are 13 ribs, the shoulder, and the
+                - link "pelvis" [ref=e1102] [cursor=pointer]:
+                  - /url: https://en.wikipedia.org/wiki/Pelvis
+                - text: .
+                - superscript [ref=e1103]:
+                  - link "[57]" [ref=e1104] [cursor=pointer]:
+                    - /url: "#cite_note-Walker-58"
+                - superscript [ref=e1106]:
+                  - 'generic "Page / location: 16" [ref=e1107]': ": 16"
+                - text: Unlike human arms, cat forelimbs are attached to the shoulder by free-floating
+                - link "clavicle" [ref=e1108] [cursor=pointer]:
+                  - /url: https://en.wikipedia.org/wiki/Clavicle
+#
+# --- block 2: source lines 3894-3901 -- backslash-escaped embedded double
+# quote in the name ('"Qitta: Arabic Cats"', i.e. the visible link text is
+# itself quoted), children-follow form (nothing after the closing colon,
+# a real /url: property line nested below it) ---
+                - generic [ref=e2716]:
+                  - generic [ref=e2717]:
+                    - text: Huehnergard, J. (2008).
+                    - 'link "\"Qitta: Arabic Cats\"" [ref=e2718] [cursor=pointer]':
+                      - /url: https://books.google.com/books?id=n1_qqgNTsX8C&pg=PA407
+                    - text: ". In Gruendler, B.; Cooperson, M. (eds.). Classical Arabic Humanities in Their Own Terms: Festschrift for Wolfhart Heinrichs on his 65th Birthday. Leiden, Boston:"
+                    - link "Brill" [ref=e2719] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Brill_(publisher)
+#
+# --- block 3: source lines 8826-8835 -- a literal apostrophe inside the
+# name, escaped by doubling the single quote per YAML convention
+# ("Ship''s Cat" -> "Ship's Cat"), also children-follow form ---
+                - generic [ref=e5079]:
+                  - generic [ref=e5080]:
+                    - text: Mayers, Barbara (2007).
+                    - 'link "Toolbox: Ship''s Cat on the Kalmar Nyckel" [ref=e5081] [cursor=pointer]':
+                      - /url: https://books.google.com/books?id=q3LvHwAACAAJ
+                    - text: . Bay Oak Publishers.
+                    - link "ISBN" [ref=e5082] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/ISBN_(identifier)
+                    - link "978-0-9741713-9-5" [ref=e5083] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Special:BookSources/978-0-9741713-9-5

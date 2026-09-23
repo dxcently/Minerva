@@ -1,0 +1,221 @@
+{
+  "id": "find-related",
+  "version": "1",
+  "description": "Trace one term across eidolon's layers — docs, Rust source, Rune scripts, the extensions that extend it, the box's design record — then open the first implementing file so \"what relates to X\" is answered by evidence rather than memory. Read-only: grep and read, nothing else.",
+  "initial": "docs",
+  "context": {},
+  "meta": {
+    "jev": {
+      "schema": 1,
+      "input": {
+        "type": "object",
+        "required": ["term"],
+        "properties": {
+          "term": {
+            "type": "string",
+            "description": "The word to trace: an identifier (`peers`), a command (`send`), or a concept (`subagent`)."
+          }
+        }
+      },
+      "budget": {
+        "steps": 12,
+        "actions": 10,
+        "wall_s": 240,
+        "escalations": 2
+      },
+      "warrant": {
+        "tools": ["grep", "read"]
+      }
+    }
+  },
+  "on": {
+    "ERROR": "nothing"
+  },
+  "states": {
+    "docs": {
+      "description": "Where the term is documented in eidolon.",
+      "entry": [
+        {
+          "type": "tool",
+          "params": {
+            "name": "grep",
+            "input": {
+              "pattern": "{{input.term}}",
+              "path": "eidolon",
+              "glob": "*.md",
+              "case_insensitive": true,
+              "max": 10
+            },
+            "into": "docs"
+          }
+        }
+      ],
+      "always": "code"
+    },
+    "code": {
+      "description": "Where the term is implemented in eidolon's Rust crates.",
+      "entry": [
+        {
+          "type": "tool",
+          "params": {
+            "name": "grep",
+            "input": {
+              "pattern": "{{input.term}}",
+              "path": "eidolon/crates",
+              "glob": "*.rs",
+              "case_insensitive": true,
+              "max": 10
+            },
+            "into": "code"
+          }
+        }
+      ],
+      "always": "scripts"
+    },
+    "scripts": {
+      "description": "Where the term appears in eidolon's Rune scripts — built-ins and user tools.",
+      "entry": [
+        {
+          "type": "tool",
+          "params": {
+            "name": "grep",
+            "input": {
+              "pattern": "{{input.term}}",
+              "path": "eidolon",
+              "glob": "*.rn",
+              "case_insensitive": true,
+              "max": 10
+            },
+            "into": "scripts"
+          }
+        }
+      ],
+      "always": "graphs"
+    },
+    "graphs": {
+      "description": "Where the term appears in this box's extensions — jev graphs, tools and services.",
+      "entry": [
+        {
+          "type": "tool",
+          "params": {
+            "name": "grep",
+            "input": {
+              "pattern": "{{input.term}}",
+              "path": "extensions",
+              "glob": "*.json,*.rn,*.py",
+              "case_insensitive": true,
+              "max": 10
+            },
+            "into": "graphs"
+          }
+        }
+      ],
+      "always": "design"
+    },
+    "design": {
+      "description": "Where the term is ruled on in the box's own design record.",
+      "entry": [
+        {
+          "type": "tool",
+          "params": {
+            "name": "grep",
+            "input": {
+              "pattern": "{{input.term}}",
+              "path": "docs",
+              "glob": "*.md",
+              "case_insensitive": true,
+              "max": 10
+            },
+            "into": "design"
+          }
+        }
+      ],
+      "always": "elsewhere"
+    },
+    "elsewhere": {
+      "description": "Where the term appears outside eidolon — the Aoide record beside it.",
+      "entry": [
+        {
+          "type": "tool",
+          "params": {
+            "name": "grep",
+            "input": {
+              "pattern": "{{input.term}}",
+              "path": "Aoide/docs",
+              "glob": "*.md",
+              "case_insensitive": true,
+              "max": 10
+            },
+            "into": "elsewhere"
+          }
+        }
+      ],
+      "always": "inspect"
+    },
+    "inspect": {
+      "description": "The first hit that names a file — the nearest thing to the term that is code.",
+      "entry": [
+        {
+          "type": "assign",
+          "params": {
+            "haystack": "{{context.code.text}}\n{{context.docs.text}}\n{{context.scripts.text}}\n{{context.graphs.text}}\n{{context.design.text}}\n{{context.elsewhere.text}}"
+          }
+        },
+        {
+          "type": "capture",
+          "params": {
+            "path": "context.haystack",
+            "pattern": "^(?P<path>[^:\\n]+):(?P<line>\\d+):",
+            "into": "hit"
+          }
+        }
+      ],
+      "always": "excerpt"
+    },
+    "excerpt": {
+      "description": "Read the head of the file that hit names, for the context a grep line cannot carry.",
+      "entry": [
+        {
+          "type": "tool",
+          "params": {
+            "name": "read",
+            "input": {
+              "path": "{{context.hit.path}}",
+              "limit": 30
+            },
+            "into": "excerpt"
+          }
+        }
+      ],
+      "always": "report"
+    },
+    "report": {
+      "type": "final",
+      "description": "Every layer the term reached, with the first file that implements it.",
+      "output": {
+        "term": "{{input.term}}",
+        "first_file": "{{context.hit.path}}",
+        "first_line": "{{context.hit.line}}",
+        "excerpt": "{{context.excerpt.text}}",
+        "eidolon_docs": "{{context.docs.text}}",
+        "eidolon_code": "{{context.code.text}}",
+        "eidolon_scripts": "{{context.scripts.text}}",
+        "extensions": "{{context.graphs.text}}",
+        "design_record": "{{context.design.text}}",
+        "elsewhere": "{{context.elsewhere.text}}"
+      }
+    },
+    "nothing": {
+      "type": "final",
+      "description": "No hit to inspect: the term reached nothing, or a search action failed.",
+      "output": {
+        "term": "{{input.term}}",
+        "error": "{{event.error}}",
+        "reason": "{{event.reason}}",
+        "eidolon_docs": "{{context.docs.text}}",
+        "eidolon_code": "{{context.code.text}}",
+        "elsewhere": "{{context.elsewhere.text}}"
+      }
+    }
+  }
+}

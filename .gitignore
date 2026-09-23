@@ -1,0 +1,37 @@
+# Local runtime state and credentials
+.webui/
+.webui_secret_key
+**/.webui_secret_key
+.cache/
+logs/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Large local model weights and compiled runtime
+models/
+llama.cpp/
+**/target/
+**/node_modules/
+**/.venv/
+**/venv/
+**/__pycache__/
+*.pyc
+*.gguf
+*.safetensors
+*.pt
+*.pth
+
+# Independent repositories: never silently stage as incomplete gitlinks.
+# Their dirty working trees remain in place; dependency pinning is separate work.
+/eidolon/
+/harnox/
+# Aoide is the same shape as those two: another project checked out here,
+# with its own history and a working tree of its own to keep dirty.
+/Aoide/
+
+# Machine-specific backups
+/bin/PATH-backup.txt
+*.orig

@@ -1,0 +1,20 @@
+// Registers as `jev_runs`. See eidolon/docs/extensions.md for the extension
+// contract this rides on. Plain pass-through to automation/run.py's
+// `list_runs` (via jev/server.py's `_automation_runs`), same shape as
+// choose.rn/entail.rn -- no input to forward, so the `call` below ignores
+// its own `input` entirely.
+pub fn manifest() {
+    #{
+        name: "runs",
+        description: "List every jev automation run this jev service process has tracked since it last started -- run id, graph, active state, outcome (null while still live or parked, \"orphaned\" for a run this process rediscovered but cannot resume), and counts. This list itself does not survive a service restart and is not where a restarted run reappears on its own (automation/run.py's own module docstring explains why: reconstruction is lazy, on the first jev_resume/jev_stop/automation.status that actually names a given id, not a scan at startup) -- an id missing here may simply be one nothing has asked about yet. Asking after it directly is not blind, either way: if it was parked waiting on an answer when the service restarted, jev_resume genuinely resumes it; if it was suspended on an action instead, jev_resume/jev_stop name what was lost rather than hanging or silently starting over. Takes no input.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{},
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::service_call("automation.runs", #{}).await
+}

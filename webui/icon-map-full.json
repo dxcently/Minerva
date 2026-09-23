@@ -1,0 +1,993 @@
+[
+ {
+  "id": 0,
+  "depicts": "pencil / edit",
+  "icon": "pencil",
+  "verified": true
+ },
+ {
+  "id": 3,
+  "depicts": "X / close / cancel",
+  "icon": "diagonal-cross",
+  "verified": true
+ },
+ {
+  "id": 6,
+  "depicts": "circular refresh/reload arrows",
+  "icon": "repeat-arrow",
+  "verified": true
+ },
+ {
+  "id": 7,
+  "depicts": "magnifying glass / search (lens top-left, handle bottom-right)",
+  "icon": "left-magnifying-glass",
+  "verified": true
+ },
+ {
+  "id": 12,
+  "depicts": "bold check mark (confirm)",
+  "icon": "white-heavy-check-mark",
+  "verified": true
+ },
+ {
+  "id": 15,
+  "depicts": "eye / view",
+  "icon": "eye",
+  "verified": true
+ },
+ {
+  "id": 16,
+  "depicts": "thin check mark (confirm)",
+  "icon": "white-heavy-check-mark-small",
+  "verified": true
+ },
+ {
+  "id": 20,
+  "depicts": "download arrow into tray",
+  "icon": "download",
+  "verified": true
+ },
+ {
+  "id": 21,
+  "depicts": "sliders / adjustments (filter controls)",
+  "icon": "adjustments",
+  "verified": true
+ },
+ {
+  "id": 22,
+  "depicts": "X mark / close / cancel",
+  "icon": "diagonal-cross",
+  "verified": true
+ },
+ {
+  "id": 24,
+  "depicts": "fork chat -- an arrow branching away from the thread",
+  "icon": "right-then-curving-down-arrow",
+  "verified": true
+ },
+ {
+  "id": 25,
+  "depicts": "eye / view",
+  "icon": "eye",
+  "verified": true
+ },
+ {
+  "id": 26,
+  "depicts": "circled info (i)",
+  "icon": "circled-information-source",
+  "verified": true
+ },
+ {
+  "id": 27,
+  "depicts": "X mark / close",
+  "icon": "diagonal-cross",
+  "verified": true
+ },
+ {
+  "id": 28,
+  "depicts": "circular refresh/reload arrows",
+  "icon": "repeat-arrow",
+  "verified": true
+ },
+ {
+  "id": 30,
+  "depicts": "circular refresh/reload arrows (same as #28)",
+  "icon": "repeat-arrow",
+  "verified": true
+ },
+ {
+  "id": 32,
+  "depicts": "clipboard",
+  "icon": "clipboard",
+  "verified": true
+ },
+ {
+  "id": 35,
+  "depicts": "checkmark / confirm",
+  "icon": "white-heavy-check-mark",
+  "verified": true
+ },
+ {
+  "id": 38,
+  "depicts": "filled rounded badge (circle/square) with a white SQUARE cutout in the center \u2014 a stop symbol; distinct from the round cutout on black-circle-for-record-filled",
+  "icon": "black-square-for-stop-filled",
+  "verified": true
+ },
+ {
+  "id": 40,
+  "depicts": "a dotted diagonal X spanning corner to corner, no enclosing box",
+  "icon": "diagonal-cross",
+  "verified": true
+ },
+ {
+  "id": 41,
+  "depicts": "a cog/gear with teeth around a hollow center",
+  "icon": "gear",
+  "verified": true
+ },
+ {
+  "id": 44,
+  "depicts": "an arrow curling back to the left (matches the classic Unicode 'leftwards arrow with hook' undo glyph)",
+  "icon": "left-hook-arrow",
+  "verified": true
+ },
+ {
+  "id": 45,
+  "depicts": "a camera body with a lens circle and a viewfinder bump on top",
+  "icon": "camera",
+  "verified": true
+ },
+ {
+  "id": 46,
+  "depicts": "a diagonal pencil with a pointed tip",
+  "icon": "pencil",
+  "verified": true
+ },
+ {
+  "id": 47,
+  "depicts": "an open box with an arrow escaping upward out of it",
+  "icon": "share",
+  "verified": true
+ },
+ {
+  "id": 48,
+  "depicts": "code brackets </>",
+  "icon": "code",
+  "verified": true
+ },
+ {
+  "id": 50,
+  "depicts": "clock face",
+  "icon": "clock",
+  "verified": true
+ },
+ {
+  "id": 51,
+  "depicts": "sparkles / magic stars (AI)",
+  "icon": "sparkles",
+  "verified": true
+ },
+ {
+  "id": 52,
+  "depicts": "3D cube / box outline",
+  "icon": "cube",
+  "verified": true
+ },
+ {
+  "id": 53,
+  "depicts": "camera",
+  "icon": "camera",
+  "verified": true
+ },
+ {
+  "id": 54,
+  "depicts": "paperclip / attachment",
+  "icon": "paperclip",
+  "verified": true
+ },
+ {
+  "id": 60,
+  "depicts": "bulleted list (dots with text lines)",
+  "icon": "view-list",
+  "verified": true
+ },
+ {
+  "id": 64,
+  "depicts": "square checkbox with a checkmark inside",
+  "icon": "ballot-box-with-check",
+  "verified": true
+ },
+ {
+  "id": 65,
+  "depicts": "left-pointing arrow inside a rounded pill/rectangle",
+  "icon": "left-arrow-circled",
+  "verified": true
+ },
+ {
+  "id": 66,
+  "depicts": "right-pointing arrow inside a rounded pill/rectangle",
+  "icon": "right-arrow-circled",
+  "verified": true
+ },
+ {
+  "id": 67,
+  "depicts": "simple smiling face (circle, two eye strokes, curved mouth)",
+  "icon": "slightly-smiling-face",
+  "verified": true
+ },
+ {
+  "id": 70,
+  "depicts": "plain thick circle outline",
+  "icon": "circle",
+  "verified": true
+ },
+ {
+  "id": 72,
+  "depicts": "play button - rounded rectangle frame with a solid right-pointing play triangle inside",
+  "icon": "right-black-triangle",
+  "verified": true
+ },
+ {
+  "id": 76,
+  "depicts": "two interlocking rings (chain / hyperlink)",
+  "icon": "link-symbol",
+  "verified": true
+ },
+ {
+  "id": 78,
+  "depicts": "circle outline with a checkmark inside (check / done)",
+  "icon": "checkmark-circled",
+  "verified": true
+ },
+ {
+  "id": 79,
+  "depicts": "arrow pointing down into a tray/underline (download)",
+  "icon": "download",
+  "verified": true
+ },
+ {
+  "id": 80,
+  "depicts": "clipboard",
+  "icon": "clipboard",
+  "verified": true
+ },
+ {
+  "id": 81,
+  "depicts": "plain speech/chat bubble outline, no marks inside",
+  "icon": "speech-balloon-empty",
+  "verified": true
+ },
+ {
+  "id": 82,
+  "depicts": "speech/chat bubble with three dots inside (typing indicator)",
+  "icon": "speech-balloon",
+  "verified": true
+ },
+ {
+  "id": 84,
+  "depicts": "price tag / label icon",
+  "icon": "label",
+  "verified": true
+ },
+ {
+  "id": 85,
+  "depicts": "rss / signal arcs",
+  "icon": "antenna-bars",
+  "verified": true
+ },
+ {
+  "id": 86,
+  "depicts": "chain link / URL link",
+  "icon": "link-symbol",
+  "verified": true
+ },
+ {
+  "id": 87,
+  "depicts": "padlock (locked)",
+  "icon": "lock",
+  "verified": true
+ },
+ {
+  "id": 88,
+  "depicts": "magnifying glass / search (circle top-left, handle bottom-right)",
+  "icon": "left-magnifying-glass",
+  "verified": true
+ },
+ {
+  "id": 90,
+  "depicts": "sparkles / AI generate",
+  "icon": "sparkles",
+  "verified": true
+ },
+ {
+  "id": 92,
+  "depicts": "outline star (favorite)",
+  "icon": "white-medium-star",
+  "verified": true
+ },
+ {
+  "id": 93,
+  "depicts": "lightbulb (idea/tip)",
+  "icon": "electric-light-bulb",
+  "verified": true
+ },
+ {
+  "id": 94,
+  "depicts": "lightning bolt (flash/fast)",
+  "icon": "high-voltage-sign",
+  "verified": true
+ },
+ {
+  "id": 95,
+  "depicts": "circle with right arrow (go/next)",
+  "icon": "right-arrow-circled",
+  "verified": true
+ },
+ {
+  "id": 97,
+  "depicts": "outline document/page with a small pencil overlapping the bottom-right corner (edit file)",
+  "icon": "memo",
+  "verified": true
+ },
+ {
+  "id": 98,
+  "depicts": "outline right-pointing triangle (play button)",
+  "icon": "right-black-triangle",
+  "verified": true
+ },
+ {
+  "id": 99,
+  "depicts": "solid/filled document with folded top-right corner and 2 text-line bars, no pencil visible",
+  "icon": "page-facing-up-filled",
+  "verified": true
+ },
+ {
+  "id": 100,
+  "depicts": "outline document with folded top-right corner and 3 text-line bars, no pencil visible",
+  "icon": "page-facing-up",
+  "verified": true
+ },
+ {
+  "id": 101,
+  "depicts": "closed padlock",
+  "icon": "lock",
+  "verified": true
+ },
+ {
+  "id": 102,
+  "depicts": "globe with meridian/longitude squiggle lines (world/language)",
+  "icon": "globe-meridians",
+  "verified": true
+ },
+ {
+  "id": 103,
+  "depicts": "two overlapping documents (copy/duplicate)",
+  "icon": "duplicate",
+  "verified": true
+ },
+ {
+  "id": 106,
+  "depicts": "speaker with an X / cancellation stroke (mute)",
+  "icon": "speaker-with-cancellation-stroke",
+  "verified": true
+ },
+ {
+  "id": 107,
+  "depicts": "speaker with two curved sound-wave arcs (volume on)",
+  "icon": "speaker-with-three-sound-waves",
+  "verified": true
+ },
+ {
+  "id": 108,
+  "depicts": "circle outline with a lowercase \"i\" inside (info icon)",
+  "icon": "circled-information-source",
+  "verified": true
+ },
+ {
+  "id": 109,
+  "depicts": "thumbs-up hand icon",
+  "icon": "thumbs-up-sign",
+  "verified": true
+ },
+ {
+  "id": 110,
+  "depicts": "thumbs-down",
+  "icon": "thumbs-up-sign",
+  "verified": true,
+  "transform": "rotate180"
+ },
+ {
+  "id": 111,
+  "depicts": "right-pointing play triangle inside a circle",
+  "icon": "right-black-triangle",
+  "verified": true
+ },
+ {
+  "id": 112,
+  "depicts": "share icon (three nodes connected by lines)",
+  "icon": "share",
+  "verified": true
+ },
+ {
+  "id": 113,
+  "depicts": "push pin / thumbtack",
+  "icon": "pushpin",
+  "verified": true
+ },
+ {
+  "id": 115,
+  "depicts": "left arrow (back)",
+  "icon": "left-arrow-circled",
+  "verified": true
+ },
+ {
+  "id": 116,
+  "depicts": "plain right-pointing play triangle, no circle or frame",
+  "icon": "right-black-triangle",
+  "verified": true
+ },
+ {
+  "id": 117,
+  "depicts": "pencil (edit)",
+  "icon": "pencil",
+  "verified": true
+ },
+ {
+  "id": 118,
+  "depicts": "document/file with a downward arrow (download)",
+  "icon": "download",
+  "verified": true
+ },
+ {
+  "id": 121,
+  "depicts": "wrench / tool",
+  "icon": "wrench",
+  "verified": true
+ },
+ {
+  "id": 122,
+  "depicts": "folder with tab, outline style",
+  "icon": "file-folder",
+  "verified": true
+ },
+ {
+  "id": 127,
+  "depicts": "globe with meridian/graticule lines",
+  "icon": "globe-meridians",
+  "verified": true
+ },
+ {
+  "id": 128,
+  "depicts": "heart outline (unfilled/white heart suit)",
+  "icon": "heart-white-suit",
+  "verified": true
+ },
+ {
+  "id": 129,
+  "depicts": "hash / pound sign",
+  "icon": "hashtag",
+  "verified": true
+ },
+ {
+  "id": 131,
+  "depicts": "solid/filled rounded-square file icon with mountain+sun graphic (image/photo placeholder) \u2014 switched to the filled variant since the sheet icon is a solid filled square, not an outline",
+  "icon": "file-graphics-filled",
+  "verified": true
+ },
+ {
+  "id": 132,
+  "depicts": "X mark / close",
+  "icon": "diagonal-cross",
+  "verified": true
+ },
+ {
+  "id": 134,
+  "depicts": "closed padlock",
+  "icon": "lock",
+  "verified": true
+ },
+ {
+  "id": 138,
+  "depicts": "X mark / close (duplicate of #132)",
+  "icon": "diagonal-cross",
+  "verified": true
+ },
+ {
+  "id": 140,
+  "depicts": "down arrow (download)",
+  "icon": "download",
+  "verified": true
+ },
+ {
+  "id": 141,
+  "depicts": "pencil / edit",
+  "icon": "pencil",
+  "verified": true
+ },
+ {
+  "id": 142,
+  "depicts": "folder",
+  "icon": "file-folder",
+  "verified": true
+ },
+ {
+  "id": 143,
+  "depicts": "share (three connected nodes)",
+  "icon": "share",
+  "verified": true
+ },
+ {
+  "id": 145,
+  "depicts": "outline cloud",
+  "icon": "cloud",
+  "verified": true
+ },
+ {
+  "id": 146,
+  "depicts": "document/file with folded top-right corner",
+  "icon": "page-facing-up",
+  "verified": true
+ },
+ {
+  "id": 147,
+  "depicts": "wrench (tools/settings)",
+  "icon": "wrench",
+  "verified": true
+ },
+ {
+  "id": 150,
+  "depicts": "clock with an arrow (history)",
+  "icon": "clock",
+  "verified": true
+ },
+ {
+  "id": 151,
+  "depicts": "shield (security)",
+  "icon": "shield",
+  "verified": true
+ },
+ {
+  "id": 154,
+  "depicts": "plain checkmark",
+  "icon": "white-heavy-check-mark",
+  "verified": true
+ },
+ {
+  "id": 155,
+  "depicts": "microphone (capsule + stand + base)",
+  "icon": "mic",
+  "verified": true
+ },
+ {
+  "id": 157,
+  "depicts": "terminal window with >_ prompt",
+  "icon": "code",
+  "verified": true
+ },
+ {
+  "id": 159,
+  "depicts": "4 diamond outlines in pinwheel cluster (wireframe cube / models icon)",
+  "icon": "cube",
+  "verified": true
+ },
+ {
+  "id": 161,
+  "depicts": "arrows pointing outward at 4 corners (expand / fullscreen)",
+  "icon": "arrows-maximize",
+  "verified": true
+ },
+ {
+  "id": 163,
+  "depicts": "checklist",
+  "icon": "view-list",
+  "verified": true
+ },
+ {
+  "id": 164,
+  "depicts": "plain checkmark, no circle or box around it",
+  "icon": "white-heavy-check-mark",
+  "verified": true
+ },
+ {
+  "id": 167,
+  "depicts": "plain circle outline",
+  "icon": "circle",
+  "verified": true
+ },
+ {
+  "id": 169,
+  "depicts": "speech bubble with a circled plus sign inside (new chat / add message)",
+  "icon": "speech-balloon",
+  "verified": true
+ },
+ {
+  "id": 170,
+  "depicts": "bold X mark (close, cancel)",
+  "icon": "diagonal-cross",
+  "verified": true
+ },
+ {
+  "id": 171,
+  "depicts": "two curved arrows forming a circle (refresh/reload/sync)",
+  "icon": "repeat-arrow",
+  "verified": true
+ },
+ {
+  "id": 172,
+  "depicts": "camera (body with lens and viewfinder bump)",
+  "icon": "camera",
+  "verified": true
+ },
+ {
+  "id": 174,
+  "depicts": "plain upright microphone with stand and base (mic unmuted)",
+  "icon": "mic",
+  "verified": true
+ },
+ {
+  "id": 175,
+  "depicts": "bold X mark (close, cancel)",
+  "icon": "diagonal-cross",
+  "verified": true
+ },
+ {
+  "id": 176,
+  "depicts": "four arrow-brackets pointing outward from the corners (expand/fullscreen)",
+  "icon": "arrows-maximize",
+  "verified": true
+ },
+ {
+  "id": 179,
+  "depicts": "two curved arrows forming a circle (refresh/reload/sync)",
+  "icon": "repeat-arrow",
+  "verified": true
+ },
+ {
+  "id": 180,
+  "depicts": "square/box outline with a diagonal arrow breaking out of the top-right corner (external-link/open glyph)",
+  "icon": "share",
+  "verified": true
+ },
+ {
+  "id": 181,
+  "depicts": "plain X mark drawn corner-to-corner (close/cancel)",
+  "icon": "diagonal-cross",
+  "verified": true
+ },
+ {
+  "id": 182,
+  "depicts": "downward arrow above a solid horizontal tray/bracket (download)",
+  "icon": "download",
+  "verified": true
+ },
+ {
+  "id": 187,
+  "depicts": "four corner brackets forming a viewfinder frame (expand/fullscreen)",
+  "icon": "arrows-maximize",
+  "verified": true
+ },
+ {
+  "id": 188,
+  "depicts": "solid filled padlock body with closed shackle arc (locked)",
+  "icon": "lock-filled",
+  "verified": true
+ },
+ {
+  "id": 189,
+  "depicts": "solid filled padlock body with shackle arc swung open (unlocked)",
+  "icon": "open-lock-filled",
+  "verified": true
+ },
+ {
+  "id": 190,
+  "depicts": "solid filled black square (stop)",
+  "icon": "black-square-for-stop-filled",
+  "verified": true
+ },
+ {
+  "id": 193,
+  "depicts": "filled circle with a white checkmark",
+  "icon": "checkmark-circled-filled",
+  "verified": true
+ },
+ {
+  "id": 195,
+  "depicts": "filled circle with a white lowercase i (info)",
+  "icon": "circled-information-source-filled",
+  "verified": true
+ },
+ {
+  "id": 197,
+  "depicts": "bold X / close mark",
+  "icon": "diagonal-cross",
+  "verified": true
+ },
+ {
+  "id": 198,
+  "depicts": "outline gear / settings cog",
+  "icon": "gear",
+  "verified": true
+ },
+ {
+  "id": 199,
+  "depicts": "outline smiley face, dot eyes and curved smile",
+  "icon": "slightly-smiling-face",
+  "verified": true
+ },
+ {
+  "id": 200,
+  "depicts": "outline calendar with two binder tabs at top",
+  "icon": "calendar",
+  "verified": true
+ },
+ {
+  "id": 201,
+  "depicts": "outline clock face with hour/minute hands",
+  "icon": "clock",
+  "verified": true
+ },
+ {
+  "id": 202,
+  "depicts": "code brackets </>",
+  "icon": "code",
+  "verified": true
+ },
+ {
+  "id": 204,
+  "depicts": "door/rectangle with arrow exiting right (logout)",
+  "icon": "exit",
+  "verified": true
+ },
+ {
+  "id": 206,
+  "depicts": "closed book, rectangular cover with spine line",
+  "icon": "closed-book",
+  "verified": true
+ },
+ {
+  "id": 207,
+  "depicts": "pushpin / thumbtack",
+  "icon": "pushpin",
+  "verified": true
+ },
+ {
+  "id": 209,
+  "depicts": "gear / cog (settings)",
+  "icon": "gear",
+  "verified": true
+ },
+ {
+  "id": 211,
+  "depicts": "person / user silhouette",
+  "icon": "adult",
+  "verified": true
+ },
+ {
+  "id": 213,
+  "depicts": "two overlapping squares (duplicate/copy)",
+  "icon": "duplicate",
+  "verified": true
+ },
+ {
+  "id": 214,
+  "depicts": "speech bubble / chat balloon, empty",
+  "icon": "speech-balloon-empty",
+  "verified": true
+ },
+ {
+  "id": 216,
+  "depicts": "two sparkle/star bursts (AI-generate sparkles)",
+  "icon": "sparkles",
+  "verified": true
+ },
+ {
+  "id": 220,
+  "depicts": "magnifying glass with lens upper-left, handle to lower-right (search)",
+  "icon": "left-magnifying-glass",
+  "verified": true
+ },
+ {
+  "id": 222,
+  "depicts": "circular refresh arrow",
+  "icon": "repeat-arrow",
+  "verified": true
+ },
+ {
+  "id": 223,
+  "depicts": "clipboard with a document/checklist inside",
+  "icon": "clipboard",
+  "verified": true
+ },
+ {
+  "id": 224,
+  "depicts": "undo -- arrow hooking back to the left",
+  "icon": "left-hook-arrow",
+  "verified": true
+ },
+ {
+  "id": 225,
+  "depicts": "pencil (edit)",
+  "icon": "pencil",
+  "verified": true
+ },
+ {
+  "id": 226,
+  "depicts": "wrench (tools/settings)",
+  "icon": "wrench",
+  "verified": true
+ },
+ {
+  "id": 227,
+  "depicts": "hollow ring/circle outline",
+  "icon": "circle",
+  "verified": true
+ },
+ {
+  "id": 229,
+  "depicts": "gear/cog wheel outline",
+  "icon": "gear",
+  "verified": true
+ },
+ {
+  "id": 230,
+  "depicts": "standing person figure (best available generic person glyph; set has no explicit 'circled user/account' icon)",
+  "icon": "adult",
+  "verified": true
+ },
+ {
+  "id": 231,
+  "depicts": "speaker with three curved sound waves",
+  "icon": "speaker-with-three-sound-waves",
+  "verified": true
+ },
+ {
+  "id": 232,
+  "depicts": "circle containing a lowercase i (info)",
+  "icon": "circled-information-source",
+  "verified": true
+ },
+ {
+  "id": 233,
+  "depicts": "simple smiling face (circular, two dot eyes, curved mouth)",
+  "icon": "slightly-smiling-face",
+  "verified": true
+ },
+ {
+  "id": 237,
+  "depicts": "computer monitor/screen on a stand",
+  "icon": "personal-computer",
+  "verified": true
+ },
+ {
+  "id": 238,
+  "depicts": "three stacked horizontal bars (hamburger-menu glyph) \u2014 sheet icon shows four bars, a minor bar-count mismatch, but the menu/list meaning is not misleading",
+  "icon": "menu",
+  "verified": true
+ },
+ {
+  "id": 243,
+  "depicts": "archive box with arrow pointing down into it",
+  "icon": "download",
+  "verified": true
+ },
+ {
+  "id": 244,
+  "depicts": "X mark (close / cancel)",
+  "icon": "diagonal-cross",
+  "verified": true
+ },
+ {
+  "id": 246,
+  "depicts": "pencil (edit)",
+  "icon": "pencil",
+  "verified": true
+ },
+ {
+  "id": 248,
+  "depicts": "two overlapping speech/chat bubbles",
+  "icon": "speech-balloon-empty",
+  "verified": true
+ },
+ {
+  "id": 249,
+  "depicts": "arrow pointing down into an open tray (download)",
+  "icon": "download",
+  "verified": true
+ },
+ {
+  "id": 251,
+  "depicts": "gear / cog (settings)",
+  "icon": "gear",
+  "verified": true
+ },
+ {
+  "id": 252,
+  "depicts": "right-pointing triangle / play button",
+  "icon": "right-black-triangle",
+  "verified": true
+ },
+ {
+  "id": 253,
+  "depicts": "right arrow",
+  "icon": "right-arrow-circled",
+  "verified": true
+ },
+ {
+  "id": 254,
+  "depicts": "solid filled black circle / dot",
+  "icon": "circle-filled",
+  "verified": true
+ },
+ {
+  "id": 255,
+  "depicts": "arrow hooking back up-left (reply/undo)",
+  "icon": "left-hook-arrow",
+  "verified": true
+ },
+ {
+  "id": 256,
+  "depicts": "microphone",
+  "icon": "microphone",
+  "verified": true
+ },
+ {
+  "id": 257,
+  "depicts": "single person / user outline",
+  "icon": "adult",
+  "verified": true
+ },
+ {
+  "id": 259,
+  "depicts": "mouse cursor with click sparkle lines",
+  "icon": "cursor-arrow",
+  "verified": true
+ },
+ {
+  "id": 260,
+  "depicts": "arrow hooking forward up-right (redo/share)",
+  "icon": "right-hook-arrow",
+  "verified": true
+ },
+ {
+  "id": 261,
+  "depicts": "download arrow into tray",
+  "icon": "download",
+  "verified": true
+ },
+ {
+  "id": 263,
+  "depicts": "open folder",
+  "icon": "file-folder",
+  "verified": true
+ },
+ {
+  "id": 264,
+  "depicts": "folder with a plus sign (add/new folder)",
+  "icon": "file-folder",
+  "verified": true
+ },
+ {
+  "id": 266,
+  "depicts": "microphone (voice input)",
+  "icon": "mic",
+  "verified": true
+ },
+ {
+  "id": 267,
+  "depicts": "right arrow",
+  "icon": "right-arrow-circled",
+  "verified": true
+ },
+ {
+  "id": 269,
+  "depicts": "Microsoft four-square logo",
+  "icon": "windows",
+  "verified": true
+ },
+ {
+  "id": 270,
+  "depicts": "GitHub octocat logo",
+  "icon": "github",
+  "verified": true
+ }
+]
