@@ -1,7 +1,14 @@
 # The brief a spawned subagent is given
 
-Every spawn composes this file with the four values below filled in, and hands
-the result as the subagent's first message. The lifecycle is the point of it:
+**This is the shape, not the shipped wording.** The brief a `spawn` actually
+hands over is composed in the harness — `subagent_brief`, in
+`eidolon/crates/rune/src/host.rs` — because the tool is compiled into the
+binary and this directory is not read at spawn time. What it implements today
+is the first half of what is written below: the parent's id, the task, the
+report shape, and the instruction to stop. **Not implemented: `{cwd}` and
+`{deadline}`** (the child runs in the parent's directory and has no deadline),
+and the journal path is not in the brief — it lands in the tool's *result*
+instead, where the parent can keep it for `eidolon resume`. The lifecycle is the point of it:
 a subagent reports, stops, and is resumed from its journal if the parent wants
 more — so the brief has to make the report addressable and the journal findable.
 
