@@ -77,7 +77,7 @@ export function Pane({ p, rect, focused, mirror, act }) {
 
 function Title({ p, mirror, act }) {
   const s = p.s, conn = s.conn.value, hl = s.hello.value;
-  const dot = { live: 'g', replaying: 'y', connecting: 'y', reconnecting: 'y', goodbye: 'faint' }[conn] || 'r';
+  const dot = { live: 'hi', replaying: 'y', connecting: 'y', reconnecting: 'y', goodbye: 'faint' }[conn] || 'r';
   const open = (e, at) => { e.preventDefault(); e.stopPropagation(); act.paneMenu(p, at); };
   return html`<div class="ftitle k ptitle" role="button" tabindex="0" title="pane menu (click or right-click)" data-owner=${'pane-' + p.id}
       onClick=${(e) => open(e, under(e.currentTarget))} onContextMenu=${(e) => open(e, atPointer(e))}
@@ -204,7 +204,7 @@ function RowBody({ r, s, v }) {
   const cm = (e) => rowMenu(e, r, v);
   switch (r.kind) {
     case 'you':
-      return html`<div class="row" onContextMenu=${cm}><${Who} who=${r.who} /><div class="body">${r.text}</div>
+      return html`<div class="row you" onContextMenu=${cm}><${Who} who=${r.who} /><div class="body">${r.text}</div>
         ${r.images > 0 && html`<div class="body faint">[${r.images} image${r.images > 1 ? 's' : ''}]</div>`}</div>`;
     case 'bot': {
       // A reply an `error` cut short is filled in place by its assistant-message.
@@ -217,7 +217,7 @@ function RowBody({ r, s, v }) {
     }
     case 'sys': return html`<div class=${'row sys ' + (r.cls || '')} onContextMenu=${cm}>${r.text}</div>`;
     case 'verdict': {
-      const f = r.f, bad = ['refused', 'declined', 'yolo'].includes(f.outcome);
+      const f = r.f, bad = ['refused', 'declined'].includes(f.outcome);
       return html`<div class=${'row sys' + (bad ? ' err' : '')} onContextMenu=${cm}>policy: ${f.tool} [${f.outcome}] ${f.reason}${f.note ? ' · ' + f.note : ''}
         <span class="dim"> (not matched to a call)</span></div>`;
     }
@@ -233,7 +233,7 @@ function RowBody({ r, s, v }) {
 }
 
 // ---------------------------------------------------------------- tool lines
-const VD = { refused: 'r', declined: 'r', yolo: 'r', judged: 'y', approved: 'g' };
+const VD = { refused: 'r', declined: 'r' };
 
 function ToolRow({ c, s, v, cm }) {
   const st = c.st.value, out = c.out.value, vd = c.verdict.value, a = c.ask.value, settled = c.settled.value;
@@ -247,7 +247,7 @@ function ToolRow({ c, s, v, cm }) {
       <span class="arrow">-></span><span class="name">${c.name}</span>
       <span class="sum" title=${sum}>${sum}</span>
       ${c.origin !== 'model' && html`<span class="faint">(${c.origin})</span>`}
-      ${vd && html`<span class=${'vd ' + (VD[vd.outcome] || 'faint')} title=${vd.reason + (vd.note ? ' · ' + vd.note : '')}>[${vd.outcome}]</span>`}
+      ${vd && html`<span class=${'vd ' + (VD[vd.outcome] || '')} title=${vd.reason + (vd.note ? ' · ' + vd.note : '')}>[${vd.outcome}]</span>`}
       ${c.fired.value && html`<span class="vd">[fired]</span>`}
       <span class=${'st ' + st}>${{ run: 'running', ok: 'ok ▸', err: 'error ▸', stop: 'stopped' }[st]}</span>
       <span class="tm">${c.time.value}</span>
@@ -450,7 +450,7 @@ function Settled({ a }) {
   const d = a.done.value, f = a.f, approval = f.kind === 'approval';
   const what = approval ? `approve: ${f.tool} ${rend(f.tool, 'input', f.input)}`.trim() : `question: ${f.prompt || ''}`;
   const picked = { answered: d.answer, cancelled: 'cancelled', elsewhere: 'answered elsewhere' }[d.how];
-  const cls = d.how !== 'answered' ? 'faint' : d.answer === a.no ? 'r' : approval ? 'g' : 'y';
+  const cls = d.how !== 'answered' ? 'faint' : d.answer === a.no ? 'r' : 'hi';
   const tail = [d.note && `note: ${d.note}`, a.chat && 'chat about it'].filter(Boolean).join(' · ');
   const labels = approval ? [a.yes, a.always, a.no].filter(Boolean).map((label) => ({ label })) : a.options;
   const line = (on, label, desc) => html`<div class=${on ? cls : 'faint'}>${on ? '✓ ' : '  '}${label}${desc && html`<span class="faint">  ${desc}</span>`}</div>`;
@@ -576,7 +576,7 @@ function Composer({ s, p, act }) {
       aria-label="message" onInput=${autosize} onKeyDown=${onKey} onFocus=${() => act.focus(p.id)}></textarea>
     <div class="fbot">
       ${w('send', 'send', run !== true, enter === 'send' ? '⏎' : '')}${sep}${w('steer', 'steer', run !== false, enter === 'steer' ? '⏎' : '')}${sep}${w('queue', 'queue', run !== false, '⌥⏎')}${sep}${w('stop', 'stop', run !== false, '^c')}
-      ${s.queued.value > 0 && html`${sep}<span class="y">${s.queued.value} queued</span>`}
+      ${s.queued.value > 0 && html`${sep}<span class="hi">${s.queued.value} queued</span>`}
       ${text.value.startsWith(':') && html`${sep}<span class="cwarn">: goes to the model; commands live in the status line</span>`}
     </div>
   </div>`;

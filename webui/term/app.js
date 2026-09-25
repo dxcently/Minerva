@@ -8,6 +8,7 @@ import { Session, tildify } from './core/state.js';
 import * as tile from './core/tile.js';
 import { menu, openMenu, closeMenu, outside, atPointer, Menus } from './core/menu.js';
 import { Pane, focusAsk, askEl } from './panes/session.js';
+import { FONTS, DEFAULT_FONT, theme, themes, font, cell, setTheme, setFont, resolve, startLook } from './core/look.js';
 
 const LEFT_TABS = ['sessions', 'projects', 'mesh'];
 const RIGHT_TABS = ['rec', 'tree', 'diff', 'graph', 'run']; // components: INSPECTOR below
@@ -24,7 +25,7 @@ const ui = {
   hint: signal(null),           // { mode: 'toast' | 'which' | 'menu', text?, err? }
   cmd: signal(null),            // the `:` line's text while open, else null
   held: signal(false),          // the oldest ask waits for a pause in typing before it takes focus
-  box: signal({ w: 0, h: 0, cw: 8, ch: 19 }),
+  box: signal({ w: 0, h: 0, ...cell.peek() }),
   token: false,
 };
 const byId = (id) => ui.panes.value.find((p) => p.id === id);
@@ -254,7 +255,17 @@ const COMMANDS = {
   sidebar: ['toggle the left sidebar', () => toggle('lrail')],
   inspector: ['toggle the inspector', () => toggle('rrail')],
   keys: ['show keys', () => whichKey()],
+  theme: ['colours: :theme <name> (none: list them)', (arg) => pickLook('theme', arg)],
+  font: ['font: :font <name> (none: list them)', (arg) => pickLook('font', arg)],
 };
+
+function pickLook(what, arg) {
+  const names = what === 'theme' ? themes.value : Object.keys(FONTS);
+  const cur = (what === 'theme' ? theme : font).value;
+  if (!arg) { toast(`${what}s: ${names.map((n) => (n === cur ? `[${n}]` : n)).join(' · ')}`); return; }
+  const set = what === 'theme' ? setTheme : setFont;
+  set(resolve(names, arg)).then((err) => err && toast(err, true));
+}
 
 function openCmd() {
   closeMenu();
@@ -329,6 +340,8 @@ function statusMenu(e) {
   openMenu([
     { label: 'model', sub: [{ label: (hl && hl.model) || '?', tick: true, off: HUB }] },
     { label: 'mode', sub: ['yolo', 'accept edits', 'manual', 'auto'].map((m) => ({ label: m, tick: m === 'yolo' && !!(hl && hl.yolo), off: HUB })) },
+    { label: 'theme', sub: themes.value.map((n) => ({ label: n, tick: n === theme.value, on: () => pickLook('theme', n) })) },
+    { label: 'font', sub: Object.entries(FONTS).map(([k, f]) => ({ label: f.label, hint: k === DEFAULT_FONT ? 'default' : '', tick: k === font.value, on: () => pickLook('font', k) })) },
     { sep: true },
     ...Object.entries(COMMANDS).map(([c, [what, fn]]) => ({ label: ':' + c, hint: what, on: () => fn('') })),
   ], atPointer(e), { title: 'status' });
@@ -369,9 +382,9 @@ function SessionItem({ p }) {
   const name = hl ? hl.session.split('/').pop().replace(/\.[^.]+$/, '') || 'session' : 'connecting…';
   const state = s.bye ? 'kept' : conn !== 'live' ? conn : run === true ? 'running' : run === false ? 'idle' : 'unknown';
   return html`<div class="it" onContextMenu=${(e) => sessionMenu(e, p)}>
-    <span class=${s.bye ? 'faint' : 'g'}>${s.bye ? '○' : '●'}</span>
+    <span class=${s.bye ? 'faint' : 'hi'}>${s.bye ? '○' : '●'}</span>
     <${K} cls=${'grow' + (ui.focus.value === p.id ? ' on' : '')} title=${hl ? hl.session : ''} on=${() => { focusPane(p.id); toComposer(); }}>${name}${isMirror(p) ? ' (mirror)' : ''}</${K}>
-    <span class=${run === true ? 'y' : 'faint'}>${state}</span>
+    <span class=${run === true ? 'hi' : 'faint'}>${state}</span>
   </div>`;
 }
 
@@ -387,7 +400,7 @@ function Left() {
       <div class="hdr">kept</div><${Needs}>other sessions need the hub (M2)</${Needs}>`;
   } else if (tab === 'projects') {
     body = html`<div class="hdr">this door</div>
-      ${hl ? html`<div class="list"><div class="it"><span class="c">▸</span><span class="grow" title=${hl.cwd}>${tildify(hl.cwd)}</span></div></div>` : html`<div class="faint">—</div>`}
+      ${hl ? html`<div class="list"><div class="it"><span class="faint">▸</span><span class="grow c" title=${hl.cwd}>${tildify(hl.cwd)}</span></div></div>` : html`<div class="faint">—</div>`}
       <div class="hdr">others</div><${Needs}>project list needs the hub</${Needs}>`;
   } else {
     body = html`<div class="note">node        paired  grants  seen</div>
@@ -407,18 +420,18 @@ function Rec({ s }) {
   return html`
     <${Kv} k="turns  " v=${s.turns.value} />
     <${Kv} k="calls  " v=${calls + (errs ? ` (${errs} failed)` : '')} cls=${errs ? 'r' : ''} />
-    <${Kv} k="asks   " v=${asks} cls=${asks ? 'y' : ''} />
+    <${Kv} k="asks   " v=${asks} cls=${asks ? 'o' : ''} />
     <${Kv} k="context" v=${ctx != null ? ctx.toLocaleString() + ' tok' : '—'} />
     <${Kv} k="budget " v=${budget != null ? budget + ' calls left' : '—'} cls=${budget != null && budget < 3 ? 'r' : ''} />
     <div class="hdr">verdicts</div>
-    ${vs.length ? vs.map((v) => html`<div class="kv"><span class="m">${v.tool}</span><span class="grow faint" title=${v.reason}>${v.reason}</span><span>${v.outcome}</span></div>`)
+    ${vs.length ? vs.map((v) => html`<div class="kv"><span class="hi">${v.tool}</span><span class="grow faint" title=${v.reason}>${v.reason}</span><span>${v.outcome}</span></div>`)
       : html`<div class="faint">none yet</div>`}`;
 }
 
 function RunTab({ s }) {
   const open = s.open.value, run = s.running.value;
   return html`<div class="hdr">open calls</div>
-    ${open.length ? open.map((c) => html`<div class="kv"><span class="m">${c.name}</span><span class="grow lc">${c.st.value}</span></div>`)
+    ${open.length ? open.map((c) => html`<div class="kv"><span class="hi">${c.name}</span><span class="grow faint">${c.st.value}</span></div>`)
       : html`<div class="faint">${run === true ? 'thinking…' : 'nothing running'}</div>`}
     <div class="hdr">parked</div><${Needs}>live park samples need the park-tick frame (gap 7)</${Needs}>`;
 }
@@ -426,7 +439,7 @@ function RunTab({ s }) {
 function DiffTab({ s }) {
   const files = [...s.touched.value];
   return html`<div class="hdr">changed</div>
-    ${files.length ? files.map(([f, n]) => html`<div class="kv"><span class="grow lc" title=${f}>${f}</span><span class="faint">${n} call${n > 1 ? 's' : ''}</span></div>`)
+    ${files.length ? files.map(([f, n]) => html`<div class="kv"><span class="grow c" title=${f}>${f}</span><span class="faint">${n} call${n > 1 ? 's' : ''}</span></div>`)
       : html`<div class="faint">no edit or write calls yet</div>`}`;
 }
 
@@ -486,7 +499,7 @@ function Tiles() {
     const size = () => {
       const r = el.getBoundingClientRect();
       const b = ui.box.value;
-      if (b.w !== r.width || b.h !== r.height) ui.box.value = { w: r.width, h: r.height, ...cells() };
+      if (b.w !== r.width || b.h !== r.height) ui.box.value = { w: r.width, h: r.height, ...cell.peek() };
     };
     size(); // now, not only when a ResizeObserver fires: it never does in a tab that is not drawing
     const ro = new ResizeObserver(size);
@@ -503,7 +516,7 @@ function Tiles() {
       <div class="empty">${'this page has no token.\n\nopen it from the launcher, or from the URL `eidolon web` printed\nwith #token=<contents of the token file> on the end.\n\nthe token is never sent to a server in the URL: the fragment stays in the browser.'}</div></div>`;
   } else if (!panes.length) {
     body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle faint">no pane</div>
-      <div class="empty">no pane open.${'\n\n'}<${K} cls="y" on=${() => openPane()}>:open</${K}>  reconnect this session${'\n'}<span class="faint">ctrl+enter  new pane with a picker (arrives with the hub, M2)</span></div></div>`;
+      <div class="empty">no pane open.${'\n\n'}<${K} cls="hi" on=${() => openPane()}>:open</${K}>  reconnect this session${'\n'}<span class="faint">ctrl+enter  new pane with a picker (arrives with the hub, M2)</span></div></div>`;
   } else {
     body = [
       ...panes.map((p) => rect.get(p.id) && html`<${Pane} key=${p.id + ' ' + p.sid} p=${p} rect=${rect.get(p.id)} focused=${p.id === f} mirror=${isMirror(p)} act=${act} />`),
@@ -556,11 +569,11 @@ function Status() {
   return html`<footer id="status" onContextMenu=${statusMenu}><span class="norm">
     <span class=${'badge ' + cls} title=${badge === '?' ? 'this page connected after the turn began or before any turn event' : ''}>${badge}</span>
     ${badge === '?' && html`<span class="faint unk">state unknown until next turn event</span>`}
-    ${hl && html`<span class="c b">${hl.model || '?'}</span>`}
+    ${hl && html`<span class="hi b">${hl.model || '?'}</span>`}
     ${hl && hl.yolo && html`<span class="yolo">yolo</span>`}
     ${ctx != null && html`<span class="faint">ctx ${ctx >= 1000 ? (ctx / 1000).toFixed(1) + 'k' : ctx} tok</span>`}
     ${budget != null && budget < 3 && html`<span class="warn">${budget} calls left</span>`}
-    ${waiting > 0 && html`<${K} cls="y waitn" title=${ui.held.value ? 'the oldest ask takes focus when you pause typing; click to go now' : 'focus the oldest ask'}
+    ${waiting > 0 && html`<${K} cls="o waitn" title=${ui.held.value ? 'the oldest ask takes focus when you pause typing; click to go now' : 'focus the oldest ask'}
       on=${focusHead}>${ui.held.value ? '▶ ' : ''}${waiting} waiting</${K}>`}
     ${p && conn !== 'live' && html`<span class=${conn === 'replaying' ? 'faint' : 'warn'}>${conn}</span>`}
     <span class="grow"></span>
@@ -579,21 +592,7 @@ function App() {
   return html`<main id="main" class=${cls}><${Left} /><${Tiles} /><${Right} /></main><${Hint} /><${Status} /><${Menus} />`;
 }
 
-// ---------------------------------------------------------------- cells
-let cell = { cw: 8, ch: 19 };
-function measure() {
-  const probe = document.createElement('span');
-  probe.textContent = 'M'.repeat(80);
-  probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;';
-  document.body.append(probe);
-  const r = probe.getBoundingClientRect();
-  probe.remove();
-  const fs = parseFloat(getComputedStyle(document.documentElement).fontSize);
-  cell = { cw: r.width / 80, ch: Math.round(fs * 1.35) };
-  document.documentElement.style.setProperty('--cw', cell.cw + 'px');
-  document.documentElement.style.setProperty('--ch', cell.ch + 'px');
-}
-const cells = () => cell;
+effect(() => { const c = cell.value; ui.box.value = { ...ui.box.peek(), ...c }; });
 
 // ---------------------------------------------------------------- keys
 document.addEventListener('keydown', (e) => {
@@ -635,7 +634,7 @@ document.addEventListener('keydown', (e) => {
 document.addEventListener('mousedown', outside);
 
 // ---------------------------------------------------------------- boot
-measure();
+startLook();
 ui.token = takeToken();
 // A token pasted into this tab's URL later (a hash change, no reload) is
 // taken and scrubbed the same way; it is never left sitting in the URL.

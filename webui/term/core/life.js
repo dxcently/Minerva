@@ -112,9 +112,9 @@ function step(world, cols) { // life.rs:151-171, a torus
 const WORDS = ['COGITAT', 'MEDITAT', 'RUMINAT', 'DELIBERAT', 'PONDERAT', 'SPECULAT', 'EXCOGITAT', 'PERPENDIT'];
 export const word = (calls) => WORDS[Math.floor(Math.max(0, calls) / 8) % WORDS.length];
 
-// The strip is shaded along its length, #ff922b at the left to #ffd43b at the
-// right (crates/tui/ui/default.rn:512-518).
+// The strip is shaded along its length, dim at the left to bright at the
+// right, as the TUI shades it orange to yellow (crates/tui/ui/default.rn:512-518);
+// the page keeps to the theme's ramp (web-ui.md 2.2).
 export function shade(x, width) {
-  const hex = (n) => Math.floor(n).toString(16).padStart(2, '0');
-  return `#ff${hex(0x92 + (0x42 * x) / width)}${hex(0x2b + (0x10 * x) / width)}`;
+  return `color-mix(in srgb, var(--bright) ${Math.round((100 * x) / width)}%, var(--faint))`;
 }

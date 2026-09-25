@@ -36,47 +36,65 @@ Framework: **plain ES modules + a ~100-line `h()` helper** (decided). The transc
 | Rule | Detail |
 |---|---|
 | Square | `border-radius: 0` everywhere, chips and the composer included |
-| Cells | one monospace font; `--cw`/`--ch` = measured cell width/height; layout sizes are whole cells where practical |
+| Cells | one monospace font at a time (2.2); `--cw`/`--ch` = measured cell width/height, re-measured when the font changes; layout sizes are whole cells where practical |
 | Frames | 1px CSS borders with the title cut into the top border (a `legend`-like span over the line), as the TUI's panels do. Not box-drawing characters, so text reflows |
 | Pane edges | snap to whole cells while dragging (`round(px / --cw)`) |
 | Motion allowed | blinking caret (TUI `cursor`), "live" wires on the mesh pane, a pulse on the running badge, a brief flash on a new ask, the composer frame's pulse and the Life strip (below) |
 | Motion forbidden | gradient borders, gradient or sheen fills; anything that moves text off its cells |
-| Composer (decided) | 3px `double` gold frame over a **flat** 8% gold tint: no gradient, no sheen. While a turn runs the border colour pulses gold <-> dark gold, 1.6 s ease-in-out |
+| Composer (decided) | 3px `double` frame in base06 over a **flat** base01 tint: no gradient, no sheen. While a turn runs the border colour pulses base06 <-> base04, 1.6 s ease-in-out |
 | Life strip (decided) | a port of the TUI pulse (**observed** `crates/tui/src/life.rs`): Conway's Life, 8-row world, middle 4 drawn in braille, cut into the composer's top border while a turn runs. Opens on the agent figure; `tool-call-started` launches a ship from the left, `tool-call-finished` one from the right; a settled world (still, period 2, or thinned below 3 lit cells) restarts with a ship from an edge chosen by launch count: from the left when the count of ships launched so far is even, from the right when odd (**observed** `life.rs:115`, `core/life.js` `step`). Stepped on the TUI's 250 ms tick (**observed** `app.rs:2087`). At rest: the static two-cell agent icon. Clock shown only when the page saw the turn start live; `⇡ ctx` only after a `context-size`; no `⇣ out` gauge (the wire carries no per-turn output count until `turn-settled`) |
 | Reduced motion | `prefers-reduced-motion: reduce` stops every animation; the strip stays on its opening frame |
 | No buttons | see 2.3 |
 
-### 2.2 Palette: TUI `theme()` -> CSS variables
+### 2.2 Theme and font (decided): base16 schemes, three vendored fonts
 
-Source: `crates/tui/ui/default.rn:388-416` (**observed**). Named terminal colours need hex values in a browser; the hex column is **chosen here**, not taken from code. Background is also chosen: the TUI uses the terminal's own, the page picks one that sits under `block` (`#262336`).
+Colours come from a **base16 scheme**, swappable live; the TUI's `theme()` (`crates/tui/ui/default.rn:388-416`, **observed**) is no longer copied hex for hex. A scheme is `webui/term/themes/<name>.yaml` in the standard base16 format (`scheme:`, `author:`, `base00`..`base0F`; the newer tinted-theming layout with `name:` and an indented `palette:` works too), listed in `themes/manifest.json` because the page cannot list a directory. `core/look.js` parses exactly that YAML subset (no YAML library) and writes the sixteen colours as `--base00`..`--base0F` on `<html>` (CSSOM writes, allowed by the CSP); `theme.css` derives every other colour from them and carries the default scheme's values, so the page is right when no scheme loads.
 
-| CSS var | theme key(s) | TUI value | Page value | Used for |
-|---|---|---|---|---|
-| `--bg` | (terminal default) | - | `#15131f` | page background |
-| `--fg` | `text` | default | `#d8d4e6` | body text |
-| `--faint` | `faint`, `gutter` | dim | `#8a849e` (**nudged lighter** for contrast, decided) | notes, captions, folded output, line numbers |
-| `--comment` | `comment` | darkgray | `#6c6680` | code comments |
-| `--yellow` | `hit`, `menu`, `dialog`, `cursor`, `heading` | yellow | `#e6c35c` | asks, which-key, caret, headings |
-| `--gold` | (composer frame) | - | `#d4a93a` | composer double frame, tinted fill at 8% |
-| `--magenta` | `tag`, `tool`, `number` | magenta | `#c77dd6` | tool names, persona, numbers |
-| `--green` | `ok`, `user`, `string` | green | `#7fc97f` | allow key, own messages |
-| `--lightgreen` | `peer` | lightgreen | `#a8e6a1` | peer messages |
-| `--red` | `error` | red | `#e06c75` | failed tool, deny key |
-| `--cyan` | `code` | cyan | `#56b6c2` | inline code, model name |
-| `--lightcyan` | `sent` | lightcyan | `#8fe3ee` | what a call sent |
-| `--blue` | `keyword`, `link` | blue | `#6f9ce8` | links, keywords |
-| `--block` | `block` | `#262336` | same | fenced block background |
-| `--added` / `--removed` | `added` / `removed` | `#1c3a28` / `#3a1f26` | same | diff lines |
-| `--focus` | `focus` | reversed | `fg`/`bg` swapped at 85% | focused block, focused pane title |
+| slot | CSS var | chrome | transcript role |
+|---|---|---|---|
+| base00 | `--bg` | page background, text on inverse | |
+| base01 | `--panel` | status line, menus, composer tint, the focused ask | code background |
+| base02 | `--sel` | selection, highlighted menu row | |
+| base03 | `--line` | frames, dividers, greyed lines | the end-turn rule's line |
+| base04 | `--faint` | dim text: hints, captions; the composer pulse's low end | thinking fold, notices' bodies (peer, `eidolon send`, sys rows), end-turn text |
+| base05 | `--fg` | | assistant body |
+| base06 | `--bright` | active tab and frame, composer frame, caret, headings | `minerva` |
+| base07 | `--brightest` | focused ask, focused pane title (inverse) | |
+| base08 | `--red` | OFF badge, `yolo` badge | call error, deny (`no`, `[declined]`, `[refused]`), errors, diff removed |
+| base09 | `--orange` | asks waiting: ask frames, `N waiting` | verdict labels (`[judged]`, `[yolo]`, `[fired]`) |
+| base0A | `--yellow` | warnings (banners, cut notices, a connecting pane) | a call's command/arguments, inline and fenced code |
+| base0B | `--green` | | call ok, diff added |
+| base0C | `--cyan` | | links, paths, notice labels (`~ scout`) |
+| base0D | `--blue` | | your prompt and the `you` label |
+| base0E | `--magenta` | | tool names (`bash`, `write`, ...) |
+| base0F | `--brown` | | syntax only |
 
-The status line's left side is badge, model in bold cyan, persona in bold magenta (**observed** `default.rn:423`, `default.rn:429-431`); the page copies that order. Light theme: open (Q4).
+**Rule:** chrome (frames, sidebars, the inspector, status line, borders, menus) uses only the base00-07 ramp, plus 08/09/0A where they mean error, ask waiting, warning. In the transcript each role has its own slot (the table), so a prompt, a tool, its command, its verdict and its status read apart at a glance. `you` is base0D rather than base07: in phosphor base07 is a pale green next to the green body, blue is not. Every role colour is at least AA (4.5:1) on base00 in all three schemes (lowest: base04, 5.01 in phosphor). `--added`/`--removed` are 18% of green/red over `--bg`. The composer is a 3px double `--bright` frame over flat `--panel`; while a turn runs it pulses `--bright` <-> `--faint` and the Life strip is shaded `--faint` -> `--bright` along its length.
+
+| scheme | look | notes |
+|---|---|---|
+| `phosphor` (default) | green phosphor | base04 nudged `2E8A1E` -> `32921F` for AA on base01 (below) |
+| `minerva-dusk` | the M1 purple page | base06 is the old composer gold `D4A93A`, so tabs, frames and the composer stay gold, apart from base0A (the old yellow `E6C35C`, now commands and code); base04 nudged `8A849E` -> `908AA4` |
+| `amber` | monochrome amber phosphor | same accent roles; base04 `B07300` |
+
+Contrast (WCAG, text on base00 / on base01): phosphor body 10.45 / 9.84, dim 5.01 / 4.71; dusk body 12.65 / 10.52, dim 5.55 / 4.62; amber body 10.90 / 10.25, dim 5.04 / 4.74; the accents 5.74 (dusk red) to 14.78. base03 stays near 2:1 in all three, so it carries no text: frames, rules, greyed (inactive) lines only. That is why the thinking fold and the end-turn text are base04, not base03.
+
+**Fonts** are vendored under `webui/term/fonts/` (SIL OFL, sources and sha256 in `fonts/VERSIONS`); nothing comes from the network (P4). Each font has its own size and line height; the cell is then measured from the font itself (80 `M`s), at load and on every switch, and the tiles re-snap to it.
+
+| font | size / line height | cell | why |
+|---|---|---|---|
+| VT323 (default) | 20px / 1.15 | 8 x 23 px | tall and narrow; smaller is hard to read |
+| Departure Mono | 11px / 1.6 | 7 x 18 px | drawn on an 11px grid, crisp only at multiples of 11 (22px would make the sidebars 420px wide) |
+| system mono | 14px / 1.35 | as measured | the M1 stack: `ui-monospace, Cascadia Mono, ... monospace` |
+
+Switch from the status line's right-click menu (`theme ▸`, `font ▸`, the current one ticked) or the `:` line (`:theme <name>`, `:font <name>`, a unique prefix is enough; no name lists them). The choice is kept in `localStorage` (colours included, so a reload paints no default first); without storage the page still works, for that tab only. Neither font has braille or `▸ ▾ ● ⇥ ⏎ ✓`, and VT323 has no arrows or box-drawing either: those glyphs fall back to the system font, so the Life strip and a few frame glyphs are not exactly one cell wide. The status line keeps the TUI's order: badge, model, persona. Light theme: any light base16 scheme dropped in works; none ships (Q4).
 
 ### 2.3 Controls without buttons
 
 | Control | What it is | Where |
 |---|---|---|
 | Keys | global and per-pane bindings (section 4.2) | everywhere |
-| `:` command line | opens in the status row; completion list in `--yellow` like the TUI's `menu` | status line |
+| `:` command line | opens in the status row; completion list, the match highlighted in `--sel` | status line |
 | Which-key hint line | after a leader key or on `?`, a line of `key label` pairs; **each entry is clickable text** | above the status line |
 | Frame-title tabs | `[rec] tree diff graph run` cut into a frame's top border; click or `[`/`]` | sidebars, inspector |
 | Rail | a collapsed sidebar leaves a 1-cell-wide rail; click it to reopen | left and right edges |
@@ -124,10 +142,10 @@ The status line's left side is badge, model in bold cyan, persona in bold magent
 | Left sidebar | owl on top; tabs `sessions` / `projects` / `mesh`; sessions `●` open, `○` kept; peers listed under sessions | `ctrl+b` -> rail | chat apps' conversation list; TUI panel frames |
 | Centre | tiled session panes (section 4) | never | tiling window managers |
 | Right sidebar "inspector" | tabs `rec` / `tree` / `diff` / `graph` / `run`; follows the **focused** pane | `ctrl+i` -> rail | IDE side panels |
-| Inline ask | yellow-framed block in the transcript: a line of choices, one highlighted, and a `note ›` line (7.1); once settled, one folded line | - | agentic coding assistants; TUI `dialog: yellow` |
+| Inline ask | orange-framed (base09) block in the transcript: a line of choices, one highlighted, and a `note ›` line (7.1); once settled, one folded line | - | agentic coding assistants; TUI `dialog: yellow` |
 | Waiting strip | `N waiting · jump` above the composer when an ask is off-screen; the status line counts the page's whole ask queue | - | chat "new messages" pills |
-| Composer | double-line gold frame, tinted fill, context chips, hint in the bottom border | - | message boards |
-| Status line | mode badge, model (cyan), persona (magenta), yolo, ctx %, clickable hints | - | the TUI's status line (**observed** `default.rn:418-431`) |
+| Composer | double-line base06 frame, base01 fill, context chips, hint in the bottom border | - | message boards |
+| Status line | mode badge, model (bold, base06), persona, yolo, ctx %, clickable hints | - | the TUI's status line (**observed** `default.rn:418-431`) |
 
 No assets, CSS or names are copied from other apps. The owl is ours (`webui/brand/`, **observed** in the repo).
 
@@ -493,7 +511,7 @@ Old gap 2 (session switching) is now the hub's job; old gap 11 (token in argv) i
 | Q1 | Markdown: our own safe subset, or vendor a library + sanitizer? | own subset |
 | Q2 | Do gaps 1 and 5 go to Noah as a small PR now, or with the #15 discussion? | with #15 |
 | Q3 | `ctrl+w` (and `ctrl+n`/`ctrl+t` if wanted) cannot be reliably captured by a page. Alternative for "close pane": `ctrl+q`, a leader chord (`ctrl+space w`), or `:close`? | `:close` + leader chord; keep `ctrl+w` only when installed as an app window |
-| Q4 | Light theme: derive one, or dark only? | dark only for M1 |
+| Q4 | Light theme: derive one, or dark only? | any light base16 scheme works (2.2); none ships |
 | Q5 | Queue while running moved off Enter: `alt+enter`, `:queue`, or drop from the UI? | `alt+enter` + `:queue` |
 | Q6 | `ctx %` needs the model's context window; the door sends tokens only. Hub lookup, `hello` field, or show tokens? | tokens until a source exists |
 | Q7 | `/api/launch` vs #15 "launchers stay out of the web": which changes? | hold `web-launch` until answered |

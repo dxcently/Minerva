@@ -1,0 +1,21 @@
+Fonts served to the page (the door's CSP allows fonts from 'self' only). Both SIL OFL 1.1;
+each licence sits beside its font. Files are byte-for-byte what the source serves; check with
+`sha256sum -c` on the lines below. Re-vendor by fetching the same URLs and comparing hashes;
+move a pin only by fetching a new tag/commit, reading the diff, testing, then editing this file.
+
+VT323 2.000  (font name table: "Version 2.000")
+  source   https://github.com/google/fonts/tree/2da41909d08a7bfeab32cfc163edb7be0c34395d/ofl/vt323
+  font     https://raw.githubusercontent.com/google/fonts/2da41909d08a7bfeab32cfc163edb7be0c34395d/ofl/vt323/VT323-Regular.ttf
+  licence  https://raw.githubusercontent.com/google/fonts/2da41909d08a7bfeab32cfc163edb7be0c34395d/ofl/vt323/OFL.txt
+  (google/fonts ships no woff2 for VT323, so the ttf is served as is)
+
+Departure Mono 1.500  (tag v1.500, commit 75152a3f1e6dacdd248a6c397c97dbf27e33eea0)
+  release  https://github.com/rektdeckard/departure-mono/releases/download/v1.500/DepartureMono-1.500.zip
+           sha256 bf3e48059aeef4617ec585bdea81dcc3491c576b3e7a472f52faf40e09ee5c3a  (82890 bytes)
+  font     DepartureMono-1.500/DepartureMono-Regular.woff2 from that zip
+  licence  DepartureMono-1.500/LICENSE from that zip
+
+cf4de751ada78ceac033dbe16a687742939995b77bc2a052ae17a4957958594d  VT323-Regular.ttf
+27d9af34210253e7ca1251fbace86c6f65b40031d6ce1a75493a1b2093631298  VT323-OFL.txt
+5b4fed1daa90708aa9c6ee1190abca9dc22164a1c1def0020386e46b61038cfb  DepartureMono-Regular.woff2
+b65e42750f3cb65437a97f4dfd781c58f199259949db2341012be60e32500e83  DepartureMono-OFL.txt

@@ -1,33 +1,49 @@
-/* The TUI's theme() (crates/tui/ui/default.rn:388-416) as CSS variables.
-   Hex values for named terminal colours are chosen in web-ui.md section 2.2. */
+/* Colours come from a base16 scheme (themes/*.yaml). core/look.js writes the
+   sixteen --base0X on <html>; everything else derives from them here. The
+   values below are themes/phosphor.yaml, so the page is right even when no
+   scheme loads. Chrome uses the 00-07 ramp; in the transcript each role
+   has its own slot (web-ui.md 2.2). */
 :root {
-  --bg: #15131f;
-  --fg: #d8d4e6;
-  --faint: #8a849e;
-  --comment: #6c6680;
-  --yellow: #e6c35c;
-  --gold: #d4a93a;
-  --magenta: #c77dd6;
-  --green: #7fc97f;
-  --lightgreen: #a8e6a1;
-  --red: #e06c75;
-  --cyan: #56b6c2;
-  --lightcyan: #8fe3ee;
-  --blue: #6f9ce8;
-  --block: #262336;
-  --added: #1c3a28;
-  --removed: #3a1f26;
+  --base00: #050a05; --base01: #0a140a; --base02: #10240f; --base03: #1f5a18;
+  --base04: #32921f; --base05: #4fd62f; --base06: #7cff4f; --base07: #b8ffa0;
+  --base08: #ff5f56; --base09: #ffb000; --base0A: #e5e510; --base0B: #7cff4f;
+  --base0C: #3fe0c5; --base0D: #5fa8ff; --base0E: #d670d6; --base0F: #b87333;
 
-  /* page-only roles */
-  --line: #4a4466;       /* frame borders */
-  --line-hi: #6e6690;    /* focused frame border */
-  --gold-dark: #7a5f1c;  /* the running composer frame pulses to this */
-  --gold-fill: rgba(212, 169, 58, 0.08);  /* flat: no gradient, no sheen */
+  --bg: var(--base00);
+  --panel: var(--base01);      /* status line, menus, composer tint, code background */
+  --sel: var(--base02);        /* selection, highlighted menu row */
+  --line: var(--base03);       /* frames, folds, greyed */
+  --faint: var(--base04);      /* dim text */
+  --fg: var(--base05);
+  --bright: var(--base06);     /* active frame, composer frame, minerva */
+  --brightest: var(--base07);  /* focused ask, inverse */
+  --red: var(--base08);        /* errors, denies, destructive, diff removed */
+  --orange: var(--base09);     /* asks waiting, verdict labels */
+  --yellow: var(--base0A);     /* warnings, a call's command, code */
+  --green: var(--base0B);      /* call ok, diff added */
+  --cyan: var(--base0C);       /* links, paths, notice labels */
+  --blue: var(--base0D);       /* your prompt */
+  --magenta: var(--base0E);    /* tool names */
+  --brown: var(--base0F);
+  --added: color-mix(in srgb, var(--green) 18%, var(--bg));
+  --removed: color-mix(in srgb, var(--red) 18%, var(--bg));
 
-  --font: ui-monospace, "Cascadia Mono", "Cascadia Code", Consolas, "DejaVu Sans Mono", "Liberation Mono", Menlo, monospace;
-  --fs: 14px;
-  --lh: 1.35;
-  /* measured at boot by app.js; these are fallbacks */
-  --cw: 8.4px;
-  --ch: 19px;
+  --system-mono: ui-monospace, "Cascadia Mono", "Cascadia Code", Consolas, "DejaVu Sans Mono", "Liberation Mono", Menlo, monospace;
+  /* core/look.js sets these three per font (FONTS) and measures the cell */
+  --font: "VT323", var(--system-mono);
+  --fs: 20px;
+  --lh: 1.15;
+  --cw: 8px;
+  --ch: 23px;
+}
+
+@font-face {
+  font-family: "VT323";
+  src: url("fonts/VT323-Regular.ttf") format("truetype");
+  font-display: block;
+}
+@font-face {
+  font-family: "Departure Mono";
+  src: url("fonts/DepartureMono-Regular.woff2") format("woff2");
+  font-display: block;
 }

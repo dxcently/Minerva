@@ -18,11 +18,12 @@ Open `http://127.0.0.1:47811/#token=<contents of the token file>`. The page move
 
 ```
 index.html           the screen skeleton; one <script type=module src>, no inline script (CSP)
-theme.css            TUI theme() -> CSS variables (web-ui.md 2.2)
-term.css             the look: square frames, cut-in titles, gold composer, no border-radius
+theme.css            base16 slots -> the page's colour variables, the default scheme as fallback, @font-face (web-ui.md 2.2)
+term.css             the look: square frames, cut-in titles, double-framed composer, no border-radius
 app.js               sidebars, split tree, inspector tabs (INSPECTOR map), status line, the ask queue, menus' items, keys, the : line
 core/ui.js           the one import point for Preact, hooks, signals, htm; K = clickable text
 core/menu.js         right-click / title menus: one open at a time, submenus, keys, kept on screen
+core/look.js         theme + font: base16 parser, --base0X on <html>, per-font size, cell measured, localStorage
 core/api.js          apiBase(sessionId): the ONE place URLs are built. Hub = `/s/${sid}/api/`
 core/sse.js          fetch-based SSE (Bearer header, never ?token=)
 core/state.js        one session stream as signals: frames -> rows, calls, asks, running
@@ -32,6 +33,8 @@ core/tile.js         split tree: dwindle at 0.618, per-split ratio, drag, promot
 panes/session.js     one pane: frame glyphs, transcript, row menus, draft, inline asks, composer
 renderers/           generic tool renderer; a renderer returns a string, a DOM Node or a vnode
 brand/owl.svg        copy of webui/owl-green.svg (the door serves only this dir)
+themes/              base16 schemes (*.yaml) + manifest.json, the list the page offers
+fonts/               VT323, Departure Mono (+ OFL licences, VERSIONS with sources and sha256)
 vendor/              preact, hooks, signals, signals-core, htm + LICENSE-* + VERSIONS + update.sh
 ```
 
@@ -48,7 +51,7 @@ Every action is clickable; keys are shortcuts for the same functions.
 | `⇥` `⇩` `×` on a pane's top border | split right / split down (the picker: mirror; new, resume, existing session need the hub) / close |
 | right-click a chat row | fork from here (needs the hub), copy (the selection, if any), copy as markdown, quote into composer |
 | right-click a sidebar session | open in new pane, show in focused pane, fork (latest) and close its door (need the hub) |
-| right-click the status line | model ▸, mode ▸ (both need the hub), then every `:` command |
+| right-click the status line | model ▸, mode ▸ (both need the hub), theme ▸, font ▸ (live, current ticked), then every `:` command |
 | sidebar tabs, `«` / `»`, rails | switch tab, fold to a rail, reopen |
 | tile borders | drag to resize (snaps to cells) |
 | an ask | one click on a choice answers: `yes · always · no · chat about it · fork · + note` (approval), `1 … n · chat about it · + note` (question); `+ note` opens the note line and sends nothing; the choice clicked next goes with the note. A click within 0.3 s of the ask appearing or jumping into view shows `steady…` and does nothing |
@@ -73,7 +76,7 @@ Menus: up/down move, Enter or right opens a submenu, Enter runs, left or Esc bac
 | ctrl+b / ctrl+i | sidebar / inspector to rails and back |
 | [ / ] | inspector tab |
 | alt+w or `:q` | close the pane (not while the composer holds text; ctrl+w belongs to the browser). Matched on the `w` character, so AZERTY works; on the physical W key only when the character is not ASCII (macOS Option) |
-| `:` | command line: q, close, open [id], vsplit (mirror right), split (mirror below), stop, queue, reconnect, sidebar, inspector, keys |
+| `:` | command line: q, close, open [id], vsplit (mirror right), split (mirror below), stop, queue, reconnect, sidebar, inspector, keys, theme [name], font [name] |
 | `?` | which-key line; every entry can be clicked |
 
 ## Asks
@@ -89,6 +92,14 @@ Every pending ask on the page, across all panes and sessions, is in ONE queue, o
 - Mirrors draw the same ask with their own highlight and note; an answer from any pane settles it everywhere.
 - After an ask settles and the blocks below it move up, clicks in that pane get the same 0.3 s `steady…` guard; the second click of a double click is ignored.
 - A settled ask stays in the transcript folded to one line, `▸ approve: bash rm -rf ./build → no (note: … · chat about it)`; opened, it lists every choice with the pick marked. The note shows only on the page that sent it. Asks are not replayed, so after F5 the fold is gone (the tool line and its verdict remain).
+
+## Themes and fonts
+
+The default is `phosphor` in VT323. Both switch live, from the status line's right-click menu or the `:` line, and are kept in `localStorage` (the page works without it). Web-ui.md 2.2 has the slot table, contrast numbers and font sizes.
+
+- **A new theme:** drop any standard base16 scheme into `themes/` as `<name>.yaml` and add `"<name>"` to `themes/manifest.json`; `:theme <name>` or the menu, no reload. The old layout (`scheme:`, `author:`, `base00: "1d2021"`, with or without `#`, quoted or not, a trailing `# comment` allowed) and the tinted-theming layout (`name:`, `palette:` with the slots indented) both parse. Anything else is refused with the line number in the hint line, and the current theme stays.
+- **The rule for colours:** chrome (frames, sidebars, inspector, status line, menus) takes only base00-07, plus red/orange/yellow for error, ask waiting, warning. In the transcript each role has its own slot: your prompt blue, tool names magenta, a call's command and code yellow, verdict labels orange, call ok green, error and deny red, links, paths and notice labels cyan, thinking and notices dim. A new style should use the named variables in `theme.css` (`--fg`, `--faint`, `--bright`, `--panel`, `--magenta`, ...), never a hex value.
+- **Fonts:** `:font vt323 | departure-mono | system` (a unique prefix does). Each font has its own size in `FONTS` (`core/look.js`); `--cw`/`--ch` are measured from the font, so the tiles snap to its cell. A new font: its file and licence in `fonts/`, an `@font-face` in `theme.css`, an entry in `FONTS`, a line in `fonts/VERSIONS`.
 
 ## Vendoring
 
@@ -110,6 +121,8 @@ Every pending ask on the page, across all panes and sessions, is in ONE queue, o
 
 To upgrade: `--bump`, read the diff, test, commit. Never edit a vendored file or `VERSIONS` by hand.
 
+The fonts are pinned the same way by hand in `fonts/VERSIONS`: source URL, tag or commit, sha256 of each file (`VT323-Regular.ttf` from google/fonts, `DepartureMono-Regular.woff2` from the v1.500 release zip).
+
 ## Rules the code keeps
 
 - No `innerHTML`, `dangerouslySetInnerHTML` or `eval`. Model and tool text is only ever a text child.
@@ -125,3 +138,4 @@ To upgrade: `--bump`, read the diff, test, commit. Never edit a vendored file or
 - **Firefox scrollbars are not square.** The square scrollbars in `term.css` use `::-webkit-scrollbar`, which Firefox ignores; Firefox only offers `scrollbar-width` and `scrollbar-color`, and neither can change the thumb's shape, so Firefox draws its own rounded overlay scrollbars. There is no CSS fix; it is left as is.
 - **A submenu on a narrow screen covers its parent.** With no room on either side it is pushed back on screen over the parent menu; the keys (left backs out) still reach both.
 - **Text in a settled ask's fold cannot be drag-selected**: a click there must not take focus from the composer. Right-click the row: copy.
+- **Some glyphs are off the cell in VT323 and Departure Mono.** Neither has braille or `▸ ▾ ● ⇥ ⏎ ✓`, and VT323 has no arrows or box-drawing either; those fall back to the system font, whose advance differs, so the Life strip and a few glyphs (`▸ ⇥ ⏎`) are not exactly one cell wide.
