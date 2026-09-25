@@ -13,6 +13,7 @@
 #   hoot models                         list models from models.ini / the API
 #   hoot get <quant>                    download a Qwen3.8-27B quant
 #   hoot bench [-Model NAME]            benchmark a local model
+#   hoot theme [NAME|--list|--restore]  eidolon TUI colours from a web UI scheme
 #   hoot setup                          re-run the installer
 #   hoot edit                           open models.ini
 #   hoot which                          show which llama.cpp binaries are in use
@@ -682,6 +683,15 @@ switch ($Command.ToLower()) {
         Box 'aoided' @(("{0} {1}" -f (Dot $a.Ok), $(if ($a.Out) { $a.Out } else { 'WSL or the unit is unreachable' })))
     }
 
+    'theme' {
+        $ErrorActionPreference = 'Continue'
+        $wslArgs = @()
+        if ($Distro) { $wslArgs += '-d', $Distro }
+        $wslArgs += '--cd', $PSScriptRoot, '--exec', 'python3', './eidolon-theme'
+        & wsl.exe @wslArgs @Rest
+        exit $LASTEXITCODE
+    }
+
     'edit' { Start-Process notepad.exe $Ini }
 
     'which' {
@@ -713,6 +723,7 @@ switch ($Command.ToLower()) {
             'models                list models (served or configured)'
             'get <quant>           fetch a Qwen3.8-27B quant, e.g. UD-Q5_K_M'
             'bench [-Model NAME]   benchmark CPU vs Vulkan'
+            'theme [name|--list]   eidolon TUI colours from a web UI scheme'
             'setup                 re-run the installer'
             'edit                  edit models.ini'
             'which                 show binaries/config in use'

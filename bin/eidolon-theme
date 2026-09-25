@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""eidolon-theme: paint eidolon's TUI with a Minerva web UI base16 scheme.
+
+  eidolon-theme [NAME]      rewrite theme() in ui.rn (default: phosphor)
+  eidolon-theme --list      the schemes in webui/term/themes/manifest.json
+  eidolon-theme --dry-run [NAME]   print the new theme() block, write nothing
+  eidolon-theme --restore   put back the newest ui.rn.bak-*
+
+The target is $EIDOLON_UI, else ${XDG_CONFIG_HOME:-~/.config}/eidolon/ui.rn.
+Takes effect on the next TUI launch. The terminal's own background and font
+are not touched.
+"""
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+THEMES = Path(__file__).resolve().parent.parent / "webui" / "term" / "themes"
+SLOTS = ["base0" + d for d in "0123456789ABCDEF"]
+KNOWN = {"scheme", "name", "author", "system", "variant", "slug", "description", "palette"}
+LINE = re.compile(r"""^\s*([A-Za-z0-9_-]+):\s*(?:"([^"]*)"|'([^']*)'|(#[0-9A-Fa-f]{6}|[^#\s'"][^#]*?))?\s*(?:#.*)?$""")
+
+# Web roles (docs/design/web-ui.md 2.2) onto eidolon's theme() roles.
+ROLES = {
+    "hit": "base0A",      # black text on it; the web's warning yellow
+    "tag": "base0E",      # black text on it
+    "menu": "base06",     # web: active frames
+    "dialog": "base09",   # web: asks waiting
+    "ok": "base0B",
+    "error": "base08",
+    "user": "base0D",
+    "peer": "base07",
+    "tool": "base0E",
+    "faint": "base04",
+    "text": "base05",
+    "sent": "base0A",
+    "gutter": "base04",   # base03 carries no text
+    "comment": "base04",
+    "string": "base0B",
+    "number": "base09",
+    "keyword": "base0E",
+    "block": "base01",
+    "added": ("base0B", 0.18),
+    "removed": ("base08", 0.18),
+    "cursor": "base06",
+    "focus": "base02",    # web: selection
+    "code": "base0A",
+    "heading": "base06",
+    "link": "base0C",
+}
+BACKGROUNDS = {"hit", "tag", "block", "added", "removed", "focus"}
+# eidolon's own notes on these say the terminal picks the colour; with hex it no longer does.
+NOTES = {
+    "faint": "// notes, captions, folded output",
+    "text": "// secondary text that is not faint",
+    "focus": "// the block the trace cursor is on",
+}
+
+
+def die(msg):
+    sys.exit(f"eidolon-theme: {msg}")
+
+
+def parse_scheme(text):
+    colors = {}
+    for i, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        m = LINE.match(raw)
+        if len(raw) > 512 or not m:
+            die(f'line {i}: not a "key: value" line')
+        key = m.group(1)
+        val = next((g for g in m.group(2, 3, 4) if g is not None), "")
+        if re.fullmatch(r"base0[0-9a-fA-F]", key):
+            slot = "base0" + key[5].upper()
+            hexm = re.fullmatch(r"#?([0-9a-fA-F]{6})", val)
+            if not hexm:
+                die(f"line {i}: {key} is not a 6-digit hex colour")
+            if slot in colors:
+                die(f"line {i}: {key} twice")
+            colors[slot] = "#" + hexm.group(1).lower()
+        elif key not in KNOWN:
+            die(f"line {i}: unknown key {key}")
+    missing = [s for s in SLOTS if s not in colors]
+    if missing:
+        die("missing " + " ".join(missing))
+    return colors
+
+
+def rgb(h):
+    return [int(h[i:i + 2], 16) for i in (1, 3, 5)]
+
+
+def blend(fg, bg, a):
+    return "#" + "".join(f"{round(f * a + b * (1 - a)):02x}" for f, b in zip(rgb(fg), rgb(bg)))
+
+
+def contrast(a, b):
+    def lum(h):
+        c = [v / 255 for v in rgb(h)]
+        c = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def palette(colors):
+    out = {}
+    for role, slot in ROLES.items():
+        out[role] = blend(colors[slot[0]], colors["base00"], slot[1]) if isinstance(slot, tuple) else colors[slot]
+    return out
+
+
+def manifest():
+    return json.loads((THEMES / "manifest.json").read_text())
+
+
+def target():
+    if os.environ.get("EIDOLON_UI"):
+        return Path(os.environ["EIDOLON_UI"])
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / "eidolon" / "ui.rn"
+
+
+ROLE_LINE = re.compile(r'^(\s*)(\w+):(\s*)"[^"]*",?(\s*)(//.*)?$')
+
+
+def rewrite(src, colours):
+    starts = [m.start() for m in re.finditer(r"^pub fn theme\(\)\s*\{", src, re.M)]
+    if len(starts) != 1:
+        die(f"found {len(starts)} `pub fn theme()` blocks, want exactly one")
+    end = re.compile(r"^\}[ \t]*$", re.M).search(src, starts[0])
+    if not end:
+        die("theme() has no closing `}` at column 0")
+    block = src[starts[0]:end.end()]
+    seen, lines = set(), []
+    for line in block.split("\n"):
+        m = ROLE_LINE.match(line)
+        if m and m.group(2) in colours:
+            role = m.group(2)
+            seen.add(role)
+            head = f'{m.group(1)}{role}: "{colours[role]}",'
+            if m.group(5):
+                col = line.index(m.group(5))
+                head = head.ljust(col - 1) + " " + NOTES.get(role, m.group(5))
+            line = head
+        lines.append(line)
+    for role in sorted(set(colours) - seen):
+        print(f"eidolon-theme: warning: theme() has no `{role}` line, left at eidolon's default", file=sys.stderr)
+    new_block = "\n".join(lines)
+    return src[:starts[0]] + new_block + src[end.end():], new_block
+
+
+def stamp(path, prefix):
+    base = path.with_name(f"{path.name}.{prefix}-{time.strftime('%Y%m%d-%H%M%S')}")
+    p, n = base, 1
+    while p.exists():
+        p, n = base.with_name(f"{base.name}.{n}"), n + 1
+    return p
+
+
+def restore(path):
+    backups = sorted(path.parent.glob(path.name + ".bak-*"))
+    if not backups:
+        die(f"no {path.name}.bak-* next to {path}")
+    latest = backups[-1]
+    old = latest.read_bytes()
+    if path.exists() and path.read_bytes() != old:
+        keep = stamp(path, "pre-restore")
+        keep.write_bytes(path.read_bytes())
+        print(f"kept the current file as {keep}")
+    path.write_bytes(old)
+    print(f"restored {path} from {latest}")
+
+
+def main(argv):
+    flags = {a for a in argv if a.startswith("-")}
+    names = [a for a in argv if not a.startswith("-")]
+    if flags - {"--list", "--dry-run", "--restore", "-h", "--help"} or len(names) > 1:
+        die("usage: eidolon-theme [--dry-run] [NAME] | --list | --restore")
+    if flags & {"-h", "--help"}:
+        print(__doc__.strip())
+        return
+    if "--list" in flags:
+        print("\n".join(manifest()))
+        return
+    path = target()
+    if "--restore" in flags:
+        restore(path)
+        return
+    name = names[0] if names else "phosphor"
+    if name not in manifest():
+        die(f"no scheme {name!r}; --list shows them")
+    colors = parse_scheme((THEMES / f"{name}.yaml").read_text())
+    colours = palette(colors)
+    for role, hexv in colours.items():
+        ratio = contrast(hexv, colors["base00"])
+        if role not in BACKGROUNDS and ratio < 4.5:
+            print(f"eidolon-theme: warning: {role} {hexv} is {ratio:.2f}:1 on base00", file=sys.stderr)
+    if not path.exists():
+        die(f"{path} does not exist")
+    src = path.read_text()
+    new, block = rewrite(src, colours)
+    if "--dry-run" in flags:
+        print(block)
+        return
+    if new == src:
+        print(f"{path} already has {name}")
+        return
+    bak = stamp(path, "bak")
+    bak.write_text(src)
+    path.write_text(new)
+    print(f"{name} written to {path} (backup {bak}); relaunch the TUI to see it")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
