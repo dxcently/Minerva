@@ -35,3 +35,8 @@ llama.cpp/
 # Machine-specific backups
 /bin/PATH-backup.txt
 *.orig
+
+# Practice VM images: large, and their license bars redistribution
+*.ova
+*.ova.part
+*.qcow2

@@ -181,7 +181,7 @@ const Needs = ({ children }) => html`<div class="needs">${children}</div>`;
 const Kv = ({ k, v, cls = '' }) => html`<div class="kv"><span class="faint">${k}</span><span class=${'grow ' + cls}>${String(v)}</span></div>`;
 
 function Owl() {
-  return html`<div class="owl">${'    ,_,\n   ('}<span class="eyes">O,O</span>)   <span class="name">minerva</span>${'\n   (   )\n   -"-"-'}</div>`;
+  return html`<div class="owl">${' ,___,  '}<span class="name">minerva</span>${'\n ['}<span class="eyes">O.o</span>${']  '}<span class="faint">Make it,</span>${'\n /)_)   '}<span class="faint">Break it,</span>${'\n  ""    '}<span class="faint">Hack it.</span></div>`;
 }
 
 function SessionItem({ p }) {
