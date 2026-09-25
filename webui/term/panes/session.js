@@ -3,22 +3,25 @@
 // Several panes may draw one Session (mirrors share its one stream), so
 // everything tied to the DOM (scroller, ask elements, which asks are
 // off-screen) lives in a per-PANE view, never on the Session.
-import { html, K, Rendered, Component, signal, useRef, useLayoutEffect, useEffect, useMemo } from '../core/ui.js';
+import { html, K, HUB, Rendered, Component, signal, useRef, useLayoutEffect, useEffect, useMemo } from '../core/ui.js';
 import { markdown } from '../core/markdown.js';
 import { render as rend } from '../renderers/index.js';
 import { icon, word, shade, CELLS } from '../core/life.js';
 import { tildify, kfmt } from '../core/state.js';
+import { openMenu, atPointer, under } from '../core/menu.js';
 
 const AGENT = icon();
-const HOVER_MS = 300;   // a mouse pointer must rest on an ask this long before a click arms allow
-const CONFIRM_MS = 400; // and the confirming click must come at least this long after the arming one
+// After focus lands on an ask, keys wait this long; after an ask appears or
+// jumps into view, clicks do. A key or click already under way when the ask
+// arrived must not answer it.
+const LAND_MS = 300;
 
 // Per-pane view helpers: the scroller, ask elements, which asks are off-screen.
 const views = new WeakMap();
 function viewOf(p) {
   let v = views.get(p);
   if (!v) {
-    v = { scroller: null, io: null, off: signal(new Set()), askEls: new Map() };
+    v = { p, scroller: null, io: null, off: signal(new Set()), askEls: new Map(), jumpAt: 0 };
     v.observe = (el) => {
       if (!v.io && v.scroller) {
         v.io = new IntersectionObserver((ents) => {
@@ -44,25 +47,27 @@ function viewOf(p) {
 // The element pane `p` draws ask `id` in, if it draws it.
 export const askEl = (p, id) => viewOf(p).askEls.get(id);
 
-// Focus the ask block `a` in pane `p` (keys reach an ask only while it holds focus).
+// Scroll pane `p` to ask `a` and give it focus, which is what keys answer.
 export function focusAsk(p, a) {
   const el = a && askEl(p, a.id);
   if (!el) return false;
+  viewOf(p).jumpAt = performance.now();
   el.scrollIntoView({ block: 'nearest' });
   el.focus({ preventScroll: true });
   return true;
 }
 
 // ---------------------------------------------------------------- the pane
-export function Pane({ p, rect, focused, menuOpen, act }) {
+export function Pane({ p, rect, focused, mirror, act }) {
   const s = p.s, v = viewOf(p);
   const style = `left:${rect.x - (rect.x > 0 ? 1 : 0)}px;top:${rect.y - (rect.y > 0 ? 1 : 0)}px;` +
     `width:${rect.w + (rect.x > 0 ? 1 : 0)}px;height:${rect.h + (rect.y > 0 ? 1 : 0)}px`;
   const banner = s.banner.value;
+  v.act = act;
   return html`<section class=${'pane frame' + (focused ? ' focus' : '')} style=${style} tabindex="-1"
       data-pane=${p.id} onMouseDown=${() => act.focus(p.id)}>
-    <${Title} p=${p} act=${act} />
-    ${menuOpen && html`<${PaneMenu} p=${p} act=${act} />`}
+    <${Title} p=${p} mirror=${mirror} act=${act} />
+    <${Glyphs} p=${p} act=${act} />
     <${Transcript} s=${s} v=${v} />
     ${banner && html`<div class=${'banner' + (banner.err ? ' err' : '')}>${banner.text}</div>`}
     <${Waiting} s=${s} v=${v} />
@@ -70,25 +75,28 @@ export function Pane({ p, rect, focused, menuOpen, act }) {
   </section>`;
 }
 
-function Title({ p, act }) {
+function Title({ p, mirror, act }) {
   const s = p.s, conn = s.conn.value, hl = s.hello.value;
   const dot = { live: 'g', replaying: 'y', connecting: 'y', reconnecting: 'y', goodbye: 'faint' }[conn] || 'r';
-  const open = (e) => { e.preventDefault(); e.stopPropagation(); act.menu(p.id); };
-  return html`<div class="ftitle k ptitle" role="button" tabindex="0" title="pane menu (click or right-click)"
-      onClick=${open} onContextMenu=${open} onKeyDown=${(e) => !e.repeat && (e.key === 'Enter' || e.key === ' ') && open(e)}>
+  const open = (e, at) => { e.preventDefault(); e.stopPropagation(); act.paneMenu(p, at); };
+  return html`<div class="ftitle k ptitle" role="button" tabindex="0" title="pane menu (click or right-click)" data-owner=${'pane-' + p.id}
+      onClick=${(e) => open(e, under(e.currentTarget))} onContextMenu=${(e) => open(e, atPointer(e))}
+      onKeyDown=${(e) => !e.repeat && (e.key === 'Enter' || e.key === ' ') && open(e, under(e.currentTarget))}>
     ${hl ? tildify(hl.cwd) : 'session'} <span class=${dot}>●</span>
     ${conn !== 'live' && html` <span class="faint">${conn}</span>`}
-    ${p.mirror && html` <span class="faint">(mirror)</span>`} <span class="faint">▾</span>
+    ${mirror && html` <span class="faint">(mirror)</span>`} <span class="faint">▾</span>
   </div>`;
 }
 
-function PaneMenu({ p, act }) {
-  const item = (label, fn, hint) => html`<div class="it"><${K} on=${() => { act.menu(null); fn(); }}>${label}</${K}>
-    <span class="faint">${hint}</span></div>`;
-  return html`<div class="pmenu frame" onMouseDown=${(e) => e.stopPropagation()}>
-    ${item('mirror', () => act.mirror(p.id), ':vsplit')}
-    ${item('reconnect', () => p.s.reconnect(), ':reconnect')}
-    ${item('close', () => act.close(p.id), '⌥w  :q')}
+// Split and close, cut into the top border on the right.
+function Glyphs({ p, act }) {
+  const g = (ch, title, owner, on) => html`<span class="k glyph" role="button" tabindex="0" title=${title} data-owner=${owner}
+    onClick=${(e) => { e.stopPropagation(); on(e.currentTarget); }}
+    onKeyDown=${(e) => { if (!e.repeat && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); e.stopPropagation(); on(e.currentTarget); } }}>${ch}</span>`;
+  return html`<div class="fglyphs">
+    ${g('⇥', 'split right', `split-row-${p.id}`, (el) => act.splitMenu(p, 'row', under(el)))}
+    ${g('⇩', 'split down', `split-col-${p.id}`, (el) => act.splitMenu(p, 'col', under(el)))}
+    ${g('×', 'close the pane (⌥w  :q)', `close-${p.id}`, () => act.close(p.id))}
   </div>`;
 }
 
@@ -96,7 +104,7 @@ function PaneMenu({ p, act }) {
 function Transcript({ s, v }) {
   const ref = useRef(null), inner = useRef(null), stick = useRef(true);
   const chunks = s.chunks.value;
-  s.stick.value; // subscribe: caught-up asks for the bottom
+  s.stick.value;
   useLayoutEffect(() => {
     const el = ref.current;
     v.scroller = el;
@@ -117,8 +125,6 @@ function Transcript({ s, v }) {
     const el = e.currentTarget;
     stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
   };
-  // A click in the transcript off an ask arms nothing: the click moves focus
-  // to the pane (tabindex -1), so no ask block holds it.
   return html`<div class="scroll" ref=${ref} onScroll=${onScroll}>
     <div class="rows" ref=${inner}>
       ${chunks.map((c) => html`<${Chunk} key=${c.key} c=${c} s=${s} v=${v} />`)}
@@ -156,36 +162,72 @@ function Fold({ label, cls, children }) {
   </div>`;
 }
 
+// ---------------------------------------------------------------- row menus
+// A row's source as markdown: what "copy as markdown" and "quote" take.
+function rowSource(r) {
+  switch (r.kind) {
+    case 'bot': return ((r.full && r.full.value) || r).text;
+    case 'peer': return `~ ${r.from}: ${r.text}`;
+    case 'pre': return '```\n' + r.text + '\n```';
+    case 'verdict': return `policy: ${r.f.tool} [${r.f.outcome}] ${r.f.reason}`;
+    case 'ask': return r.ask.f.prompt || '';
+    case 'tool': {
+      const c = r.call, out = c.out.value;
+      const line = '`' + c.name + '` ' + rend(c.name, 'input', c.input);
+      return out ? line + '\n```\n' + String(out.output ?? '').replace(/\n+$/, '') + '\n```' : line;
+    }
+    default: return r.text || r.label || '';
+  }
+}
+
+const quoted = (t) => t.split('\n').map((l) => '> ' + l).join('\n');
+
+function copy(text, act) {
+  navigator.clipboard.writeText(text).then(() => act.toast('copied'), () => act.toast('the browser refused the clipboard', true));
+}
+
+// A right-click on a row. With text selected in the row, copy and quote take
+// the selection; a selection elsewhere keeps the browser's own menu.
+function rowMenu(e, r, v) {
+  const el = e.currentTarget, got = getSelection(), sel = String(got);
+  if (sel && !el.contains(got.anchorNode)) return;
+  e.preventDefault();
+  openMenu([
+    { label: 'fork from here', off: HUB },
+    { label: sel ? 'copy selection' : 'copy', on: () => copy(sel || el.innerText.trim(), v.act) },
+    { label: 'copy as markdown', on: () => copy(rowSource(r), v.act) },
+    { label: 'quote into composer', on: () => v.p.prefill(quoted(sel || rowSource(r)) + '\n\n') },
+  ], atPointer(e), { title: 'row' });
+}
+
 function RowBody({ r, s, v }) {
+  const cm = (e) => rowMenu(e, r, v);
   switch (r.kind) {
     case 'you':
-      return html`<div class="row"><${Who} who=${r.who} /><div class="body">${r.text}</div>
+      return html`<div class="row" onContextMenu=${cm}><${Who} who=${r.who} /><div class="body">${r.text}</div>
         ${r.images > 0 && html`<div class="body faint">[${r.images} image${r.images > 1 ? 's' : ''}]</div>`}</div>`;
     case 'bot': {
       // A reply an `error` cut short is filled in place by its assistant-message.
       const full = r.full && r.full.value, x = full || r, cut = full ? null : r.cut;
-      return html`<div class="row"><${Who} who=${r.who} />
+      return html`<div class="row" onContextMenu=${cm}><${Who} who=${r.who} />
         ${x.thinking && html`<${Fold} cls="think" label=${`thinking (${x.thinking.split('\n').length} lines)`}>${x.thinking}</${Fold}>`}
         ${x.redacted > 0 && html`<div class="think">(${x.redacted} redacted thinking block${x.redacted > 1 ? 's' : ''})</div>`}
         ${x.text && html`<div class="body">${cut ? x.text : markdown(x.text)}</div>`}
         ${cut && html`<div class="sys y">(${cut})</div>`}</div>`;
     }
-    case 'sys': return html`<div class=${'row sys ' + (r.cls || '')}>${r.text}</div>`;
+    case 'sys': return html`<div class=${'row sys ' + (r.cls || '')} onContextMenu=${cm}>${r.text}</div>`;
     case 'verdict': {
       const f = r.f, bad = ['refused', 'declined', 'yolo'].includes(f.outcome);
-      return html`<div class=${'row sys' + (bad ? ' err' : '')}>policy: ${f.tool} [${f.outcome}] ${f.reason}${f.note ? ' · ' + f.note : ''}
+      return html`<div class=${'row sys' + (bad ? ' err' : '')} onContextMenu=${cm}>policy: ${f.tool} [${f.outcome}] ${f.reason}${f.note ? ' · ' + f.note : ''}
         <span class="dim"> (not matched to a call)</span></div>`;
     }
-    case 'settle': return html`<div class="row settle">${r.text}</div>`;
-    case 'fold': return html`<div class="row"><${Fold} cls="sys" label=${r.label}>${r.text}</${Fold}></div>`;
-    case 'peer': return html`<div class="row peer"><span class="b">~ ${r.from}</span>  ${r.text}</div>`;
-    case 'pre': return html`<div class="row"><pre>${r.text}</pre></div>`;
-    case 'tool': return html`<${ToolRow} c=${r.call} s=${s} v=${v} />`;
-    case 'ask': {
-      const done = r.ask.done.value;
-      if (done) return done.line ? html`<div class=${'row sys ' + done.cls}>${done.line}</div>` : null;
-      return html`<div class="row"><${AskBlock} a=${r.ask} s=${s} v=${v} /></div>`;
-    }
+    case 'settle': return html`<div class="row settle" onContextMenu=${cm}>${r.text}</div>`;
+    case 'fold': return html`<div class="row" onContextMenu=${cm}><${Fold} cls="sys" label=${r.label}>${r.text}</${Fold}></div>`;
+    case 'peer': return html`<div class="row peer" onContextMenu=${cm}><span class="b">~ ${r.from}</span>  ${r.text}</div>`;
+    case 'pre': return html`<div class="row" onContextMenu=${cm}><pre>${r.text}</pre></div>`;
+    case 'tool': return html`<${ToolRow} c=${r.call} s=${s} v=${v} cm=${cm} />`;
+    case 'ask':
+      return html`<div class="row" onContextMenu=${cm}>${r.ask.done.value ? html`<${Settled} a=${r.ask} />` : html`<${AskBlock} a=${r.ask} s=${s} v=${v} />`}</div>`;
     default: return null;
   }
 }
@@ -193,112 +235,177 @@ function RowBody({ r, s, v }) {
 // ---------------------------------------------------------------- tool lines
 const VD = { refused: 'r', declined: 'r', yolo: 'r', judged: 'y', approved: 'g' };
 
-function ToolRow({ c, s, v: view }) {
-  const st = c.st.value, out = c.out.value, v = c.verdict.value, a = c.ask.value, settled = c.settled.value;
+function ToolRow({ c, s, v, cm }) {
+  const st = c.st.value, out = c.out.value, vd = c.verdict.value, a = c.ask.value, settled = c.settled.value;
   const open = useMemo(() => signal(null), []);
   const shown = open.value ?? (out && out.isError);
   const sum = useMemo(() => rend(c.name, 'input', c.input), [c.input]);
   const body = useMemo(() => (out ? rend(c.name, 'output', out.output, out.isError) : null), [out]);
   const toggle = () => { if (out) open.value = !shown; };
-  return html`<div class="row tool">
+  return html`<div class="row tool" onContextMenu=${cm}>
     <div class=${'tline' + (out ? ' k' : '')} onClick=${toggle}>
       <span class="arrow">-></span><span class="name">${c.name}</span>
       <span class="sum" title=${sum}>${sum}</span>
       ${c.origin !== 'model' && html`<span class="faint">(${c.origin})</span>`}
-      ${v && html`<span class=${'vd ' + (VD[v.outcome] || 'faint')} title=${v.reason + (v.note ? ' · ' + v.note : '')}>[${v.outcome}]</span>`}
+      ${vd && html`<span class=${'vd ' + (VD[vd.outcome] || 'faint')} title=${vd.reason + (vd.note ? ' · ' + vd.note : '')}>[${vd.outcome}]</span>`}
       ${c.fired.value && html`<span class="vd">[fired]</span>`}
       <span class=${'st ' + st}>${{ run: 'running', ok: 'ok ▸', err: 'error ▸', stop: 'stopped' }[st]}</span>
       <span class="tm">${c.time.value}</span>
     </div>
     ${shown && body && html`<${Rendered} value=${body} />`}
-    ${a && html`<${AskBlock} a=${a} s=${s} v=${view} />`}
-    ${settled && html`<div class=${'sys ' + settled.cls}>${settled.line}</div>`}
+    ${a && html`<${AskBlock} a=${a} s=${s} v=${v} />`}
+    ${settled && html`<${Settled} a=${settled} />`}
   </div>`;
 }
 
 // ---------------------------------------------------------------- asks
-// Keys reach an ask only while its block holds focus (Tab or a click puts it
-// there), and the block shows that with a mark. Only this block's handler
-// acts on keys inside it (K ignores keys inside an ask, core/ui.js).
-// Approve by key: exactly `y` (or `Y`), then Enter; `n` denies at once. Held
-// keys (e.repeat) are ignored, and a bare modifier (Shift, Caps Lock...)
-// neither arms nor disarms. Enter or Space never completes a click confirm:
-// on an armed [confirm allow?] they disarm it.
-// Approve by click: a first click arms [allow] -> [confirm allow?] for 3 s,
-// and a second click at least CONFIRM_MS after the arming one allows,
-// whatever e.detail says (so a double-click, which lands sooner, never
-// confirms, and slow repeated clicks are not refused). With a mouse, the
-// pointer must also have rested on the ask HOVER_MS before a click arms (an
-// ask drawn under a moving pointer is not armed by a click already under
-// way). Touch, pen and pointerless clicks (a screen reader's activate) have
-// no hover to rest, so they arm on the first tap. A click that does nothing
-// yet (still in the rest window, or too soon to confirm) says "steady…".
-// [deny] is one click.
-// The arm belongs to this block, so to this pane: a mirror's [allow] is not
-// armed by this one, and closing the pane drops its arm.
-// A question whose options are exactly yes/no (a.yesno, core confirm())
-// takes the same two steps for yes; other questions answer on one key/click.
+// An ask is a line of choices with one highlighted (the first, yes, to start).
+// The page's oldest pending ask can take focus by itself (app.js steer), and
+// keys answer the ask that holds focus:
+//   left/right move the highlight, Enter takes it, y / n answer yes / no and
+//   1-9 a question's option, Esc goes back to the composer and leaves the ask
+//   queued.
+// A note goes with whatever is chosen next: Tab, down or the `+ note` choice
+// open the note line (none of them answers); in it Enter takes the highlighted
+// choice with the note, up goes back to the choices keeping the note, Esc
+// closes the note line and drops the note.
+// Words of the user's own go through "chat about it", not a free-text answer.
+// For LAND_MS after focus lands keys do nothing, and for LAND_MS after the
+// ask appears, jumps into view, or an ask above it settles, clicks do nothing
+// but say "steady…"; a double click never answers.
+// The highlight and the note belong to this pane; the answer settles every
+// pane (ask-settled).
 const MODIFIERS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'AltGraph', 'Fn', 'NumLock', 'OS']);
-const LAPSE_MS = 3000;
+
+// The choices on an ask, in order. `go(note)` answers; `off` says why a
+// choice is greyed; `+ note` (id 'note') only opens the note line.
+function choices(a, s, v) {
+  const f = a.f;
+  const send = (answer) => (note) => {
+    const reply = { answer };
+    if (note.trim() && !s.noNote.peek()) reply.note = note.trim();
+    return s.answer(a, reply);
+  };
+  const chat = { id: 'chat', label: 'chat about it', go: (note) => chatAbout(a, s, v, note) };
+  const note = { id: 'note', label: '+ note' };
+  if (f.kind === 'approval') {
+    return [
+      { id: 'yes', label: 'yes', off: a.yes ? null : 'not offered', go: send(a.yes) },
+      { id: 'always', label: 'always', off: a.always ? null : 'needs eidolon PR', go: send(a.always) },
+      { id: 'no', label: 'no', off: a.no ? null : 'not offered', go: send(a.no) },
+      chat,
+      { id: 'fork', label: 'fork', off: HUB },
+      note,
+    ];
+  }
+  return [
+    ...a.options.map((o, i) => ({ id: 'o' + i, label: o.label, key: o.key, desc: o.description, go: send(o.label) })),
+    chat,
+    note,
+  ];
+}
+
+// "chat about it": deny (when there is a no to give), stop the turn, and hand
+// the composer a quote of the ask to talk about.
+async function chatAbout(a, s, v, note) {
+  const f = a.f, no = f.kind === 'approval' || a.yesno ? a.no : null;
+  v.act.letBe(s); // the turn's other asks are about to be cancelled: none takes focus meanwhile
+  a.chat = true;
+  if (no) await s.answer(a, { answer: no });
+  s.cancel();
+  const what = f.kind === 'approval' ? `${f.tool} ${rend(f.tool, 'input', f.input)}`.trim() : 'question';
+  const text = `${what}: ${f.prompt || ''}`.replace(/\s+/g, ' ').trim();
+  v.p.prefill(quoted(text.length > 160 ? text.slice(0, 159) + '…' : text) + '\n\n' + note.trim());
+}
 
 function AskBlock({ a, s, v }) {
-  const ref = useRef(null), hover = useRef(null), down = useRef(null), timer = useRef(0), steadyT = useRef(0);
-  const arm = useMemo(() => signal(null), [a]);       // null | { how: 'key' | 'click', at }
-  const steady = useMemo(() => signal(false), [a]);
-  const f = a.f, busy = a.busy.value, armed = arm.value, how = armed && armed.how;
-  const two = f.kind === 'approval' || a.yesno;
+  const ref = useRef(null), field = useRef(null), landed = useRef(0), born = useRef(0), steadyT = useRef(0);
+  const f = a.f, busy = a.busy.value, opts = choices(a, s, v);
+  const hi = useMemo(() => signal(opts.findIndex((o) => !o.off)), [a]);
+  const note = useMemo(() => signal(''), [a]);
+  const noting = useMemo(() => signal(false), [a]); // the note line is open
+  const steady = useMemo(() => signal(''), [a]);
+  const noteOff = s.noNote.value;
   useLayoutEffect(() => {
     const el = ref.current;
+    born.current = performance.now();
     v.askEls.set(a.id, el);
     v.observe(el);
     return () => {
       v.unobserve(el, a.id);
       if (v.askEls.get(a.id) === el) v.askEls.delete(a.id);
-      clearTimeout(timer.current); clearTimeout(steadyT.current);
+      clearTimeout(steadyT.current);
+      v.jumpAt = performance.now(); // this block leaving moves what is under the pointer
     };
   }, [a]);
-  const setArm = (h) => {
-    clearTimeout(timer.current);
-    arm.value = h ? { how: h, at: performance.now() } : null;
-    if (h === 'click') timer.current = setTimeout(() => { arm.value = null; }, LAPSE_MS);
-  };
-  const say = () => {
-    steady.value = true;
+  const say = (text) => {
+    steady.value = text;
     clearTimeout(steadyT.current);
-    steadyT.current = setTimeout(() => { steady.value = false; }, 900);
+    steadyT.current = setTimeout(() => { steady.value = ''; }, 1500);
   };
-  const onKey = (e) => {
-    if (e.repeat || e.ctrlKey || e.metaKey || e.altKey || MODIFIERS.has(e.key)) return;
-    const stop = () => { e.preventDefault(); e.stopPropagation(); };
-    const cur = arm.peek();
-    if (two) {
-      if (e.key === 'y' || e.key === 'Y') { stop(); setArm('key'); return; }
-      if (e.key === 'n' || e.key === 'N') { stop(); setArm(null); s.answer(a, a.no); return; }
-      if (e.key === 'Enter' && cur && cur.how === 'key') { stop(); setArm(null); s.answer(a, a.yes); return; }
-    } else {
-      const o = a.options.find((x) => x.key === e.key);
-      if (o) { stop(); s.answer(a, o.label); return; }
+  const openNote = () => {
+    if (noting.peek()) field.current.focus(); else noting.value = true;
+  };
+  // Focus lands in the same render that draws the line, before the next key.
+  useLayoutEffect(() => { if (noting.value && field.current) field.current.focus(); }, [noting.value]);
+  const closeNote = () => {
+    noting.value = false;
+    note.value = '';
+    ref.current.focus({ preventScroll: true });
+  };
+  const take = (i) => {
+    const o = opts[i];
+    if (o.off || a.busy.peek()) return;
+    if (o.id === 'note') { openNote(); return; }
+    o.go(noting.peek() ? note.peek() : '');
+  };
+  const move = (d) => {
+    for (let j = 1; j < opts.length; j++) {
+      const i = (hi.peek() + d * j + opts.length * j) % opts.length;
+      if (!opts[i].off) { hi.value = i; return; }
     }
-    if (e.key === 'Escape') { stop(); setArm(null); ref.current.closest('.pane').focus(); return; }
-    if (e.key === 'Enter' || e.key === ' ') { stop(); if (cur) setArm(null); return; }
-    if (e.key !== 'Tab' && cur) setArm(null);
   };
-  const allow = (e) => {
-    const now = performance.now();
-    const cur = arm.peek();
-    if (cur && cur.how === 'click') {
-      if (now - cur.at >= CONFIRM_MS) { setArm(null); s.answer(a, a.yes); } else say();
+  const pick = (id) => {
+    const i = opts.findIndex((o) => o.id === id);
+    if (i >= 0) { hi.value = i; take(i); }
+  };
+  const optionId = (label) => 'o' + a.options.findIndex((o) => o.label === label);
+  const onKey = (e) => {
+    if (e.isComposing || e.keyCode === 229) return; // an IME's own Enter and keys
+    if (e.ctrlKey || e.metaKey || e.altKey || MODIFIERS.has(e.key)) return;
+    if (e.key === 'Tab' && e.shiftKey) return; // shift+Tab: the previous ask (app.js)
+    const stop = () => { e.preventDefault(); e.stopPropagation(); };
+    if (performance.now() - landed.current < LAND_MS) { stop(); return; }
+    const k = e.key, typing = e.target === field.current;
+    if (typing) {
+      if (k === 'Escape') { stop(); closeNote(); }
+      else if (k === 'Enter') {
+        stop();
+        if (e.repeat) return;
+        if (opts[hi.peek()].id === 'note') { ref.current.focus({ preventScroll: true }); say('pick what to send the note with'); return; }
+        take(hi.peek());
+      } else if (k === 'ArrowUp' || k === 'Tab') { stop(); ref.current.focus({ preventScroll: true }); }
       return;
     }
-    // The pointer that made this click: the click's own pointerType where the
-    // browser gives one, else the last pointerdown on this ask; '' = none.
-    const d = down.current;
-    const type = e.pointerType != null ? e.pointerType : d && now - d.at < 1500 ? d.type : '';
-    if (type === 'mouse' && (hover.current == null || now - hover.current < HOVER_MS)) { say(); return; }
-    setArm('click');
+    stop();
+    if (k === 'Escape') { v.act.leaveAsk(v.p); return; }
+    if (k === 'Tab' || k === 'ArrowDown') { openNote(); return; }
+    if (k === 'ArrowLeft' || k === 'ArrowRight') { move(k === 'ArrowLeft' ? -1 : 1); return; }
+    if (e.repeat) return;
+    if (k === 'Enter') { take(hi.peek()); return; }
+    const yes = k === 'y' || k === 'Y', no = k === 'n' || k === 'N';
+    if (f.kind === 'approval') { if (yes) pick('yes'); else if (no) pick('no'); return; }
+    if (a.yesno && (yes || no)) { pick(optionId(yes ? a.yes : a.no)); return; }
+    const o = a.options.find((x) => x.key === k);
+    if (o) pick(optionId(o.label));
   };
-  const yesWord = f.kind === 'approval' ? 'allow' : a.yes;
-  let title, body, keys, hint;
+  const click = (e, i) => {
+    if (e.detail > 1) return; // the second click of a double click
+    if (performance.now() - Math.max(born.current, v.jumpAt) < LAND_MS) { say('steady…'); return; }
+    hi.value = i;
+    take(i);
+  };
+  let title, body;
   if (f.kind === 'approval') {
     const sum = rend(f.tool, 'input', f.input);
     title = `approve: ${f.tool}${sum ? '  ' + sum : ''}`;
@@ -313,32 +420,49 @@ function AskBlock({ a, s, v }) {
     title = 'question';
     body = html`<div>${f.prompt || ''}</div>`;
   }
-  if (two) {
-    keys = html`
-      <${K} cls=${'allow' + (how === 'click' ? ' armed' : '')} on=${allow}>${how === 'click' ? `[confirm ${yesWord}?]` : `[${yesWord}]`}${steady.value && html`<span class="faint steady"> steady…</span>`}</${K}>
-      <${K} cls="deny" on=${() => { setArm(null); s.answer(a, a.no); }}>[${f.kind === 'approval' ? 'deny' : a.no}]</${K}>`;
-    hint = how === 'key' ? html`<span class="armed">⏎ to confirm ${yesWord}</span> <span class="faint">· any other key cancels</span>`
-      : html`<span class="key">y</span> ${yesWord} · <span class="key">n</span> ${f.kind === 'approval' ? 'deny' : a.no}`;
-  } else {
-    keys = a.options.map((o) => html`<${K} cls="opt" on=${() => s.answer(a, o.label)}>
-      [${o.key ? o.key + ' ' : ''}${o.label}]${o.description && html`<span class="desc">  ${o.description}</span>`}</${K}>`);
-    hint = html`<span class="key">1-${Math.min(9, a.options.length)}</span> answer`;
-  }
+  const key = (k, label) => html` · <span class="key">${k}</span> ${label}`;
   return html`<div class=${'ask' + (a.fresh ? ' fresh' : '') + (busy ? ' busy' : '')} ref=${ref} tabindex="0"
       data-ask=${a.id} onKeyDown=${onKey}
-      onPointerDown=${(e) => { down.current = { type: e.pointerType, at: performance.now() }; }}
-      onPointerEnter=${(e) => { if (e.pointerType === 'mouse') hover.current = performance.now(); }}
-      onPointerMove=${(e) => { if (e.pointerType === 'mouse' && hover.current == null) hover.current = performance.now(); }}
-      onPointerLeave=${(e) => { if (e.pointerType === 'mouse') hover.current = null; }}
-      onBlur=${(e) => {
-        const cur = arm.peek();
-        if (cur && cur.how === 'key' && !e.currentTarget.contains(e.relatedTarget)) setArm(null);
-      }}>
+      onFocusIn=${(e) => { if (!e.currentTarget.contains(e.relatedTarget)) landed.current = performance.now(); }}>
     <div class="ftitle">${title}</div>
     ${body}
-    <div class="keys">${keys}</div>
-    <div class="akeys">keys: ${hint}</div>
+    <div class="keys">
+      ${opts.map((o, i) => html`<span class=${'opt ' + o.id + (i === hi.value ? ' hi' : '') + (o.off ? ' dis' : ' k')}
+          role="button" tabindex="-1" aria-disabled=${o.off ? 'true' : null} title=${o.off || o.desc || ''}
+          onClick=${o.off ? null : (e) => click(e, i)}>${o.key ? o.key + ' ' : ''}${o.label}${o.off && html`<span class="off"> (${o.off})</span>`}</span>`)}
+      ${steady.value ? html`<span class="faint">${steady.value}</span>` : !noting.value && html`<span class="faint tabhint">tab: add a note</span>`}
+    </div>
+    ${noting.value && html`<div class="aline"><span class="faint">note ›</span><input ref=${field} type="text" spellcheck="false" autocomplete="off"
+      aria-label="note sent with your choice" readOnly=${noteOff} value=${note.value}
+      placeholder=${noteOff ? 'the door takes no note' : 'sent with the choice you take next; esc drops it'}
+      onInput=${(e) => { note.value = e.currentTarget.value; }} /></div>`}
+    <div class="akeys">keys: <span class="key">←→</span> choose${key('⏎', 'take')}${key('tab ↓', 'note')}${(f.kind === 'approval' || a.yesno) && html`${key('y', 'yes')}${key('n', 'no')}`}${f.kind !== 'approval' && key('1-' + Math.min(9, a.options.length), 'option')}${key('esc', 'composer')}</div>
     ${a.err.value && html`<div class="aerr">${a.err.value}</div>`}
+  </div>`;
+}
+
+// A settled ask, folded to one line: what it asked and what was picked (the
+// note too, when this page sent it). Opened (click or Enter) it lists every
+// choice with the picked one marked, so the choices can still be read while
+// the composer talks about them ("chat about it").
+function Settled({ a }) {
+  const open = useMemo(() => signal(false), [a]);
+  const d = a.done.value, f = a.f, approval = f.kind === 'approval';
+  const what = approval ? `approve: ${f.tool} ${rend(f.tool, 'input', f.input)}`.trim() : `question: ${f.prompt || ''}`;
+  const picked = { answered: d.answer, cancelled: 'cancelled', elsewhere: 'answered elsewhere' }[d.how];
+  const cls = d.how !== 'answered' ? 'faint' : d.answer === a.no ? 'r' : approval ? 'g' : 'y';
+  const tail = [d.note && `note: ${d.note}`, a.chat && 'chat about it'].filter(Boolean).join(' · ');
+  const labels = approval ? [a.yes, a.always, a.no].filter(Boolean).map((label) => ({ label })) : a.options;
+  const line = (on, label, desc) => html`<div class=${on ? cls : 'faint'}>${on ? '✓ ' : '  '}${label}${desc && html`<span class="faint">  ${desc}</span>`}</div>`;
+  // A click opens it without taking focus from the composer being typed in.
+  return html`<div class="sys settled" onMouseDown=${(e) => e.preventDefault()}>
+    <${K} on=${() => { open.value = !open.value; }}>${open.value ? '▾ ' : '▸ '}${what} → <span class=${cls}>${picked}</span>${tail && html`<span class="faint"> (${tail})</span>`}</${K}>
+    ${open.value && html`<div class="choices">
+      ${approval && f.prompt && html`<div>${f.prompt}</div>`}
+      ${labels.map((o) => line(d.how === 'answered' && o.label === d.answer, o.label, o.description))}
+      ${line(!!a.chat, 'chat about it')}
+      ${d.note && html`<div class="faint">note: ${d.note}</div>`}
+    </div>`}
   </div>`;
 }
 
@@ -347,7 +471,7 @@ function Waiting({ s, v }) {
   const asks = s.asks.value.filter((a) => off.has(a.id));
   if (!asks.length) return null;
   return html`<div class="waiting"><span>${asks.length} waiting</span><span class="faint">·</span>
-    <${K} on=${() => { const el = v.askEls.get(asks[0].id); if (el) { el.scrollIntoView({ block: 'center' }); el.focus({ preventScroll: true }); } }}>jump</${K}></div>`;
+    <${K} on=${() => focusAsk(v.p, asks[0])}>jump</${K}></div>`;
 }
 
 // ---------------------------------------------------------------- draft
@@ -402,7 +526,18 @@ function Composer({ s, p, act }) {
   const ta = useRef(null);
   const text = useMemo(() => signal(''), []);
   const run = s.running.value, bye = s.bye || s.conn.value === 'goodbye';
-  useEffect(() => { p.focusComposer = () => ta.current && ta.current.focus(); }, [p]);
+  useEffect(() => {
+    // A blurred textarea keeps its selection, so focus() puts the caret back where it was.
+    p.focusComposer = () => ta.current && ta.current.focus();
+    // Text put in front of what is already typed, the caret at the end.
+    p.prefill = (text) => {
+      const el = ta.current;
+      el.value = text + el.value;
+      autosize();
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    };
+  }, [p]);
   const autosize = () => {
     const el = ta.current;
     el.style.height = 'auto';
@@ -420,9 +555,9 @@ function Composer({ s, p, act }) {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !e.ctrlKey) {
       e.preventDefault();
       go(e.altKey ? 'queue' : run === true ? 'steer' : 'send');
-    } else if (e.key === 'Tab' && !e.shiftKey && s.asks.value.length) {
-      // Tab from the composer goes to the oldest pending ask, if this pane draws it.
-      if (focusAsk(p, s.asks.value[0])) e.preventDefault();
+    } else if (e.key === 'Tab' && !e.shiftKey) {
+      // Tab from the composer goes to the oldest pending ask on the page.
+      if (act.focusHead()) e.preventDefault();
     } else if (e.key === 'Escape') {
       e.preventDefault();
       ta.current.blur();

@@ -96,14 +96,36 @@ html, body {
 .pane:focus-visible { outline: none; }
 .pane.focus > .ftitle { background: var(--fg); color: var(--bg); opacity: .92; }
 .pane.focus > .ftitle .faint, .pane.focus > .ftitle .g, .pane.focus > .ftitle .y { color: var(--bg); }
-.ptitle { cursor: pointer; }
-/* the pane menu: a small square frame under the title, clickable words */
-.pmenu {
-  position: absolute; z-index: 5; top: calc(var(--ch) / 2); left: calc(2 * var(--cw));
-  background: var(--bg); border-color: var(--yellow);
-  padding: calc(var(--ch) * 0.2) var(--cw); min-width: calc(24 * var(--cw));
+.ptitle { cursor: pointer; max-width: calc(100% - 12 * var(--cw)); }
+/* split and close glyphs, cut into the top border on the right */
+.fglyphs {
+  position: absolute; right: var(--cw); z-index: 2; top: calc(var(--ch) / -2 - 0.5px);
+  padding: 0 calc(var(--cw) / 2); background: var(--bg); line-height: var(--ch); white-space: pre;
 }
-.pmenu .it { display: flex; justify-content: space-between; gap: calc(2 * var(--cw)); }
+.fglyphs .glyph { color: var(--faint); padding: 0 calc(var(--cw) / 2); }
+.fglyphs .glyph:hover { color: var(--yellow); text-decoration: none; background: var(--block); }
+.pane.focus > .fglyphs .glyph { color: var(--fg); }
+
+/* ---- menus (core/menu.js): a square frame of lines ---- */
+.pop {
+  position: fixed; z-index: 30; left: 0; top: 0;
+  background: var(--bg); border-color: var(--yellow);
+  padding: calc(var(--ch) * 0.5) 0 calc(var(--ch) * 0.2); min-width: calc(24 * var(--cw));
+  white-space: pre; outline: none;
+}
+.pop:not(:has(> .ftitle)) { padding-top: calc(var(--ch) * 0.2); }
+.pop > .ftitle { color: var(--yellow); }
+.pop .mi { display: flex; gap: var(--cw); padding: 0 var(--cw); cursor: pointer; }
+.pop .mi .ml { flex: 1; }
+.pop .mi .mh { color: var(--faint); }
+.pop .mi .tick { color: var(--green); }
+.pop .mi.sel { background: var(--yellow); color: var(--bg); }
+.pop .mi.sel .mh, .pop .mi.sel .tick { color: var(--bg); }
+.pop .mi.dis { color: var(--comment); cursor: default; }
+.pop .mi.dis .mh { color: var(--comment); }
+.pop .mi.dis.sel { background: var(--line); color: var(--faint); }
+.pop .mi.dis.sel .mh { color: var(--faint); }
+.pop .msep { border-top: 1px solid var(--line); margin: calc(var(--ch) * 0.2) 0; }
 /* tile dividers: an invisible cell-wide handle over the shared border.
    Under the frame titles (z-index 2): a pane's title is cut into the same
    border line, and must stay clickable; the rest of the line drags. */
@@ -197,16 +219,31 @@ pre, .pre {
 .ask .akeys { visibility: hidden; color: var(--faint); margin-top: calc(var(--ch) * 0.2); }
 .ask:focus-within .akeys { visibility: visible; }
 .ask .akeys .key { color: var(--yellow); font-weight: bold; }
-.ask .armed { color: var(--bg); background: var(--green); padding: 0 var(--cw); font-weight: bold; }
 .ask .why { color: var(--faint); }
 .ask .warn { color: var(--bg); background: var(--red); padding: 0 var(--cw); }
-.ask .keys { margin-top: calc(var(--ch) * 0.3); display: flex; flex-wrap: wrap; gap: 0 calc(3 * var(--cw)); }
-.ask .keys .allow { color: var(--green); font-weight: bold; }
-.ask .keys .allow.armed { color: var(--bg); background: var(--green); }
-.ask .keys .deny { color: var(--red); font-weight: bold; }
-.ask .keys .opt { color: var(--yellow); }
-.ask .desc { color: var(--faint); }
+/* the choices: the highlighted one in reverse video, as the TUI selects */
+.ask .keys { margin-top: calc(var(--ch) * 0.3); display: flex; flex-wrap: wrap; gap: 0 var(--cw); }
+.ask .opt { --c: var(--yellow); color: var(--c); padding: 0 var(--cw); white-space: pre; }
+.ask .opt.yes { --c: var(--green); font-weight: bold; }
+.ask .opt.no { --c: var(--red); font-weight: bold; }
+.ask .opt.hi { background: var(--c); color: var(--bg); }
+.ask:not(:focus-within) .opt.hi { background: none; color: var(--c); box-shadow: inset 0 0 0 1px var(--c); }
+.ask .opt.note { --c: var(--faint); }
+.ask .keys .tabhint { margin-left: var(--cw); }
+.ask .opt.dis { --c: var(--comment); color: var(--comment); }
+.ask .opt .off { color: var(--comment); font-weight: normal; }
+.ask .aline { display: flex; margin-top: calc(var(--ch) * 0.2); }
+.ask .aline input {
+  flex: 1; min-width: 0; margin-left: var(--cw); padding: 0;
+  border: 0; border-bottom: 1px dashed var(--line); outline: 0;
+  background: transparent; color: var(--fg); caret-color: var(--yellow); font: inherit;
+}
+.ask .aline input:focus { border-bottom-color: var(--yellow); }
+.ask .aline input::placeholder { color: var(--comment); }
+.ask .aline input:read-only { border-bottom-style: dotted; }
 .ask.busy { opacity: 0.6; }
+/* a settled ask: one folded line; opened, its choices with the pick marked */
+.settled .choices { padding-left: calc(2 * var(--cw)); }
 .ask .aerr { color: var(--red); }
 
 /* ---- under the transcript ---- */

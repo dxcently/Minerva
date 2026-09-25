@@ -12,6 +12,9 @@ export { signal, computed, effect, batch, untracked } from '../vendor/signals.js
 
 export const html = htm.bind(h);
 
+// Why a control is greyed until the Minerva hub exists.
+export const HUB = 'needs the hub';
+
 // Clickable text: looks like text, acts like a control, announces itself as
 // one (web-ui.md 2.3). There are no <button> elements anywhere in the page.
 // `off` draws the same words faint and inert.

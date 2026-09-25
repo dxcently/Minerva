@@ -13,14 +13,15 @@ const MIN = 0.12;
 
 export const leaf = (id) => ({ leaf: id });
 
-// Split leaf `at` (or the root when the tree is empty) to add `id`.
-// `box` is the pixel size of the tile area, used to pick the longer side.
-export function add(tree, at, id, box) {
+// Split leaf `at` (or the root when the tree is empty) to add `id`, to its
+// right (`dir` 'row') or below it ('col'). With no `dir`, along the leaf's
+// longer side; `box` is the pixel size of the tile area.
+export function add(tree, at, id, box, dir) {
   if (!tree) return leaf(id);
   const rects = layout(tree, box);
   const r = rects.panes.find((p) => p.id === at) || rects.panes[rects.panes.length - 1];
   const target = r.id;
-  const dir = r.w >= r.h ? 'row' : 'col';
+  dir = dir || (r.w >= r.h ? 'row' : 'col');
   const swap = (n) => (n.leaf === target ? { dir, ratio: PHI, a: n, b: leaf(id) }
     : n.leaf != null ? n : { ...n, a: swap(n.a), b: swap(n.b) });
   return swap(tree);

@@ -2,10 +2,11 @@
 // line. Sessions live in core/state.js and panes draw them (panes/session.js);
 // this file arranges panes and routes every action. Every action is reachable
 // by mouse; keys and the `:` line are shortcuts to the same functions.
-import { html, render, K, signal, computed, batch, useRef, useLayoutEffect } from './core/ui.js';
+import { html, render, K, HUB, signal, computed, effect, batch, useRef, useLayoutEffect } from './core/ui.js';
 import { takeToken, DOOR } from './core/api.js';
 import { Session, tildify } from './core/state.js';
 import * as tile from './core/tile.js';
+import { menu, openMenu, closeMenu, outside, atPointer, Menus } from './core/menu.js';
 import { Pane, focusAsk, askEl } from './panes/session.js';
 
 const LEFT_TABS = ['sessions', 'projects', 'mesh'];
@@ -13,7 +14,7 @@ const RIGHT_TABS = ['rec', 'tree', 'diff', 'graph', 'run']; // components: INSPE
 
 // ---------------------------------------------------------------- screen state
 const ui = {
-  panes: signal([]),            // [{ id, sid, mirror, s: Session }]; panes on one sid share s
+  panes: signal([]),            // [{ id, sid, s: Session }]; panes on one sid share s; a pane's sid can change (showIn)
   tree: signal(null),           // core/tile.js split tree of pane ids
   focus: signal(null),          // pane id
   left: signal('sessions'),
@@ -22,12 +23,13 @@ const ui = {
   rrail: signal(innerWidth < 900),
   hint: signal(null),           // { mode: 'toast' | 'which' | 'menu', text?, err? }
   cmd: signal(null),            // the `:` line's text while open, else null
-  menu: signal(null),           // pane id whose title menu is open
+  held: signal(false),          // the oldest ask waits for a pause in typing before it takes focus
   box: signal({ w: 0, h: 0, cw: 8, ch: 19 }),
   token: false,
 };
 const byId = (id) => ui.panes.value.find((p) => p.id === id);
 const focused = computed(() => byId(ui.focus.value) || null);
+const isMirror = (p) => ui.panes.value.find((x) => x.s === p.s) !== p;
 let paneSeq = 0, toastTimer = 0;
 
 // ---------------------------------------------------------------- actions
@@ -41,37 +43,50 @@ const sessionFor = (sid) => {
   return p ? p.s : new Session(sid, { toast });
 };
 
-function openPane(sid = DOOR, mirror = false) {
+// A new pane on `sid`, splitting pane `at` (default: the focused one) to the
+// right (`dir` 'row'), below ('col'), or along its longer side.
+function openPane(sid = DOOR, { at = ui.focus.value, dir } = {}) {
   const id = 'p' + ++paneSeq;
-  const p = { id, sid, mirror, s: sessionFor(sid) };
+  const p = { id, sid, s: sessionFor(sid) };
   batch(() => {
     ui.panes.value = [...ui.panes.value, p];
-    ui.tree.value = tile.add(ui.tree.value, ui.focus.value, id, ui.box.value);
+    ui.tree.value = tile.add(ui.tree.value, at, id, ui.box.value, dir);
     ui.focus.value = id;
   });
   requestAnimationFrame(() => p.focusComposer && p.focusComposer());
   return p;
 }
 
-function mirrorPane(id = ui.focus.value) {
+function mirrorPane(id = ui.focus.value, dir) {
   const p = byId(id);
   if (!p) { openPane(); return; }
-  ui.focus.value = p.id;
-  openPane(p.sid, true);
+  openPane(p.sid, { at: p.id, dir });
+}
+
+// Show session `sid` in pane `id` instead of the one it shows. The pane is
+// drawn afresh (Tiles keys it by id and sid); the old Session closes when no
+// pane still shows it.
+function showIn(id, sid) {
+  const p = byId(id);
+  if (!p || p.sid === sid) return;
+  const next = { ...p, sid, s: sessionFor(sid) };
+  ui.panes.value = ui.panes.value.map((x) => (x === p ? next : x));
+  if (!ui.panes.value.some((x) => x.s === p.s)) p.s.close();
 }
 
 function closePane(id = ui.focus.value) {
   const p = byId(id);
   if (!p) return;
-  if (!ui.panes.value.some((x) => x !== p && x.s === p.s)) p.s.close();
+  const last = !ui.panes.value.some((x) => x !== p && x.s === p.s);
+  if (last) p.s.close();
   batch(() => {
     ui.panes.value = ui.panes.value.filter((x) => x !== p);
     ui.tree.value = tile.remove(ui.tree.value, id);
     const rest = tile.leaves(ui.tree.value);
     if (ui.focus.value === id) ui.focus.value = rest[rest.length - 1] || null;
-    if (ui.menu.value === id) ui.menu.value = null;
   });
-  toast('pane closed; the session keeps running. :open brings it back');
+  toast(last ? 'pane closed, and this page stopped following its session (the door keeps it). :open follows it again'
+    : 'pane closed; another pane still shows its session');
 }
 
 const focusPane = (id) => { if (ui.focus.value !== id) ui.focus.value = id; };
@@ -79,16 +94,117 @@ const withPane = (fn) => () => { const p = focused.value; if (p) fn(p); else toa
 const cancel = withPane((p) => p.s.cancel());
 const toComposer = withPane((p) => p.focusComposer && p.focusComposer());
 
-// Focus the next (or previous) ask in the focused pane: this is what lets
-// keys reach an ask (web-ui.md 7.1).
-function cycleAsk(dir = 1) {
-  const p = focused.value;
+// Every open session once, as [sid, Session].
+const sessions = () => [...new Map(ui.panes.value.map((p) => [p.sid, p.s]))];
+const sessionName = (s) => {
+  const hl = s.hello.value;
+  return hl ? hl.session.split('/').pop().replace(/\.[^.]+$/, '') || 'session' : s.sid;
+};
+
+// ---------------------------------------------------------------- the ask queue
+// Every pending ask on the page, oldest first, once however many panes draw
+// it. The oldest takes focus by itself, once (web-ui.md 7.1), and only:
+//   - when what has focus holds no text: a composer or the `:` line with
+//     anything typed in it keeps focus for as long as it holds text, and the
+//     status line says `▶ N waiting` (Tab, a click on it or on the ask go there);
+//   - after PAUSE_MS with no typing in a composer or the `:` line, and not
+//     while a menu is open or another ask holds focus;
+//   - in the focused pane if that pane shows its session, else the first that does.
+// When the queue empties, focus goes back to the composer it came from (a
+// blurred textarea keeps its caret). Esc in an ask goes back to the composer
+// and leaves the ask queued; it never takes focus by itself again, and the
+// asks behind it wait too, until it is answered: `N waiting`, Tab and `jump`
+// reach them.
+const PAUSE_MS = 1000;
+const DRAW_TRIES = 20; // polls (50 ms) for the head to be drawn before steer parks until the queue or panes change
+const queue = computed(() => {
+  const seen = new Set(), out = [];
+  for (const p of ui.panes.value) {
+    if (seen.has(p.s)) continue;
+    seen.add(p.s);
+    for (const a of p.s.asks.value) out.push({ s: p.s, a });
+  }
+  return out.sort((x, y) => x.a.n - y.a.n);
+});
+// Asks that had their one automatic focus, by session and ask id, so a
+// reconnect's replayed copy of an ask does not take focus again.
+const taken = new Set();
+const tag = (s, a) => s.sid + ' ' + a.id;
+let typedAt = 0, steerT = 0, tries = 0, returnTo = null, owed = false;
+
+const paneFor = (s) => {
+  const f = focused.peek();
+  return f && f.s === s ? f : ui.panes.peek().find((x) => x.s === s);
+};
+const askHolder = (q) => { const p = paneFor(q.s); return p && askEl(p, q.a.id); };
+const holdsText = (el) => el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') && !el.closest('.ask') && el.value !== '';
+
+function focusQueued(q) {
+  const p = paneFor(q.s);
   if (!p) return false;
-  const asks = p.s.asks.value;
-  if (!asks.length) return false;
-  const at = asks.findIndex((a) => askEl(p, a.id) === document.activeElement);
-  const next = asks[(at < 0 ? (dir > 0 ? 0 : asks.length - 1) : at + dir + asks.length) % asks.length];
-  return focusAsk(p, next);
+  const at = document.activeElement;
+  if (at && at.tagName === 'TEXTAREA' && at.closest('.composer')) returnTo = at;
+  taken.add(tag(q.s, q.a));
+  owed = true;
+  focusPane(p.id);
+  return focusAsk(p, q.a);
+}
+
+function steer(poll) {
+  clearTimeout(steerT);
+  if (!poll) tries = 0;
+  const head = queue.peek()[0];
+  if (!head) { ui.held.value = false; giveBack(); return; }
+  if (taken.has(tag(head.s, head.a))) { ui.held.value = false; return; }
+  const el = askHolder(head), at = document.activeElement;
+  if (el && el.contains(at)) { taken.add(tag(head.s, head.a)); return; } // already there
+  const wait = typedAt + PAUSE_MS - performance.now();
+  const busy = holdsText(at) || menu.peek() || ui.cmd.peek() != null || (at && at.closest && at.closest('.ask'));
+  if (wait > 0 || busy) {
+    ui.held.value = true;
+    steerT = setTimeout(() => steer(true), Math.max(wait, 150));
+    return;
+  }
+  if (!el) { // not drawn yet (it arrived this tick), or no pane draws it
+    if (++tries < DRAW_TRIES) steerT = setTimeout(() => steer(true), 50);
+    return;
+  }
+  ui.held.value = false;
+  focusQueued(head);
+}
+effect(() => { queue.value; steer(); });
+
+function giveBack() {
+  const back = returnTo, at = document.activeElement;
+  returnTo = null;
+  if (!owed) return;
+  owed = false;
+  const lost = !at || at === document.body || at.closest('.ask') || at.classList.contains('pane');
+  if (!lost) return;
+  if (back && back.isConnected) back.focus(); else toComposer();
+}
+
+// The asks session `s` holds now take no focus by themselves (their turn is being cancelled).
+const letBe = (s) => { for (const a of s.asks.peek()) taken.add(tag(s, a)); };
+
+function focusHead() {
+  const head = queue.peek()[0];
+  return head ? focusQueued(head) : false;
+}
+
+// Esc in an ask: back to the composer the ask took focus from, else the pane's own.
+function leaveAsk(p) {
+  const back = returnTo;
+  owed = false;
+  if (back && back.isConnected) back.focus(); else if (p.focusComposer) p.focusComposer();
+}
+
+// Tab / shift+Tab: the next (previous) ask in the queue.
+function cycleAsk(dir = 1) {
+  const q = queue.peek();
+  if (!q.length) return false;
+  const at = q.findIndex((x) => { const el = askHolder(x); return el && el.contains(document.activeElement); });
+  return focusQueued(q[(at < 0 ? (dir > 0 ? 0 : q.length - 1) : at + dir + q.length) % q.length]);
 }
 
 const toggle = (rail) => { ui[rail].value = !ui[rail].value; };
@@ -108,15 +224,16 @@ function toast(text, err) {
 const KEYS = [
   ['⏎', 'send / steer', toComposer],
   ['⌥⏎', 'queue', toComposer],
-  ['esc', 'leave composer', () => document.activeElement && document.activeElement.blur()],
-  ['tab', 'focus next ask', () => cycleAsk(1)],
-  ['y ⏎ / n / 1-9', 'answer the focused ask', () => cycleAsk(1)],
+  ['esc', 'leave composer / ask', () => document.activeElement && document.activeElement.blur()],
+  ['tab', 'next ask', () => cycleAsk(1)],
+  ['←→ ⏎', 'choose / take (in an ask)', focusHead],
+  ['y n 1-9', 'yes / no / option (in an ask)', focusHead],
   ['^c', 'stop turn', cancel],
   ['^b', 'sidebar', () => toggle('lrail')],
   ['^i', 'inspector', () => toggle('rrail')],
   ['[ ]', 'inspector tab', () => cycleRight(1)],
   ['⌥w  :q', 'close pane', () => closePane()],
-  [':vsplit', 'mirror pane', () => mirrorPane()],
+  [':vsplit :split', 'mirror right / down', () => mirrorPane(undefined, 'row')],
   [':', 'commands', () => openCmd()],
 ];
 
@@ -128,9 +245,9 @@ function whichKey() {
 const COMMANDS = {
   q: ['close the pane', () => closePane()],
   close: ['close the pane', () => closePane()],
-  open: ['open a pane on this door', () => openPane()],
-  vsplit: ['mirror the focused pane', () => mirrorPane()],
-  split: ['mirror the focused pane', () => mirrorPane()],
+  open: ['open a pane on this door (or on session id <arg>, with the hub)', (arg) => openPane(arg || DOOR)],
+  vsplit: ['mirror the focused pane to the right', () => mirrorPane(undefined, 'row')],
+  split: ['mirror the focused pane below', () => mirrorPane(undefined, 'col')],
   stop: ['cancel the running turn', cancel],
   queue: ['queue text (or the composer) behind the turn', (arg) => withPane((p) => p.s.submit('queue', arg || ''))()],
   reconnect: ['drop the stream and replay', withPane((p) => p.s.reconnect())],
@@ -140,7 +257,8 @@ const COMMANDS = {
 };
 
 function openCmd() {
-  batch(() => { ui.cmd.value = ''; ui.hint.value = { mode: 'menu' }; ui.menu.value = null; });
+  closeMenu();
+  batch(() => { ui.cmd.value = ''; ui.hint.value = { mode: 'menu' }; });
 }
 function closeCmd() {
   batch(() => { ui.cmd.value = null; if (ui.hint.value && ui.hint.value.mode === 'menu') ui.hint.value = null; });
@@ -158,12 +276,74 @@ function runCmd(text = ui.cmd.value || '') {
   else toast(`:${w}: session commands arrive with the registry (M4)`, true);
 }
 
+// ---------------------------------------------------------------- menus
+// What a split opens: in M1 only a mirror; new, resume and another session
+// arrive with the hub.
+function splitItems(p, dir) {
+  const others = sessions().filter(([sid]) => sid !== p.sid);
+  return [
+    { label: 'mirror', hint: dir === 'row' ? ':vsplit' : ':split', on: () => openPane(p.sid, { at: p.id, dir }) },
+    { label: 'new session', off: HUB },
+    { label: 'resume…', off: HUB },
+    others.length ? { label: 'existing session', sub: others.map(([sid, s]) => ({ label: sessionName(s), on: () => openPane(sid, { at: p.id, dir }) })) }
+      : { label: 'existing session', off: HUB },
+  ];
+}
+
+function showItems(p) {
+  return [
+    ...sessions().map(([sid, s]) => (sid === p.sid ? { label: sessionName(s), tick: true, off: 'shown here' }
+      : { label: sessionName(s), on: () => showIn(p.id, sid) })),
+    { sep: true },
+    { label: 'new session', off: HUB },
+    { label: 'resume…', off: HUB },
+  ];
+}
+
+const paneMenu = (p, at) => openMenu([
+  { label: 'split right', sub: splitItems(p, 'row') },
+  { label: 'split down', sub: splitItems(p, 'col') },
+  { label: 'show…', sub: showItems(p) },
+  { label: 'mirror', on: () => mirrorPane(p.id) },
+  { label: 'reconnect', hint: ':reconnect', on: () => p.s.reconnect() },
+  { label: 'close', hint: '⌥w  :q', on: () => closePane(p.id) },
+], at, { title: 'pane', owner: 'pane-' + p.id });
+
+const splitMenu = (p, dir, at) => openMenu(splitItems(p, dir), at,
+  { title: dir === 'row' ? 'split right' : 'split down', owner: `split-${dir}-${p.id}` });
+
+function sessionMenu(e, p) {
+  e.preventDefault();
+  const f = focused.value;
+  openMenu([
+    { label: 'open in new pane', on: () => openPane(p.sid) },
+    { label: 'show in focused pane', off: !f ? 'no pane focused' : f.sid === p.sid ? 'shown there' : null, on: () => showIn(f.id, p.sid) },
+    { label: 'fork (latest)', off: HUB },
+    { label: 'close its door', off: HUB },
+  ], atPointer(e), { title: sessionName(p.s) });
+}
+
+function statusMenu(e) {
+  e.preventDefault();
+  const p = focused.value, hl = p && p.s.hello.value;
+  openMenu([
+    { label: 'model', sub: [{ label: (hl && hl.model) || '?', tick: true, off: HUB }] },
+    { label: 'mode', sub: ['yolo', 'accept edits', 'manual', 'auto'].map((m) => ({ label: m, tick: m === 'yolo' && !!(hl && hl.yolo), off: HUB })) },
+    { sep: true },
+    ...Object.entries(COMMANDS).map(([c, [what, fn]]) => ({ label: ':' + c, hint: what, on: () => fn('') })),
+  ], atPointer(e), { title: 'status' });
+}
+
 // ---------------------------------------------------------------- views
 const act = {
   focus: focusPane,
-  menu: (id) => { ui.menu.value = ui.menu.value === id ? null : id; },
-  mirror: mirrorPane,
+  paneMenu,
+  splitMenu,
   close: closePane,
+  leaveAsk,
+  focusHead,
+  letBe,
+  toast,
 };
 
 // Frame-title tabs, plus the arrow that folds the sidebar to its rail
@@ -188,9 +368,9 @@ function SessionItem({ p }) {
   const s = p.s, hl = s.hello.value, conn = s.conn.value, run = s.running.value;
   const name = hl ? hl.session.split('/').pop().replace(/\.[^.]+$/, '') || 'session' : 'connecting…';
   const state = s.bye ? 'kept' : conn !== 'live' ? conn : run === true ? 'running' : run === false ? 'idle' : 'unknown';
-  return html`<div class="it">
+  return html`<div class="it" onContextMenu=${(e) => sessionMenu(e, p)}>
     <span class=${s.bye ? 'faint' : 'g'}>${s.bye ? '○' : '●'}</span>
-    <${K} cls=${'grow' + (ui.focus.value === p.id ? ' on' : '')} title=${hl ? hl.session : ''} on=${() => { focusPane(p.id); toComposer(); }}>${name}${p.mirror ? ' (mirror)' : ''}</${K}>
+    <${K} cls=${'grow' + (ui.focus.value === p.id ? ' on' : '')} title=${hl ? hl.session : ''} on=${() => { focusPane(p.id); toComposer(); }}>${name}${isMirror(p) ? ' (mirror)' : ''}</${K}>
     <span class=${run === true ? 'y' : 'faint'}>${state}</span>
   </div>`;
 }
@@ -314,7 +494,7 @@ function Tiles() {
     addEventListener('resize', size);
     return () => { ro.disconnect(); removeEventListener('resize', size); };
   }, []);
-  const panes = ui.panes.value, tree = ui.tree.value, box = ui.box.value, f = ui.focus.value, menu = ui.menu.value;
+  const panes = ui.panes.value, tree = ui.tree.value, box = ui.box.value, f = ui.focus.value;
   const lay = tile.layout(tree, box);
   const rect = new Map(lay.panes.map((r) => [r.id, r]));
   let body;
@@ -326,7 +506,7 @@ function Tiles() {
       <div class="empty">no pane open.${'\n\n'}<${K} cls="y" on=${() => openPane()}>:open</${K}>  reconnect this session${'\n'}<span class="faint">ctrl+enter  new pane with a picker (arrives with the hub, M2)</span></div></div>`;
   } else {
     body = [
-      ...panes.map((p) => rect.get(p.id) && html`<${Pane} key=${p.id} p=${p} rect=${rect.get(p.id)} focused=${p.id === f} menuOpen=${menu === p.id} act=${act} />`),
+      ...panes.map((p) => rect.get(p.id) && html`<${Pane} key=${p.id + ' ' + p.sid} p=${p} rect=${rect.get(p.id)} focused=${p.id === f} mirror=${isMirror(p)} act=${act} />`),
       ...lay.dividers.map((d) => html`<${Divider} key=${d.path} d=${d} />`),
     ];
   }
@@ -371,16 +551,17 @@ function Status() {
   const off = !p || !['live', 'replaying'].includes(conn);
   const badge = !p ? 'NONE' : s.bye ? 'BYE' : off ? 'OFF' : run === true ? 'RUN' : run === false ? 'IDLE' : '?';
   const cls = { RUN: 'run', IDLE: 'idle', '?': 'unknown' }[badge] || 'off';
-  const ctx = s && s.ctx.value, budget = s && s.budget.value, asks = s ? s.asks.value.length : 0;
+  const ctx = s && s.ctx.value, budget = s && s.budget.value, waiting = queue.value.length;
   const hk = (k, label, fn, opt) => html`<${K} cls=${opt ? 'opt' : ''} on=${fn}><span class="key">${k}</span> ${label}</${K}>`;
-  return html`<footer id="status"><span class="norm">
+  return html`<footer id="status" onContextMenu=${statusMenu}><span class="norm">
     <span class=${'badge ' + cls} title=${badge === '?' ? 'this page connected after the turn began or before any turn event' : ''}>${badge}</span>
     ${badge === '?' && html`<span class="faint unk">state unknown until next turn event</span>`}
     ${hl && html`<span class="c b">${hl.model || '?'}</span>`}
     ${hl && hl.yolo && html`<span class="yolo">yolo</span>`}
     ${ctx != null && html`<span class="faint">ctx ${ctx >= 1000 ? (ctx / 1000).toFixed(1) + 'k' : ctx} tok</span>`}
     ${budget != null && budget < 3 && html`<span class="warn">${budget} calls left</span>`}
-    ${asks > 0 && html`<${K} cls="y" title="focus the first ask" on=${() => cycleAsk(1)}>${asks} ask${asks > 1 ? 's' : ''}</${K}>`}
+    ${waiting > 0 && html`<${K} cls="y waitn" title=${ui.held.value ? 'the oldest ask takes focus when you pause typing; click to go now' : 'focus the oldest ask'}
+      on=${focusHead}>${ui.held.value ? '▶ ' : ''}${waiting} waiting</${K}>`}
     ${p && conn !== 'live' && html`<span class=${conn === 'replaying' ? 'faint' : 'warn'}>${conn}</span>`}
     <span class="grow"></span>
     <span class="hints">
@@ -395,7 +576,7 @@ function Status() {
 
 function App() {
   const cls = (ui.lrail.value ? 'lrail ' : '') + (ui.rrail.value ? 'rrail' : '');
-  return html`<main id="main" class=${cls}><${Left} /><${Tiles} /><${Right} /></main><${Hint} /><${Status} />`;
+  return html`<main id="main" class=${cls}><${Left} /><${Tiles} /><${Right} /></main><${Hint} /><${Status} /><${Menus} />`;
 }
 
 // ---------------------------------------------------------------- cells
@@ -418,6 +599,7 @@ const cells = () => cell;
 document.addEventListener('keydown', (e) => {
   const k = e.key.toLowerCase(), t = e.target;
   const typing = t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT');
+  if (typing && !t.closest('.ask')) typedAt = performance.now(); // the pause the ask queue waits for
   // global, even while typing
   if (e.ctrlKey && !e.altKey && k === 'b') { e.preventDefault(); toggle('lrail'); return; }
   if (e.ctrlKey && !e.altKey && k === 'i') { e.preventDefault(); toggle('rrail'); return; }
@@ -435,11 +617,11 @@ document.addEventListener('keydown', (e) => {
   if (typing) return;
   if (e.key === ':') { e.preventDefault(); openCmd(); return; }
   if (e.key === '?') { e.preventDefault(); whichKey(); return; }
-  if (e.key === 'Escape') { ui.hint.value = null; ui.menu.value = null; return; }
+  if (e.key === 'Escape') { ui.hint.value = null; closeMenu(); return; }
+  if (e.key === 'Tab' && queue.value.length) { e.preventDefault(); cycleAsk(e.shiftKey ? -1 : 1); return; }
   const p = focused.value;
   if (!p) return;
   if (e.ctrlKey && k === 'c' && !String(getSelection())) { e.preventDefault(); p.s.cancel(); return; }
-  if (e.key === 'Tab' && p.s.asks.value.length) { e.preventDefault(); cycleAsk(e.shiftKey ? -1 : 1); return; }
   if (e.ctrlKey || e.altKey || e.metaKey || e.repeat) return;
   if (t && t.closest && t.closest('.ask')) return; // an ask's own keys, handled by its block
   if (e.key === '[') { cycleRight(-1); return; }
@@ -450,10 +632,7 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-// A click anywhere outside an open pane menu closes it.
-document.addEventListener('mousedown', (e) => {
-  if (ui.menu.value && !e.target.closest('.pmenu, .ptitle')) ui.menu.value = null;
-});
+document.addEventListener('mousedown', outside);
 
 // ---------------------------------------------------------------- boot
 measure();

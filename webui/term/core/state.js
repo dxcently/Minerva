@@ -66,6 +66,10 @@ export class Session {
     this.strip = signal(this.life.render());
     this.clock = signal(0);
     this.timer = 0;
+    // The door turned down a note beside an answer (notes arrive with a
+    // pending eidolon PR): later answers go without one.
+    this.noNote = signal(false);
+    this.arrived = new Map(); // ask_id -> arrival order, kept across reconnects
     this.reset();
     this.run();
   }
@@ -479,18 +483,25 @@ export class Session {
   // ---------------------------------------------------------------- asks
   ask(f) {
     if (this.asks.value.some((a) => a.id === f.ask_id)) return;
+    // Arrival order across every session (the page's one ask queue is oldest
+    // first). An ask replayed after a reconnect keeps the place it had.
+    if (!this.arrived.has(f.ask_id)) this.arrived.set(f.ask_id, ++seq);
     const a = {
-      id: f.ask_id, f, fresh: this.live,
+      id: f.ask_id, f, fresh: this.live, n: this.arrived.get(f.ask_id),
       busy: signal(false), err: signal(''), done: signal(null),
     };
     if (f.kind === 'approval') {
-      const [yes, no] = f.answers && f.answers.length === 2 ? f.answers : ['yes', 'no'];
-      a.yes = yes; a.no = no;
+      // `always` is offered only by a door that lists it (gap 13), and is
+      // never what yes or no fall back to. No plain no offered: `no` is greyed.
+      const offered = f.answers && f.answers.length >= 2 ? f.answers : ['yes', 'no'];
+      const plain = offered.filter((x) => x !== 'always');
+      a.yes = plain.includes('yes') ? 'yes' : plain[0] || null;
+      a.no = plain.includes('no') ? 'no' : plain.length > 1 ? plain[plain.length - 1] : null;
+      a.always = offered.includes('always') ? 'always' : null;
     } else {
       a.options = (f.options || []).map((o, i) => ({ ...o, key: i < 9 ? String(i + 1) : null }));
       // A question whose options are exactly yes and no (core confirm()
-      // arrives this way, user.rs:380-403) answers yes by the same two steps
-      // as an approval's allow; other questions stay one step.
+      // arrives this way, user.rs:380-403) also answers to `y` and `n`.
       const labels = a.options.map((o) => String(o.label).trim().toLowerCase());
       if (labels.length === 2 && labels.includes('yes') && labels.includes('no')) {
         a.yesno = true;
@@ -507,38 +518,44 @@ export class Session {
 
   askSettled(f) {
     const a = this.asks.value.find((x) => x.id === f.ask_id);
-    if (!a) return;
-    let text;
-    if (f.how === 'cancelled') text = 'cancelled';
-    else if (a.f.kind === 'approval') text = f.answer === a.yes ? 'allowed' : f.answer === a.no ? 'denied' : `answered ${f.answer}`;
-    else text = `answered: ${f.answer}`;
-    this.dropAsk(a, `${a.f.kind === 'approval' ? a.f.tool : 'question'}: ${text}`, text);
+    if (a) this.dropAsk(a, f.how === 'cancelled' ? { how: 'cancelled' } : { how: 'answered', answer: f.answer });
   }
 
-  dropAsk(a, line, text) {
+  // A settled ask leaves the queue but stays in the transcript, folded to
+  // what was picked (panes/session.js Settled), so its choices can still be
+  // read. The note is known only when this page sent it.
+  // done: { how: 'answered' | 'cancelled' | 'elsewhere', answer?, note? }
+  dropAsk(a, done) {
     this.asks.value = this.asks.value.filter((x) => x !== a);
-    const cls = text === 'allowed' ? 'g' : text === 'denied' ? 'r' : '';
-    const settled = line ? { line, cls } : null;
-    if (a.call) { a.call.ask.value = null; a.call.settled.value = settled; }
-    a.done.value = settled || { line: '', cls: 'gone' };
+    const sent = a.sent && a.sent.answer === done.answer ? a.sent : {};
+    a.done.value = { ...done, note: sent.note };
+    if (a.call) { a.call.ask.value = null; a.call.settled.value = a; }
   }
 
-  async answer(a, label) {
-    if (a.busy.value || !this.asks.value.includes(a)) return;
+  // reply: { answer, note? }. A door that turns the note down (400/422, a
+  // door without the pending eidolon PR) is remembered, so the next try goes
+  // without it. Resolves to the status (0 = not sent).
+  async answer(a, reply) {
+    if (a.busy.value || !this.asks.value.includes(a)) return 0;
     a.busy.value = true;
     a.err.value = '';
-    const r = await post(this.sid, 'answer', { ask_id: a.id, answer: label });
-    if (r.status === 204) return; // ask-settled draws the rest
+    a.sent = reply; // set first: the ask-settled frame can beat the POST's own answer
+    const r = await post(this.sid, 'answer', { ask_id: a.id, ...reply });
+    if (r.status === 204) return 204; // ask-settled draws the rest
+    a.sent = null;
     if (r.status === 409) {
-      this.dropAsk(a, null);
+      if (this.asks.value.includes(a)) this.dropAsk(a, { how: 'elsewhere' });
       this.hooks.toast('that ask was answered elsewhere');
-      return;
+      return 409;
     }
     a.busy.value = false;
-    a.err.value = `${r.status || 'network'}: ${(r.data && r.data.error) || 'not accepted'}`;
+    const why = `${r.status || 'network'}: ${(r.data && r.data.error) || 'not accepted'}`;
+    if ((r.status === 400 || r.status === 422) && reply.note != null) {
+      this.noNote.value = true;
+      a.err.value = `the door did not take the note (${why}); choose again to send without it`;
+    } else a.err.value = why;
+    return r.status;
   }
-
-  // The allow confirm's arm is view state, per pane (panes/session.js AskBlock).
 
   // ---------------------------------------------------------------- turns
   // A turn that ended leaves no spinner behind: calls it never finished are

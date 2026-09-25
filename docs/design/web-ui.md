@@ -80,7 +80,9 @@ The status line's left side is badge, model in bold cyan, persona in bold magent
 | Which-key hint line | after a leader key or on `?`, a line of `key label` pairs; **each entry is clickable text** | above the status line |
 | Frame-title tabs | `[rec] tree diff graph run` cut into a frame's top border; click or `[`/`]` | sidebars, inspector |
 | Rail | a collapsed sidebar leaves a 1-cell-wide rail; click it to reopen | left and right edges |
-| Clickable text | `jump`, `y allow`, `n deny`, hint entries: underlined on hover, `<span role="button" tabindex="0">`, so "no buttons" is visual only, not a screen-reader loss (reasoned) | inline |
+| Clickable text | `jump`, an ask's choices, hint entries: underlined on hover, `<span role="button" tabindex="0">`, so "no buttons" is visual only, not a screen-reader loss (reasoned) | inline |
+| Frame glyphs (decided) | `⇥` split right, `⇩` split down, `×` close, cut into each pane's top border on the right; each has a tooltip | pane frames |
+| Menus (decided) | a square frame of lines, opened by right-click (at the pointer) or a click on a title or glyph (under it); keys: up/down, Enter or right into a submenu, left or Esc out; closes on an outside click; flips to the other side of its anchor rather than run off screen. Greyed lines say why (`needs the hub`) | pane titles, glyphs, chat rows, sidebar sessions, status line |
 
 ---
 
@@ -101,7 +103,7 @@ The status line's left side is badge, model in bold cyan, persona in bold magent
 |   peers                      |   +- approve: write ./notes.md ---------------+    |  scout  running  2 calls      |
 |   ~ scout@/srv/ctf  ●        |   | outside the working directory. Run it?    |    |                               |
 |   ~ vex@lab-2       ○        |   | judge: structural rule                    |    | parked                        |
-|                              |   |   y allow    n deny                       |    |  wait_for :31337  tick 4      |
+|                              |   | [yes] always no  chat about it  fork      |    |  wait_for :31337  tick 4      |
 |                              |   +-------------------------------------------+    |                               |
 |                              |   ~ scout  "port 31337 is open"                    |                               |
 |                              |  -- 1 waiting · jump --------------------------    |                               |
@@ -122,8 +124,8 @@ The status line's left side is badge, model in bold cyan, persona in bold magent
 | Left sidebar | owl on top; tabs `sessions` / `projects` / `mesh`; sessions `●` open, `○` kept; peers listed under sessions | `ctrl+b` -> rail | chat apps' conversation list; TUI panel frames |
 | Centre | tiled session panes (section 4) | never | tiling window managers |
 | Right sidebar "inspector" | tabs `rec` / `tree` / `diff` / `graph` / `run`; follows the **focused** pane | `ctrl+i` -> rail | IDE side panels |
-| Inline ask | yellow-framed block in the transcript with `y allow` / `n deny` | - | agentic coding assistants; TUI `dialog: yellow` |
-| Waiting strip | `N waiting · jump` above the composer when an ask is off-screen | - | chat "new messages" pills |
+| Inline ask | yellow-framed block in the transcript: a line of choices, one highlighted, and a `note ›` line (7.1); once settled, one folded line | - | agentic coding assistants; TUI `dialog: yellow` |
+| Waiting strip | `N waiting · jump` above the composer when an ask is off-screen; the status line counts the page's whole ask queue | - | chat "new messages" pills |
 | Composer | double-line gold frame, tinted fill, context chips, hint in the bottom border | - | message boards |
 | Status line | mode badge, model (cyan), persona (magenta), yolo, ctx %, clickable hints | - | the TUI's status line (**observed** `default.rn:418-431`) |
 
@@ -169,13 +171,27 @@ Gain: predictable layout, Hyprland muscle memory. Loss: the fifth pane is small 
 | `ctrl+enter` | new pane with a **picker inside it**: `n` new session, `r` resume a kept one, `m` mirror an open one | picker is a list in the pane, not a modal |
 | `alt+w` / `:q` | close the **pane**; the session is kept (`○`) | not `ctrl+w`: browsers reserve it and do not deliver it to pages in most cases (reasoned from browser behaviour). See Q3 |
 | `ctrl+b` / `ctrl+i` | toggle left sidebar / inspector | Firefox binds `ctrl+b` and `ctrl+i`; `preventDefault` works for these (hypothesis: test) |
-| `Tab`, then `y` ⏎ / `n` / `1-9` | answer the focused ask | keys reach an ask only after `Tab` or a click puts focus on it (a visible mark shows which); `y` arms ("⏎ to confirm allow"), ⏎ allows, `n` denies at once; held keys (`e.repeat`) ignored. See 7.1 |
+| in an ask: `←`/`→`, ⏎, Tab or `↓` / `↑`, `y`, `n`, `1-9`, Esc | move the highlight, take it (with the note if the line is open), open the note line / back to the choices, yes, no, a question's option, back to the composer (from the note line: close it, drop the note) | the oldest ask takes focus by itself only when the composer is empty (7.1); `y`/`n`/digits are text in the note line; held keys ignored |
+| `Tab` / `shift+Tab` | from the composer: the oldest ask; in an ask Tab opens the note line, shift+Tab the previous ask | Tab is the way to a waiting ask while the composer holds text |
 | `alt+w` | close the pane | matched on `e.key` `w`/`W` first (so AZERTY's w works), on `e.code` `KeyW` only when `e.key` is not ASCII (macOS Option types `∑`); not while the composer holds text |
-
-Every key is a shortcut for something also clickable (decided): the composer's bottom-border words `send · steer · queue · stop`, the `:` in the status line (opens a clickable command list), a pane's frame title (click or right-click: a menu with `mirror`, `reconnect`, `close`), rails, tab labels, and tile borders (drag to resize).
 | `ctrl+c` | cancel the focused pane's turn (when composer is empty or unfocused) | mirrors the TUI |
 | `:` | command line | outside the composer |
 | `?` | which-key hint line | |
+
+Every key is a shortcut for something also clickable (decided): the composer's bottom-border words `send · steer · queue · stop`, the `:` in the status line (opens a clickable command list), `N waiting` in the status line (focus the oldest ask), rails, tab labels, tile borders (drag to resize), and these menus and glyphs:
+
+| Where | Opens | Live in M1 | Needs the hub |
+|---|---|---|---|
+| pane title, click or right-click | split right ▸ · split down ▸ · show… ▸ · mirror · reconnect · close | mirror, reconnect, close; the split pickers' `mirror` | show…: another session, new session, resume… |
+| `⇥` / `⇩` on the pane frame | the split picker: mirror · new session · resume… · existing session ▸ | mirror | the rest |
+| `×` on the pane frame | closes the pane | yes | - |
+| a chat row, right-click | fork from here · copy · copy as markdown · quote into composer | copy (the selection, if any), copy as markdown, quote | fork from here |
+| a sidebar session, right-click | open in new pane · show in focused pane · fork (latest) · close its door | open in new pane (a mirror), show in focused pane | fork, close its door |
+| the status line, right-click | model ▸ · mode ▸ (yolo / accept edits / manual / auto) · every `:` command | the `:` commands | model, mode |
+
+A pane's session can change (`show…`): the page structures a pane as `{ id, sid }`, so a mirror becomes an independent pane on another session once the hub lists more than one. In M1 only the one door session exists; `:open <id>` opens a pane on another session id, for the hub's `/s/<id>/api/`.
+
+The `ctrl+enter` picker row above is the M2 plan; in M1 the split picker is a menu off the `⇥`/`⇩` glyphs, not a list inside the new pane.
 
 ### 4.3 Mirroring
 
@@ -209,7 +225,7 @@ Routes (**observed** `lib.rs:7-19`, `serve.rs:240-277`; launch **(in progress)**
 | `GET /api/events` | - | `200 text/event-stream`; `401` empty |
 | `POST /api/say` | `{"text", "mode"?: "send"\|"steer"}`, text only (`serve.rs:413`) | `202 {"queued"}`; `400`; `413` over 8 MiB |
 | `POST /api/cancel` | none | `204`; `409 {"error"}` idle |
-| `POST /api/answer` | `{"ask_id", "answer"}` | `204`; `409` not pending; `422` not offered, stays pending (`serve.rs:445-464`) |
+| `POST /api/answer` | `{"ask_id", "answer"}`; with the pending eidolon PR also `"note"?` (free text beside the answer) | `204`; `409` not pending; `422` not offered, stays pending (`serve.rs:445-464`); a door without the PR may refuse `note` (400/422) or ignore it |
 | `POST /api/launch` **(in progress)** | `{"window":"terminal"\|"editor"\|"files","path"?}` | `200 {"opened"}`; `422`; `501`; `500` |
 
 Every frame is one SSE `data:` line of JSON with a `type`; no `id:`, no `event:` (**observed** `stream.rs:44-46`, `wire.rs:28`). Order per connection (**observed** `stream.rs:108-139`): subscribe, `hello`, replayed branch, pending `ask`s oldest first, `caught-up`, then live frames until `lagged` or `goodbye`.
@@ -277,20 +293,40 @@ Components: **Tr** transcript (rows keyed by `record`), **Dr** draft (streaming 
 
 ### 7.1 Inline asks
 
+**Decided 2026-09-25 (rework):** one page-wide queue with automatic focus, a highlighted choice line and an optional note. It replaces the two-step `y` ⏎ / two-click confirm and the "keys only after Tab" rule; the safety those gave now comes from the empty-composer rule, the pause guard and the landing guard below.
+
+```text
++- ▶ approve: bash  rm -rf ./build ---------------------------------+
+| bash — deletes files. Run it?                                     |
+| reason: destructive                                               |
+| [yes]  always  no  chat about it  fork  + note   tab: add a note  |
+| note › (only once opened: tab, ↓ or + note; esc drops it)         |
+| keys: ←→ choose · ⏎ take · tab note · y yes · n no · esc composer |
++-------------------------------------------------------------------+
+   greyed: always (needs eidolon PR), fork (needs the hub)
+   settled:  ▸ approve: bash rm -rf ./build → no (note: only ./build · chat about it)
+```
+
 | Rule | Why |
 |---|---|
-| Map keyed by `ask_id`, any number at once, per pane | the door settles only the one named (**observed** `user.rs:1-8`, `user.rs:221-239`) |
+| Map keyed by `ask_id` per session, any number at once; the page keeps **one queue** of every pending ask across all panes and sessions, oldest first by arrival; the status line shows `N waiting` (click: focus the oldest) | the door settles only the one named (**observed** `user.rs:1-8`, `user.rs:221-239`); one place to look, however many panes |
 | Approval block sits right after `Tc[call_id]`, input shown through the tool's renderer | `call_id` pairs them (**observed** `user.rs:67-69`) |
-| `y allow` / `n deny` send the label verbatim (`yes`/`no`), questions send the option `label` | door checks membership (**observed** `user.rs:95-100`) |
-| Keys act on an ask only while **it holds focus**: `Tab` (or clicking the ask block) moves focus onto it, and a focused ask shows a mark. A click elsewhere in the transcript arms nothing (decided, option b) | two asks at once make "latest" a guess; a stray `y` must not approve |
-| By key: exactly `y` (or `Y`, for Caps Lock), then ⏎. `y` shows "⏎ to confirm allow", ⏎ allows; any other key cancels the arm, except a bare modifier (Shift, Ctrl, Alt, Meta, Caps Lock), which does nothing; `n` denies at once. `e.repeat` is ignored everywhere. Inside an ask only the ask's own key handler acts: Enter or Space on a focused `[allow]` / `[confirm allow?]` never allows (on an armed one it disarms) | a held or doubled `y`, or a stray click then ⏎, cannot allow |
-| By click or tap: `[allow]` becomes `[confirm allow?]` for 3 s, and a second click at least 400 ms after the arming one allows, whatever `e.detail` says (a double-click lands sooner, so it never confirms; slow repeated clicks are not refused). With a **mouse** (`pointerType === 'mouse'`) a click arms only after the pointer has rested on the ask for about 300 ms. Touch, pen and pointerless clicks (a screen reader's activate) have no hover to rest, so they arm on the first tap. A click that does nothing yet (still in the rest window, or too soon to confirm) flashes a faint `steady…` on `[allow]`, so a click never silently does nothing. `[deny]` is one click | parity across mouse, touch, pen and assistive tech (a tap fires `pointerleave` before `click`, and a soft keyboard does not open for a div, so a hover rule or keys alone would lock them out); an ask drawn under a moving mouse, or a double-click, cannot allow |
-| The arm (key or click) belongs to the pane that armed it: a mirror's `[allow]` is not armed by another pane, and closing a pane drops its arm | a confirm is one person's two deliberate acts in one place |
-| A question whose options are exactly `yes` / `no` (core `confirm()` arrives this way, **observed** `user.rs:380-403`) answers `yes` by the same two steps as allow (`y` ⏎, or two clicks); other questions answer on one key (`1-9`) or one click | a confirm is an approval in all but name |
-| Disabled while the POST is in flight; `204` -> wait for `ask-settled`; `409` -> remove, toast "answered elsewhere"; `422` -> keep, show error | (**observed** `user.rs:146-155`) |
+| **The oldest ask takes focus by itself, once** (once per session + `ask_id`, so a reconnect's replayed copy does not take it again and keeps its place in the queue): its pane scrolls to it and it is marked `▶`; in the focused pane if that pane shows its session, else the first pane that does | the operator should not have to hunt for what blocks the turn |
+| **Empty-composer rule**: an ask never takes focus from a text field holding text (a composer with anything typed in it). It waits; the status line says `▶ N waiting`, and Tab from the composer, a click on `▶ N waiting` or a click on the ask goes there | a half-written message is never interrupted, however long the pause |
+| **Pause guard** (composer empty): focus moves only after 1 s with no keys in a composer or the `:` line, and not while a menu is open or another ask holds focus; until then the status line says `▶ N waiting` | a message being typed must not be interrupted, nor its keystrokes land in an ask |
+| **Landing guard**: for 0.3 s after focus lands on an ask its keys do nothing; for 0.3 s after an ask appears, jumps into view, or moves because an ask above it in the same pane settled, a click on it does nothing but say `steady…`. The second click of a double click is ignored; IME composition keys (`isComposing`, keyCode 229) are ignored | an Enter or click already under way when the ask arrived or moved must not answer it |
+| When the queue empties, focus goes back to the composer it was taken from, caret where it was. Esc leaves an ask (still queued) for the composer; neither it nor the asks behind it take focus by themselves after that (the head was taken; the queue waits behind it), but `N waiting`, Tab, a click and `jump` reach them | the ask gives back what it borrowed; Esc is honoured |
+| Keys in an ask: `←`/`→` move the highlight (it starts on the first live choice, never `+ note`; greyed choices are skipped), ⏎ takes it, Tab or `↓` open the note line and `↑` or Tab go back to the choices (the note kept), `y`/`n` yes/no at once (approvals and yes/no questions; never `always` or `+ note`), `1-9` a question's option, Esc to the composer, shift+Tab the previous ask. In the note line: `y`/`n`/digits are text, ⏎ takes the highlighted choice with the note, Esc closes the line and drops the note. Held keys are ignored. Mouse: one click on a choice; a click on `+ note` opens the note line | mouse for everything, keys the same functions |
+| Approval choices: `yes · always · no · chat about it · fork · + note`. Question: `1 … n · chat about it · + note`. `yes`/`no` send the offered labels verbatim, options their `label`; `always` is never the fallback for either, and `no` is greyed `not offered` when the answers hold no plain no | door checks membership (**observed** `user.rs:95-100`) |
+| **No free-text answer** to a question: the user's own words go through `chat about it` (decided) | one path for words, the composer |
+| `always` is drawn greyed `needs eidolon PR` unless the approval's `answers` list `always` (gap 13); `fork` greyed `needs the hub` | never a choice the door will refuse |
+| **Note** (optional, pending eidolon PR): closed until asked for (Tab, `↓`, or `+ note` by key or click). Opening it never answers; `+ note` is an entry, not an answer, and ⏎ on it from the note line sends nothing. The choice taken next goes with the note. `POST /api/answer {"ask_id","answer","note"}`. A 400/422 to a body with a note is shown in the ask, the note line goes read-only for that session, and the next choice goes without it. A door that ignores unknown fields drops the note silently (not detectable from the page) | the note is extra, never a reason an answer fails |
+| **`chat about it`**: answer `no` (approvals and yes/no questions; other questions have no no), then `POST /api/cancel`, then the composer gets focus with a `> ` quote of the ask (and the note, if typed). Cancelling the turn also cancels the turn's other pending asks; they take no focus meanwhile | stop, then talk, with the context in front of the user |
+| **Settled asks stay, folded**: one line `▸ approve: … → yes` / `▸ question: … → 31337 (note: …)`; opened (click or ⏎) it lists every choice with the pick marked. Opening it does not take focus from the composer. The note shows only on the page that sent it (`ask-settled` carries no note). Asks are not replayed, so after F5 the fold is gone | after `chat about it` the choices must stay readable while the user types |
+| Highlight and note belong to the pane; every view draws every ask, and an answer from any of them settles it everywhere (`ask-settled`) | mirrors, 4.3 |
+| Disabled while the POST is in flight; `204` -> wait for `ask-settled`; `409` -> folded as "answered elsewhere", toast; `422` -> keep, show error | (**observed** `user.rs:146-155`) |
 | `judged` / `structural` shown plainly; `yolo: true` on an approval shows a warning chip | the operator should see why the gate asked |
 | Waiting strip: `IntersectionObserver` per pane on each ask block; any unanswered block off-screen -> `N waiting · jump`. Asks a pane drew before its observer existed (a mirror opened with an ask pending) are observed as soon as it does | reasoned; no door work |
-| **`a` = always this session: future/upstream.** Needs a core policy rule the session can add at runtime; no such route or answer label exists (answers are the offered labels only, **observed** `user.rs:95-100`) | wanted (decided); listed as gap 13 |
 
 Reconnect check: pending asks arrive before `caught-up` and `hello.pending` equals their count (**observed** `stream.rs:64-67`, `133-139`); assert at `caught-up`.
 
@@ -444,7 +480,7 @@ Before M4 the `:` line offers only page-local commands (`:split`, `:close`, `:st
 | 10. Full replay per reconnect | no SSE `id:` (**observed** `stream.rs:44-46`) | defer (hypothesis: measure a 2 000-record branch); matters more with many panes | not proposed |
 | 12. Stale doc comment | `wire.rs:25-26` cites a page DOM-contract comment that does not exist | reword | not proposed |
 | 14. Verdict has no call id | `policy-verdict` carries `tool, reason, outcome, note?` only (**observed** `wire.rs:61-67`); with two open calls of one tool the page cannot tell which the verdict is for, so it attaches only when exactly one open call has that name and otherwise draws its own row | add `call_id` to the wire's `PolicyVerdict`: the journal record already has `tool_use_id` (**observed** core `session/mod.rs:239-240`), additive | not proposed |
-| **13. "Always this session"** | answers must be offered labels (**observed** `user.rs:95-100`); no runtime allow-rule | core: a session-scoped policy rule + an `always` answer label on approvals | **future/upstream** |
+| **13. "Always this session"** | answers must be offered labels (**observed** `user.rs:95-100`); no runtime allow-rule | core: a session-scoped policy rule + an `always` answer label on approvals | **future/upstream**; the page already draws `always` greyed and enables it when an approval's `answers` list it (7.1) |
 
 Old gap 2 (session switching) is now the hub's job; old gap 11 (token in argv) is closed by the redirect file. Gaps 1 and 5 are one-line, additive, and fix wrong information on screen: send first.
 
