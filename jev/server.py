@@ -53,6 +53,7 @@ import uvicorn
 import _paths
 import automation.graph as automation_graph
 import automation.run as automation_run
+import automation.systemone as automation_systemone
 import automation.warrant as automation_warrant
 
 # --- jevlike -----------------------------------------------------------------
@@ -423,7 +424,14 @@ def _ckpt_id() -> str | None:
 # previous one parked can be reconstructed rather than reported lost (see
 # automation/run.py's module docstring) -- a `Run` that is still in `_RUNS`
 # never touches either, so this costs nothing on the common path either.
+# `JEV_CHOOSER` (automation/systemone.py) swaps jevlike for a System One
+# model over HTTP; a bad spec stops the service here rather than at a run.
+_SYSTEMONE = automation_systemone.from_env()
+
+
 def _chooser(context: str, labels: list[str]) -> list[float]:
+    if _SYSTEMONE is not None:
+        return _SYSTEMONE(context, labels)
     return list(_jevlike()(context, labels))
 
 
@@ -499,7 +507,7 @@ def _automation_start(args: dict) -> dict:
         entail=_entailer,
         option_tokens=OPTION_TOKENS,
         context_tokens=CONTEXT_TOKENS,
-        ckpt_id=_ckpt_id(),
+        ckpt_id=None if _SYSTEMONE is not None else _ckpt_id(),
         warrant=args.get("warrant"),
     )
 

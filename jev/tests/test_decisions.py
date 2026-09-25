@@ -78,6 +78,7 @@ class RowShapeTests(_TempDecisionsDir):
             {
                 "id", "context", "options", "label", "chosen", "probs", "source", "verified",
                 "floor", "margin", "run", "graph", "state", "step", "ts", "ckpt", "action", "warrant",
+                "chooser",
             },
         )
         self.assertEqual(row["label"], 1)

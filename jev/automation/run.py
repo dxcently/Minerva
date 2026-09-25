@@ -150,6 +150,17 @@ from . import graph as graph_mod
 from . import warrant as warrant_mod
 
 Chooser = Callable[[str, list[str]], list[float]]
+
+
+class ChooserUnavailable(Exception):
+    """A chooser that could not score this menu -- the one exception a
+    chooser may raise to *park* the choice instead of ending the run.
+    `chooser` is what the decision log and the escalation name it by."""
+
+    def __init__(self, reason: str, chooser: dict | None = None):
+        self.chooser = chooser
+        super().__init__(reason)
+
 # `(premise, hypotheses) -> [{"contradiction": p, "entailment": p, "neutral":
 # p}, ...]` -- `guards.Entailer`'s own shape, restated here so this module's
 # signatures do not have to import guards.py just to spell it out.
@@ -864,6 +875,14 @@ def _floor_escalation(
     }
 
 
+def _unavailable_escalation(
+    rt: _RunState, path: tuple[str, ...], state: dict, opts: list, error: ChooserUnavailable, floor: float, margin: float
+) -> dict:
+    escalation = _floor_escalation(rt, path, state, opts, [0.0] * len(opts), floor, margin)
+    escalation["why"] = f"chooser unavailable: {error}"
+    return escalation
+
+
 # --- persistence: parked runs surviving a service restart (section 4) -----------
 # The module's one new write hook, called only from `_park` (below) and
 # `_resume_parked_choice` (above) -- never from `_run_tool_action`, on
@@ -1305,7 +1324,7 @@ def _preview_action(rt: _RunState, path: tuple[str, ...], event: str, event_scop
 
 
 def _record_choice(rt, path, opts, index, probs, source, floor, margin, waiting=False):
-    scored = source not in {"rule", "forced"}
+    scored = probs is not None and source not in {"rule", "forced"}
     ordered = sorted(probs, reverse=True) if scored else []
     row = {
         "state": ".".join(path), "step": rt.counts["steps"], "source": source,
@@ -1332,6 +1351,7 @@ def _log_pick(
     verified: str | None,
     floor: float,
     margin: float,
+    chooser: dict | None = None,
 ) -> None:
     _record_choice(rt, path, opts, index, probs, source, floor, margin)
     _trace(rt, "decision", decision=rt.decisions[-1], context=context_str)
@@ -1346,7 +1366,7 @@ def _log_pick(
             options=[o.label for o in opts],
             label=index,
             chosen=chosen.label,
-            probs=list(probs),
+            probs=None if probs is None else list(probs),
             source=source,
             verified=verified,
             floor=floor,
@@ -1358,6 +1378,7 @@ def _log_pick(
             ckpt=rt.ckpt_id,
             action=action,
             warrant=rt.warrant_id,
+            chooser=chooser,
         )
     except OSError as e:
         rt.warnings.append(f"decision log write failed: {e}")
@@ -1410,6 +1431,7 @@ def _finish_choice(
     floor: float,
     margin: float,
     context_str: str,
+    chooser: dict | None = None,
 ) -> Generator[dict, dict, str]:
     """The tail every choice reaches once an `index` has been decided,
     whichever of the three ways got it there (forced, cleared the floor,
@@ -1424,7 +1446,7 @@ def _finish_choice(
             f"stale ref {ref!r}: the snapshot that produced it is no longer current",
             reason="stale", tool="pick",
         )
-    _log_pick(rt, path, context_str, opts, index, probs, source, verified, floor, margin)
+    _log_pick(rt, path, context_str, opts, index, probs, source, verified, floor, margin, chooser)
     event_data = {"option": {**chosen.data, "label": chosen.label, "event": chosen.event}}
     status = yield from _fire_event(rt, path, chosen.event, event_data)
     return status
@@ -1450,6 +1472,7 @@ def _choose_phase(rt: _RunState, path: tuple[str, ...], state: dict, choose_cfg:
         choose_cfg.get("prefer") or [], opts, scope, rt.warnings,
         entail=rt.entail, default_threshold=rt.default_threshold(),
     )
+    chooser = None
     if preferred is not None:
         # docs/design/judgement.md section 3's cost table is literal: "zero
         # cost (no model call)" -- the chooser is never reached on a rule
@@ -1468,20 +1491,34 @@ def _choose_phase(rt: _RunState, path: tuple[str, ...], state: dict, choose_cfg:
     elif len(opts) == 1:
         index, probs, source, verified = 0, [1.0], "forced", None
     else:
-        probs = list(rt.chooser(context_str, [o.label for o in opts]))
+        escalation = None
         rt.counts["chooser_calls"] += 1
-        index = max(range(len(probs)), key=lambda i: probs[i])
-        top1 = probs[index]
-        top2 = sorted(probs, reverse=True)[1]
-        if not (top1 >= floor and (top1 - top2) >= margin):
-            _record_choice(rt, path, opts, None, probs, "jevlike", floor, margin, waiting=True)
-            escalation = _floor_escalation(rt, path, state, opts, probs, floor, margin)
+        try:
+            scores = rt.chooser(context_str, [o.label for o in opts])
+        except ChooserUnavailable as e:
+            chooser = e.chooser
+            probs = None
+            _record_choice(rt, path, opts, None, probs, "unavailable", floor, margin, waiting=True)
+            escalation = _unavailable_escalation(rt, path, state, opts, e, floor, margin)
+        else:
+            chooser = getattr(scores, "chooser", None)
+            scorer = "jevlike" if chooser is None else "chooser"
+            probs = list(scores)
+            index = max(range(len(probs)), key=lambda i: probs[i])
+            top1 = probs[index]
+            top2 = sorted(probs, reverse=True)[1]
+            if not (top1 >= floor and (top1 - top2) >= margin):
+                _record_choice(rt, path, opts, None, probs, scorer, floor, margin, waiting=True)
+                escalation = _floor_escalation(rt, path, state, opts, probs, floor, margin)
+            else:
+                source, verified = scorer, None
+        if escalation is not None:
+            if chooser is not None:
+                escalation["chooser"] = chooser
             answer = yield from _park(rt, escalation)
             index = answer["index"]
             source = verified = answer["by"]
-        else:
-            source, verified = "jevlike", None
-    status = yield from _finish_choice(rt, path, opts, index, probs, source, verified, floor, margin, context_str)
+    status = yield from _finish_choice(rt, path, opts, index, probs, source, verified, floor, margin, context_str, chooser)
     return status
 
 
@@ -1576,8 +1613,11 @@ def _resume_parked_choice(
         )
     index = answer["index"]
     source = verified = answer["by"]
-    probs = [float(o.get("p", 0.0)) for o in menu]
-    status = yield from _finish_choice(rt, path, opts, index, probs, source, verified, floor, margin, context_str)
+    unscored = bool((escalation.get("chooser") or {}).get("error"))
+    probs = None if unscored else [float(o.get("p", 0.0)) for o in menu]
+    status = yield from _finish_choice(
+        rt, path, opts, index, probs, source, verified, floor, margin, context_str, escalation.get("chooser")
+    )
     return status
 
 

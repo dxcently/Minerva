@@ -82,7 +82,7 @@ def log_decision(
     options: list[str],
     label: int,
     chosen: str,
-    probs: list[float],
+    probs: list[float] | None,
     source: str,
     verified: str | None,
     floor: float,
@@ -95,12 +95,15 @@ def log_decision(
     action: dict | None,
     ts: float | None = None,
     warrant: str | None = None,
+    chooser: dict | None = None,
 ) -> None:
-    """The row from section 5, verbatim, plus this step's `warrant`:
-    `{id, context, options, label, chosen, probs, source, verified, floor,
-    margin, run, graph, state, step, ts, ckpt, action, warrant}`.
+    """The row from section 5, verbatim, plus this step's `warrant` and
+    `chooser`: `{id, context, options, label, chosen, probs, source,
+    verified, floor, margin, run, graph, state, step, ts, ckpt, action,
+    warrant, chooser}`.
 
-    `source` is who made the pick that was taken: `"jevlike"`, `"model"`,
+    `source` is who made the pick that was taken: `"jevlike"`, `"chooser"`
+    (an HTTP chooser -- `chooser` below says which), `"model"`,
     `"human"`, `"forced"` (a menu with one option -- written for the
     record, per the design, even though this build has no exporter yet to
     skip it on export), `"rule"` (a `choose.prefer` guard matched before
@@ -118,6 +121,11 @@ def log_decision(
     `warrant` is the run's own `warrant_id` -- `None` for an attended run,
     written unconditionally either way so every row in a graph's log has
     the same key set regardless of which kind of run produced it.
+    `chooser` names an HTTP chooser that scored (or failed to score) this
+    menu -- `{spec, model, served_model, latency_ms}`, or `{spec, model,
+    latency_ms, error}` when it failed, in which case `probs` is `None`:
+    nothing was scored. `None` for jevlike, whose identity is `ckpt`. Rows
+    written before it existed simply lack the key; read it with `.get`.
     """
     if not 0 <= label < len(options):
         raise ValueError(f"label {label!r} is not a valid index into {len(options)} options")
@@ -140,6 +148,7 @@ def log_decision(
         "ckpt": ckpt,
         "action": action,
         "warrant": warrant,
+        "chooser": chooser,
     }
     _append(graph, row)
 
