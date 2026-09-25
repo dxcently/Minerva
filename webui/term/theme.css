@@ -1,0 +1,33 @@
+/* The TUI's theme() (crates/tui/ui/default.rn:388-416) as CSS variables.
+   Hex values for named terminal colours are chosen in web-ui.md section 2.2. */
+:root {
+  --bg: #15131f;
+  --fg: #d8d4e6;
+  --faint: #8a849e;
+  --comment: #6c6680;
+  --yellow: #e6c35c;
+  --gold: #d4a93a;
+  --magenta: #c77dd6;
+  --green: #7fc97f;
+  --lightgreen: #a8e6a1;
+  --red: #e06c75;
+  --cyan: #56b6c2;
+  --lightcyan: #8fe3ee;
+  --blue: #6f9ce8;
+  --block: #262336;
+  --added: #1c3a28;
+  --removed: #3a1f26;
+
+  /* page-only roles */
+  --line: #4a4466;       /* frame borders */
+  --line-hi: #6e6690;    /* focused frame border */
+  --gold-dark: #7a5f1c;  /* the running composer frame pulses to this */
+  --gold-fill: rgba(212, 169, 58, 0.08);  /* flat: no gradient, no sheen */
+
+  --font: ui-monospace, "Cascadia Mono", "Cascadia Code", Consolas, "DejaVu Sans Mono", "Liberation Mono", Menlo, monospace;
+  --fs: 14px;
+  --lh: 1.35;
+  /* measured at boot by app.js; these are fallbacks */
+  --cw: 8.4px;
+  --ch: 19px;
+}

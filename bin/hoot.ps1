@@ -6,8 +6,9 @@
 #   hoot serve [-Port N] [-Bind ADDR]   start llama-server (router mode)
 #   hoot shim  [-ShimPort N]            start `eidolon serve` (the agent shim)
 #   hoot webui [-WebuiPort N]           start Open WebUI through eidolon
-#   hoot up                             serve + shim + webui, backgrounded
-#   hoot stop                           stop everything
+#   hoot up                             serve + shim + webui backgrounded, then aoided
+#   hoot stop                           stop serve + shim + webui (aoided stays up)
+#   hoot aoide [start|stop|restart]     aoided, the WSL mesh node (default: status)
 #   hoot status                         what is up, and what is loaded
 #   hoot models                         list models from models.ini / the API
 #   hoot get <quant>                    download a Qwen3.8-27B quant
@@ -53,6 +54,8 @@ $Logs   = Join-Path $Root 'logs'
 # Get-EidolonExe and the 'setup'/'up' cases below for why a real subcommand
 # replaced what used to be a hand-rolled config.toml editor here).
 $Extensions = Join-Path $Root 'extensions'
+# Unset means wsl.exe's default distro.
+$Distro = $env:AOIDE_DISTRO
 
 $W = 66
 
@@ -125,6 +128,18 @@ function Get-Owui {
     $shim = Join-Path $env:USERPROFILE '.local\bin\open-webui.exe'
     if (Test-Path $shim) { return $shim }
     return $null
+}
+
+# aoided is a systemd user unit inside WSL with linger on, so hoot drives the
+# unit, never the process.
+function Invoke-AoidedUnit([string]$verb) {
+    # Native stderr under 'Stop' throws in PowerShell 5.1.
+    $ErrorActionPreference = 'Continue'
+    $wslArgs = @()
+    if ($Distro) { $wslArgs += '-d', $Distro }
+    $wslArgs += '--exec', 'systemctl', '--user', $verb, 'aoided'
+    $out = & wsl.exe @wslArgs 2>$null
+    [pscustomobject]@{ Ok = ($LASTEXITCODE -eq 0); Out = (@($out) -join ' ').Trim() }
 }
 
 function Get-EidolonConfigDir {
@@ -517,6 +532,13 @@ switch ($Command.ToLower()) {
                 -ArgumentList 'serve', '--host', $Bind, '--port', $WebuiPort -WindowStyle Hidden
             Wait-Api "$WebUI/health" 420 'open webui' | Out-Null
         }
+
+        if ((Invoke-AoidedUnit 'is-active').Ok) { Ok 'aoided already up' }
+        else {
+            Say 'starting aoided'
+            $r = Invoke-AoidedUnit 'start'
+            if (-not $r.Ok) { Warn "aoided did not start -- hoot aoide for its state" }
+        }
         Write-Host ''
         & $PSCommandPath status
     }
@@ -556,10 +578,13 @@ switch ($Command.ToLower()) {
         $srvUp = Test-Api "$Base/v1/models"
         $wuiUp = Test-Api "$WebUI/health"
         $shmUp = Test-Api "$Shim/api/ext"
+        $aoide = Invoke-AoidedUnit 'is-active'
+        $where = if ($Distro) { "wsl $Distro" } else { 'wsl (default distro)' }
         Box 'status' @(
             ("{0} router      {1,-24} {2}" -f (Dot $srvUp), $Base,  $(if ($srvUp) { 'responding' } else { 'not responding' }))
             ("{0} eidolon     {1,-24} {2}" -f (Dot $shmUp), $Shim,  $(if ($shmUp) { 'responding' } else { 'not responding' }))
             ("{0} open webui  {1,-24} {2}" -f (Dot $wuiUp), $WebUI, $(if ($wuiUp) { 'responding' } else { 'not responding' }))
+            ("{0} aoided      {1,-24} {2}" -f (Dot $aoide.Ok), $where, $(if ($aoide.Out) { $aoide.Out } else { 'unreachable' }))
         )
         if ($shmUp -and -not (Get-ShimToken)) {
             Warn "shim is up but $(Get-ShimTokenPath) is missing -- open webui cannot authenticate to it"
@@ -645,6 +670,18 @@ switch ($Command.ToLower()) {
         }
     }
 
+    'aoide' {
+        Banner
+        $verb = if ($Rest) { $Rest[0].ToLower() } else { 'status' }
+        if ($verb -notin 'status', 'start', 'stop', 'restart') { Die "aoide: unknown '$verb' (start, stop, restart, status)" }
+        if ($verb -ne 'status') {
+            Say "$verb aoided"
+            if (-not (Invoke-AoidedUnit $verb).Ok) { Warn "systemctl --user $verb aoided failed" }
+        }
+        $a = Invoke-AoidedUnit 'is-active'
+        Box 'aoided' @(("{0} {1}" -f (Dot $a.Ok), $(if ($a.Out) { $a.Out } else { 'WSL or the unit is unreachable' })))
+    }
+
     'edit' { Start-Process notepad.exe $Ini }
 
     'which' {
@@ -669,8 +706,9 @@ switch ($Command.ToLower()) {
             'serve                 start the llama.cpp router'
             'shim                  start eidolon serve (an agent per chat)'
             'webui                 start Open WebUI against both'
-            'up                    all three, in the background'
-            'stop                  stop everything'
+            'up                    all three in the background, then aoided'
+            'stop                  stop all three (aoided stays up)'
+            'aoide [start|stop]    the WSL mesh node; bare = status'
             'status                what is running + models served'
             'models                list models (served or configured)'
             'get <quant>           fetch a Qwen3.8-27B quant, e.g. UD-Q5_K_M'
