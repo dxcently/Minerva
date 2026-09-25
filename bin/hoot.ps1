@@ -685,6 +685,9 @@ switch ($Command.ToLower()) {
 
     'theme' {
         $ErrorActionPreference = 'Continue'
+        # The TUI runs natively here, so its ui.rn is the Windows one; /p has WSL translate the path.
+        $env:EIDOLON_UI = Join-Path $env:APPDATA 'eidolon\ui.rn'
+        $env:WSLENV = (@($env:WSLENV, 'EIDOLON_UI/p') | Where-Object { $_ }) -join ':'
         $wslArgs = @()
         if ($Distro) { $wslArgs += '-d', $Distro }
         $wslArgs += '--cd', $PSScriptRoot, '--exec', 'python3', './eidolon-theme'

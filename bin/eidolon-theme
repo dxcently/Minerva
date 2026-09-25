@@ -124,6 +124,8 @@ def target():
     return Path(base) / "eidolon" / "ui.rn"
 
 
+STARTER = "pub fn theme() {\n    #{\n" + "".join(f'        {r}: "",\n' for r in ROLES) + "    }\n}\n"
+
 ROLE_LINE = re.compile(r'^(\s*)(\w+):(\s*)"[^"]*",?(\s*)(//.*)?$')
 
 
@@ -199,9 +201,7 @@ def main(argv):
         ratio = contrast(hexv, colors["base00"])
         if role not in BACKGROUNDS and ratio < 4.5:
             print(f"eidolon-theme: warning: {role} {hexv} is {ratio:.2f}:1 on base00", file=sys.stderr)
-    if not path.exists():
-        die(f"{path} does not exist")
-    src = path.read_text()
+    src = path.read_text() if path.exists() else STARTER
     new, block = rewrite(src, colours)
     if "--dry-run" in flags:
         print(block)
@@ -209,10 +209,15 @@ def main(argv):
     if new == src:
         print(f"{path} already has {name}")
         return
-    bak = stamp(path, "bak")
-    bak.write_text(src)
+    if path.exists():
+        bak = stamp(path, "bak")
+        bak.write_text(src)
+        kept = f"backup {bak}"
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        kept = "new file; eidolon's defaults fill every other function"
     path.write_text(new)
-    print(f"{name} written to {path} (backup {bak}); relaunch the TUI to see it")
+    print(f"{name} written to {path} ({kept}); relaunch the TUI to see it")
 
 
 if __name__ == "__main__":
