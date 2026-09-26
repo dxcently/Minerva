@@ -6,19 +6,25 @@
 import { html, h, K, useState } from '../core/ui.js';
 import { markdown } from '../core/markdown.js';
 import generic from './generic.js';
+import files from './files.js';
 
-const named = new Map();
+const named = new Map(Object.entries(files));
 export const register = (tool, mod) => named.set(tool, mod);
 export const ctx = Object.freeze({ html, h, K, markdown, useState });
 
 const pick = (tool) => named.get(tool) || generic;
 
-export function render(tool, part, ...args) {
+// `render` draws with the shared ctx; `renderCall` hands the renderer the
+// call too, as ctx.tool and ctx.input (a read's output wants its path).
+export const render = (tool, part, ...args) => draw(ctx, tool, part, args);
+export const renderCall = (input, tool, part, ...args) => draw(Object.freeze({ ...ctx, tool, input }), tool, part, args);
+
+function draw(c, tool, part, args) {
   const r = pick(tool);
   try {
-    if (typeof r[part] === 'function') return r[part](...args, ctx);
+    if (typeof r[part] === 'function') return r[part](...args, c);
   } catch (e) {
     console.error('renderer failed:', tool, part, e && e.message);
   }
-  return generic[part](...args, ctx);
+  return generic[part](...args, c);
 }

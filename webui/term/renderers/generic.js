@@ -3,7 +3,11 @@
 //   input(input, ctx)             -> one-line summary string for the tool line
 //   inputFull(input, ctx)         -> Node | vnode, the whole input (approvals)
 //   output(output, isError, ctx)  -> Node | vnode, folded past FOLD lines
+//   preview(input, ctx)           -> vnode | null, drawn under the tool line
+//                                    while the call runs and after (a diff)
 // `ctx` carries { html, h, markdown, K } so an extension needs no imports.
+import { Diff, isUnified, parseUnified } from '../core/syntax.js';
+
 const FOLD = 20;
 const PREFERRED = ['command', 'cmd', 'path', 'file_path', 'pattern', 'query', 'url', 'condition', 'to', 'text', 'prompt'];
 
@@ -28,8 +32,12 @@ export default {
     return ctx.html`<${Folded} text=${txt} ctx=${ctx} />`;
   },
 
+  preview() { return null; },
+
   output(output, isError, ctx) {
-    return ctx.html`<${Folded} text=${String(output ?? '')} err=${isError} ctx=${ctx} />`;
+    const t = String(output ?? '');
+    if (!isError && isUnified(t)) return ctx.html`<${Diff} lines=${parseUnified(t)} />`; // a git diff through the shell, a patch
+    return ctx.html`<${Folded} text=${t} err=${isError} ctx=${ctx} />`;
   },
 };
 

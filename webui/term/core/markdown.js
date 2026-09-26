@@ -1,9 +1,11 @@
 // A small, safe markdown subset (web-ui.md Q1 default: our own), as Preact
 // vnodes. Model text is only ever text children, never HTML.
-//   ``` fences -> <pre>, # headings, `code`, **bold**, [label](https://...)
+//   ``` fences -> numbered, highlighted code (a `diff` fence as a diff),
+//   # headings, `code`, **bold**, [label](https://...)
 // Links are made only for http(s) URLs, and always open with
 // rel="noopener noreferrer".
 import { html } from './ui.js';
+import { Code, Diff, extOf, parseUnified } from './syntax.js';
 
 export function markdown(src) {
   const out = [];
@@ -15,11 +17,13 @@ export function markdown(src) {
   };
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
-    if (/^\s*```/.test(l)) {
+    const fence = /^\s*```\s*([\w+#.-]*)/.exec(l);
+    if (fence) {
       flush();
       const code = [];
       for (i++; i < lines.length && !/^\s*```/.test(lines[i]); i++) code.push(lines[i]);
-      out.push(html`<pre>${code.join('\n')}</pre>`);
+      const text = code.join('\n'), info = fence[1].toLowerCase(), name = info.includes('.') ? extOf(info) : info; // a file's name: its extension
+      out.push(name === 'diff' || name === 'patch' ? html`<${Diff} lines=${parseUnified(text)} />` : html`<${Code} text=${text} name=${name} />`);
       continue;
     }
     const hd = /^(#{1,6})\s+(.*)$/.exec(l);

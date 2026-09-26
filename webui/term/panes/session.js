@@ -1,60 +1,25 @@
-// One session pane: the transcript, the draft, inline asks, the composer.
-// It draws a core/state.js Session and holds no session state of its own.
-// Several panes may draw one Session (mirrors share its one stream), so
-// everything tied to the DOM (scroller, ask elements, which asks are
-// off-screen) lives in a per-PANE view, never on the Session.
-import { html, K, HUB, Rendered, Component, signal, useRef, useLayoutEffect, useEffect, useMemo } from '../core/ui.js';
+// One session pane: the transcript, the draft, the ask panel (when the
+// current ask is this pane's, panes/asks.js), the composer. It draws a
+// core/state.js Session and holds no session state of its own. Several panes
+// may draw one Session (mirrors share its one stream), so what is tied to the
+// DOM lives in a per-PANE view, never on the Session.
+import { html, K, HUB, Rendered, Component, signal, effect, useRef, useLayoutEffect, useEffect, useMemo, useState } from '../core/ui.js';
+import { IMAGE_TYPES, MAX_IMAGES, looksImage, readImage, readText, tooBig } from '../core/attach.js';
 import { markdown } from '../core/markdown.js';
-import { render as rend } from '../renderers/index.js';
+import { render as rend, renderCall } from '../renderers/index.js';
 import { icon, word, shade, CELLS } from '../core/life.js';
-import { tildify, kfmt } from '../core/state.js';
+import { tildify, kfmt, hhmm, stateOf, STATE_CLS, MODES } from '../core/state.js';
 import { openMenu, atPointer, under } from '../core/menu.js';
+import { AskPanel, AskMark, Settled, quoted } from './asks.js';
 
 const AGENT = icon();
-// After focus lands on an ask, keys wait this long; after an ask appears or
-// jumps into view, clicks do. A key or click already under way when the ask
-// arrived must not answer it.
-const LAND_MS = 300;
 
-// Per-pane view helpers: the scroller, ask elements, which asks are off-screen.
+// Per-pane view helpers: what the row menus reach (the pane and the actions).
 const views = new WeakMap();
 function viewOf(p) {
   let v = views.get(p);
-  if (!v) {
-    v = { p, scroller: null, io: null, off: signal(new Set()), askEls: new Map(), jumpAt: 0 };
-    v.observe = (el) => {
-      if (!v.io && v.scroller) {
-        v.io = new IntersectionObserver((ents) => {
-          const off = new Set(v.off.value);
-          for (const e of ents) {
-            const id = Number(e.target.dataset.ask);
-            if (e.isIntersecting) off.delete(id); else off.add(id);
-          }
-          v.off.value = off;
-        }, { root: v.scroller, threshold: 0.2 });
-      }
-      if (v.io) v.io.observe(el);
-    };
-    v.unobserve = (el, id) => {
-      if (v.io) v.io.unobserve(el);
-      if (v.off.value.has(id)) { const off = new Set(v.off.value); off.delete(id); v.off.value = off; }
-    };
-    views.set(p, v);
-  }
+  if (!v) { v = { p }; views.set(p, v); }
   return v;
-}
-
-// The element pane `p` draws ask `id` in, if it draws it.
-export const askEl = (p, id) => viewOf(p).askEls.get(id);
-
-// Scroll pane `p` to ask `a` and give it focus, which is what keys answer.
-export function focusAsk(p, a) {
-  const el = a && askEl(p, a.id);
-  if (!el) return false;
-  viewOf(p).jumpAt = performance.now();
-  el.scrollIntoView({ block: 'nearest' });
-  el.focus({ preventScroll: true });
-  return true;
 }
 
 // ---------------------------------------------------------------- the pane
@@ -70,21 +35,23 @@ export function Pane({ p, rect, focused, mirror, act }) {
     <${Glyphs} p=${p} act=${act} />
     <${Transcript} s=${s} v=${v} />
     ${banner && html`<div class=${'banner' + (banner.err ? ' err' : '')}>${banner.text}</div>`}
-    <${Waiting} s=${s} v=${v} />
+    ${act.panelPane.value === p.id && html`<${AskPanel} p=${p} act=${act} />`}
+    <${Outbox} p=${p} />
     <${Composer} s=${s} p=${p} act=${act} />
   </section>`;
 }
 
+// Session name, its menu, the project chip, the connection dot.
 function Title({ p, mirror, act }) {
   const s = p.s, conn = s.conn.value, hl = s.hello.value;
   const dot = { live: 'hi', replaying: 'y', connecting: 'y', reconnecting: 'y', goodbye: 'faint' }[conn] || 'r';
   const open = (e, at) => { e.preventDefault(); e.stopPropagation(); act.paneMenu(p, at); };
-  return html`<div class="ftitle k ptitle" role="button" tabindex="0" title="pane menu (click or right-click)" data-owner=${'pane-' + p.id}
+  return html`<div class="ftitle k ptitle" role="button" tabindex="0" title=${'pane menu (click or right-click)' + (hl ? '\n' + hl.cwd : '')} data-owner=${'pane-' + p.id}
       onClick=${(e) => open(e, under(e.currentTarget))} onContextMenu=${(e) => open(e, atPointer(e))}
       onKeyDown=${(e) => !e.repeat && (e.key === 'Enter' || e.key === ' ') && open(e, under(e.currentTarget))}>
-    ${hl ? tildify(hl.cwd) : 'session'} <span class=${dot}>●</span>
+    <span class="b">${act.name(s)}</span>${mirror && html` <span class="faint">(mirror)</span>`} <span class="faint">▾</span>
+    ${hl && html` <span class="proj">[${act.project(hl.cwd)}]</span>`} <span class=${dot}>●</span>
     ${conn !== 'live' && html` <span class="faint">${conn}</span>`}
-    ${mirror && html` <span class="faint">(mirror)</span>`} <span class="faint">▾</span>
   </div>`;
 }
 
@@ -103,19 +70,14 @@ function Glyphs({ p, act }) {
 // ---------------------------------------------------------------- transcript
 function Transcript({ s, v }) {
   const ref = useRef(null), inner = useRef(null), stick = useRef(true);
-  const chunks = s.chunks.value;
-  s.stick.value;
+  const chunks = s.chunks.value, jumps = s.jumpToEnd.value;
+  useLayoutEffect(() => { stick.current = true; }, [jumps]);
   useLayoutEffect(() => {
     const el = ref.current;
-    v.scroller = el;
-    // Asks drawn before this ran (a child's layout effect runs before its
-    // parent's, so a mirror opened with an ask pending registers it first)
-    // are observed now that the observer can exist.
-    for (const x of v.askEls.values()) v.observe(x);
     const pin = new ResizeObserver(() => { if (stick.current) el.scrollTop = el.scrollHeight; });
     pin.observe(inner.current);
     pin.observe(el);
-    return () => { pin.disconnect(); if (v.io) v.io.disconnect(); v.io = null; };
+    return () => pin.disconnect();
   }, []);
   useLayoutEffect(() => {
     const el = ref.current;
@@ -127,9 +89,33 @@ function Transcript({ s, v }) {
   };
   return html`<div class="scroll" ref=${ref} onScroll=${onScroll}>
     <div class="rows" ref=${inner}>
+      ${!chunks.length && !s.draft.value && html`<${Start} s=${s} v=${v} />`}
       ${chunks.map((c) => html`<${Chunk} key=${c.key} c=${c} s=${s} v=${v} />`)}
       <${DraftView} s=${s} />
     </div>
+  </div>`;
+}
+
+// A session nobody has spoken in opens on the start screen, as the TUI's
+// does (default.rn:253-285): the owl, what the session runs on (read live),
+// and enough keys to begin; `?` has the rest.
+function Start({ s, v }) {
+  const hl = s.hello.value;
+  if (!hl) return null;
+  const line = (k, val) => html`<div><span class="faint">  ${k}  </span>${val}</div>`;
+  const key = (k, what) => html`<div>  <span class="kk">${k}</span>  ${what}</div>`;
+  return html`<div class="start">
+    <div class="owl big">${'   ,___,\n   ['}<span class="eyes">O.o</span>${']    '}<span class="name">minerva</span>${'\n   /)__)    '}<span class="faint">Make it, Break it, Hack it.</span>${'\n  ---"-"---'}</div>
+    ${line('session ', v.act.name(s))}
+    ${line('model   ', html`<span class="c b">${hl.model || '?'}</span>`)}
+    ${line('persona ', hl.persona ? html`<span class="m b">${hl.persona}</span>` : 'none')}
+    ${line('gate    ', hl.yolo ? html`<span class="r b">YOLO</span>` : 'asks')}
+    ${line('cwd     ', tildify(hl.cwd))}
+    <div class="gap"></div>
+    ${key('i', 'write a message · ⏎ sends · ⇧⏎ is a newline · esc leaves the composer')}
+    ${key(':', 'a command · tab completes')}
+    ${key('tab', 'the oldest waiting ask · h l between asks')}
+    ${key('?', 'the key reference')}
   </div>`;
 }
 
@@ -152,7 +138,19 @@ class Row extends Component {
   render({ r, s, v }) { return html`<${RowBody} r=${r} s=${s} v=${v} />`; }
 }
 
-const Who = ({ who }) => (who ? html`<div class=${'who ' + (who === 'you' ? 'you' : 'bot')}>${who === 'you' ? 'you' : 'minerva'}</div>` : null);
+// The speaker's name on the first row of a run, and beside it, dim, what is
+// known of the run: its time (the record's, else when it arrived; none for a
+// replayed record without one) and, for the agent, what its turns cost.
+function Who({ r, at = r.at }) {
+  if (!r.who) return null;
+  const m = r.meta && r.meta.value;
+  const bits = [at != null ? hhmm(at) : null];
+  if (m && (m.in || m.out)) bits.push(`${kfmt(m.in)} in`, `${kfmt(m.out)} out`);
+  if (m && m.ms) bits.push(secs(m.ms));
+  const info = bits.filter(Boolean).join(' · ');
+  return html`<div class=${'who ' + (r.who === 'you' ? 'you' : 'bot')}>${r.who === 'you' ? 'you' : 'minerva'}${info && html`<span class="wt" title=${at != null ? new Date(at).toLocaleString() : ''}>  ${info}</span>`}</div>`;
+}
+const secs = (ms) => (ms >= 60000 ? `${Math.floor(ms / 60000)}m${Math.round((ms % 60000) / 1000)}s` : `${Math.round(ms / 100) / 10}s`);
 
 function Fold({ label, cls, children }) {
   const open = useMemo(() => signal(false), []);
@@ -180,7 +178,6 @@ function rowSource(r) {
   }
 }
 
-const quoted = (t) => t.split('\n').map((l) => '> ' + l).join('\n');
 
 function copy(text, act) {
   navigator.clipboard.writeText(text).then(() => act.toast('copied'), () => act.toast('the browser refused the clipboard', true));
@@ -203,13 +200,14 @@ function rowMenu(e, r, v) {
 function RowBody({ r, s, v }) {
   const cm = (e) => rowMenu(e, r, v);
   switch (r.kind) {
+    case 'day': return html`<div class="row day" role="separator">${r.text}</div>`;
     case 'you':
-      return html`<div class="row you" onContextMenu=${cm}><${Who} who=${r.who} /><div class="body">${r.text}</div>
+      return html`<div class="row you" onContextMenu=${cm}><${Who} r=${r} /><div class="body">${r.text}</div>
         ${r.images > 0 && html`<div class="body faint">[${r.images} image${r.images > 1 ? 's' : ''}]</div>`}</div>`;
     case 'bot': {
       // A reply an `error` cut short is filled in place by its assistant-message.
       const full = r.full && r.full.value, x = full || r, cut = full ? null : r.cut;
-      return html`<div class="row" onContextMenu=${cm}><${Who} who=${r.who} />
+      return html`<div class="row" onContextMenu=${cm}><${Who} r=${r} />
         ${x.thinking && html`<${Fold} cls="think" label=${`thinking (${x.thinking.split('\n').length} lines)`}>${x.thinking}</${Fold}>`}
         ${x.redacted > 0 && html`<div class="think">(${x.redacted} redacted thinking block${x.redacted > 1 ? 's' : ''})</div>`}
         ${x.text && html`<div class="body">${cut ? x.text : markdown(x.text)}</div>`}
@@ -227,7 +225,7 @@ function RowBody({ r, s, v }) {
     case 'pre': return html`<div class="row" onContextMenu=${cm}><pre>${r.text}</pre></div>`;
     case 'tool': return html`<${ToolRow} c=${r.call} s=${s} v=${v} cm=${cm} />`;
     case 'ask':
-      return html`<div class="row" onContextMenu=${cm}>${r.ask.done.value ? html`<${Settled} a=${r.ask} />` : html`<${AskBlock} a=${r.ask} s=${s} v=${v} />`}</div>`;
+      return html`<div class="row" onContextMenu=${cm}>${r.ask.done.value ? html`<${Settled} a=${r.ask} />` : html`<${AskMark} a=${r.ask} s=${s} act=${v.act} />`}</div>`;
     default: return null;
   }
 }
@@ -240,7 +238,8 @@ function ToolRow({ c, s, v, cm }) {
   const open = useMemo(() => signal(null), []);
   const shown = open.value ?? (out && out.isError);
   const sum = useMemo(() => rend(c.name, 'input', c.input), [c.input]);
-  const body = useMemo(() => (out ? rend(c.name, 'output', out.output, out.isError) : null), [out]);
+  const body = useMemo(() => (out ? renderCall(c.input, c.name, 'output', out.output, out.isError) : null), [out]);
+  const preview = useMemo(() => renderCall(c.input, c.name, 'preview', c.input), [c.input]);
   const toggle = () => { if (out) open.value = !shown; };
   return html`<div class="row tool" onContextMenu=${cm}>
     <div class=${'tline' + (out ? ' k' : '')} onClick=${toggle}>
@@ -252,226 +251,11 @@ function ToolRow({ c, s, v, cm }) {
       <span class=${'st ' + st}>${{ run: 'running', ok: 'ok ▸', err: 'error ▸', stop: 'stopped' }[st]}</span>
       <span class="tm">${c.time.value}</span>
     </div>
+    ${preview && html`<${Rendered} value=${preview} />`}
     ${shown && body && html`<${Rendered} value=${body} />`}
-    ${a && html`<${AskBlock} a=${a} s=${s} v=${v} />`}
+    ${a && html`<${AskMark} a=${a} s=${s} act=${v.act} />`}
     ${settled && html`<${Settled} a=${settled} />`}
   </div>`;
-}
-
-// ---------------------------------------------------------------- asks
-// An ask is a line of choices with one highlighted (the first, yes, to start).
-// The page's oldest pending ask can take focus by itself (app.js steer), and
-// keys answer the ask that holds focus:
-//   left/right move the highlight, Enter takes it, y / n answer yes / no and
-//   1-9 a question's option, Esc goes back to the composer and leaves the ask
-//   queued.
-// A note goes with whatever is chosen next: Tab, down or the `+ note` choice
-// open the note line (none of them answers); in it Enter takes the highlighted
-// choice with the note, up goes back to the choices keeping the note, Esc
-// closes the note line and drops the note.
-// Words of the user's own go through "chat about it", not a free-text answer.
-// For LAND_MS after focus lands keys do nothing, and for LAND_MS after the
-// ask appears, jumps into view, or an ask above it settles, clicks do nothing
-// but say "steady…"; a double click never answers.
-// The highlight and the note belong to this pane; the answer settles every
-// pane (ask-settled).
-const MODIFIERS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'AltGraph', 'Fn', 'NumLock', 'OS']);
-
-// The choices on an ask, in order. `go(note)` answers; `off` says why a
-// choice is greyed; `+ note` (id 'note') only opens the note line.
-function choices(a, s, v) {
-  const f = a.f;
-  const send = (answer) => (note) => {
-    const reply = { answer };
-    if (note.trim() && !s.noNote.peek()) reply.note = note.trim();
-    return s.answer(a, reply);
-  };
-  const chat = { id: 'chat', label: 'chat about it', go: (note) => chatAbout(a, s, v, note) };
-  const note = { id: 'note', label: '+ note' };
-  if (f.kind === 'approval') {
-    return [
-      { id: 'yes', label: 'yes', off: a.yes ? null : 'not offered', go: send(a.yes) },
-      { id: 'always', label: 'always', off: a.always ? null : 'needs eidolon PR', go: send(a.always) },
-      { id: 'no', label: 'no', off: a.no ? null : 'not offered', go: send(a.no) },
-      chat,
-      { id: 'fork', label: 'fork', off: HUB },
-      note,
-    ];
-  }
-  return [
-    ...a.options.map((o, i) => ({ id: 'o' + i, label: o.label, key: o.key, desc: o.description, go: send(o.label) })),
-    chat,
-    note,
-  ];
-}
-
-// "chat about it": deny (when there is a no to give), stop the turn, and hand
-// the composer a quote of the ask to talk about.
-async function chatAbout(a, s, v, note) {
-  const f = a.f, no = f.kind === 'approval' || a.yesno ? a.no : null;
-  v.act.letBe(s); // the turn's other asks are about to be cancelled: none takes focus meanwhile
-  a.chat = true;
-  if (no) await s.answer(a, { answer: no });
-  s.cancel();
-  const what = f.kind === 'approval' ? `${f.tool} ${rend(f.tool, 'input', f.input)}`.trim() : 'question';
-  const text = `${what}: ${f.prompt || ''}`.replace(/\s+/g, ' ').trim();
-  v.p.prefill(quoted(text.length > 160 ? text.slice(0, 159) + '…' : text) + '\n\n' + note.trim());
-}
-
-function AskBlock({ a, s, v }) {
-  const ref = useRef(null), field = useRef(null), landed = useRef(0), born = useRef(0), steadyT = useRef(0);
-  const f = a.f, busy = a.busy.value, opts = choices(a, s, v);
-  const hi = useMemo(() => signal(opts.findIndex((o) => !o.off)), [a]);
-  const note = useMemo(() => signal(''), [a]);
-  const noting = useMemo(() => signal(false), [a]); // the note line is open
-  const steady = useMemo(() => signal(''), [a]);
-  const noteOff = s.noNote.value;
-  useLayoutEffect(() => {
-    const el = ref.current;
-    born.current = performance.now();
-    v.askEls.set(a.id, el);
-    v.observe(el);
-    return () => {
-      v.unobserve(el, a.id);
-      if (v.askEls.get(a.id) === el) v.askEls.delete(a.id);
-      clearTimeout(steadyT.current);
-      v.jumpAt = performance.now(); // this block leaving moves what is under the pointer
-    };
-  }, [a]);
-  const say = (text) => {
-    steady.value = text;
-    clearTimeout(steadyT.current);
-    steadyT.current = setTimeout(() => { steady.value = ''; }, 1500);
-  };
-  const openNote = () => {
-    if (noting.peek()) field.current.focus(); else noting.value = true;
-  };
-  // Focus lands in the same render that draws the line, before the next key.
-  useLayoutEffect(() => { if (noting.value && field.current) field.current.focus(); }, [noting.value]);
-  const closeNote = () => {
-    noting.value = false;
-    note.value = '';
-    ref.current.focus({ preventScroll: true });
-  };
-  const take = (i) => {
-    const o = opts[i];
-    if (o.off || a.busy.peek()) return;
-    if (o.id === 'note') { openNote(); return; }
-    o.go(noting.peek() ? note.peek() : '');
-  };
-  const move = (d) => {
-    for (let j = 1; j < opts.length; j++) {
-      const i = (hi.peek() + d * j + opts.length * j) % opts.length;
-      if (!opts[i].off) { hi.value = i; return; }
-    }
-  };
-  const pick = (id) => {
-    const i = opts.findIndex((o) => o.id === id);
-    if (i >= 0) { hi.value = i; take(i); }
-  };
-  const optionId = (label) => 'o' + a.options.findIndex((o) => o.label === label);
-  const onKey = (e) => {
-    if (e.isComposing || e.keyCode === 229) return; // an IME's own Enter and keys
-    if (e.ctrlKey || e.metaKey || e.altKey || MODIFIERS.has(e.key)) return;
-    if (e.key === 'Tab' && e.shiftKey) return; // shift+Tab: the previous ask (app.js)
-    const stop = () => { e.preventDefault(); e.stopPropagation(); };
-    if (performance.now() - landed.current < LAND_MS) { stop(); return; }
-    const k = e.key, typing = e.target === field.current;
-    if (typing) {
-      if (k === 'Escape') { stop(); closeNote(); }
-      else if (k === 'Enter') {
-        stop();
-        if (e.repeat) return;
-        if (opts[hi.peek()].id === 'note') { ref.current.focus({ preventScroll: true }); say('pick what to send the note with'); return; }
-        take(hi.peek());
-      } else if (k === 'ArrowUp' || k === 'Tab') { stop(); ref.current.focus({ preventScroll: true }); }
-      return;
-    }
-    stop();
-    if (k === 'Escape') { v.act.leaveAsk(v.p); return; }
-    if (k === 'Tab' || k === 'ArrowDown') { openNote(); return; }
-    if (k === 'ArrowLeft' || k === 'ArrowRight') { move(k === 'ArrowLeft' ? -1 : 1); return; }
-    if (e.repeat) return;
-    if (k === 'Enter') { take(hi.peek()); return; }
-    const yes = k === 'y' || k === 'Y', no = k === 'n' || k === 'N';
-    if (f.kind === 'approval') { if (yes) pick('yes'); else if (no) pick('no'); return; }
-    if (a.yesno && (yes || no)) { pick(optionId(yes ? a.yes : a.no)); return; }
-    const o = a.options.find((x) => x.key === k);
-    if (o) pick(optionId(o.label));
-  };
-  const click = (e, i) => {
-    if (e.detail > 1) return; // the second click of a double click
-    if (performance.now() - Math.max(born.current, v.jumpAt) < LAND_MS) { say('steady…'); return; }
-    hi.value = i;
-    take(i);
-  };
-  let title, body;
-  if (f.kind === 'approval') {
-    const sum = rend(f.tool, 'input', f.input);
-    title = `approve: ${f.tool}${sum ? '  ' + sum : ''}`;
-    body = html`
-      <div>${f.prompt || ''}</div>
-      ${f.reason && html`<div class="why">reason: ${f.reason}</div>`}
-      ${f.judged && html`<div class="why">judge: ${f.judged}</div>`}
-      ${f.structural && html`<div class="why">structural rule</div>`}
-      ${f.yolo && html`<div><span class="warn">yolo is on</span><span class="why"> and the gate still asked</span></div>`}
-      <${Rendered} value=${rend(f.tool, 'inputFull', f.input)} />`;
-  } else {
-    title = 'question';
-    body = html`<div>${f.prompt || ''}</div>`;
-  }
-  const key = (k, label) => html` · <span class="key">${k}</span> ${label}`;
-  return html`<div class=${'ask' + (a.fresh ? ' fresh' : '') + (busy ? ' busy' : '')} ref=${ref} tabindex="0"
-      data-ask=${a.id} onKeyDown=${onKey}
-      onFocusIn=${(e) => { if (!e.currentTarget.contains(e.relatedTarget)) landed.current = performance.now(); }}>
-    <div class="ftitle">${title}</div>
-    ${body}
-    <div class="keys">
-      ${opts.map((o, i) => html`<span class=${'opt ' + o.id + (i === hi.value ? ' hi' : '') + (o.off ? ' dis' : ' k')}
-          role="button" tabindex="-1" aria-disabled=${o.off ? 'true' : null} title=${o.off || o.desc || ''}
-          onClick=${o.off ? null : (e) => click(e, i)}>${o.key ? o.key + ' ' : ''}${o.label}${o.off && html`<span class="off"> (${o.off})</span>`}</span>`)}
-      ${steady.value ? html`<span class="faint">${steady.value}</span>` : !noting.value && html`<span class="faint tabhint">tab: add a note</span>`}
-    </div>
-    ${noting.value && html`<div class="aline"><span class="faint">note ›</span><input ref=${field} type="text" spellcheck="false" autocomplete="off"
-      aria-label="note sent with your choice" readOnly=${noteOff} value=${note.value}
-      placeholder=${noteOff ? 'the door takes no note' : 'sent with the choice you take next; esc drops it'}
-      onInput=${(e) => { note.value = e.currentTarget.value; }} /></div>`}
-    <div class="akeys">keys: <span class="key">←→</span> choose${key('⏎', 'take')}${key('tab ↓', 'note')}${(f.kind === 'approval' || a.yesno) && html`${key('y', 'yes')}${key('n', 'no')}`}${f.kind !== 'approval' && key('1-' + Math.min(9, a.options.length), 'option')}${key('esc', 'composer')}</div>
-    ${a.err.value && html`<div class="aerr">${a.err.value}</div>`}
-  </div>`;
-}
-
-// A settled ask, folded to one line: what it asked and what was picked (the
-// note too, when this page sent it). Opened (click or Enter) it lists every
-// choice with the picked one marked, so the choices can still be read while
-// the composer talks about them ("chat about it").
-function Settled({ a }) {
-  const open = useMemo(() => signal(false), [a]);
-  const d = a.done.value, f = a.f, approval = f.kind === 'approval';
-  const what = approval ? `approve: ${f.tool} ${rend(f.tool, 'input', f.input)}`.trim() : `question: ${f.prompt || ''}`;
-  const picked = { answered: d.answer, cancelled: 'cancelled', elsewhere: 'answered elsewhere' }[d.how];
-  const cls = d.how !== 'answered' ? 'faint' : d.answer === a.no ? 'r' : 'hi';
-  const tail = [d.note && `note: ${d.note}`, a.chat && 'chat about it'].filter(Boolean).join(' · ');
-  const labels = approval ? [a.yes, a.always, a.no].filter(Boolean).map((label) => ({ label })) : a.options;
-  const line = (on, label, desc) => html`<div class=${on ? cls : 'faint'}>${on ? '✓ ' : '  '}${label}${desc && html`<span class="faint">  ${desc}</span>`}</div>`;
-  // A click opens it without taking focus from the composer being typed in.
-  return html`<div class="sys settled" onMouseDown=${(e) => e.preventDefault()}>
-    <${K} on=${() => { open.value = !open.value; }}>${open.value ? '▾ ' : '▸ '}${what} → <span class=${cls}>${picked}</span>${tail && html`<span class="faint"> (${tail})</span>`}</${K}>
-    ${open.value && html`<div class="choices">
-      ${approval && f.prompt && html`<div>${f.prompt}</div>`}
-      ${labels.map((o) => line(d.how === 'answered' && o.label === d.answer, o.label, o.description))}
-      ${line(!!a.chat, 'chat about it')}
-      ${d.note && html`<div class="faint">note: ${d.note}</div>`}
-    </div>`}
-  </div>`;
-}
-
-function Waiting({ s, v }) {
-  const off = v.off.value;
-  const asks = s.asks.value.filter((a) => off.has(a.id));
-  if (!asks.length) return null;
-  return html`<div class="waiting"><span>${asks.length} waiting</span><span class="faint">·</span>
-    <${K} on=${() => focusAsk(v.p, asks[0])}>jump</${K}></div>`;
 }
 
 // ---------------------------------------------------------------- draft
@@ -496,8 +280,9 @@ function DraftView({ s }) {
   if (!d) return null;
   const lines = d.thinkLines.value;
   const tools = d.tools.value;
+  const first = s.lastWho !== 'bot';
   return html`<div class="row draft" key=${d.key}>
-    ${s.lastWho !== 'bot' && html`<div class="who bot">minerva</div>`}
+    ${first && html`<${Who} r=${{ who: 'bot', at: d.at }} />`}
     ${lines > 0 && html`<div class="think"><${K} on=${() => { open.value = !open.value; }}>${(open.value ? 'v' : '>') + ` thinking (${lines} lines)`}</${K}>
       <div class="body" hidden=${!open.value}><${Stream} d=${d} which="think" /></div></div>`}
     <div class="body"><${Stream} d=${d} which="text" /><span class="caret"></span></div>
@@ -507,24 +292,81 @@ function DraftView({ s }) {
 }
 
 // ---------------------------------------------------------------- composer
-// Square double gold frame, flat tint. While a turn runs the frame's border
-// pulses and the Life strip runs in its title, as the TUI draws it in the
-// prompt frame's title (crates/tui/ui/default.rn:494-521).
+// The composer is the TUI's prompt frame (crates/tui/ui/default.rn:226-521):
+// one square frame in the session's state colour (stateOf: the status
+// line's badge wears the same), titled on the left, the agent on the right
+// of its top border. While a turn runs the agent grows into the Life strip,
+// with the word and the gauge to its left, and the frame pulses. The strip
+// has a fixed slot of CELLS cells, each one cell wide, so nothing moves as
+// it steps whatever font draws the braille. The bottom border holds the
+// menus (attach, model, effort, mode, mic) on the left, the verbs on the right.
 function Pulse({ s }) {
-  if (s.running.value !== true) return html`<span class="agent" title="at rest">${AGENT}</span>`;
-  const strip = s.strip.value;
+  if (s.running.value !== true) return html`<span class="slot rest" title="at rest">${cells(AGENT)}</span>`;
   const ms = s.clock.value, known = s.t0 != null;
   const secs = Math.floor(ms / 1000);
   const clock = secs >= 60 ? `${Math.floor(secs / 60)}m${secs % 60}s` : `${secs}.${Math.floor(ms / 100) % 10}s`;
   const ctx = s.ctx.value;
   const gauge = [known ? clock : null, ctx != null ? `⇡ ${kfmt(ctx)}` : null].filter(Boolean).join(' · ');
-  return html`<span class="life" aria-hidden="true">${[...strip].map((c, x) => html`<span style=${'color:' + shade(x, CELLS)}>${c}</span>`)}</span>
-    <span class="word">  ${word(s.finished.value)}</span>${gauge && html`<span class="gauge"> ${gauge}</span>`}`;
+  return html`<span class="word">${word(s.finished.value)}</span>${gauge && html`<span class="gauge"> ${gauge}</span>`}<span class="faint"> </span><span
+    class="slot life" aria-hidden="true">${cells(s.strip.value, true)}</span>`;
+}
+const cells = (t, shaded) => [...t].map((c, x) => html`<span class="cell" style=${shaded ? 'color:' + shade(x, CELLS) : null}>${c}</span>`);
+
+// ---------------------------------------------------------------- the outbox
+// Messages queued (⌥⏎) while a turn runs are held here, in the pane, not on
+// the door: the door's own queue (core follow_up) has no route to edit or
+// drop a message, and these stay editable until the model reads them. When
+// the turn ends (turn-state idle) the first is sent, which starts the next
+// turn; the rest wait for that one to end, in order. Each row: its text (one
+// line; a click shows it whole), `edit` (back into the composer; ⏎ puts it
+// back in its place, Esc leaves it as it was), `steer ↑` (send it now, into
+// the running turn) and `×` (drop it). ↑ in an empty composer edits the last.
+let qSeq = 0;
+export const enqueue = (p, text, images = []) => { p.queue.value = [...p.queue.peek(), { id: ++qSeq, text, images }]; };
+
+function Outbox({ p }) {
+  const list = p.queue.value, ed = p.editing.value;
+  const open = useMemo(() => signal(new Set()), []);
+  if (!list.length) return null;
+  const flip = (id) => { const o = new Set(open.peek()); if (!o.delete(id)) o.add(id); open.value = o; };
+  const drop = (id) => { p.queue.value = p.queue.peek().filter((m) => m.id !== id); };
+  const steer = async (m) => {
+    const at = p.queue.peek().indexOf(m);
+    drop(m.id);
+    if (!(await p.s.submit('steer', m.text, m.images))) {
+      const q = [...p.queue.peek()];
+      q.splice(Math.min(at, q.length), 0, m);
+      p.queue.value = q;
+    }
+  };
+  const one = (t) => t.replace(/\s+/g, ' ').trim();
+  return html`<div class="outbox" onMouseDown=${(e) => e.preventDefault()}>
+    <div class="ohead faint">queued · sent in order when the turn ends</div>
+    ${list.map((m, i) => {
+      const editing = ed && ed.id === m.id, whole = open.value.has(m.id);
+      return html`<div class=${'qm' + (editing ? ' editing' : '')} data-q=${m.id}>
+        <span class="faint">${i + 1} </span>${m.images.length > 0 && html`<span class="c">[img${m.images.length > 1 ? '×' + m.images.length : ''}] </span>`}<${K} cls=${'qt' + (whole ? ' whole' : '')} title=${whole ? 'fold' : 'show it whole'} on=${() => flip(m.id)}>${whole ? m.text : one(m.text)}</${K}>
+        <span class="qv">${editing ? html`<span class="o">editing in the composer</span>`
+          : html`<${K} cls="qe" title="back into the composer; ⏎ puts it back here" on=${() => p.editQueued && p.editQueued(m.id)}>edit</${K}><span class="faint"> · </span><${K}
+              cls="qs" title="send it now, into the running turn" on=${() => steer(m)}>steer ↑</${K}><span class="faint"> · </span><${K} cls="qx" title="drop it" on=${() => drop(m.id)}>×</${K}>`}</span>
+      </div>`;
+    })}
+  </div>`;
 }
 
+// The composer's bottom border: a line of menus (switching what is loaded
+// needs the hub: the door restarts between turns) and the verbs. It fits the
+// frame as the status line does: the verbs drop their keys, the labels drop
+// to glyphs, every menu goes into one `⋯`, then only send and stop stay.
+const RESTART = 'needs the hub (restarts the door between turns)';
+const MIC = 'needs local dictation (hub + whisper.cpp)';
+let attSeq = 0;
+
 function Composer({ s, p, act }) {
-  const ta = useRef(null);
+  const ta = useRef(null), root = useRef(null), bar = useRef(null), fileIn = useRef(null);
   const text = useMemo(() => signal(''), []);
+  const atts = useMemo(() => signal([]), []); // images going with the next message
+  const [fit, setFit] = useState(0), [cw, setCw] = useState(0);
   const run = s.running.value, bye = s.bye || s.conn.value === 'goodbye';
   useEffect(() => {
     // A blurred textarea keeps its selection, so focus() puts the caret back where it was.
@@ -544,17 +386,104 @@ function Composer({ s, p, act }) {
     el.style.height = el.scrollHeight + 'px';
     if (text.value !== el.value) text.value = el.value;
   };
+  const put = (t) => { const el = ta.current; el.value = t; autosize(); el.focus(); el.setSelectionRange(t.length, t.length); };
+  // Editing a queued message: what was typed waits aside and comes back after.
+  useEffect(() => {
+    p.editQueued = (id) => {
+      const m = p.queue.peek().find((x) => x.id === id);
+      if (!m) return;
+      const cur = p.editing.peek();
+      p.editing.value = { id, stash: cur ? cur.stash : ta.current.value };
+      put(m.text);
+    };
+  }, [p]);
+  const endEdit = (save) => {
+    const e = p.editing.peek(), t = ta.current.value;
+    if (save) p.queue.value = p.queue.peek().flatMap((m) => (m.id !== e.id ? [m] : t.trim() || m.images.length ? [{ ...m, text: t }] : []));
+    p.editing.value = null;
+    put(e.stash);
+  };
+  // The turn ended: send the first held message. One at a time: the next
+  // waits for the turn this one starts to end (`sent` until running is seen).
+  useEffect(() => {
+    let sent = false, t = 0;
+    const stop = effect(() => {
+      const run = s.running.value, q = p.queue.value, e = p.editing.value, live = s.conn.value === 'live';
+      if (run === true) { sent = false; clearTimeout(t); return; }
+      if (run !== false || sent || !q.length || !live || s.bye || (e && e.id === q[0].id)) return;
+      const m = q[0];
+      sent = true;
+      t = setTimeout(() => { sent = false; }, 5000); // no turn-state came: try again
+      p.queue.value = q.slice(1);
+      s.submit('send', m.text, m.images).then((ok) => { if (!ok) { p.queue.value = [m, ...p.queue.peek()]; } });
+    });
+    return () => { stop(); clearTimeout(t); };
+  }, [p, s]);
   const go = async (how) => {
     const el = ta.current;
     if (how === 'stop') { s.cancel(); return; }
-    if (!el.value.trim()) { el.focus(); return; }
-    const sent = el.value;
-    if (await s.submit(how, sent) && el.value === sent) { el.value = ''; autosize(); }
+    if (p.editing.peek()) { endEdit(true); return; }
+    const imgs = atts.peek();
+    if (!el.value.trim() && !imgs.length) { el.focus(); return; }
+    const sent = el.value, big = tooBig(sent, imgs);
+    if (big) { act.toast(big, true); return; }
+    // Queued while a turn runs: held here, editable until it is sent.
+    if (how === 'queue' && s.running.peek() === true) { enqueue(p, sent, imgs); el.value = ''; autosize(); atts.value = []; return; }
+    if (await s.submit(how, sent, imgs) && el.value === sent) { el.value = ''; autosize(); atts.value = []; }
   };
+  // ---- attachments: + attach, a paste, a drop
+  const pick = (kind) => {
+    const el = fileIn.current;
+    el.accept = kind === 'image' ? IMAGE_TYPES.join(',') : '';
+    el.dataset.kind = kind;
+    el.value = '';
+    el.click();
+  };
+  const insert = (t) => {
+    const el = ta.current, a = el.selectionStart, b = el.selectionEnd;
+    el.setRangeText((a > 0 && el.value[a - 1] !== '\n' ? '\n' : '') + t, a, b, 'end');
+    autosize();
+  };
+  const take = async (files, kind) => {
+    for (const f of files) {
+      try {
+        if (kind === 'image' || (kind !== 'text' && looksImage(f))) {
+          if (atts.peek().length >= MAX_IMAGES) throw new Error(`at most ${MAX_IMAGES} images go with one message`);
+          const a = await readImage(f);
+          atts.value = [...atts.peek(), { ...a, id: ++attSeq }];
+        } else insert(await readText(f));
+      } catch (err) { act.toast(err.message, true); }
+    }
+    ta.current.focus();
+  };
+  const onPaste = (e) => {
+    const fs = [...((e.clipboardData && e.clipboardData.files) || [])].filter(looksImage);
+    if (fs.length) { e.preventDefault(); take(fs, 'image'); }
+  };
+  const files = (e) => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+  // ---- the bottom border fits: 0 all, 1 verbs without keys (css), 2 glyphs, 3 one menu, 4 fewer verbs (css)
+  useLayoutEffect(() => {
+    const ro = new ResizeObserver(() => setCw(root.current ? root.current.clientWidth : 0));
+    ro.observe(root.current);
+    return () => ro.disconnect();
+  }, []);
+  const hl = s.hello.value, yolo = !!(hl && hl.yolo), model = (hl && hl.model) || '?';
+  useLayoutEffect(() => { setFit(0); }, [cw, model, yolo, run, !!p.editing.value]);
+  useLayoutEffect(() => {
+    const el = bar.current;
+    if (el && fit < 4 && el.scrollWidth > el.clientWidth + 1) setFit(fit + 1);
+  });
   const onKey = (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !e.ctrlKey) {
       e.preventDefault();
       go(e.altKey ? 'queue' : run === true ? 'steer' : 'send');
+    } else if (e.key === 'Escape' && p.editing.peek()) {
+      e.preventDefault();
+      endEdit(false);
+    } else if (e.key === 'ArrowUp' && !ta.current.value && !p.editing.peek() && p.queue.peek().length) {
+      e.preventDefault();
+      const q = p.queue.peek();
+      p.editQueued(q[q.length - 1].id);
     } else if (e.key === 'Tab' && !e.shiftKey) {
       // Tab from the composer goes to the oldest pending ask on the page.
       if (act.focusHead()) e.preventDefault();
@@ -568,16 +497,48 @@ function Composer({ s, p, act }) {
     }
   };
   const enter = run === true ? 'steer' : 'send';
-  const w = (how, label, on, keyHint) => html`<${K} off=${!on || bye} on=${() => go(how)} cls="verb">${label}${keyHint && html`<span class="kh"> ${keyHint}</span>`}</${K}>`;
+  // [verb, key, drawn in a narrow pane]
+  const verbs = [
+    run !== true && ['send', '⏎', true],
+    run !== false && ['steer', enter === 'steer' ? '⏎' : '', enter === 'steer'],
+    run !== false && ['queue', '⌥⏎', false],
+    run !== false && ['stop', '^c', true],
+  ].filter(Boolean);
   const sep = html`<span class="faint"> · </span>`;
-  return html`<div class=${'composer' + (run === true ? ' running' : '')}>
-    <div class="ftitle"><span class="mode">${run === true ? 'steer' : 'message'}</span> <${Pulse} s=${s} /></div>
-    <textarea ref=${ta} rows="1" spellcheck="false" placeholder=${bye ? 'this session said goodbye' : 'say something to minerva'}
-      aria-label="message" onInput=${autosize} onKeyDown=${onKey} onFocus=${() => act.focus(p.id)}></textarea>
-    <div class="fbot">
-      ${w('send', 'send', run !== true, enter === 'send' ? '⏎' : '')}${sep}${w('steer', 'steer', run !== false, enter === 'steer' ? '⏎' : '')}${sep}${w('queue', 'queue', run !== false, '⌥⏎')}${sep}${w('stop', 'stop', run !== false, '^c')}
-      ${s.queued.value > 0 && html`${sep}<span class="hi">${s.queued.value} queued</span>`}
-      ${text.value.startsWith(':') && html`${sep}<span class="cwarn">: goes to the model; commands live in the status line</span>`}
+  const menus = [
+    { id: 'attach', full: '+ attach', short: '+', items: () => [
+      { label: 'image…', hint: 'png jpeg gif webp · 4 MiB', on: () => pick('image') },
+      { label: 'file…', hint: 'text, inlined', on: () => pick('text') },
+      { label: 'folder…', off: `${HUB}: a session's folder is fixed at launch` },
+    ] },
+    { id: 'model', full: `model ${model}`, short: model.split(/[/:]/).pop(), items: () => [
+      { label: model, tick: true, off: RESTART }, { label: 'another model…', off: RESTART }] },
+    { id: 'effort', full: 'effort ?', short: '◔', items: () => ['low', 'medium', 'high'].map((l) => ({ label: l, off: RESTART })) },
+    { id: 'mode', full: `mode ${yolo ? 'YOLO' : 'gated'}`, short: yolo ? 'YOLO' : '⚑', items: () => MODES.map((m) => ({ label: m, tick: m === 'yolo' && yolo, off: RESTART })) },
+    { id: 'mic', full: '◉ mic', short: '◉', off: MIC },
+  ];
+  const menuAt = (m) => (e) => openMenu(m.items(), under(e.currentTarget), { title: m.full, owner: `cm-${m.id}-${p.id}` });
+  const cmenus = fit >= 3
+    ? html`<${K} cls="cm cm-all" title="attach, model, effort, mode, mic" on=${(e) => openMenu(menus.map((m) => (m.off ? { label: m.full, off: m.off } : { label: m.full, sub: m.items() })),
+        under(e.currentTarget), { title: 'composer', owner: `cm-all-${p.id}` })}>⋯ ▾</${K}>`
+    : menus.map((m, i) => html`${i > 0 && sep}${m.off ? html`<span class=${'dis cm cm-' + m.id} title=${m.off}>${fit >= 2 ? m.short : m.full}</span>`
+      : html`<${K} cls=${'cm cm-' + m.id} title=${m.full} on=${menuAt(m)}>${fit >= 2 ? m.short : m.full} ▾</${K}>`}`);
+  const st = stateOf(s), ed = p.editing.value;
+  const edN = ed ? p.queue.value.findIndex((m) => m.id === ed.id) + 1 : 0;
+  return html`<div class=${'composer st-' + STATE_CLS[st] + (run === true ? ' running' : '') + (ed ? ' editing' : '')} ref=${root}
+      onDragOver=${(e) => { if (files(e)) e.preventDefault(); }} onDrop=${(e) => { if (files(e) && e.dataTransfer.files.length) { e.preventDefault(); take([...e.dataTransfer.files]); } }}>
+    <div class="ftitle">message${ed && html`<span class="o"> · editing queued ${edN}</span>`}</div>
+    <div class="ftitle fr"><${Pulse} s=${s} /></div>
+    ${atts.value.length > 0 && html`<div class="chips">${atts.value.map((a) => html`<span class="chip" title=${`${a.media_type}, ${kfmt(a.size)} bytes`}><span class="c">[img]</span> ${a.name} <${K}
+        cls="cx" title="remove it" on=${() => { atts.value = atts.peek().filter((x) => x !== a); }}>×</${K}></span>`)}</div>`}
+    <textarea ref=${ta} rows="1" spellcheck="false" aria-label="message"
+      placeholder=${bye ? 'this session said goodbye' : `Write a message… (⏎ ${enter} · ⌥⏎ queue · ^c stop)`}
+      onInput=${autosize} onKeyDown=${onKey} onPaste=${onPaste} onFocus=${() => act.focus(p.id)}></textarea>
+    <input type="file" ref=${fileIn} multiple hidden aria-hidden="true" tabindex="-1" onChange=${(e) => take([...e.currentTarget.files], e.currentTarget.dataset.kind)} />
+    ${text.value.startsWith(':') && html`<div class="cwarn">: goes to the model; commands live in the status line</div>`}
+    <div class=${'fbar fit' + fit} ref=${bar}><span class="cmenus">${cmenus}</span><span class="grow"></span>
+      <span class="verbs">${ed ? html`<${K} cls="verb" on=${() => endEdit(true)}><span class="kh">⏎ </span>save</${K}>${sep}<${K} cls="verb" on=${() => endEdit(false)}><span class="kh">esc </span>cancel</${K}>`
+        : html`${s.queued.value > 0 && html`<span class="hi">${s.queued.value} queued</span>${sep}`}${verbs.map(([how, kh, narrow], i) => html`<span class=${narrow ? '' : 'wide'}>${i > 0 && sep}<${K} off=${bye} on=${() => go(how)} cls="verb">${kh && html`<span class="kh">${kh} </span>`}${how}</${K}></span>`)}`}</span>
     </div>
   </div>`;
 }

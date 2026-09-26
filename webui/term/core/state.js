@@ -13,6 +13,36 @@ import { World, TICK_MS } from './life.js';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export const kfmt = (n) => (n >= 10000 ? (n / 1000).toFixed(0) + 'k' : n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
 export const tildify = (p) => String(p || '').replace(/^\/home\/[^/]+(?=\/|$)|^\/root(?=\/|$)/, '~');
+export const MODES = ['yolo', 'accept edits', 'manual', 'auto'];
+
+export const STATE_CLS = { RUN: 'run', IDLE: 'idle', ASK: 'ask', '?': 'unknown', OFF: 'off', BYE: 'bye', NONE: 'off' };
+// Where a session stands, in one word: the status line's badge and the
+// composer frame's colour both read it. ASK: an ask of its is not yet sent
+// (answered in the panel but not submitted still waits on the operator).
+export function stateOf(s) {
+  if (!s) return 'NONE';
+  const conn = s.conn.value;
+  if (s.bye || conn === 'goodbye') return 'BYE';
+  if (conn !== 'live' && conn !== 'replaying') return 'OFF';
+  if (s.asks.value.some((a) => !a.busy.value)) return 'ASK';
+  const run = s.running.value;
+  return run === true ? 'RUN' : run === false ? 'IDLE' : '?';
+}
+const pad = (n) => String(n).padStart(2, '0');
+const DAYS = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+const MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+export const dayLabel = (t) => { const d = new Date(t); return `${DAYS[d.getDay()]} ${pad(d.getDate())} ${MONTHS[d.getMonth()]}`; };
+const dayOf = (t) => new Date(t).toDateString();
+export const hhmm = (t) => { const d = new Date(t); return pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+// A record's own time: a `ts` (epoch ms or s, or an RFC 3339 string), else
+// null. No door frame carries one yet, so no day rows are drawn until one
+// does; a live row is stamped on arrival instead (Session.frame).
+function stampOf(f) {
+  const v = f.ts;
+  const t = typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : typeof v === 'string' ? Date.parse(v) : NaN;
+  return Number.isFinite(t) ? t : null;
+}
+const oneLine = (t) => String(t || '').replace(/`+/g, '').replace(/\s+/g, ' ').trim();
 const VERDICT_CAP = 50;
 // Read once and kept current by its change event, not queried every tick.
 const motion = matchMedia('(prefers-reduced-motion: reduce)');
@@ -38,6 +68,7 @@ const keyOf = (f) => (f.record != null ? 'r' + f.record : f.type === 'tool-call-
 class Draft {
   constructor() {
     this.key = 'draft' + ++seq;
+    this.at = Date.now(); // it is live by nature: its time is now
     this.text = []; this.think = [];
     this.sinks = new Set(); this.thinkSinks = new Set();
     this.thinkLines = signal(0);
@@ -70,6 +101,10 @@ export class Session {
     // pending eidolon PR): later answers go without one.
     this.noNote = signal(false);
     this.arrived = new Map(); // ask_id -> arrival order, kept across reconnects
+    this.picked = new Map();  // ask_id -> the answer recorded and not yet sent, kept across reconnects
+    this.unread = signal(0);  // live replies, peer messages and asks while no focused pane shows this session
+    this.at = null;           // the time of the frame being handled: its record's, else its arrival while live, else null
+    this.real = false;        // whether that time is the record's own (only those draw day rows)
     this.reset();
     this.run();
   }
@@ -83,18 +118,24 @@ export class Session {
       this.running = this.running || signal(null);   // true | false | null = unknown (gap 1)
       this.setRunning(null);
       for (const k of ['ctx', 'budget']) { this[k] = this[k] || signal(null); this[k].value = null; }
-      for (const k of ['queued', 'turns', 'calls', 'fails', 'finished']) { this[k] = this[k] || signal(0); this[k].value = 0; }
+      for (const k of ['queued', 'turns', 'calls', 'fails', 'finished', 'usedIn', 'usedOut']) { this[k] = this[k] || signal(0); this[k].value = 0; }
       for (const k of ['chunks', 'asks', 'open', 'verdicts']) { this[k] = this[k] || signal([]); this[k].value = []; }
+      this.last = this.last || signal(null); // { who, text }: the sidebar's one-line preview
+      this.last.value = null;
       this.touched = this.touched || signal(new Map());
       this.touched.value = new Map();
+      this.tools = this.tools || signal(new Map()); // tool name -> calls seen (the door lists no tools; these are the ones used)
+      this.tools.value = new Map();
       this.draft = this.draft || signal(null);
       this.draft.value = null;
-      this.stick = this.stick || signal(0); // bumped to ask the view to jump to the bottom
+      this.jumpToEnd = this.jumpToEnd || signal(0); // a counter; each bump puts every view at the bottom
     });
     this.records = new Set();
     this.byId = new Map();   // call id -> call
     this.pending = [];       // rows waiting for the next flush
     this.lastWho = null;
+    this.head = null;        // the first row of the agent's current run: its settles add up there
+    this.day = null;         // the date of the last row with a known time: a new one draws a day row
     this.partial = null;     // a reply row an `error` cut short, until its assistant-message
     this.seqReplay = [];     // replayed frames, for the overlap window
     this.win = null;
@@ -105,11 +146,29 @@ export class Session {
   // list is copied only when a new chunk starts (every CHUNK rows).
   addRow(row) {
     row.key = row.key || 'r' + ++seq;
+    row.at = this.at;
+    const first = !this.pending.length;
     // Anything that is not a speaker's own line ends that speaker's run, so
     // the next message names who says it again.
     if (!['you', 'bot', 'tool', 'ask', 'verdict'].includes(row.kind)) this.lastWho = null;
+    if (this.real && dayOf(row.at) !== this.day) {
+      this.day = dayOf(row.at);
+      this.pending.push({ kind: 'day', key: 'r' + ++seq, text: dayLabel(row.at) });
+      if ((row.kind === 'you' || row.kind === 'bot') && !row.who) row.who = this.lastWho = row.kind;
+    }
+    // The first row of a speaker's run carries the run's facts beside the
+    // name: its time, and for the agent what its turns cost (settled below).
+    if (row.who) {
+      row.meta = signal(null);
+      this.head = row.who === 'bot' ? row : null;
+    }
+    if (row.kind === 'you' || row.kind === 'bot' || row.kind === 'peer') {
+      const text = oneLine(row.text);
+      if (text) this.last.value = { who: row.kind === 'peer' ? '~ ' + row.from : row.kind, text };
+    }
+    if (row.kind === 'bot' || row.kind === 'peer' || row.kind === 'ask') this.bump();
     this.pending.push(row);
-    if (this.pending.length === 1) queueMicrotask(() => this.flush());
+    if (first) queueMicrotask(() => this.flush());
     return row;
   }
   flush() {
@@ -130,6 +189,10 @@ export class Session {
       for (const c of touched) c.ver.value++;
       if (fresh) this.chunks.value = list.concat(fresh);
     });
+  }
+
+  bump() {
+    if (this.live && !(this.hooks.seen && this.hooks.seen(this))) this.unread.value++;
   }
 
   who(kind) {
@@ -267,6 +330,9 @@ export class Session {
 
   // ---------------------------------------------------------------- frames
   frame(f) {
+    const ts = stampOf(f);
+    this.real = ts != null;
+    this.at = ts ?? (this.live ? Date.now() : null);
     if (this.live) {
       if (this.dupInWindow(f)) return;
     } else if (this.gotHello && f.type !== 'hello' && f.type !== 'caught-up') {
@@ -292,7 +358,7 @@ export class Session {
         }
         // `running` stays unknown here: hello has no `running` (gap 1), and
         // only turn-state may set it.
-        this.stick.value++;
+        this.jumpToEnd.value++;
         break;
       }
       case 'turn-state':
@@ -441,6 +507,7 @@ export class Session {
     };
     this.byId.set(f.id, c);
     this.calls.value++;
+    if (f.name) this.tools.value = new Map(this.tools.value).set(f.name, (this.tools.value.get(f.name) || 0) + 1);
     this.open.value = [...this.open.value, c];
     if (/^(edit|write|multi_?edit|patch|apply_patch)$/i.test(c.name)) {
       const p = c.input && (c.input.path || c.input.file_path);
@@ -488,7 +555,7 @@ export class Session {
     if (!this.arrived.has(f.ask_id)) this.arrived.set(f.ask_id, ++seq);
     const a = {
       id: f.ask_id, f, fresh: this.live, n: this.arrived.get(f.ask_id),
-      busy: signal(false), err: signal(''), done: signal(null),
+      busy: signal(false), err: signal(''), done: signal(null), chosen: signal(this.picked.get(f.ask_id) || null),
     };
     if (f.kind === 'approval') {
       // `always` is offered only by a door that lists it (gap 13), and is
@@ -512,7 +579,7 @@ export class Session {
     const c = f.call_id != null ? this.byId.get(f.call_id) : null;
     a.call = c;
     this.asks.value = [...this.asks.value, a];
-    if (c) c.ask.value = a;
+    if (c) { c.ask.value = a; this.bump(); }
     else this.addRow({ kind: 'ask', ask: a });
   }
 
@@ -527,35 +594,51 @@ export class Session {
   // done: { how: 'answered' | 'cancelled' | 'elsewhere', answer?, note? }
   dropAsk(a, done) {
     this.asks.value = this.asks.value.filter((x) => x !== a);
-    const sent = a.sent && a.sent.answer === done.answer ? a.sent : {};
+    this.picked.delete(a.id);
+    const sent = a.chosen.peek() && a.chosen.peek().answer === done.answer ? a.chosen.peek() : {};
     a.done.value = { ...done, note: sent.note };
     if (a.call) { a.call.ask.value = null; a.call.settled.value = a; }
   }
 
-  // reply: { answer, note? }. A door that turns the note down (400/422, a
-  // door without the pending eidolon PR) is remembered, so the next try goes
-  // without it. Resolves to the status (0 = not sent).
-  async answer(a, reply) {
-    if (a.busy.value || !this.asks.value.includes(a)) return 0;
-    a.busy.value = true;
+  // Answering is two steps: choose records the reply (the panel shows it as
+  // answered, and it can be chosen again until it is sent; a reconnect keeps
+  // it), send posts it. A door that turns the note down (400/422, a door
+  // without the pending eidolon PR) is remembered, so the next try goes
+  // without it; any refusal clears the choice so it can be made again. A 409
+  // (answered elsewhere) or 404 (the session is gone) drops the ask.
+  // reply: { answer, note? }
+  choose(a, reply) {
+    if (a.busy.peek() || !this.asks.peek().includes(a)) return false;
     a.err.value = '';
-    a.sent = reply; // set first: the ask-settled frame can beat the POST's own answer
+    a.chosen.value = reply;
+    this.picked.set(a.id, reply);
+    return true;
+  }
+
+  // Resolves to { status, why } (status 0: not sent).
+  async send(a) {
+    const reply = a.chosen.peek();
+    if (!reply || a.busy.peek() || !this.asks.peek().includes(a)) return { status: 0 };
+    a.busy.value = true;
     const r = await post(this.sid, 'answer', { ask_id: a.id, ...reply });
-    if (r.status === 204) return 204; // ask-settled draws the rest
-    a.sent = null;
-    if (r.status === 409) {
-      if (this.asks.value.includes(a)) this.dropAsk(a, { how: 'elsewhere' });
-      this.hooks.toast('that ask was answered elsewhere');
-      return 409;
-    }
+    if (r.status === 204) { this.picked.delete(a.id); return { status: 204 }; } // ask-settled draws the rest
     a.busy.value = false;
+    if (r.status === 409 || r.status === 404) {
+      if (this.asks.peek().includes(a)) this.dropAsk(a, { how: 'elsewhere' });
+      this.hooks.toast(r.status === 409 ? 'that ask was answered elsewhere' : 'that ask is gone (404): its session ended');
+      return { status: r.status };
+    }
+    a.chosen.value = null;
+    this.picked.delete(a.id);
     const why = `${r.status || 'network'}: ${(r.data && r.data.error) || 'not accepted'}`;
     if ((r.status === 400 || r.status === 422) && reply.note != null) {
       this.noNote.value = true;
       a.err.value = `the door did not take the note (${why}); choose again to send without it`;
     } else a.err.value = why;
-    return r.status;
+    return { status: r.status || -1, why };
   }
+
+  answer(a, reply) { return this.choose(a, reply) ? this.send(a) : Promise.resolve({ status: 0 }); }
 
   // ---------------------------------------------------------------- turns
   // A turn that ended leaves no spinner behind: calls it never finished are
@@ -573,6 +656,13 @@ export class Session {
     this.stopOpen();
     this.turns.value++;
     const u = f.usage || {};
+    this.usedIn.value += (u.input_tokens || 0) + (u.cache_read_input_tokens || 0);
+    this.usedOut.value += u.output_tokens || 0;
+    const h = this.head;
+    if (h) {
+      const m = h.meta.peek() || { in: 0, out: 0, ms: 0 };
+      h.meta.value = { in: m.in + (u.input_tokens || 0) + (u.cache_read_input_tokens || 0), out: m.out + (u.output_tokens || 0), ms: m.ms + ((f.timing && f.timing.total_ms) || 0) };
+    }
     const bits = [String(f.stop_reason || 'settled').replace(/-/g, ' ')];
     if (u.input_tokens || u.output_tokens) bits.push(`${kfmt(u.input_tokens + (u.cache_read_input_tokens || 0))} in`, `${kfmt(u.output_tokens)} out`);
     if (f.timing) bits.push((f.timing.total_ms / 1000).toFixed(1) + 's');
@@ -583,13 +673,16 @@ export class Session {
   // ---------------------------------------------------------------- verbs
   // how: 'send' | 'steer' | 'queue'. A steer is never sent to a session known
   // to be idle (it would sit unread, core agent.rs:430); `queue` is a send,
-  // which the door queues behind a running turn.
-  async submit(how, text) {
-    if (!text.trim() || this.sending) return false;
+  // which the door queues behind a running turn. images: [{ name, media_type,
+  // data }] as core/attach.js reads them (checked there against the door's limits).
+  async submit(how, text, images = []) {
+    if ((!text.trim() && !images.length) || this.sending) return false;
     if (this.bye) { this.hooks.toast('this session said goodbye', true); return false; }
     const mode = how === 'steer' && this.running.value !== false ? 'steer' : 'send';
     this.sending = true;
-    const r = await post(this.sid, 'say', { text, mode });
+    const body = { text, mode };
+    if (images.length) body.images = images.map(({ name, media_type, data }) => ({ name, media_type, data }));
+    const r = await post(this.sid, 'say', body);
     this.sending = false;
     if (r.status === 202) {
       if (r.data && r.data.queued) this.hooks.toast('queued behind the running turn');

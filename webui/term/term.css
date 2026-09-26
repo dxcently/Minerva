@@ -25,7 +25,8 @@ html, body {
 .k { cursor: pointer; }
 .k:hover { text-decoration: underline; text-underline-offset: 2px; }
 .k:focus-visible, [tabindex]:focus-visible { outline: 1px dashed var(--bright); outline-offset: 0; }
-.dis { color: var(--line); cursor: default; }
+/* greyed: still readable (base04 keeps AA), struck through to say it does nothing */
+.dis { color: var(--faint); text-decoration: line-through; cursor: default; }
 .faint { color: var(--faint); }
 .dim { color: var(--faint); }
 .hi { color: var(--bright); } .b { font-weight: bold; }
@@ -54,7 +55,8 @@ html, body {
 #main {
   display: grid;
   grid-template-columns: var(--lw) minmax(0, 1fr) var(--rw);
-  --lw: calc(30 * var(--cw)); --rw: calc(34 * var(--cw));
+  /* --lc / --rc: the sidebars' widths in cells (app.js), never past 45% of the screen */
+  --lw: min(calc(var(--lc, 30) * var(--cw)), 45vw); --rw: min(calc(var(--rc, 34) * var(--cw)), 45vw);
   padding: calc(var(--ch) / 2) 0 0;
   min-height: 0;
 }
@@ -72,14 +74,30 @@ html, body {
   line-height: calc(3 * var(--cw) - 2px);
 }
 .rail:hover { color: var(--bright); background: var(--panel); }
+/* a sidebar's inner border: a cell-wide handle over the line */
+.edge { position: absolute; top: 0; bottom: 0; width: var(--cw); z-index: 3; cursor: col-resize; touch-action: none; }
+.edge.l { right: calc(var(--cw) / -2 - 0.5px); }
+.edge.r { left: calc(var(--cw) / -2 - 0.5px); }
+.edge::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; }
+.edge:hover::after, .edge.drag::after, .edge:focus-visible::after { background: var(--bright); }
+.edge:focus-visible { outline: none; }
 
 /* ---- left sidebar ---- */
 .owl { color: var(--faint); margin: 0 0 var(--ch); white-space: pre; line-height: var(--ch); }
 .owl .eyes { color: var(--bright); }
 .owl .name { color: var(--brightest); font-weight: bold; }
 .list { white-space: pre; }
-.list .it { display: flex; gap: var(--cw); }
+.list .it + .it { margin-top: calc(var(--ch) * 0.3); }
+.list .it .l1 { display: flex; gap: var(--cw); }
 .list .it .grow { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.list .it .nm { font-weight: bold; }
+.list .it .nm.on { color: var(--brightest); }
+.list .it .pv { color: var(--faint); padding-left: calc(2 * var(--cw)); overflow: hidden; text-overflow: ellipsis; }
+/* sessions grouped by project */
+.grp + .grp { margin-top: calc(var(--ch) * 0.5); }
+.gh { display: flex; gap: var(--cw); white-space: pre; }
+.gh .gname { color: var(--bright); font-weight: bold; overflow: hidden; text-overflow: ellipsis; }
+.grp > .list { padding-left: calc(2 * var(--cw)); }
 .hdr { color: var(--bright); margin-top: var(--ch); }
 .note { color: var(--faint); white-space: pre-wrap; }
 .needs { color: var(--faint); }
@@ -90,11 +108,13 @@ html, body {
 .pane {
   position: absolute; display: flex; flex-direction: column;
   border-color: var(--line);
+  container-type: inline-size;
 }
 .pane.focus { border-color: var(--bright); }
 .pane:focus-visible { outline: none; }
 .pane.focus > .ftitle { background: var(--brightest); color: var(--bg); }
-.pane.focus > .ftitle .faint, .pane.focus > .ftitle .hi, .pane.focus > .ftitle .y { color: var(--bg); }
+.pane.focus > .ftitle .faint, .pane.focus > .ftitle .hi, .pane.focus > .ftitle .y, .pane.focus > .ftitle .proj { color: var(--bg); }
+.ptitle .proj { color: var(--fg); }
 .ptitle { cursor: pointer; max-width: calc(100% - 12 * var(--cw)); }
 /* split and close glyphs, cut into the top border on the right */
 .fglyphs {
@@ -121,9 +141,9 @@ html, body {
 .pop .mi.sel { background: var(--sel); color: var(--brightest); }
 .pop .mi.sel .mh { color: var(--fg); }
 .pop .mi.sel .tick { color: var(--brightest); }
-.pop .mi.dis { color: var(--line); cursor: default; }
-.pop .mi.dis .mh { color: var(--line); }
-.pop .mi.dis.sel, .pop .mi.dis.sel .mh { color: var(--faint); }
+.pop .mi.dis { color: var(--faint); text-decoration: none; cursor: default; }
+.pop .mi.dis .ml { text-decoration: line-through; }
+.pop .mi.dis .mh { color: var(--faint); }
 .pop .msep { border-top: 1px solid var(--line); margin: calc(var(--ch) * 0.2) 0; }
 /* tile dividers: an invisible cell-wide handle over the shared border.
    Under the frame titles (z-index 2): a pane's title is cut into the same
@@ -149,6 +169,13 @@ html, body {
 }
 .row.draft { content-visibility: visible; }
 .row + .row { margin-top: calc(var(--ch) * 0.35); }
+/* a day separator, drawn only from the records' own timestamps */
+.row.day {
+  display: flex; align-items: center; gap: var(--cw);
+  color: var(--faint); white-space: nowrap; margin: calc(var(--ch) * 0.3) 0;
+}
+.row.day::before, .row.day::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+.row.day::before { flex: 0 0 calc(2 * var(--cw)); }
 .who { font-weight: bold; }
 /* transcript roles each take their own slot (web-ui.md 2.2) */
 .who.you, .row.you > .body { color: var(--blue); }
@@ -202,22 +229,52 @@ pre, .pre {
   white-space: pre-wrap; overflow-wrap: anywhere; background: none;
 }
 .tout.err { color: var(--red); }
+
+/* ---- code, file reads and diffs (core/syntax.js), as the TUI draws them:
+   a number gutter on a rule, the code in its roles, a diff's lines on the
+   ground of their sign ---- */
+.code { margin: calc(var(--ch) * 0.15) 0 calc(var(--ch) * 0.15) calc(3 * var(--cw)); background: var(--panel); color: var(--yellow); }
+.body .code { margin-left: 0; }
+.code .cr { display: flex; }
+.code .ln { flex: none; white-space: pre; color: var(--faint); padding: 0 var(--cw); border-right: 1px solid var(--line); margin-right: var(--cw); user-select: none; }
+.code .sg { flex: none; width: calc(2 * var(--cw)); white-space: pre; user-select: none; }
+.code .cx { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.code .cr.add { background: var(--added); }
+.code .cr.del { background: var(--removed); }
+.code .cr.add .sg { color: var(--green); }
+.code .cr.del .sg { color: var(--red); }
+.code .cr.dh .cx { color: var(--faint); }
+.code .cmore { display: block; padding-left: var(--cw); }
+.sx-c { color: var(--faint); }
+.sx-s { color: var(--green); }
+.sx-n { color: var(--orange); }
+.sx-k { color: var(--magenta); }
+/* beside a speaker's name: the run's time and cost */
+.who .wt { color: var(--faint); font-weight: normal; }
 .more { color: var(--bright); }
 
-/* ---- inline asks ---- */
+/* ---- the ask panel: one frame above the composer, a tab per pending ask cut into its top line ---- */
 .ask {
-  position: relative; border: 1px solid var(--orange);
-  margin: calc(var(--ch) * 0.8) calc(2 * var(--cw)) calc(var(--ch) * 0.4);
+  position: relative; flex: none; border: 1px solid var(--orange);
+  margin: calc(var(--ch) * 0.8) var(--cw) 0;
   padding: calc(var(--ch) * 0.5) var(--cw) calc(var(--ch) * 0.2);
 }
+/* the strip sits on the frame's line, so the body scrolls, not the frame */
+.ask .abody { max-height: 45vh; overflow-y: auto; }
 .ask > .ftitle { color: var(--orange); }
 .ask.fresh { animation: flash 1.2s ease-out 2; }
 @keyframes flash { 0% { background: color-mix(in srgb, var(--orange) 22%, transparent); } 100% { background: transparent; } }
 .ask:focus { outline: none; }
 /* the focus mark: keys reach this ask only while it holds focus */
 .ask:focus-within { box-shadow: inset 0 0 0 1px var(--brightest); background: var(--panel); }
-.ask:focus-within > .ftitle { color: var(--brightest); }
-.ask:focus-within > .ftitle::before { content: "▶ "; }
+.astrip { color: var(--faint); max-width: calc(100% - 2 * var(--cw)); overflow: hidden; white-space: pre; }
+.astrip .asep { color: var(--line); padding: 0 calc(var(--cw) / 2); }
+.astrip .atab { color: var(--faint); }
+.astrip .atab:hover { color: var(--fg); }
+.astrip .atab.on { color: var(--orange); font-weight: bold; }
+.ask:focus-within .astrip .atab.on { background: var(--orange); color: var(--bg); }
+.astrip .atab.done { color: var(--green); }
+.ask .ahead { color: var(--orange); font-weight: bold; }
 /* always laid out, shown only with focus: focusing an ask must not move
    the words a click is about to land on */
 .ask .akeys { visibility: hidden; color: var(--faint); margin-top: calc(var(--ch) * 0.2); }
@@ -226,16 +283,22 @@ pre, .pre {
 .ask .why { color: var(--faint); }
 .ask .warn { color: var(--bg); background: var(--red); padding: 0 var(--cw); }
 /* the choices: the highlighted one in reverse video, as the TUI selects */
-.ask .keys { margin-top: calc(var(--ch) * 0.3); display: flex; flex-wrap: wrap; gap: 0 var(--cw); }
-.ask .opt { --c: var(--fg); color: var(--c); padding: 0 var(--cw); white-space: pre; }
+.ask .keys { margin-top: calc(var(--ch) * 0.3); display: flex; flex-direction: column; align-items: flex-start; }
+.ask .opt { --c: var(--fg); color: var(--c); padding: 0 var(--cw) 0 0; white-space: pre; }
+.ask .opt::before { content: "  "; }
+.ask .opt.hi::before { content: "› "; }
 .ask .opt.yes { --c: var(--brightest); font-weight: bold; }
 .ask .opt.no { --c: var(--red); font-weight: bold; }
 .ask .opt.hi { background: var(--c); color: var(--bg); }
 .ask:not(:focus-within) .opt.hi { background: none; color: var(--c); box-shadow: inset 0 0 0 1px var(--c); }
 .ask .opt.note { --c: var(--faint); }
-.ask .keys .tabhint { margin-left: var(--cw); }
-.ask .opt.dis { --c: var(--line); color: var(--line); }
-.ask .opt .off { color: var(--line); font-weight: normal; }
+/* submit sends every tab's answer: set apart below the rows */
+.ask .opt.submit { --c: var(--bright); font-weight: bold; margin-top: calc(var(--ch) * 0.3); }
+.ask .keys .tabhint { margin-left: calc(2 * var(--cw)); }
+.ask .opt.dis { --c: var(--faint); color: var(--faint); }
+.ask .opt.submit.dis { font-weight: normal; }
+/* why a row is greyed is read, so it is not struck */
+.ask .opt .off { display: inline-block; text-decoration: none; color: var(--faint); font-weight: normal; }
 .ask .aline { display: flex; margin-top: calc(var(--ch) * 0.2); }
 .ask .aline input {
   flex: 1; min-width: 0; margin-left: var(--cw); padding: 0;
@@ -256,70 +319,124 @@ pre, .pre {
   background: var(--panel); color: var(--yellow); white-space: pre-wrap;
 }
 .banner.err { color: var(--red); }
-.waiting {
-  display: flex; align-items: center; gap: var(--cw);
-  margin: 0 var(--cw); color: var(--orange);
-}
-.waiting::before { content: ""; flex: 0 0 calc(2 * var(--cw)); border-top: 1px solid var(--orange); }
-.waiting::after { content: ""; flex: 1; border-top: 1px solid var(--orange); }
+/* where an ask arose: one line until it settles */
+.askmark { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.askmark .askl { color: var(--faint); margin-left: var(--cw); }
 
-/* ---- composer: square double frame, flat tint, pulsing frame ---- */
+/* ---- composer: the TUI's prompt frame, in the session's state colour
+   (--sc, core/state.js stateOf); it pulses while a turn runs ---- */
+/* messages queued while a turn runs, held in the pane until it ends */
+.outbox { flex: none; margin: calc(var(--ch) * 0.4) var(--cw) 0; padding: 0 var(--cw); border-left: 1px solid var(--line); max-height: 30vh; overflow-y: auto; }
+.outbox .qm { display: flex; gap: var(--cw); white-space: nowrap; line-height: var(--ch); }
+.outbox .qt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--fg); }
+.outbox .qt.whole { white-space: pre-wrap; }
+.outbox .qv { flex: none; }
+.outbox .qm.editing .qt { color: var(--orange); }
+.composer.editing .ftitle .o { color: var(--orange); }
 .composer {
-  position: relative;
-  margin: calc(var(--ch) * 0.8) var(--cw) calc(var(--ch) * 0.9);
-  border: 3px double var(--bright);
-  background: var(--panel);
-  padding: calc(var(--ch) * 0.55) var(--cw) calc(var(--ch) * 0.45);
+  --sc: var(--faint);
+  position: relative; flex: none;
+  margin: calc(var(--ch) * 0.6) var(--cw) calc(var(--ch) * 0.6);
+  border: 1px solid var(--sc);
+  padding: calc(var(--ch) * 0.5) var(--cw) calc(var(--ch) * 0.45);
 }
-/* while a turn runs the frame's colour breathes bright <-> dim */
+.composer.st-idle { --sc: var(--blue); }
+.composer.st-run { --sc: var(--green); }
+.composer.st-ask { --sc: var(--orange); }
+.composer.st-off { --sc: var(--red); }
 .composer.running { animation: frame-pulse 1.6s ease-in-out infinite alternate; }
-@keyframes frame-pulse { from { border-color: var(--bright); } to { border-color: var(--faint); } }
-.composer > .ftitle { color: var(--bright); max-width: calc(100% - 2 * var(--cw)); }
-.composer > .ftitle .mode { font-weight: bold; }
-.composer > .ftitle .agent { color: var(--bright); font-weight: bold; }
-.composer > .ftitle .life { font-weight: bold; }
+@keyframes frame-pulse { from { border-color: var(--sc); } to { border-color: var(--faint); } }
+.composer > .ftitle { color: var(--sc); font-weight: bold; }
+.composer > .ftitle.fr { left: auto; right: var(--cw); max-width: calc(100% - 12 * var(--cw)); font-weight: normal; }
 .composer > .ftitle .word { color: var(--bright); font-weight: bold; }
 .composer > .ftitle .gauge { color: var(--faint); }
-.composer > .fbot { color: var(--faint); }
-.composer > .fbot .verb { color: var(--bright); }
-.composer > .fbot .verb.dis { color: var(--line); }
-.composer > .fbot .kh { color: var(--faint); }
+/* the agent and the Life strip: every cell one cell wide whatever font draws
+   the braille, so nothing moves as the strip steps */
+.composer .slot { display: inline-block; vertical-align: top; white-space: pre; overflow: hidden; font-weight: bold; color: var(--bright); }
+.composer .slot .cell { display: inline-block; width: var(--cw); overflow: hidden; text-align: center; }
+.composer .slot.life { width: calc(12 * var(--cw)); }
+/* the bottom border: the verbs on the right, cut into the line */
+.composer > .fbar {
+  position: absolute; left: var(--cw); right: var(--cw); bottom: calc(var(--ch) / -2 - 0.5px); z-index: 2;
+  display: flex; gap: calc(2 * var(--cw));
+  line-height: var(--ch); white-space: nowrap; pointer-events: none;
+}
+.composer > .fbar > .grow { flex: 1; }
+.composer > .fbar > .verbs { flex: none; color: var(--faint); background: var(--bg); padding: 0 var(--cw); pointer-events: auto; }
+.composer > .fbar > .cmenus { flex: none; color: var(--faint); background: var(--bg); padding: 0 var(--cw); pointer-events: auto; }
+.composer .cm { color: var(--fg); }
+.composer > .fbar:not(.fit0) .verb .kh, .composer > .fbar.fit4 .verbs .wide { display: none; }
+.composer > .fbar.fit3, .composer > .fbar.fit4 { gap: var(--cw); }
+.composer .cm-model { color: var(--cyan); }
+.composer .cm-mode { color: var(--magenta); }
+/* the picker behind `+ attach`: never drawn, but in the page's one font */
+.composer input[type=file] { display: none; font: inherit; }
+/* images going with the next message, inside the frame above the text */
+.composer .chips { display: flex; flex-wrap: wrap; gap: 0 calc(2 * var(--cw)); line-height: var(--ch); }
+.composer .chip { white-space: nowrap; }
+.composer .chip .cx { color: var(--red); }
+.composer .verb { color: var(--bright); }
+.composer .verb.dis { color: var(--faint); }
+.composer .verb .kh { color: var(--faint); }
 .composer textarea {
   display: block; width: 100%; resize: none; border: 0; outline: 0; margin: 0; padding: 0;
-  background: transparent; color: var(--fg); caret-color: var(--bright);
+  background: transparent; color: var(--fg); caret-color: var(--bright); caret-shape: block;
   font: inherit; line-height: var(--ch); min-height: var(--ch); max-height: calc(10 * var(--ch));
   overflow-y: auto;
 }
 .composer textarea::placeholder { color: var(--faint); }
 .composer .cwarn { color: var(--yellow); }
+@container (max-width: 480px) {
+  .composer .verb .kh, .composer .verbs .wide, .composer > .ftitle .gauge { display: none; }
+}
 
-/* ---- the which-key / completion / toast line ---- */
+/* ---- the start screen: a session nobody has spoken in ---- */
+.start { white-space: pre; overflow: hidden; padding: var(--ch) 0; }
+.start .owl.big { margin-bottom: var(--ch); }
+.start .gap { height: var(--ch); }
+.kk { color: var(--cyan); font-weight: bold; }
+.m { color: var(--magenta); }
+
+/* ---- the completion / toast line ---- */
 #hint { padding: 0 var(--cw); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 0; }
 #hint:empty { display: none; }
 #hint .pair { margin-right: calc(3 * var(--cw)); }
-#hint .pair .key { color: var(--bright); font-weight: bold; }
 #hint.menu { color: var(--fg); }
 #hint .sel { background: var(--sel); color: var(--brightest); }
 #hint.toast { color: var(--fg); }
 #hint.toast.err { color: var(--red); }
 
-/* ---- status line ---- */
-#status {
-  display: flex; gap: var(--cw); white-space: nowrap; overflow: hidden;
-  background: var(--panel); height: var(--ch);
+/* ---- the key reference (`?`) ---- */
+.keyref {
+  left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: min(calc(100vw - 2 * var(--cw)), calc(112 * var(--cw))); max-height: calc(100vh - 4 * var(--ch));
+  overflow-y: auto; white-space: normal; padding: var(--ch) var(--cw) calc(var(--ch) * 0.5);
 }
-#status .badge { padding: 0 var(--cw); font-weight: bold; color: var(--bg); background: var(--faint); }
-#status .badge.run { background: var(--bright); animation: pulse 1.4s ease-in-out infinite; }
-#status .badge.off { background: var(--red); }
-@keyframes pulse { 50% { background: var(--faint); } }
-#status .grow { flex: 1; }
-#status .hints { color: var(--faint); padding-right: var(--cw); }
-#status .hints > * + * { margin-left: calc(2 * var(--cw)); }
-#status .hints .key { color: var(--bright); }
-#status .yolo { color: var(--bg); background: var(--red); padding: 0 var(--cw); font-weight: bold; }
+.keyref .kgroups { display: grid; grid-template-columns: repeat(auto-fill, minmax(calc(44 * var(--cw)), 1fr)); gap: var(--ch) calc(2 * var(--cw)); }
+.keyref .kgh { color: var(--yellow); font-weight: bold; }
+.keyref .kr { display: flex; gap: var(--cw); white-space: nowrap; }
+.keyref .kr .kk { flex: 0 0 calc(15 * var(--cw)); overflow: hidden; text-overflow: ellipsis; }
+.keyref .kr .kw { overflow: hidden; text-overflow: ellipsis; }
+.keyref .kr:hover { background: var(--sel); text-decoration: none; }
+
+/* ---- status line: the TUI's, a state badge then model · persona · YOLO,
+   the gauges and `? keys` on the right ---- */
+#status { background: var(--panel); height: var(--ch); overflow: hidden; }
+#status .bar { display: flex; height: 100%; white-space: nowrap; overflow: hidden; padding-right: var(--cw); }
+#status .left { display: flex; flex: none; white-space: pre; }
+#status .right { display: flex; flex: none; gap: calc(2 * var(--cw)); white-space: pre; }
+#status .grow { flex: 1; min-width: var(--cw); }
+#status .badge { padding: 0 var(--cw); margin-right: var(--cw); font-weight: bold; color: var(--bg); background: var(--faint); }
+#status .badge.st-idle { background: var(--blue); }
+#status .badge.st-run { background: var(--green); }
+#status .badge.st-ask { background: var(--orange); }
+#status .badge.st-off { background: var(--red); }
+#status .model { color: var(--cyan); }
+#status .persona { color: var(--magenta); }
+#status .yolo { color: var(--red); }
 #status .warn { color: var(--red); }
+#status .qk .kk { color: var(--cyan); }
 #cmd { display: flex; flex: 1; }
-#status .norm { display: flex; gap: var(--cw); flex: 1; min-width: 0; overflow: hidden; }
 #cmd .colon { color: var(--bright); padding-left: var(--cw); }
 #cmd input {
   flex: 1; border: 0; outline: 0; background: transparent; color: var(--fg);
@@ -329,17 +446,19 @@ pre, .pre {
 /* inspector */
 .kv { display: flex; gap: var(--cw); white-space: pre; }
 .kv .grow { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.files .filter { display: flex; gap: var(--cw); margin-bottom: calc(var(--ch) * 0.3); border-bottom: 1px dashed var(--line); }
+.files .filter:focus-within { border-bottom-color: var(--bright); }
+.files .filter input { flex: 1; min-width: 0; border: 0; outline: 0; padding: 0; background: transparent; color: var(--fg); caret-color: var(--bright); font: inherit; }
+.files .filter input::placeholder { color: var(--faint); }
+.files .fl { white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+.files .fl.dir { color: var(--bright); }
 
 /* ---- narrow screens: rails by default (app.js), hints trimmed ---- */
 @media (max-width: 760px) {
-  #status .hints .opt { display: none; }
   .pane .scroll { padding-left: calc(var(--cw) / 2); padding-right: calc(var(--cw) / 2); }
   .body, .tool, .sys, .peer, .think { padding-left: var(--cw); }
-  .ask { margin-left: var(--cw); margin-right: 0; }
+  .ask { margin-left: calc(var(--cw) / 2); margin-right: calc(var(--cw) / 2); }
   .composer { margin-left: calc(var(--cw) / 2); margin-right: calc(var(--cw) / 2); }
-  /* the four verbs must fit: key hints go, the words stay clickable */
-  .composer > .fbot .kh { display: none; }
-  #status .unk { display: none; }
 }
 
 /* ---- reduced motion: a static Life strip (core/state.js), and no pulse,
