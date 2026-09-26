@@ -7,7 +7,9 @@
 #   botforge-vm.sh freeze  make the base image read-only
 #   botforge-vm.sh reset   throw away the run overlay and start a fresh one
 #   botforge-vm.sh up      boot the overlay headless: no outbound, ssh on 127.0.0.1:2222 only
-#   botforge-vm.sh down    power the guest off
+#   botforge-vm.sh down    power the guest off, and wait until qemu has exited
+#   botforge-vm.sh ready   exit 0 once the guest answers ssh, 1 until then
+#   botforge-vm.sh score   print the Aeacus score as one line: score N/T penalties P generated ...
 set -eu
 
 # WSL inherits the Windows PATH, whose entries have spaces ("/mnt/c/Program
@@ -37,6 +39,18 @@ qemu() {
         -device ahci,id=ahci -device ide-hd,drive=disk0,bus=ahci.0 \
         -device e1000,netdev=net0 -vga std \
         -serial file:"$DIR/serial.log" "$@"
+}
+
+running() {
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+# The agent's own door into the guest. Host key checks are off because every
+# reset boots the same image on a loopback-only port; there is nothing to pin.
+guest() {
+    ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+        -p 2222 -i "$KEY" mford@127.0.0.1 "$@"
 }
 
 case "${1:-}" in
@@ -100,6 +114,7 @@ freeze)
     ls -l "$BASE"
     ;;
 reset)
+    ! running || { echo "the guest is running; botforge-vm.sh down first" >&2; exit 1; }
     rm -f "$OVERLAY"
     qemu-img create -f qcow2 -b "$BASE" -F qcow2 "$OVERLAY" >/dev/null
     echo "fresh overlay on $(basename "$BASE")"
@@ -113,10 +128,56 @@ up)
     echo "booting; ssh -p 2222 -i $KEY mford@127.0.0.1 once sshd answers"
     ;;
 down)
-    [ -S "$MONITOR" ] && printf 'system_powerdown\n' | nc -U -q1 "$MONITOR" >/dev/null 2>&1 || true
+    # An ACPI power-off first, then `quit` if the guest is still up after 20 s.
+    # The Mint desktop ignores the power button (measured: never within 90 s),
+    # and the overlay is thrown away at the next reset, so the hard stop loses
+    # nothing. Returns once qemu is gone, so a `reset` right after never deletes
+    # an overlay a live qemu still has open.
+    running || exit 0
+    printf 'system_powerdown\n' | nc -U -q1 "$MONITOR" >/dev/null 2>&1 || true
+    i=0; while running && [ "$i" -lt 20 ]; do sleep 1; i=$((i + 1)); done
+    if running; then
+        printf 'quit\n' | nc -U -q1 "$MONITOR" >/dev/null 2>&1 || true
+        sleep 2
+    fi
+    ! running || { echo "qemu $(cat "$PIDFILE") did not exit" >&2; exit 1; }
+    ;;
+ready)
+    # Not just "ssh answers". phocus writes its first report seconds into boot,
+    # before the guest's services settle, and that report is wrong: measured
+    # 2026-09-26, a fresh overlay's first report read 8/256 with 1 penalty and
+    # the next, 14 s later, 0/256. So ready also waits for systemd to finish
+    # booting and for a report written after that moment; a baseline read any
+    # earlier would credit the agent with points nobody earned.
+    guest '
+        case $(systemctl is-system-running 2>/dev/null) in running|degraded) ;; *) exit 1 ;; esac
+        fin=$(systemctl show -p FinishTimestampMonotonic --value)
+        up=$(cut -d. -f1 /proc/uptime)
+        settled=$(( $(date +%s) - up + fin / 1000000 ))
+        [ "$(stat -c %Y /opt/aeacus/assets/ScoringReport.html 2>/dev/null || echo 0)" -gt "$settled" ]
+    ' 2>/dev/null || { echo "guest not ready (ssh, boot, or a post-boot score) yet" >&2; exit 1; }
+    ;;
+score)
+    # Aeacus's phocus service rescores about once a minute and writes this
+    # world-readable report, so reading it needs no root in the guest. Output is
+    # ONE line with ONE N/T pair: bench's parser takes the first pair it sees,
+    # and the report's own date (2026/09/26) would otherwise parse as 9 of 26.
+    # A guest that cannot be reached prints nothing parseable and still exits 0,
+    # so the bench loop retries instead of aborting the run. ssh is the agent's
+    # own door too: an agent that locks it has ended its own run.
+    report=$(guest 'cat /opt/aeacus/assets/ScoringReport.html' 2>/dev/null) \
+        || { echo "score: guest unreachable over ssh" >&2; exit 0; }
+    pair=$(printf '%s\n' "$report" | grep -oE '[0-9]+ out of [0-9]+ points received' | head -n1)
+    [ -n "$pair" ] || { echo "score: no points line in the report" >&2; exit 0; }
+    earned=${pair%% *}
+    total=$(printf '%s\n' "$pair" | awk '{print $4}')
+    pen=$(printf '%s\n' "$report" | grep -oE '[0-9]+ penalties assessed' | head -n1 | awk '{print $1}')
+    gen=$(printf '%s\n' "$report" | grep -oE 'Generated At: [0-9/]+ [0-9:]+' | head -n1 \
+        | sed -e 's/Generated At: //' -e 's#/#-#g' -e 's/ /T/')
+    echo "score $earned/$total penalties ${pen:-?} generated ${gen:-?}"
     ;;
 *)
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

@@ -36,6 +36,10 @@ pub fn run_benchmark(
     agent: &dyn AgentRunner,
     clock: &dyn Clock,
 ) -> io::Result<Row> {
+    // A previous run that failed part-way leaves its guest up, and a reset
+    // under a live qemu would pull its overlay out from under it: stop first
+    // (a no-op when nothing runs).
+    vm.stop()?;
     vm.reset()?;
     vm.boot()?;
     vm.wait_ready(clock, cfg.boot_timeout_s)?;
@@ -55,7 +59,9 @@ pub fn run_benchmark(
     let reason = work_loop(cfg, scorer, agent, clock, &ctx, &mut timeline)?;
     agent.stop()?;
 
-    // Authoritative, after the agent can no longer touch the guest.
+    // Authoritative, after the agent can no longer touch the guest, and after
+    // the scorer has had time to rescore the agent's last change.
+    clock.sleep_s(cfg.score_settle_s);
     let final_score = match scorer.read()? {
         Some(s) => s,
         None => Score { earned: timeline.peak(), total: cfg.score_total },
@@ -148,6 +154,18 @@ mod tests {
         assert_eq!(row.stop_reason, StopReason::TimeBox);
         assert_eq!(row.points, 0);
         assert!(row.wall_s >= 300);
+    }
+
+    #[test]
+    fn stops_before_reset_and_settles_before_the_final_read() {
+        let c = cfg(60);
+        let vm = Vm::new(FakeHarness::with_scores(&["0 / 256"]), &c);
+        let clock = FakeClock::new();
+        let row = run_benchmark(&c, &vm, &vm, &NoopRunner, &clock).unwrap();
+        let calls = vm.harness().calls.borrow().clone();
+        assert_eq!(&calls[..3], &["vm down", "vm reset", "vm up"]);
+        assert_eq!(calls.last().map(String::as_str), Some("vm down"));
+        assert!(row.wall_s >= 60 + c.score_settle_s);
     }
 
     #[test]

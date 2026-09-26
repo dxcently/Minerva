@@ -153,6 +153,20 @@ mod tests {
     }
 
     #[test]
+    fn botforge_vm_score_line() {
+        // The exact line `botforge-vm.sh score` prints, read live off the
+        // practice image on 2026-09-26.
+        let line = "score 0/256 penalties 0 generated 2026-09-26T08:13:03\n";
+        assert_eq!(parse_score(line, 256), Some(Score { earned: 0, total: 256 }));
+        // Why the verb normalises instead of passing the report through: the
+        // report's own words are not a pair, and its date would read as 9 of 26.
+        assert_eq!(parse_score("0 out of 256 points received", 256), None);
+        assert_eq!(parse_score("Generated At: 2026/09/26 08:11:19", 256), Some(Score { earned: 9, total: 26 }));
+        // An unreachable guest prints nothing on stdout: no reading, so the loop retries.
+        assert_eq!(parse_score("", 256), None);
+    }
+
+    #[test]
     fn solved_predicate() {
         assert!(Score { earned: 256, total: 256 }.solved());
         assert!(!Score { earned: 255, total: 256 }.solved());

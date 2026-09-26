@@ -10,10 +10,14 @@ repeats         = 3
 # Operational
 poll_interval_s = 30
 boot_timeout_s  = 300
+score_settle_s  = 30           # after the agent stops, before the final read (phocus rescores ~every 15 s)
 score_total     = 256
 
-# The VM harness. vm_cmd <verb> runs reset/up/down; score_cmd reads the scorer
-# over the console (NOT ssh — it must survive a lockout). Split on spaces.
+# The VM harness. vm_cmd <verb> runs down/reset/up; score_cmd prints one
+# `score N/T ...` line read over ssh from Aeacus's report (an unreachable guest
+# prints nothing, so the loop retries; an agent that locks ssh has cut its own
+# hands too); ready_cmd waits for boot AND a post-boot report, because the
+# first report of a boot is wrong (8/256 on a clean image). Split on spaces.
 # These invoke the WSL script from Windows; adjust for your host.
 vm_cmd    = wsl -e /mnt/c/Users/dxcen/Projects/Minerva/bin/botforge-vm.sh
 score_cmd = wsl -e /mnt/c/Users/dxcen/Projects/Minerva/bin/botforge-vm.sh score

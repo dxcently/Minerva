@@ -65,6 +65,11 @@ impl<H: Harness> Vm<H> {
         }
     }
 
+    #[cfg(test)]
+    pub fn harness(&self) -> &H {
+        &self.harness
+    }
+
     fn verb(&self, verb: &str) -> io::Result<String> {
         let mut argv = self.vm_cmd.clone();
         argv.push(verb.to_string());

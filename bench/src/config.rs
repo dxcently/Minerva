@@ -15,10 +15,13 @@ pub struct BenchConfig {
     // Operational.
     pub poll_interval_s: u64,
     pub boot_timeout_s: u64,
+    /// Seconds between stopping the agent and the final score read, so the
+    /// scorer has rescored the agent's last change (phocus: every ~14-18 s).
+    pub score_settle_s: u64,
     pub score_total: i64,
 
     // The VM harness: `vm_cmd <verb>` runs a lifecycle verb (reset/up/down);
-    // `score_cmd` reads the scorer over the console. Split on spaces.
+    // `score_cmd` reads the scorer (botforge-vm.sh: over ssh). Split on spaces.
     pub vm_cmd: Vec<String>,
     pub score_cmd: Vec<String>,
     pub ready_cmd: Vec<String>,
@@ -42,6 +45,7 @@ impl Default for BenchConfig {
             repeats: 3,
             poll_interval_s: 30,
             boot_timeout_s: 300,
+            score_settle_s: 30,
             score_total: 256,
             vm_cmd: vec!["botforge-vm.sh".into()],
             score_cmd: vec![],
@@ -75,6 +79,7 @@ impl BenchConfig {
                 "repeats" => cfg.repeats = parse_u64(key, val, n + 1)? as u32,
                 "poll_interval_s" => cfg.poll_interval_s = parse_u64(key, val, n + 1)?,
                 "boot_timeout_s" => cfg.boot_timeout_s = parse_u64(key, val, n + 1)?,
+                "score_settle_s" => cfg.score_settle_s = parse_u64(key, val, n + 1)?,
                 "score_total" => cfg.score_total = parse_u64(key, val, n + 1)? as i64,
                 "vm_cmd" => cfg.vm_cmd = words(val),
                 "score_cmd" => cfg.score_cmd = words(val),
