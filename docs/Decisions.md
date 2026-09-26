@@ -6147,3 +6147,13 @@ Measured by replaying every session log on this box through `eidolon log` (104 l
 Also measured: **274 gate asks** across the logs, 79 of them in the busiest single session. Each ask parks a turn and each answer resumes one, and every turn re-sends the context - so the friction is proportional to asks, not to output.
 
 Caveat, so this is not read as the provider's own invoice: 17 of the 104 logs record no usage at all, sessions still mid-turn hold none, and the text rendering humanises large numbers (`in=1.88M`) - the exact shape that made a first pass of this measurement wrong by three orders of magnitude until it was re-parsed, and the reason the counts here were taken from a second pass.
+
+## 2026-09-26 - Members run upstream eidolon in WSL; Minerva vendors what it ships
+
+The operator's rulings, taken together:
+
+- **Platform.** eidolon follows upstream, which is Unix-only, and runs in WSL. The one native-Windows piece is llama-server: upstream `ggml-org/llama.cpp`'s Vulkan build, launched by `hoot`. The Prism fork and the Bonsai models are dropped. Open WebUI is retired in favour of `webui/term`. The native-Windows ports of eidolon, harnox and Aoide are archived on local `archive/windows-port-2026-09-26` branches (and `archive/minerva-2026-09-21*` for eidolon). None of them was deleted.
+- **Shipping.** eidolon (`c725183`) and harnox (`v0.3.8`) are vendored as plain snapshots, published with Noah's OK. Aoide's mesh node is split to `dxcently/aoide-core`, without the lyra/song/screen half, and vendored the same way. It stays GPL-3.0 inside an MIT repo. jev is vendored with its checkpoint, and openjev's weights are a pinned download. See `VENDORED.md`.
+- **Members' minimum.** WSL, a Rust toolchain, and either an Ollama Pro key or a model download (`docs/Getting-Started.md`).
+
+**What it cost:** upstream eidolon has no extension host. `extensions/jev`, `extensions/browser` and `extensions/subagent` were written for the fork's host and do not load today (S86). The Minerva `/ext`, `/auth` and `/jev` pages and the OpenAI shim stay on the archived fork line.

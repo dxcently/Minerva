@@ -1,20 +1,24 @@
 # Minerva
 
-A local AI workstation: one box serves the models, one chat app fronts them, and
-one agent core does the work. Nothing leaves the machine unless a cloud provider
-is deliberately logged in.
+A club AI workstation: one agent core does the work, a terminal-style web page
+fronts it, and the brain is either an Ollama Pro key or models on your own GPU.
+Nothing leaves the machine unless a cloud provider is deliberately logged in.
+
+**New here? Start with [docs/Getting-Started.md](docs/Getting-Started.md)** — Windows
+to a running agent, plus a free coding helper on the same Ollama plan.
 
 **Minerva** is the product. **`hoot`** — `bin/hoot.ps1` — is the Windows
 launcher for its model server, and it keeps that name and filename so existing
 configs and provider ids (`providers/hoot.rn`) go on working.
 
-## Three pieces
+## The pieces
 
 | piece | what it is | where |
 |---|---|---|
 | **webui/term** | the face — a terminal-style web UI, served by `eidolon web` | `webui/term/`, WSL |
-| **eidolon** | the agent core: a Rust coding-agent harness, and the sole extension host | `eidolon/`, WSL |
-| **jev** | an eidolon-managed extension — browser automation, graph-driven navigation | `jev/`, WSL, service port assigned dynamically |
+| **eidolon** | the agent core: a Rust coding-agent harness (vendored, with `harnox/`) | `eidolon/`, WSL |
+| **jev** | the chooser: one-pass `choose`, NLI `entail`, automation graphs; standalone until its tools are ported to Rune | `jev/`, WSL |
+| **aoide** | the mesh node that links club machines (optional, GPL-3.0) | `aoide-core/`, WSL |
 
 A local llama.cpp router (upstream `ggml-org/llama.cpp`, Vulkan build) serves
 the models on `:8080`. It is the one piece that runs natively on Windows;
@@ -49,6 +53,8 @@ The launcher's other commands:
 
 | | |
 |---|---|
+| [`docs/Getting-Started.md`](docs/Getting-Started.md) | install and run, step by step |
+| [`VENDORED.md`](VENDORED.md) | what is copied in from upstream, at which revision, under which license |
 | [`docs/Hoot.md`](docs/Hoot.md) | the project's own front door: layers, direction, layout, constraints |
 | [`docs/Architecture.md`](docs/Architecture.md) | the box, the serving layer, the face, the core, the vault |
 | [`docs/Decisions.md`](docs/Decisions.md) | what was decided, why, and what it replaced |
