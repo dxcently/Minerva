@@ -61,16 +61,36 @@ impl Transport for SshTransport {
     }
 
     fn run_root(&self, cmd: &str) -> io::Result<Out> {
-        let path = self.sudo_file.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no sudo_file configured; fixes are disabled")
-        })?;
-        let mut pw = std::fs::read(path)?;
-        pw.push(b'\n');
-        // `-p ''` keeps sudo's prompt out of stderr; `sh -c` so a pipeline or
-        // `&&` chain runs wholly as root rather than only its first word.
-        let out = self.exec(&format!("sudo -S -p '' sh -c {}", shell_quote(cmd)), Some(&pw));
-        pw.iter_mut().for_each(|b| *b = 0);
-        out
+        match &self.sudo_file {
+            None => self.exec(&sudo_line(cmd, false), None),
+            // A target that needs a password: read it per call, hand it to
+            // sudo on stdin, and zero the buffer after.
+            Some(path) => {
+                let mut pw = std::fs::read(path)?;
+                pw.push(b'\n');
+                let out = self.exec(&sudo_line(cmd, true), Some(&pw));
+                pw.iter_mut().for_each(|b| *b = 0);
+                out
+            }
+        }
+    }
+}
+
+/// The remote line that runs `cmd` as root. `sh -c` so a pipeline or `&&`
+/// chain runs wholly as root rather than only its first word.
+///
+/// Without a password (`with_stdin == false`): `sudo -n`. The practice image
+/// grants mford `NOPASSWD: ALL` (measured 2026-09-26), and `-n` never
+/// prompts, so a target that *does* want a password fails at once with a
+/// clear rc instead of hanging on a prompt nobody will answer.
+/// With one: `sudo -S -p ''`, the password on stdin and the prompt kept out
+/// of stderr.
+pub fn sudo_line(cmd: &str, with_stdin: bool) -> String {
+    let wrapped = format!("sh -c {}", shell_quote(cmd));
+    if with_stdin {
+        format!("sudo -S -p '' {wrapped}")
+    } else {
+        format!("sudo -n {wrapped}")
     }
 }
 
@@ -136,8 +156,30 @@ mod tests {
     }
 
     #[test]
-    fn root_without_a_sudo_file_refuses() {
-        let t = SshTransport { argv: vec!["ssh".into()], sudo_file: None };
-        assert_eq!(t.run_root("true").unwrap_err().kind(), io::ErrorKind::NotFound);
+    fn root_line_is_non_interactive_without_a_password_and_stdin_with_one() {
+        assert_eq!(sudo_line("id -u", false), "sudo -n sh -c 'id -u'");
+        assert_eq!(sudo_line("a && b | c", true), "sudo -S -p '' sh -c 'a && b | c'");
+    }
+
+    /// Live: the real transport against the practice guest. Needs the guest
+    /// up and `MINERVA_SSH` set to the ssh argv up to the host, e.g.
+    /// `wsl -e ssh -o BatchMode=yes … -p 2222 -i ~/.ssh/minerva_agent mford@127.0.0.1`.
+    /// Run with `cargo test --ignored live_guest -- --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_guest_runs_as_user_and_as_root() {
+        let argv: Vec<String> = std::env::var("MINERVA_SSH")
+            .expect("MINERVA_SSH")
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        let t = SshTransport { argv, sudo_file: None };
+        let user = t.run("id -u").unwrap();
+        assert!(user.ok, "user run failed: {}", user.stderr);
+        assert_eq!(user.stdout.trim(), "1000", "expected mford (uid 1000)");
+        let root = t.run_root("id -u && echo chain-ran").unwrap();
+        assert!(root.ok, "root run failed: {}", root.stderr);
+        assert_eq!(root.stdout.trim(), "0\nchain-ran", "sudo -n sh -c must run the whole chain as root");
+        println!("live: user uid={} root chain ok", user.stdout.trim());
     }
 }
