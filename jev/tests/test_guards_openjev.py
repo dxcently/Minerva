@@ -12,9 +12,9 @@ otherwise. This is where "neutral never passes anything" -- section 3's
 actual safety claim -- is checked against the real model rather than a
 fake standing in for it.
 
-Run with the jevlike venv's python, from jev/:
+Run with jev's venv, from jev/:
 
-    JEV_TEST_OPENJEV=1 <venv>/python.exe -m unittest tests.test_guards_openjev -v
+    JEV_TEST_OPENJEV=1 ./.venv/bin/python -m unittest tests.test_guards_openjev -v
 """
 from __future__ import annotations
 

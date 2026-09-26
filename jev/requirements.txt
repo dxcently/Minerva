@@ -1,0 +1,15 @@
+# jev extension service, in WSL: python3 -m venv jev/.venv && jev/.venv/bin/pip install -r jev/requirements.txt
+# The CPU torch wheel: jev runs every model on CPU, and the default Linux wheel
+# drags in ~2 GB of CUDA libraries it never uses.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2
+numpy>=1.26
+fastapi>=0.141
+uvicorn>=0.53
+# openjev (entail) only; huggingface_hub also provides the `hf` CLI that
+# jev/get-openjev.sh downloads the weights with.
+transformers>=5.17
+safetensors>=0.8
+huggingface_hub>=1.32
+# tests only: fastapi TestClient
+httpx>=0.28

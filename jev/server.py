@@ -57,14 +57,20 @@ import automation.systemone as automation_systemone
 import automation.warrant as automation_warrant
 
 # --- jevlike -----------------------------------------------------------------
-# Imported from the sibling checkout rather than vendored: it is a real repo
-# with its own venv and training scripts, and a copy here would rot.
-JEVLIKE_ROOT = Path(
-    os.getenv("JEVLIKE_ROOT", r"C:\Users\dxcen\Projects\cms-agent\models\jevlike")
-)
-JEVLIKE_CKPT = Path(os.getenv("JEVLIKE_CKPT", JEVLIKE_ROOT / "runs" / "synthetic.pt"))
+# Vendored at jev/jevlike (the three modules imported below) with its 169 KB
+# checkpoint at jev/runs/synthetic.pt, so a fresh clone chooses with nothing
+# to download. It used to be imported from a sibling checkout on one dev box;
+# a tool members run unmaintained is better served by a frozen copy than by
+# a path that exists on one machine. JEVLIKE_ROOT still overrides it.
+_JEV_DIR = Path(__file__).resolve().parent
+JEVLIKE_ROOT = Path(os.getenv("JEVLIKE_ROOT", str(_JEV_DIR)))
+JEVLIKE_CKPT = Path(os.getenv("JEVLIKE_CKPT", str(_JEV_DIR / "runs" / "synthetic.pt")))
 
-OPENJEV_DIR = Path(os.getenv("OPENJEV_DIR", r"C:\Users\dxcen\Projects\bonsai2\models\openjev"))
+# openjev's weights (~9 GB) are the one download: jev/get-openjev.sh puts them
+# in <repo>/models/openjev. Its model code is vendored at jev/openjev, pinned
+# to the revision those weights were checked against.
+OPENJEV_DIR = Path(os.getenv("OPENJEV_DIR", str(_JEV_DIR.parent / "models" / "openjev")))
+OPENJEV_CODE_DIR = _JEV_DIR / "openjev"
 
 # --- automation (docs/design/automation.md) -----------------------------------
 # Where `automation.start` resolves a graph id (`{"graph": "wiki-hop"}`) to a
@@ -214,12 +220,13 @@ Hypothesis: {hypothesis}
             # either.
             raise RuntimeError(
                 f"OPENJEV_DIR is not a directory: {OPENJEV_DIR} -- set the "
-                f"OPENJEV_DIR environment variable to the openjev checkout"
+                f"OPENJEV_DIR environment variable to the openjev weights "
+                f"(jev/get-openjev.sh downloads them)"
             )
         import torch
 
-        if str(OPENJEV_DIR) not in sys.path:
-            sys.path.insert(0, str(OPENJEV_DIR))
+        if str(OPENJEV_CODE_DIR) not in sys.path:
+            sys.path.insert(0, str(OPENJEV_CODE_DIR))
         from modeling_openjev import OpenJevCrossEncoder
 
         # float32 on CPU: bf16 is the repo default for GPU, and CPU bf16

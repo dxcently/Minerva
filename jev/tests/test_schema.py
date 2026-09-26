@@ -1,9 +1,9 @@
 """Tests for automation/graph.py -- docs/design/automation.md section 1's
 schema, loaded and linted by hand (no `jsonschema` package in the jevlike
-venv -- see graph.py's own docstring). Run with the jevlike venv's python,
+venv -- see graph.py's own docstring). Run with jev's venv,
 same as jev/test_server.py:
 
-    C:\\Users\\dxcen\\Projects\\cms-agent\\models\\jevlike\\.venv\\Scripts\\python.exe jev\\tests\\test_schema.py
+    jev/.venv/bin/python jev/tests/test_schema.py
 
 Covers: both worked-example graphs load and lint cleanly (the "done" bar's
 "a graph file loaded/linted with useful errors" half, on the clean side);

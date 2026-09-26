@@ -5,9 +5,9 @@ already exercise for `choose`. A separate file, not an addition to
 jev/test_server.py itself: that file's 33 tests must stay exactly as they
 are (see its own module docstring and this task's brief).
 
-Run with the jevlike venv's python:
+Run with jev's venv:
 
-    C:\\Users\\dxcen\\Projects\\cms-agent\\models\\jevlike\\.venv\\Scripts\\python.exe jev\\tests\\test_server_automation.py
+    jev/.venv/bin/python jev/tests/test_server_automation.py
 
 Scores through the real jevlike checkpoint, same as ChooseTests -- "fast
 enough on CPU that faking it would not save anything" (test_server.py's own

@@ -1,13 +1,12 @@
 """Tests for jev/server.py -- the eidolon extension service.
 
-Run with the jevlike venv's python (it already has fastapi, httpx and the
-jevlike package this service imports lazily -- nothing extra to install):
+Run with jev's own venv (WSL; jev/requirements.txt, which carries httpx for
+fastapi's test client), from the repo root:
 
-    C:\\Users\\dxcen\\Projects\\cms-agent\\models\\jevlike\\.venv\\Scripts\\python.exe jev\\test_server.py
+    jev/.venv/bin/python jev/test_server.py
 
-`unittest`, not pytest: that venv is jevlike's own checkout, not this repo's,
-and pytest is not in it -- installing a test runner into someone else's venv
-to test this file is a heavier ask than the stdlib already sitting there.
+`unittest`, not pytest: the stdlib runner keeps the venv to what the service
+itself needs.
 
 `choose` runs against the real 169 KB jevlike checkpoint in every run here --
 it is fast enough on CPU that faking it would not save anything and would

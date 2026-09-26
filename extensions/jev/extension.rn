@@ -25,10 +25,11 @@ pub fn manifest() {
         description: "jevlike (one-pass N-way chooser) and openjev (NLI cross-encoder) as jev_choose and jev_entail, plus jev_run/jev_resume/jev_stop/jev_runs to drive a jev automation graph end to end, parking and all, and jev_warrant to read a graph's declared warrant block for running it unattended, and jev_order to queue a standing order (`automation.order`) on a live run for the next chooser call to fold into its context",
 
         service: #{
-            // The venv is the jevlike checkout's own, not this repo's --
-            // torch and transformers have no business in eidolon or
-            // bonsai2, so the interpreter is named by its full path rather
-            // than assumed to be on PATH. `-u`: unbuffered stdout, so the
+            // The venv is jev's own, at jev/.venv (WSL; made from
+            // jev/requirements.txt) -- torch and transformers have no
+            // business on the system Python, so the interpreter is named
+            // relative to `cwd` below rather than assumed to be on PATH.
+            // `-u`: unbuffered stdout, so the
             // background log (what an operator sees when `ready_timeout_s`
             // is blown, per eidolon/docs/extensions.md's "When it will not
             // start") shows the real failure instead of whatever was still
@@ -38,10 +39,8 @@ pub fn manifest() {
             // root and back down into jev/, because the service script
             // itself lives at jev/server.py, not copied in here -- it is
             // one file whether started by hand (`hoot jev`, historically)
-            // or adopted by this loader, and a copy under tools/ would rot
-            // the way the module docstring already warns jevlike itself
-            // would if vendored.
-            command: "'C:/Users/dxcen/Projects/cms-agent/models/jevlike/.venv/Scripts/python.exe' -u server.py",
+            // or adopted by this loader, and a copy under tools/ would rot.
+            command: ".venv/bin/python -u server.py",
             cwd: "../../jev",
             health: "/health",
 

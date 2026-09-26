@@ -1,8 +1,6 @@
 """graph.py -- docs/design/automation.md section 1: load, validate, lint.
 
-No `jsonschema` package is installed in the jevlike venv this service runs
-under (checked directly against
-`C:/Users/dxcen/Projects/cms-agent/models/jevlike/.venv`), so this is a
+No `jsonschema` package is in jev's venv (jev/requirements.txt), so this is a
 hand-rolled validator shaped specifically to `schema.json` -- not a general
 draft-2020-12 engine. It covers every constraint that schema actually uses
 (required keys, the enum sets, `additionalProperties: false`, the
