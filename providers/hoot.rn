@@ -1,12 +1,19 @@
 //! hoot — the llama.cpp router on this box, as an eidolon provider.
 //!
 //! An ordinary provider script (drop it in `providers_dir`, default
-//! `%APPDATA%\eidolon\providers\`): the router serves an OpenAI-compatible
-//! surface on loopback, so `wire: "openai"` and a base_url is the whole
-//! wiring. No token — the router has no auth and is bound to 127.0.0.1;
-//! the placeholder only satisfies clients that insist on sending one.
+//! `~/.config/eidolon/providers/` — eidolon runs in WSL now): the router
+//! serves an OpenAI-compatible surface, so `wire: "openai"` and a base_url
+//! is the whole wiring. No token — the router has no auth; the placeholder
+//! only satisfies clients that insist on sending one.
 //!
-//! Model ids are the section names in bonsai2\models.ini, and the router
+//! The router is the one native-Windows piece (`hoot serve`, upstream
+//! llama.cpp Vulkan build) and eidolon calls it from inside WSL. Whether
+//! `127.0.0.1` below reaches it depends on WSL's networking mode: under
+//! `networkingMode=mirrored` it does; under the default NAT mode WSL's
+//! loopback is its own, and the URL must name the Windows host instead.
+//!
+//! Model ids are the section names in the repo's models.ini — keep the two
+//! lists in step, router first (restart it), this file second. The router
 //! loads/swaps them on demand (`--models-max 2`). Speeds are measured on
 //! this machine (Ryzen AI 7 PRO 350, tg32): see models.ini's comment block.
 //! Costs are zero because the electricity is yours.
@@ -19,24 +26,41 @@ pub fn provider() {
         token: "sk-no-key-required",
         models: [
             #{
-                id: "Qwen3.8-27B-UD-Q4_K_M",
-                name: "Qwen3.8 27B (local, MTP ~3 tok/s)",
+                id: "gpt-oss-20b",
+                name: "gpt-oss 20B (local, ~12 tok/s)",
                 context: 16384,
                 reasoning: true,
+                vision: false,
+                cost: #{ input: 0.0, output: 0.0 },
+            },
+            #{
+                id: "Qwen3-Coder-30B-A3B",
+                name: "Qwen3 Coder 30B A3B (local, ~9 tok/s)",
+                context: 16384,
+                reasoning: false,
+                vision: false,
+                cost: #{ input: 0.0, output: 0.0 },
+            },
+            #{
+                id: "gemma-3-12b",
+                name: "Gemma 3 12B (local, ~6 tok/s)",
+                context: 16384,
+                reasoning: false,
                 vision: true,
                 cost: #{ input: 0.0, output: 0.0 },
             },
             #{
-                id: "bonsai-8b",
-                name: "Bonsai 8B 1-bit (local, ~10 tok/s)",
+                id: "gemma-3-27b",
+                name: "Gemma 3 27B (local, unbenched)",
                 context: 16384,
-                reasoning: true,
+                reasoning: false,
+                vision: true,
                 cost: #{ input: 0.0, output: 0.0 },
             },
             #{
-                id: "bonsai-2-27b",
-                name: "Bonsai 2 27B ternary (local, ~3 tok/s)",
-                context: 32768,
+                id: "Qwen3.8-27B-UD-Q4_K_M",
+                name: "Qwen3.8 27B (local, MTP ~3 tok/s)",
+                context: 16384,
                 reasoning: true,
                 vision: true,
                 cost: #{ input: 0.0, output: 0.0 },

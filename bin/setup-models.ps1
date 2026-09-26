@@ -1,27 +1,43 @@
-# Ternary-Bonsai-2-27B + Qwen3.8-27B on thinkchiyo (Ryzen AI 7 PRO 350 / Radeon 860M / 64 GB)
+# Model-server setup for Minerva's one native-Windows piece (thinkchiyo:
+# Ryzen AI 7 PRO 350 / Radeon 860M / 64 GB).
 #
-# Uses the PrismML prebuilt Windows Vulkan binaries -- no cmake, no MSVC, no CUDA.
-# (This box has no NVIDIA GPU, so the original from-source CUDA build could never work.)
-# Stock llama.cpp still cannot load the P* ternary quants; the Prism fork can.
+# Fetches upstream llama.cpp's prebuilt Windows Vulkan build from the
+# ggml-org/llama.cpp GitHub releases -- no cmake, no MSVC, no CUDA -- and,
+# optionally, a Qwen3.8-27B quant. Everything else (eidolon, Aoide, jev, the
+# web door, bench) lives in WSL and is not this script's business.
 #
-#   cd C:\Users\dxcen\Projects\bonsai2
-#   powershell -ExecutionPolicy Bypass -File .\setup-bonsai2.ps1
-#   powershell -ExecutionPolicy Bypass -File .\setup-bonsai2.ps1 -QwenQuant UD-Q4_K_M
+# Upstream, not the PrismML fork: the fork was only needed for the Bonsai
+# P* ternary quants, which were dropped on 2026-09-26. Router mode and
+# relative models.ini paths work on the stock build (docs/design/linux.md
+# findings 8 and 9).
+#
+#   hoot setup                         binaries only (latest upstream release)
+#   hoot setup -Tag b10883             pin a release instead of 'latest'
+#   hoot setup -Force                  replace llama.cpp\ (e.g. the old Prism build)
+#   hoot get UD-Q4_K_M                 a Qwen3.8-27B quant (= -QwenQuant)
 
 [CmdletBinding()]
 param(
     # Extra Qwen3.8-27B quant to fetch from unsloth/Qwen3.8-27B-GGUF. '' = skip.
     [string]$QwenQuant = '',
-    # Prism release to pull prebuilt binaries from.
-    [string]$PrismTag  = 'prism-b10685-7dffb15',
-    [switch]$SkipBonsai
+    # ggml-org/llama.cpp release tag to pull the win-vulkan-x64 zip from.
+    # 'latest' asks the GitHub API which release that is today.
+    [string]$Tag = 'latest',
+    # Replace an existing llama.cpp\ instead of keeping it. The old one is
+    # renamed to llama.cpp.prev, not deleted, so a bad release rolls back.
+    [switch]$Force,
+    # Weights only; leave llama.cpp\ alone (what `hoot get` passes).
+    [switch]$SkipBinaries
 )
 
 $ErrorActionPreference = 'Stop'
-$root   = $PSScriptRoot
+# This file lives in bin\; the repo root is one up.
+$root   = Split-Path $PSScriptRoot -Parent
 $models = Join-Path $root 'models'
 $bin    = Join-Path $root 'llama.cpp'
-$hf     = 'https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main'
+$prev   = Join-Path $root 'llama.cpp.prev'
+$stamp  = Join-Path $bin 'RELEASE.txt'
+$repo   = 'ggml-org/llama.cpp'
 $hfQwen = 'https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main'
 
 function Get-File($url, $out) {
@@ -55,91 +71,82 @@ function Get-File($url, $out) {
     throw "download failed after 20 attempts: $url"
 }
 
+function Get-Release($tag) {
+    # curl.exe rather than Invoke-RestMethod, same as Get-File: it carries
+    # its own TLS stack, so PowerShell 5.1's protocol defaults never matter.
+    $api = if ($tag -eq 'latest') { "https://api.github.com/repos/$repo/releases/latest" }
+           else { "https://api.github.com/repos/$repo/releases/tags/$tag" }
+    $json = curl.exe -sL --fail -H 'Accept: application/vnd.github+json' $api
+    if ($LASTEXITCODE -ne 0 -or -not $json) { throw "GitHub API did not answer for $repo release '$tag': $api" }
+    $rel = ($json -join "`n") | ConvertFrom-Json
+    # Matched by suffix, not by a built name, so a change in upstream's
+    # tag scheme does not break the lookup.
+    $asset = $rel.assets | Where-Object { $_.name -match '-bin-win-vulkan-x64\.zip$' } | Select-Object -First 1
+    if (-not $asset) { throw "release $($rel.tag_name) has no *-bin-win-vulkan-x64.zip asset" }
+    [pscustomobject]@{ Tag = $rel.tag_name; Name = $asset.name; Url = $asset.browser_download_url }
+}
+
 # --- preflight ---------------------------------------------------------------
 if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) { throw 'curl.exe not on PATH' }
 
 $free = (Get-PSDrive $root.Substring(0,1)).Free / 1GB
 Write-Host ("Free on {0}: {1:N1} GB" -f $root.Substring(0,1), $free)
-if ($free -lt 15) { throw ("Only {0:N1} GB free; need ~15 GB minimum." -f $free) }
+if ($QwenQuant -and $free -lt 20) { throw ("Only {0:N1} GB free; a Qwen3.8-27B quant needs ~20 GB." -f $free) }
 
 # --- binaries ----------------------------------------------------------------
 # Vulkan build drives the Radeon 860M iGPU and still carries the CPU backend,
 # so -ngl 0 falls back to CPU for any op the Vulkan path doesn't implement.
-Write-Host "`n==> llama.cpp (Prism fork, prebuilt win-vulkan-x64)" -ForegroundColor Green
-$zipName = "llama-$PrismTag-bin-win-vulkan-x64.zip"
-$zip     = Join-Path $env:TEMP $zipName
-if (-not (Test-Path (Join-Path $bin 'llama-server.exe'))) {
-    Get-File "https://github.com/PrismML-Eng/llama.cpp/releases/download/$PrismTag/$zipName" $zip
-    New-Item -ItemType Directory -Force -Path $bin | Out-Null
-    Expand-Archive -Path $zip -DestinationPath $bin -Force
-    # release zips nest everything under build\bin\; flatten it
-    $nested = Get-ChildItem $bin -Recurse -Filter 'llama-server.exe' | Select-Object -First 1
-    if ($nested -and $nested.DirectoryName -ne $bin) {
-        Get-ChildItem $nested.DirectoryName | Move-Item -Destination $bin -Force
+if (-not $SkipBinaries) {
+    Write-Host "`n==> llama.cpp ($repo, prebuilt win-vulkan-x64)" -ForegroundColor Green
+    $have = Test-Path (Join-Path $bin 'llama-server.exe')
+    $from = if (Test-Path $stamp) { (Get-Content -Raw $stamp).Trim() } else { '' }
+    if ($have -and $Force) {
+        if (Test-Path $prev) { throw "$prev already exists; remove it, then re-run with -Force" }
+        Write-Host "  moving the current build to $prev" -ForegroundColor Yellow
+        Move-Item $bin $prev
+        $have = $false
     }
-} else {
-    Write-Host "  have llama-server.exe" -ForegroundColor DarkGray
+    if (-not $have) {
+        $rel = Get-Release $Tag
+        Write-Host "  release $($rel.Tag)" -ForegroundColor Gray
+        $zip = Join-Path $env:TEMP $rel.Name
+        Get-File $rel.Url $zip
+        New-Item -ItemType Directory -Force -Path $bin | Out-Null
+        Expand-Archive -Path $zip -DestinationPath $bin -Force
+        # Some release zips nest everything under build\bin\; flatten it.
+        $nested = Get-ChildItem $bin -Recurse -Filter 'llama-server.exe' | Select-Object -First 1
+        if ($nested -and $nested.DirectoryName -ne $bin) {
+            Get-ChildItem $nested.DirectoryName | Move-Item -Destination $bin -Force
+        }
+        # Which build this is, for `hoot which` and the check below.
+        [System.IO.File]::WriteAllText($stamp, "$repo $($rel.Tag)")
+    } elseif ($from -notlike "$repo *") {
+        # No stamp means the build predates this script: on this box, the
+        # PrismML fork. It still serves the non-Bonsai models, but it is
+        # not the build the setup decision names.
+        Write-Host "  have llama-server.exe, but not from $repo (no $stamp)" -ForegroundColor Yellow
+        Write-Host "  replace it with:  hoot setup -Force" -ForegroundColor Yellow
+    } else {
+        Write-Host "  have llama-server.exe ($from)" -ForegroundColor DarkGray
+    }
 }
 
 # --- weights -----------------------------------------------------------------
 # Router mode wants multi-file models in their own subdir, and the projector
 # filename must start with "mmproj".
-if (-not $SkipBonsai) {
-    Write-Host "`n==> Ternary-Bonsai-2-27B PTQ1_0 (5.95 GB, 1.75 bpw)" -ForegroundColor Green
-    $dir = Join-Path $models 'Ternary-Bonsai-2-27B-PTQ1_0'
-    Get-File "$hf/Ternary-Bonsai-2-27B-PTQ1_0.gguf"   (Join-Path $dir 'Ternary-Bonsai-2-27B-PTQ1_0.gguf')
-    Get-File "$hf/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf" (Join-Path $dir 'mmproj-Q8_0.gguf')
-}
-
 if ($QwenQuant) {
     $f = "Qwen3.8-27B-$QwenQuant.gguf"
     Write-Host "`n==> $f" -ForegroundColor Green
     $dir = Join-Path $models "Qwen3.8-27B-$QwenQuant"
     Get-File "$hfQwen/$f"             (Join-Path $dir $f)
     Get-File "$hfQwen/mmproj-F16.gguf" (Join-Path $dir 'mmproj-F16.gguf')
-}
-
-# --- model list --------------------------------------------------------------
-# llama-server router mode reads this and exposes every entry on GET /v1/models,
-# which is also what the built-in WebUI's model picker and any OpenAI-compatible
-# client (Cline, Open WebUI, ...) will show.
-$ini = Join-Path $root 'models.ini'
-if (-not (Test-Path $ini)) {
-    @"
-version = 1
-
-[*]
-c = 16384
-jinja = true
-flash-attn = on
-; Measured: bandwidth-bound past 8 threads (16 threads is ~23% SLOWER).
-threads = 8
-
-[bonsai-2-27b]
-model = $models\Ternary-Bonsai-2-27B-PTQ1_0\Ternary-Bonsai-2-27B-PTQ1_0.gguf
-mmproj = $models\Ternary-Bonsai-2-27B-PTQ1_0\mmproj-Q8_0.gguf
-n-gpu-layers = 99
-c = 32768
-temp = 1.0
-top-p = 0.95
-top-k = 20
-load-on-startup = true
-"@ | ForEach-Object { [System.IO.File]::WriteAllText($ini, $_) }   # no BOM; the INI parser trips on it
-    Write-Host "`nWrote $ini" -ForegroundColor Green
-} else {
-    Write-Host "`nKept existing $ini" -ForegroundColor DarkGray
+    Write-Host "  add a [Qwen3.8-27B-$QwenQuant] section to models.ini to serve it" -ForegroundColor Gray
 }
 
 # --- done --------------------------------------------------------------------
+# models.ini is tracked in the repo, so this script never writes it.
 Write-Host @"
 
 Serve everything in models.ini (model list at http://127.0.0.1:8080):
-  .\serve.ps1
-
-One-off, single model:
-  .\llama.cpp\llama-server.exe -m .\models\Ternary-Bonsai-2-27B-PTQ1_0\Ternary-Bonsai-2-27B-PTQ1_0.gguf ``
-      --mmproj .\models\Ternary-Bonsai-2-27B-PTQ1_0\mmproj-Q8_0.gguf ``
-      -ngl 99 -fa on -c 32768 --temp 1.0 --top-p 0.95 --top-k 20 --port 8080
-
-If Vulkan chokes on a PTQ1_0 op, re-run with -ngl 0 to stay on CPU.
+  hoot serve        (foreground)   or   hoot up   (background)
 "@ -ForegroundColor Gray
