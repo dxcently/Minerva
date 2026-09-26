@@ -15,6 +15,7 @@
 //! competitor. See docs/design/triage-toolkit.md §7–§8.
 
 pub mod agent;
+pub mod brain;
 pub mod clock;
 pub mod config;
 pub mod guard;
