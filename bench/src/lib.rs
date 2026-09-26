@@ -14,6 +14,7 @@
 //! Nothing here reaches the answer key or the writeup; the agent runs as a
 //! competitor. See docs/design/triage-toolkit.md §7–§8.
 
+pub mod action;
 pub mod agent;
 pub mod brain;
 pub mod clock;
