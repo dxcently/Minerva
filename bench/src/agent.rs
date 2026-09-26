@@ -32,6 +32,12 @@ pub trait AgentRunner {
     fn tokens(&self) -> u64 {
         0
     }
+    /// The brain model this runner actually drove, for the row's provenance.
+    /// `None` means no model ran — the honest label for a baseline (Noop) run,
+    /// which must not inherit the configured `brain_model` it never called.
+    fn model(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct NoopRunner;

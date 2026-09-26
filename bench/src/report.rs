@@ -46,6 +46,11 @@ pub struct Row {
     pub tokens: u64,
     pub wall_s: u64,
     pub stop_reason: StopReason,
+    /// How the authoritative `points` were obtained: `"read"` when the scorer
+    /// answered at the final read, `"peak_fallback"` when it did not and the
+    /// row fell back to the timeline's high-water mark. A reader must not treat
+    /// a fallback number as a measured final score.
+    pub score_source: &'static str,
     pub timeline: Timeline,
 }
 
@@ -68,6 +73,7 @@ impl Row {
         push_num(&mut o, "tokens", self.tokens as i64);
         push_num(&mut o, "wall_s", self.wall_s as i64);
         push_str(&mut o, "stop_reason", self.stop_reason.as_str(), false);
+        push_str(&mut o, "score_source", self.score_source, false);
         push_raw(&mut o, "timeline", &timeline_array(&self.timeline));
         o.push('}');
         o
@@ -143,6 +149,7 @@ mod tests {
             tokens: 12345,
             wall_s: 7200,
             stop_reason: StopReason::TimeBox,
+            score_source: "read",
             timeline: {
                 let mut t = Timeline::new();
                 t.push(0, 0);

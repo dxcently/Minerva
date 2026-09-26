@@ -122,6 +122,8 @@ Ollama Pro costs **$20/month**. It gives you Ollama's larger cloud models over a
    eidolon tui --model ollama:deepseek-v4.1-flash
    ```
 
+   There is no `config.toml` by default, so eidolon has no default model: **name the model on every call** with `--model` (or `-m`), e.g. `eidolon run -m ollama:deepseek-v4.1-flash "…"`. Without it the turn has no backend.
+
    Inside the TUI, `space m` opens the model picker. eidolon's built-in Ollama provider lists DeepSeek V4.1 Flash, DeepSeek V4 Pro, GLM 5.3 and 5.3 Flash, Kimi K2.7 Code, Qwen 3.5 397B, GPT-OSS 120B and Nemotron 3 Super (`eidolon/crates/providers/builtin/ollama.rn`). Its header records the per-token prices it estimates spend with.
 
 **Watch your usage.** Every eidolon turn draws on the same monthly allowance. So does opencode, if you set it up in Part 7. The Ollama dashboard shows what has been spent.

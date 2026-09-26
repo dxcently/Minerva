@@ -25,8 +25,13 @@ llama.cpp.prev/
 *.safetensors
 *.pt
 *.pth
-# jev's vendored chooser checkpoint (169 KB) ships with the repo
+# jev's vendored chooser checkpoints (169 KB each) ship with the repo; the
+# Wikispeedia one (S56) is the trained baseline the CTF chooser warm-starts from.
 !jev/runs/synthetic.pt
+!jev/runs/wikispeedia.pt
+
+# Training corpora are large and rebuildable (jev/get-wikispeedia.sh); never staged.
+/jev/data/
 
 # eidolon/, harnox/ and aoide-core/ are vendored snapshots (VENDORED.md), tracked.
 # Aoide is the full upstream project checked out here for development, with its

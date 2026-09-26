@@ -62,9 +62,12 @@ pub fn run_benchmark(
     // Authoritative, after the agent can no longer touch the guest, and after
     // the scorer has had time to rescore the agent's last change.
     clock.sleep_s(cfg.score_settle_s);
-    let final_score = match scorer.read()? {
-        Some(s) => s,
-        None => Score { earned: timeline.peak(), total: cfg.score_total },
+    let (final_score, score_source) = match scorer.read()? {
+        Some(s) => (s, "read"),
+        None => (
+            Score { earned: timeline.peak(), total: cfg.score_total, penalties: None },
+            "peak_fallback",
+        ),
     };
     timeline.push(clock.elapsed_s(), final_score.earned);
     vm.stop()?;
@@ -72,7 +75,9 @@ pub fn run_benchmark(
     Ok(Row {
         image: cfg.image.clone(),
         sha: cfg.image_sha.clone(),
-        model: cfg.brain_model.clone(),
+        // The model the agent actually drove, not the configured default: a
+        // Noop baseline calls nothing and must not claim `brain_model`.
+        model: agent.model().unwrap_or_else(|| "none".into()),
         graphs_snapshot: cfg.graphs_snapshot.clone(),
         mode: cfg.mode().into(),
         points: final_score.earned,
@@ -80,12 +85,14 @@ pub fn run_benchmark(
         peak_points: timeline.peak(),
         forensics_k: 0,
         forensics_of: 7,
-        penalties: 0,
+        // Unknown on a peak fallback (that reading carried no penalties token).
+        penalties: final_score.penalties.unwrap_or(0),
         escalations_by_tier: [0; 4],
         leak_hits: 0,
         tokens: agent.tokens(),
         wall_s: clock.elapsed_s(),
         stop_reason: reason,
+        score_source,
         timeline,
     })
 }
@@ -154,6 +161,22 @@ mod tests {
         assert_eq!(row.stop_reason, StopReason::TimeBox);
         assert_eq!(row.points, 0);
         assert!(row.wall_s >= 300);
+        // Honesty: a baseline run drove no model and read its final score.
+        assert_eq!(row.model, "none");
+        assert_eq!(row.score_source, "read");
+    }
+
+    #[test]
+    fn a_final_read_that_fails_is_flagged_as_a_peak_fallback() {
+        let c = cfg(60);
+        // The score answers during the loop (so peak climbs) then goes silent,
+        // so the authoritative read falls back to the high-water mark.
+        let vm = Vm::new(FakeHarness::with_scores(&["10 / 256", ""]), &c);
+        let clock = FakeClock::new();
+        let row = run_benchmark(&c, &vm, &vm, &NoopRunner, &clock).unwrap();
+        assert_eq!(row.score_source, "peak_fallback");
+        assert_eq!(row.points, row.peak_points);
+        assert_eq!(row.penalties, 0); // unknown on a fallback, recorded as 0
     }
 
     #[test]

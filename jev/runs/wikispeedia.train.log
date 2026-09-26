@@ -1,0 +1,5 @@
+{"epoch": 1, "train_nll": 3.407296178987092, "validation_nll": 3.381779298069638, "device": "cpu"}
+{"epoch": 2, "train_nll": 3.0313095392588076, "validation_nll": 3.172712650502704, "device": "cpu"}
+{"epoch": 3, "train_nll": 2.8492271342860365, "validation_nll": 3.0637922456680244, "device": "cpu"}
+{"epoch": 4, "train_nll": 2.7542537477033715, "validation_nll": 3.0152040176120094, "device": "cpu"}
+{"checkpoint": "C:\\Users\\dxcen\\AppData\\Local\\Temp\\claude\\C--Users-dxcen-Projects-bonsai2\\c41775bb-150c-47bc-ad99-8b73621aa4d5\\scratchpad\\s47\\wikispeedia.pt", "best_validation_nll": 3.0152040176120094}
