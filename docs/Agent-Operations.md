@@ -34,3 +34,21 @@ Workspace catalog integration:
 - Runtime inventory retains the existing operator/admin boundary. Other users keep their normal permission-filtered native records. Club-wide per-user runtime grants are not implemented yet.
 - Native Python tests and a native-frontend fixture verified merged lists and search. An empty Knowledge/Prompts/Skills catalog still correctly counts as zero.
 - The bidirectional bridge for Eidolon to read/create/use WebUI notes, knowledge, prompts, skills and tools remains unfinished. Catalog visibility does not imply that bridge is complete.
+
+## Orchestration
+
+The orchestrator's duties, which are the loop and not the code:
+
+1. claim the unit before editing; ONE WRITER PER UNIT, one agent per directory
+2. dispatch with a stated target and a stated proof; serial for the memory floor
+3. inspect every report before accepting it, and spot-check citations rather than trusting "done"
+4. nothing is landed until a reviewer that did not write it says so
+5. keep docs/Tasklist.md state current, plus a record of decisions and landings
+6. on a failed call, re-read the target instead of repeating it unchanged
+7. report to the operator as dispatched / blocked / theirs-to-decide, each labelled observed or reasoned
+8. the orchestrator writes no implementation code
+
+Glyphs: one mark for the orchestrator, one for a live child, one for a finished child. No per-role variation, and no emoji.
+
+A roster entry carries role and parent. For a spawned child it carries no title
+and no spend until a turn settles, and no context size at all.

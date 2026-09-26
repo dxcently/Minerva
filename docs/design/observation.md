@@ -12,8 +12,8 @@ of a thing's meaning, in the process that owns it* (the textarea); *a
 protection is only as reachable as the layer it inspects* (the fourth time);
 *an observation that is not what the node believes it is*; and *a synthetic
 fixture proves a mechanism; a captured one proves the contract with the
-outside world*. It writes no code. The specification at the end is what a
-Sonnet lands.
+outside world*. It writes no code. The specification at the end is what an
+executor lands.
 
 Every number below was observed on Windows 11 on this box unless it says
 otherwise. `spill()`, `clip()`, `aria_snapshot` and `get_by_role` have no

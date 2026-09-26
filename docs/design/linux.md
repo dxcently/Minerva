@@ -793,7 +793,7 @@ to fix the two working directories and seed the provider.
   `.gitmodules` is the one thing that would make the root's fetch depend
   on them.
 
-### Stage 1 — Windows-testable portability fixes (Sonnet, on Windows)
+### Stage 1 — Windows-testable portability fixes (executor, on Windows)
 
 - **1.1 `models.ini` relative, router cwd fixed.** Strip the absolute
   prefix from every `model =`, `mmproj =`, `model-draft =`; add
@@ -864,7 +864,7 @@ to fix the two working directories and seed the provider.
   Test: alter one byte of a copied small GGUF in a scratch models dir and
   see `differs`.
 
-### Stage 2 — the POSIX launcher, proven under Git Bash with stubs (Sonnet, on Windows)
+### Stage 2 — the POSIX launcher, proven under Git Bash with stubs (executor, on Windows)
 
 `bin/hoot` in bash, `set -euo pipefail`, `bash -n` clean, shellcheck clean
 if available. Verbs: `serve shim webui up stop status models env setup
@@ -972,8 +972,8 @@ stubs do under Linux process semantics — §6(m).
 
 ### Order of dispatch
 
-0.3 → 1.1–1.8 (one Sonnet, on Windows, in that order; 1.3 and 1.4 are
-independent of 1.1) → 2.1–2.7 (one Sonnet, on Windows) → 0.1, 0.2 (the
-operator) → 3.1–3.3 (one Sonnet with a Linux box) → 4.1–4.6 → 5.1–5.3.
+0.3 → 1.1–1.8 (one executor, on Windows, in that order; 1.3 and 1.4 are
+independent of 1.1) → 2.1–2.7 (one executor, on Windows) → 0.1, 0.2 (the
+operator) → 3.1–3.3 (one executor with a Linux box) → 4.1–4.6 → 5.1–5.3.
 Stage 3 cannot start without 0.3 and should not start before stage 2,
 because the launcher is what the acceptance test runs.

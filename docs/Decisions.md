@@ -4795,7 +4795,7 @@ working.** This is the development box. The existing discipline -- thread
 platform as a **parameter** so both branches run as ordinary tests everywhere --
 is the standard, not `cfg!(windows)`.
 
-## 2026-09-19 - A fourth tier: DeepSeek V4.1 Flash, headless, through eidolon
+## 2026-09-19 - A fourth tier: the confined executor, headless, through eidolon
 
 Operator direction: **"use eidolon deepseek 4.1 flash ollama plan to execute"**,
 then **"my ollama plan through eidolon, you can summon headless agents."**
@@ -4848,14 +4848,14 @@ pool: several keys are several isolated lanes, not more throughput on one.
 
 ### What it changes about staffing
 
-Sonnet is no longer the only executor. The measured profile is **precise
+The executor is no longer a single model. The measured profile is **precise
 navigation, exact reporting, and verify-by-readback at roughly thirty seconds
 and a cent a task** -- the profile of a *confined* executor, not of an agent you
 hand six-step worktree choreography to. So the division is by task shape rather
 than by prestige:
 
-> **DeepSeek Flash gets tasks whose correctness I can check by content in one
-> command.** Single file, stated target, stated proof. Sonnet keeps anything
+> **Confined executor gets tasks whose correctness I can check by content in one
+> command.** Single file, stated target, stated proof. Executor keeps anything
 > needing the worktree discipline, cross-crate reasoning, or a judgement call
 > about what the task should have been.
 
@@ -5939,7 +5939,7 @@ is not missing that thing.**
 at a keyboard and one spawned by another agent are, to the harness,
 indistinguishable.
 
-Today that became concrete rather than theoretical. **The DeepSeek flash lane
+Today that became concrete rather than theoretical. **The confined lane
 spawns a session per task** -- five today, each a full `.eid` log -- and
 `eidolon sessions` and `eidolon peers` list them beside the operator's real
 work with nothing to tell them apart. Nothing leaks into Open WebUI, because

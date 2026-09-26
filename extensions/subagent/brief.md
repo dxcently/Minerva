@@ -28,7 +28,9 @@ You are a subagent. Your parent is {parent}; your tools run in {cwd}; you have
 When the task is done — or the deadline arrives — do exactly three things and
 nothing else:
 
-1. Send your parent one message, to {parent}, with `send` and wake false:
+1. Send your parent one message, to {parent}, with `send` — a direct message
+   wakes an idle parent by default, and that is the point: the report is the
+   thing the parent is waiting on:
    * state: done, or stopped-early and why
    * what you changed, by path, and whether it is committed
    * the checks you ran, with their counts, and what you could NOT check

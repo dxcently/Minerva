@@ -3344,7 +3344,7 @@ the changes are plain Rust string assertions with no OS-specific paths, so
 Linux-safety is **reasoned, not observed**. Exactly the labelling A7 was told to
 use, arrived at independently.
 
-### S62 - `eidolon-web` 317 -> 318, on the DeepSeek Flash lane
+### S62 - `eidolon-web` 317 -> 318, on the confined lane
 
 See [Decisions](Decisions.md#2026-09-19---the-first-flash-task-landed-and-the-checksum-is-the-proof).
 

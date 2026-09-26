@@ -98,7 +98,7 @@ Closures, cheapest first. **Disclosure** — the case (section 3) carries captur
 
 ### 2.5 Confidence
 
-That the third way is the right answer and that `reads` is its smallest honest form: **0.85**. That the four-step mechanism lands in one Sonnet day without touching harnox: **0.8** — the one risk is the number of `Ruling { … }` literal constructions the new field breaks (the compiler enumerates them; I did not count them). That the disclosure and network holes are as stated: **0.9** (observed verdicts). That the sandbox is a sufficient closure for network: **0.5** (hypothesis; depends on A7's box).
+That the third way is the right answer and that `reads` is its smallest honest form: **0.85**. That the four-step mechanism lands in one executor day without touching harnox: **0.8** — the one risk is the number of `Ruling { … }` literal constructions the new field breaks (the compiler enumerates them; I did not count them). That the disclosure and network holes are as stated: **0.9** (observed verdicts). That the sandbox is a sufficient closure for network: **0.5** (hypothesis; depends on A7's box).
 
 ### 2.6 The second wall: shapes the algebra refuses
 

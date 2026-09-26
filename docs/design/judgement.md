@@ -14,7 +14,7 @@ justification and leave the ruling standing*; *a protection is only as
 reachable as the layer it inspects*; *a filter that is too narrow produces
 exactly what a filter that is working produces*; and *report the number you
 measured, not the number you were given*. It writes no code. The
-specification at the end is what a Sonnet lands.
+specification at the end is what an executor lands.
 
 Every number below was measured on this box, today, in this session, by the
 procedure named beside it, unless it is attributed to a Build-Log entry.
@@ -260,7 +260,7 @@ timescale strip — at 0.53, a label shape Wikispeedia's titles never had. A
 calibrated checkpoint is calibrated on its set's menus; that is C3 in §6,
 with a face.
 
-### The experiment, as a Sonnet runs it
+### The experiment, as an executor runs it
 
 No judgement calls; every command is literal, every result has a meaning
 stated before it is read. Run from `C:\Users\dxcen\Projects\cms-agent\models\jevlike`
@@ -780,7 +780,7 @@ after any live step.
 
 | step | tree | agent | depends on |
 |---|---|---|---|
-| 0 | none — the experiment, into the Build-Log | Sonnet | — |
+| 0 | none — the experiment, into the Build-Log | executor | — |
 | 1 | `jev/automation/calibration.py`, `jev/calibrate.py`, `jev/server.py` | jev | — |
 | 2 | `jev/automation/run.py`, `graph.py`, `schema.json`, both graphs, tests | jev | 1 |
 | 3 | `jev/automation/options.py`, `guards.py`, `graph.py`, `schema.json`, `decisions.py`, `wiki-hop.json`, a fixture | jev | — (lands after 2 for one coherent `_choose_phase`) |
@@ -791,7 +791,7 @@ after any live step.
 
 ### Step 0 — the experiment
 
-Exactly §1's "as a Sonnet runs it", with `--epochs 8`, recorded in the
+Exactly §1's "as an executor runs it", with `--epochs 8`, recorded in the
 Build-Log as observed numbers: the three `jevlike.eval` outputs (shipped on
 synthetic, shipped on Wikispeedia, trained on Wikispeedia), and the bin and
 gate tables from `jev/calibrate.py` once step 1 exists — until then from the
