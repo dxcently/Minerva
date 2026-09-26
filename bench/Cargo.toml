@@ -1,0 +1,17 @@
+[package]
+name = "minerva-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Runs a defender agent against a fresh scored practice image and reports how far it got"
+license = "MIT"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[lib]
+name = "minerva_bench"
+path = "src/lib.rs"
+
+# No dependencies on purpose: a club tool must build years from now with only a
+# Rust toolchain. The report is small enough to serialise by hand (report.rs).

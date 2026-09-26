@@ -1,0 +1,179 @@
+//! The loop (triage-toolkit.md §7–§8):
+//!
+//!   reset → boot → wait_ready → baseline read → agent works within the time box
+//!   → agent stopped → authoritative read → VM down → one Row.
+//!
+//! The authoritative points are read over the console *after* the agent is
+//! stopped (§7.4.1), so a guest the agent locked itself out of is still scored.
+
+use crate::agent::{AgentRunner, RunCtx};
+use crate::clock::Clock;
+use crate::config::BenchConfig;
+use crate::report::{Row, Timeline};
+use crate::score::Score;
+use crate::vm::{ScoreReader, VmControl};
+use std::io;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    Solved,
+    TimeBox,
+}
+
+impl StopReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StopReason::Solved => "solved",
+            StopReason::TimeBox => "time_box",
+        }
+    }
+}
+
+pub fn run_benchmark(
+    cfg: &BenchConfig,
+    vm: &dyn VmControl,
+    scorer: &dyn ScoreReader,
+    agent: &dyn AgentRunner,
+    clock: &dyn Clock,
+) -> io::Result<Row> {
+    vm.reset()?;
+    vm.boot()?;
+    vm.wait_ready(clock, cfg.boot_timeout_s)?;
+
+    let mut timeline = Timeline::new();
+    let baseline = read_until_some(scorer, clock, cfg)?;
+    timeline.push(clock.elapsed_s(), baseline.earned);
+
+    let ctx = RunCtx {
+        ssh_host: "127.0.0.1".into(),
+        ssh_port: 2222,
+        brain_model: cfg.brain_model.clone(),
+        blind: cfg.feedback_blind,
+    };
+
+    agent.start(&ctx)?;
+    let reason = work_loop(cfg, scorer, agent, clock, &ctx, &mut timeline)?;
+    agent.stop()?;
+
+    // Authoritative, after the agent can no longer touch the guest.
+    let final_score = match scorer.read()? {
+        Some(s) => s,
+        None => Score { earned: timeline.peak(), total: cfg.score_total },
+    };
+    timeline.push(clock.elapsed_s(), final_score.earned);
+    vm.stop()?;
+
+    Ok(Row {
+        image: cfg.image.clone(),
+        sha: cfg.image_sha.clone(),
+        model: cfg.brain_model.clone(),
+        graphs_snapshot: cfg.graphs_snapshot.clone(),
+        mode: cfg.mode().into(),
+        points: final_score.earned,
+        total: final_score.total,
+        peak_points: timeline.peak(),
+        forensics_k: 0,
+        forensics_of: 7,
+        penalties: 0,
+        escalations_by_tier: [0; 4],
+        leak_hits: 0,
+        tokens: agent.tokens(),
+        wall_s: clock.elapsed_s(),
+        stop_reason: reason,
+        timeline,
+    })
+}
+
+fn work_loop(
+    cfg: &BenchConfig,
+    scorer: &dyn ScoreReader,
+    agent: &dyn AgentRunner,
+    clock: &dyn Clock,
+    ctx: &RunCtx,
+    timeline: &mut Timeline,
+) -> io::Result<StopReason> {
+    loop {
+        if clock.elapsed_s() >= cfg.time_box_s {
+            return Ok(StopReason::TimeBox);
+        }
+        let _ = agent.step(ctx)?;
+        if let Some(s) = scorer.read()? {
+            timeline.push(clock.elapsed_s(), s.earned);
+            if s.solved() {
+                return Ok(StopReason::Solved);
+            }
+        }
+        clock.sleep_s(cfg.poll_interval_s);
+    }
+}
+
+/// The first read after boot can come back before the scorer has run; retry
+/// within the boot timeout rather than record a missing baseline.
+fn read_until_some(scorer: &dyn ScoreReader, clock: &dyn Clock, cfg: &BenchConfig) -> io::Result<Score> {
+    let deadline = clock.elapsed_s() + cfg.boot_timeout_s;
+    loop {
+        if let Some(s) = scorer.read()? {
+            return Ok(s);
+        }
+        if clock.elapsed_s() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "scorer produced no reading"));
+        }
+        clock.sleep_s(cfg.poll_interval_s);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::NoopRunner;
+    use crate::clock::test_support::FakeClock;
+    use crate::vm::test_support::FakeHarness;
+    use crate::vm::Vm;
+
+    fn cfg(time_box_s: u64) -> BenchConfig {
+        let mut c = BenchConfig::default();
+        c.score_cmd = vec!["score".into()];
+        c.vm_cmd = vec!["vm".into()];
+        c.time_box_s = time_box_s;
+        c.poll_interval_s = 30;
+        c
+    }
+
+    #[test]
+    fn noop_agent_runs_to_the_time_box_at_baseline() {
+        let c = cfg(300);
+        let vm = Vm::new(FakeHarness::with_scores(&["0 / 256"]), &c);
+        let clock = FakeClock::new();
+        let row = run_benchmark(&c, &vm, &vm, &NoopRunner, &clock).unwrap();
+        assert_eq!(row.stop_reason, StopReason::TimeBox);
+        assert_eq!(row.points, 0);
+        assert!(row.wall_s >= 300);
+    }
+
+    #[test]
+    fn a_rising_score_reaches_solved_and_stops() {
+        let c = cfg(7200);
+        // Score climbs each poll; once it hits the total the loop stops.
+        let scores = ["0 / 256", "40 / 256", "180 / 256", "256 / 256"];
+        let vm = Vm::new(FakeHarness::with_scores(&scores), &c);
+        let clock = FakeClock::new();
+        let row = run_benchmark(&c, &vm, &vm, &NoopRunner, &clock).unwrap();
+        assert_eq!(row.stop_reason, StopReason::Solved);
+        assert_eq!(row.points, 256);
+        assert_eq!(row.peak_points, 256);
+        assert!(row.wall_s < 7200, "should stop early on solve, not run the box");
+    }
+
+    #[test]
+    fn timeline_records_the_climb() {
+        let c = cfg(7200);
+        let scores = ["0 / 256", "40 / 256", "256 / 256"];
+        let vm = Vm::new(FakeHarness::with_scores(&scores), &c);
+        let clock = FakeClock::new();
+        let row = run_benchmark(&c, &vm, &vm, &NoopRunner, &clock).unwrap();
+        let earned: Vec<i64> = row.timeline.points.iter().map(|&(_, p)| p).collect();
+        assert_eq!(earned.first(), Some(&0));
+        assert!(earned.contains(&40));
+        assert_eq!(earned.last(), Some(&256));
+    }
+}
