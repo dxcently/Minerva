@@ -20,6 +20,42 @@ impl Timeline {
     pub fn peak(&self) -> i64 {
         self.points.iter().map(|&(_, p)| p).max().unwrap_or(0)
     }
+
+    /// Area under the score curve, in points·seconds (trapezoidal over the
+    /// recorded samples). Rewards a score reached early over the same score
+    /// reached late: speed and height in one number. Zero for a flat baseline.
+    pub fn auc_points_s(&self) -> i64 {
+        self.points
+            .windows(2)
+            .map(|w| {
+                let (t0, p0) = w[0];
+                let (t1, p1) = w[1];
+                (t1.saturating_sub(t0)) as i64 * (p0 + p1) / 2
+            })
+            .sum()
+    }
+
+    /// Seconds from the start until the score first rose above the baseline
+    /// (the first sample), or `-1` if it never did.
+    pub fn time_to_first_point_s(&self) -> i64 {
+        let Some(&(_, base)) = self.points.first() else { return -1 };
+        self.points
+            .iter()
+            .find(|&&(_, p)| p > base)
+            .map(|&(t, _)| t as i64)
+            .unwrap_or(-1)
+    }
+
+    /// Seconds until the peak was first reached — when the run stopped
+    /// improving. `-1` for an empty timeline.
+    pub fn time_to_peak_s(&self) -> i64 {
+        let peak = self.peak();
+        self.points
+            .iter()
+            .find(|&&(_, p)| p == peak)
+            .map(|&(t, _)| t as i64)
+            .unwrap_or(-1)
+    }
 }
 
 impl Default for Timeline {
@@ -74,6 +110,11 @@ impl Row {
         push_num(&mut o, "wall_s", self.wall_s as i64);
         push_str(&mut o, "stop_reason", self.stop_reason.as_str(), false);
         push_str(&mut o, "score_source", self.score_source, false);
+        // Reward primitives off the timeline: speed and timing, so training can
+        // weight a fast climb, not only the final height (points, above).
+        push_num(&mut o, "auc_points_s", self.timeline.auc_points_s());
+        push_num(&mut o, "time_to_first_point_s", self.timeline.time_to_first_point_s());
+        push_num(&mut o, "time_to_peak_s", self.timeline.time_to_peak_s());
         push_raw(&mut o, "timeline", &timeline_array(&self.timeline));
         o.push('}');
         o
@@ -183,5 +224,43 @@ mod tests {
         t.push(30, 44);
         t.push(60, 40);
         assert_eq!(t.peak(), 44);
+    }
+
+    #[test]
+    fn area_rewards_the_faster_climb_at_equal_final_score() {
+        // Both reach 100 by t=100, but A gets there at t=10 and holds.
+        let mut fast = Timeline::new();
+        fast.push(0, 0);
+        fast.push(10, 100);
+        fast.push(100, 100);
+        let mut slow = Timeline::new();
+        slow.push(0, 0);
+        slow.push(90, 0);
+        slow.push(100, 100);
+        assert_eq!(fast.points.last(), slow.points.last()); // same final score
+        assert!(fast.auc_points_s() > slow.auc_points_s()); // fast wins on area
+        assert_eq!(fast.time_to_first_point_s(), 10);
+        assert_eq!(slow.time_to_first_point_s(), 100);
+    }
+
+    #[test]
+    fn area_and_timings_of_a_flat_baseline_are_zero_and_minus_one() {
+        let mut t = Timeline::new();
+        t.push(0, 0);
+        t.push(300, 0);
+        assert_eq!(t.auc_points_s(), 0);
+        assert_eq!(t.time_to_first_point_s(), -1); // never rose
+        assert_eq!(t.time_to_peak_s(), 0); // peak is the baseline, reached at t=0
+    }
+
+    #[test]
+    fn area_is_the_trapezoid_sum() {
+        // 0..60 rising 0→40 is a triangle (1200), 60..120 flat at 40 is 2400.
+        let mut t = Timeline::new();
+        t.push(0, 0);
+        t.push(60, 40);
+        t.push(120, 40);
+        assert_eq!(t.auc_points_s(), 1200 + 2400);
+        assert_eq!(t.time_to_peak_s(), 60);
     }
 }
