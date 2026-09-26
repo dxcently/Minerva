@@ -1,0 +1,30 @@
+//! Built-in `edit`: exact-substring replacement via `fs_edit`. The
+//! parameters are `old_str`/`new_str` from the start — see the vault note
+//! on Melete's `new_string` rename.
+
+pub fn manifest() {
+    #{
+        name: "edit",
+        description: "Replace an exact substring in a file. old_str must match exactly once unless replace_all is set; include enough surrounding context to make it unique.",
+        prompt: "Read a file before editing it: `old_str` must match the file byte for byte, including indentation and blank lines. If an edit comes back `not found` or `occurs N times`, read the region again and copy from what you read — adding guessed context makes a wrong match wrong in a new way.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "path": #{ "type": "string", "description": "File path, absolute or relative to the working directory" },
+                "old_str": #{ "type": "string", "description": "The exact text to replace" },
+                "new_str": #{ "type": "string", "description": "The replacement text" },
+                "replace_all": #{ "type": "boolean", "description": "Replace every occurrence (default false)" },
+            },
+            "required": ["path", "old_str", "new_str"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let replace_all = match input.get("replace_all") {
+        Some(b) => b == true,
+        None => false,
+    };
+    eidolon::fs_edit(input.path, input.old_str, input.new_str, replace_all).await
+}

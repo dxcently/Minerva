@@ -1,0 +1,98 @@
+# ~/.config/eidolon/config.toml
+#
+# Hand-written, or generated — by Nix, by whatever else owns this machine's
+# dotfiles. The harness reads these settings and has no command that writes
+# one back, so a generated file is never fought over: what is here at launch
+# is what the session runs on, and changing a setting means changing the
+# thing that produced this file.
+
+# default_model = "sonnet"          # with [claude_cli] present this is the default
+# max_tokens = 64000
+# thinking_budget = 4096
+# sessions_dir = "~/.local/share/eidolon/sessions"
+# providers_dir = "~/.config/eidolon/providers"   # Rune provider scripts
+# tools_dir = "~/.config/eidolon/tools"           # Rune tools; the built-ins are seeded here
+# secrets_dir = "~/.config/eidolon/secrets"       # secrets.enc + secret.key
+
+# How long an endpoint holds what a turn writes to its prompt cache:
+# "short" (the endpoint's own default, five minutes on the Anthropic wire),
+# "long" (the hour-long entry), or "none" (no breakpoints at all).
+#
+# The harness always marks the stable prefix and rolls a third breakpoint
+# along the conversation, so a tool loop re-reads the transcript from the
+# cache rather than at the fresh rate. What this chooses is how long the
+# entry survives *between* turns: five minutes covers the loop and misses
+# whenever a person reads the answer before replying, which is most of an
+# interactive session. "long" costs more to write (2x the base rate rather
+# than 1.25x) and pays for itself on the first turn that would have missed.
+# cache_retention = "short"
+
+[claude_cli]                      # the Claude Code CLI as a backend
+# binary = "claude"
+models = ["claude-*", "sonnet", "opus", "haiku"]
+# Which tools the CLI may use:
+#   own     (default) its own built-ins, policed by the PreToolUse hook
+#   eidolon only this harness's registry, served over MCP (`--tools ""`
+#           disables the built-ins); the harness executes every call
+# tools = "own"
+
+# The model picker's ordering: high floats, negative sinks, unnamed is
+# zero, and a glob covers a class. An exact key beats a glob, and the
+# longest glob wins among globs. Declared here and nowhere else — the
+# picker shows a weight and sorts by it, and never writes one back.
+# [model_weights]
+# "fau:azure_ai/gpt-5.4" = 5
+# "deepseek:deepseek-v4-pro" = 3
+# "fau:openai/*" = -5             # the tiny local ones, out of the way
+
+# DeepSeek ships with the harness and needs no entry here — only a key:
+#   eidolon secret set deepseek < key.txt      (or export DEEPSEEK_API_KEY)
+#
+# To point it somewhere else instead — a file a secret manager writes,
+# say — name it and change the one field. An entry naming a provider that
+# is already loaded is a *patch*: what it does not mention it inherits, so
+# there is no copy of the endpoint, the models or their prices to go stale.
+# [[providers]]
+# name = "deepseek"
+# token_file = "/run/secrets/deepseek"    # replaces token_secret/token_env
+#
+# Naming a provider that is *not* loaded declares a new one, and then wire
+# and base_url are required. A providers_dir script named `deepseek` still
+# replaces the built-in whole, for when the wire itself is what is wrong.
+#
+# An OpenAI-compatible or Anthropic-wire provider in TOML (a Rune script
+# in providers_dir can do the same plus hooks — see examples/providers/).
+# [[providers]]
+# name = "kimi"
+# wire = "anthropic"
+# base_url = "https://api.moonshot.ai/anthropic"
+# token_secret = "kimi"
+# models = ["kimi-*", { id = "kimi-k2", name = "Kimi K2", context = 128000 }]
+
+# The chat-completions wire has no prompt caching of its own: an endpoint
+# that caches does it unasked, on the request prefix, and the harness's
+# side of that is a prefix that does not change between turns. Two
+# gateways are the exception, and say so here rather than being sniffed
+# for:
+#
+#   cache_control    — the gateway forwards Anthropic models and passes
+#                      the Anthropic `cache_control` block through. Those
+#                      models cache nothing without it. A gateway that
+#                      has not heard of the field answers 400, which is
+#                      why this is declared and not assumed.
+#   prompt_cache_key — the gateway shards its cache and routes on the
+#                      key. Without it a perfectly stable prefix still
+#                      misses whenever the balancer picks another machine.
+#                      The harness sends the session's own name.
+#
+# [[providers]]
+# name = "openrouter"
+# wire = "openai"
+# base_url = "https://openrouter.ai/api/v1"
+# token_secret = "openrouter"
+# models = ["anthropic/*", "deepseek/*"]
+# compat = { cache_control = true }
+
+# [mneme]
+# mcp_url = "https://vault.example/mcp"
+# passphrase_file = "~/.config/eidolon/mneme.pass"

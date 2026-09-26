@@ -1,0 +1,24 @@
+//! Built-in `mneme_rpc`: one exact call onto the vault server. The model
+//! discovers functions with `list` and `schema` and then calls them here;
+//! nothing about Mneme's surface is registered into the model's context.
+
+pub fn manifest() {
+    #{
+        name: "mneme_rpc",
+        description: "Call one function on the Mneme vault server by exact name, e.g. {\"function\": \"read_note\", \"args\": {\"title\": \"Groceries\"}}. Discovery: {\"function\": \"list\"} returns every callable name; {\"function\": \"schema\", \"args\": {\"functions\": [\"read_note\"]}} returns descriptions and input schemas. Destructive functions need confirm=true in args. For natural-language vault commands use the vault command channel — a `! <command>` line in your reply, or the `vv` tool, whichever your prompt names — and treat this tool as the escape hatch: discovery, writes, and anything the channel declines.",
+        prompt: "Mneme is the remote vault, not this checkout. Natural-language vault reads go through the vault command channel (the notes beside this one, or the `vv` tool), and reading RPC before guessing a function is what this tool is for. Use RPC for discovery, unsupported precise operations, or channel fallback; discover callable names with list and inspect schema before guessing arguments. Classifier intent_candidates are not callable names. RPC takes function plus an args object, not Melete lib_rpc's call envelope or positional array. Read the target before editing, follow relevant wikilinks explicitly, and read back important mutations to verify both content and destination. A successful call alone does not prove the right note changed.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "function": #{ "type": "string", "description": "The Mneme function name, or `list` / `schema`" },
+                "args": #{ "type": "object", "description": "That function's named arguments (omit for none)" },
+            },
+            "required": ["function"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::mneme_call("rpc", input).await
+}

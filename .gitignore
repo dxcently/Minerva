@@ -13,6 +13,8 @@ logs/
 # Large local model weights and compiled runtime
 models/
 llama.cpp/
+# the build `hoot setup -Force` replaced, kept for rollback
+llama.cpp.prev/
 **/target/
 **/node_modules/
 **/.venv/
@@ -23,13 +25,12 @@ llama.cpp/
 *.safetensors
 *.pt
 *.pth
+# jev's vendored chooser checkpoint (169 KB) ships with the repo
+!jev/runs/synthetic.pt
 
-# Independent repositories: never silently stage as incomplete gitlinks.
-# Their dirty working trees remain in place; dependency pinning is separate work.
-/eidolon/
-/harnox/
-# Aoide is the same shape as those two: another project checked out here,
-# with its own history and a working tree of its own to keep dirty.
+# eidolon/, harnox/ and aoide-core/ are vendored snapshots (VENDORED.md), tracked.
+# Aoide is the full upstream project checked out here for development, with its
+# own history and working tree; never stage it as an incomplete gitlink.
 /Aoide/
 
 # Machine-specific backups

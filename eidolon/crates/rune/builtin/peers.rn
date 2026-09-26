@@ -1,0 +1,21 @@
+//! Built-in `peers`: the other harness sessions running right now.
+//!
+//! Registered only on a host whose session is registered among its peers,
+//! so a lone harness does not offer the model a tool that can only ever
+//! answer "nobody".
+
+pub fn manifest() {
+    #{
+        name: "peers",
+        description: "List the other Eidolon sessions running right now — their id, working directory, model, whether they are mid-turn, and what each was asked to do. The ones on this project are reachable together as `channel`. Call this before `send` rather than guessing a session id.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{},
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::swarm_call("peers", #{}).await
+}

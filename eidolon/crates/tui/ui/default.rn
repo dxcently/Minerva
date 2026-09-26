@@ -1,0 +1,1307 @@
+//! The default interactive layout **and keymap**. It is seeded to
+//! `~/.config/eidolon/ui.rn` on first launch and that copy is the one the
+//! harness compiles: edit it there, and `:reload_ui` reads it again. A
+//! copy that does not compile falls back to this (with the error shown).
+//! An upgrade carries the copy forward while it is untouched and leaves
+//! it alone once edited; the shipped version is then in
+//! `~/.config/eidolon/system/ui.rn` to diff against, with `prelude.rn` —
+//! the builders this calls, compiled in front of every `ui.rn` — beside it.
+//!
+//! ## The entry points
+//!
+//! `view(s)` gets a snapshot each frame: model, persona (the vault note
+//! this session is wearing, empty when none), session, cwd, working,
+//! elapsed_ms, context_tokens, turn_out (this turn's output so far, a
+//! streamed estimate until the settle), life (the pulse's strip of Life,
+//! one row of braille), usage_in, usage_out, spend (a dollar string,
+//! empty until a priced turn has settled), tools_run, last_tool,
+//! dialog, following, detail, copied, queued, transcript_len, tick,
+//! `mode` (with `mode_colour`, `mode_label`, `mode_sigil` and
+//! `mode_kind` beside it), `pending` (the chord typed so far) and
+//! `empty` (is the prompt blank).
+//!
+//! `modes()` and `theme()` are the two tables below, read once at load
+//! along with `keymap()`, and `commands()` is a third this script does
+//! not need: a table of commands of your own — `#{ "shout":
+//! custom_arg("shout", "TEXT", "send TEXT in capitals") }` with `pub fn
+//! shout(s, arg) { send(`SHOUT ${arg}`) }` beside it — which are then
+//! bound, typed on the `:` line, completed and printed by `:help`
+//! exactly as the built-ins are. A command's function
+//! answers with the same actions `on_submit` does, plus `insert(text)`
+//! and `info(text)`. `custom_fill` says where the argument's values come
+//! from as well as what it is called, and the `:` line then completes it
+//! — see the prelude. `:reload_ui` reads all four tables again — so
+//! changing a colour, a badge, a binding or a command is a save and a
+//! command.
+//!
+//! `detail` is how much tool traffic the transcript is drawing:
+//! "folded" (a settled run of calls is one summary line), "calls" (every
+//! call, capped output) or "full" (every call, all of it). `space o`
+//! cycles it.
+//!
+//! The status line's left half is borrowed for a few seconds by a
+//! *notice* — what the last keystroke came to: "no matches", "yanked 2
+//! blocks", "no such command" — drawn by Rust over whatever `left(s)`
+//! returned, so a layout of your own shows it without asking. It is
+//! never on the transcript, which is for the conversation. `:messages`
+//! pages through every notice said so far. A page (`:help`, `:context`,
+//! `:tree`, `:messages`, `:usage`) is a dialog the way the pickers are:
+//! the `page` table below is its keys and `modes()` has its badge.
+//!
+//! `mode` is "normal", "insert" or "select" — the prompt's own — or one
+//! of the three **one-line modes**, "command", "search" and
+//! "dispatch", which are not editing modes at all: each is a second,
+//! shorter buffer (the *minibuffer*) written along the prompt's bottom
+//! border, with the message you were composing still in the box above
+//! it and still being searched. All three are reported as modes because
+//! they are modes to the hands, and the frame says which one has the
+//! keyboard.
+//!
+//! That the message stays put is the point. The `:` line used to *be*
+//! the prompt, dispatch was a mode the prompt was put into, and the
+//! search line stood in the prompt's screen slot — so reaching for any
+//! of the three took a half-written message off the screen, and
+//! searching the session for the very thing you were in the middle of
+//! saying meant losing what you had said of it.
+//!
+//! `menu()` fills with completion while the `:` line is up, so
+//! the same popup that shows an open chord shows what could come next:
+//! the matching commands before the space, and — past it — what could go
+//! in *that command's argument*, from the source its row names (a path,
+//! a model key, a mode, a record id, a staged image). `tab` walks the
+//! list and `up`/`down` do too; a name that takes an argument completes
+//! with the space already on the end. An argument that is prose gets its
+//! shape said (`[TEXT]`) and nothing offered.
+//!
+//! `mode_colour`, `mode_label` and `mode_sigil` are that mode's row of
+//! `modes()`, handed back rather than looked up here again: the frame
+//! round the prompt, the title on it and the badge below all read one
+//! answer, so they cannot disagree. Every mode names itself on its
+//! frame, and each one-line mode wears its own character at the head of
+//! its line, in the same colour: `:` command, `/` search, `?` search
+//! back, `!` dispatch. All four are the `sigil` on that mode's row —
+//! drawn, never stored, so the buffer holds the command, the pattern or
+//! the utterance alone. Drop the sigil from a row and none is drawn;
+//! `?` is the one exception, standing in for `/` when the search is
+//! going backwards, because a direction is not a mode.
+//!
+//! `s.dispatch` names the surface the dispatch line is aimed at ("" when
+//! none is configured) — see "Dispatches" below.
+//!
+//! `keymap()` is read **once**, at startup: a table of mode → key →
+//! command. It is pure data, because the state a modal keymap needs (the
+//! open chord, the count, the mode) lives in Rust — a Rune VM is built per
+//! call and could not remember that you pressed `g` a moment ago. There is
+//! no `on_key` any more; this table replaced it.
+//!
+//! `on_submit(s, text)` still decides what a submitted line *means*.
+//!
+//! ## The keys
+//!
+//! Helix, with one deliberate departure, forced by this being a chat
+//! prompt rather than a file:
+//!
+//!  * **`j`/`k` scroll the transcript, not the prompt.** There are two
+//!    surfaces and one keyboard: vertical motion inside a three-line
+//!    prompt is rare, and scrolling back through a session is not. The
+//!    prompt's own vertical motion is on `up`/`down`. Consequently
+//!    `gg`/`ge` are the *prompt's* ends, Helix-faithfully, and the
+//!    transcript's top is `gt`.
+//!  * **`gw` and `gW` are the letter tags**, over the two things on the
+//!    screen worth pointing at: `gw` labels every word in the visible
+//!    conversation and in the draft, `gW` labels every block. Type the
+//!    label — one letter, or two on a busy screen — and you are there.
+//!    A word in the prompt is a motion (select mode extends to it); a
+//!    word in the transcript has no cursor to be, so landing on one
+//!    selects it and yanks it, which is what one wants a word out of a
+//!    transcript for; a block lands the trace cursor.
+//!
+//! **Normal is the resting mode**, as in Helix. Insert was tried first —
+//! a chat prompt is mostly typing, so opening in insert saves an `i` per
+//! message — but it costs the whole keyboard: `:` typed a colon instead of
+//! opening the command line, and the leader needed an `esc` in front of it
+//! that nothing on screen suggested. A modal prompt that is never in the
+//! mode where keys mean things is not modal. So `i` starts a message and
+//! `esc` comes back, and a blank prompt is the harness's keyboard.
+//!
+//! Sending, though, is not a reason to leave insert: the prompt comes
+//! back empty in the mode the message was written in, so a run of
+//! messages costs one `i` and not one per message. The dispatch line
+//! keeps its line up for the same reason, so a run of utterances costs
+//! one `!`; the `:` line and the search are done with when they are
+//! answered, and come down.
+//!
+//! **The readline keys are bound wherever text is typed** — insert, the
+//! three one-line modes, and a dialog's field. `C-a`/`C-e` are the ends
+//! of the line, `C-b`/`C-f` and `A-b`/`A-f` are the two step sizes,
+//! `C-u`/`C-k`/`C-w`/`A-d` are the four kills and `C-y` puts back what
+//! the last one took. They are not a second modal vocabulary: they are
+//! what every unix text field has done for forty years, and the hand
+//! that reaches for `C-a` mid-message is not in Helix at the time.
+//! Normal and select keep the Helix keyboard exactly — `^`, `$`, `w`,
+//! `d` already say all of it in one keystroke there.
+//!
+//! There is one control binding, and it is not a vocabulary — `space` is
+//! the leader, and the popup that opens under it says what it can become.
+//! `C-t` is the exception because the operator's own Helix config already
+//! made it one: `T` is the prefix that opens another window there, so
+//! `till_prev_char` moved out of its way, and a harness that put it
+//! somewhere else would fork the hands rather than follow them.
+//!
+//! ## Another window
+//!
+//! `T` opens one, where helix and yazi both already open one: `T T` a
+//! terminal, `T R` the file manager, `T H` the editor, `T E` another
+//! eidolon. All four open **here** — and *here* is the session's working
+//! directory in normal mode and, in trace mode, the file the call under
+//! the cursor touched. That last part is the half only this tool can
+//! offer: it is the one of the three that knows what was just written.
+//!
+//! Which programs those are is `[terminal]` in `config.toml`, and with no
+//! table the harness works it out on the first press — `$TERM` for the
+//! emulator it is running inside, `$EDITOR` for the editor. Nothing is
+//! resolved at startup, because the launch budget is ten milliseconds and
+//! a session that never presses `T` should not pay for a `PATH` scan.
+//!
+//! ## The vocabulary
+//!
+//! A binding names a command from the harness's one registry, and so does
+//! the `:` line — `space m` and `:model` are the same command reached two
+//! ways, and `space p` is a second key onto that line. A name the
+//! registry does not know is reported at startup rather than silently
+//! doing nothing, so this table cannot invent a command.
+//! `ui::commands()` hands the table to a script that wants to build a
+//! menu or a help page of its own.
+//!
+//! `space p` used to open a *palette* — the registry as a filterable
+//! list. It is gone. The `:` line completes the same table with the same
+//! ranking, and it shows you the command it resolved to before you run
+//! it, where a list ran whatever was under the highlight; it also
+//! completes the argument, which a list of names cannot. What the
+//! palette was better at was browsing, and `:help` is better at that
+//! still: the whole vocabulary, grouped, on a page you can scroll, with
+//! the live keymap above it.
+//!
+//! There is no `/` **command prefix**. A submitted line beginning with a
+//! slash is ordinary prompt text and goes to the model; the command line
+//! is `:` and only `:`. The `/` *key* is a different thing and is bound,
+//! in normal mode, to the transcript's search — exactly as in Helix, and
+//! with no ambiguity, because a message is typed in insert mode, where
+//! `/` is a character like any other.
+//!
+//! ## Dispatches
+//!
+//! `!` (or `space d d`) opens **dispatch mode**: the line is read by a
+//! local classifier and becomes one typed tool call, with no model turn.
+//! `ret` resolves and runs it, `tab` changes surface, `esc` comes back.
+//! Typing there is insert's, to the character — the difference is only
+//! what `on_submit` does with the line, which is why the table below is
+//! insert's with one key added, and why `on_submit` branches on the mode
+//! before it looks at the text.
+//!
+//! ## Finding things
+//!
+//! `/` and `?` search the transcript, incrementally: the matches light up
+//! as you type and the view follows the nearest one. `ret` keeps it (`n`
+//! and `N` then walk the matches), `esc` drops it and puts the view back.
+//! `*` searches for whatever the prompt has selected.
+//!
+//! `tab`, while the search line is up, is the quick half: every match on
+//! screen takes a letter, and typing that letter goes there. `gn` does
+//! the same after the line has come down, and `gw` is Helix's `gw` — the
+//! same tags over the prompt's own words.
+//!
+//! A match can be somewhere that is not drawn — inside folded tool
+//! traffic, or below the cap on an output. Those are still matches, and
+//! the line standing in for them says so: `Wrote 3 files · 2 matches`,
+//! in the highlight's own colour. `S-tab` on the search line opens it
+//! without leaving the search, and the search line only offers that
+//! while there is something to open. Both that key and `tab` live on
+//! the search line and nowhere else — see "where a binding lives".
+//!
+//! Rune rules worth knowing before editing: no `let mut` (everything is
+//! mutable), `()` cannot be interpolated, and match an `Option` by variant
+//! rather than comparing to unit.
+
+pub fn view(s) {
+    // A session no one has spoken in opens on the start screen; `:help`
+    // has the rest. Not "an empty transcript": model, persona, dispatch
+    // and cwd may all change before the first message, and the screen's
+    // rows read them live — the changes interact with the screen, they
+    // do not dismiss it.
+    let body = if s.fresh { start(s) } else { transcript() };
+    column([
+        fixed(1, empty()),
+        fill(body),
+        // The prompt grows with what is in it, from one text row to
+        // ten. A message is not a line — a paste, a stack trace, a
+        // paragraph written with `S-ret` — and a box pinned at one row
+        // hides all but the row the caret is on.
+        grow(3, 12, prompt(titled(s))),
+        fixed(1, status(left(s), right(s))),
+        menu(),
+        dialog(),
+    ])
+}
+
+// --------------------------------------------------------------- the start screen
+//
+// The agent, the name, and enough to begin. One `text` node per row, so
+// a narrow terminal clips the art rather than wrapping it. The keys are
+// written by hand: a map of the keymap would be the help page again.
+
+fn start(s) {
+    // [wordmark, sprite, ink, tint]. The wordmark is padded to one width, so
+    // the sprite column stays straight; both colours ramp down the six rows.
+    let art = [
+        ["  ▄▄▄▄▄▄▄               ▄▄             ", "      ", "#2f6fd0", ""],
+        [" █▀██▀▀▀        █▄       ██            ", "  ██  ", "#2f81d0", "#ffd43b"],
+        ["   ██     ▀▀    ██       ██       ▄    ", "██████", "#2f92d0", "#ffbe36"],
+        ["   ████   ██ ▄████ ▄███▄ ██ ▄███▄ ████▄", "  ██  ", "#2fa4d0", "#ffa830"],
+        ["   ██     ██ ██ ██ ██ ██ ██ ██ ██ ██ ██", "██  ██", "#2fb5d0", "#ff922b"],
+        ["   ▀█████▄██▄█▀███▄▀███▀▄██▄▀███▀▄██ ▀█", "      ", "#2fc7d0", ""],
+    ];
+    let rows = [fixed(1, empty())];
+    for r in art {
+        rows.push(fixed(1, text([bold(` ${r[0]}`, r[2]), bold(`      ${r[1]}`, r[3])])));
+    }
+    let persona = if s.persona != "" { s.persona } else { "none" };
+    let surface = if s.dispatch != "" { s.dispatch } else { "none" };
+    let line = |k, v| fixed(1, text([dim(`  ${k}  `), styled(v, "gray")]));
+    let keys = |k, v| fixed(1, text([dim("  "), bold(k, "cyan"), styled(`  ${v}`, "gray")]));
+    rows.push(fixed(1, empty()));
+    rows.push(line("model   ", s.model));
+    rows.push(line("persona ", persona));
+    rows.push(line("dispatch", surface));
+    rows.push(line("cwd     ", s.cwd));
+    rows.push(fixed(1, empty()));
+    rows.push(keys("i", "type a message · ret sends · S-ret is a newline · esc back to normal"));
+    rows.push(keys(":", "a command · space p too · tab completes"));
+    rows.push(keys("/", "search the transcript · ! a dispatch line"));
+    rows.push(keys("space", "leader: m model · c context · n new · r resume · u usage · o tool detail · q quit"));
+    rows.push(keys("?", "space ? is the key reference · :help lists every command"));
+    column(rows)
+}
+
+/// The mode badge. Colour carries it faster than the letters do.
+fn badge(s) {
+    // Both halves come from the mode's row in `modes()` below, by way of
+    // the snapshot: the same answer the prompt's border and its title are
+    // drawn from, so the badge cannot say one thing while the frame round
+    // the text says another. Dispatch being the loud one is decided in
+    // that table, once.
+    on(` ${s.mode_label} `, s.mode_colour)
+}
+
+// --------------------------------------------------------------- the modes
+//
+// Every mode the harness has, as a row: what the badge says, what colour
+// the frame wears, and — for the ones the prompt can be in — what *kind*
+// of mode it is, which is the one thing the buffer needs to know.
+//
+//  * **normal**, **insert** and **select** are the three kinds, and the
+//    three names Helix's verbs reach (`i`, `v`, `esc`), so their kind is
+//    fixed; restyle them freely.
+//  * **command**, **search** and **dispatch** have a look but no kind.
+//    They are the **one-line modes**: what is being typed there is not
+//    the message, it is a command, a pattern or an utterance, and it is
+//    written on the prompt's bottom border with the message still in
+//    the box above it. So they are modes to the hands without being
+//    modes on the buffer, and the badge and frame say so like any
+//    other. Three colours and not one: two one-line modes wearing the
+//    same colour is exactly the confusion the colour is for, and
+//    dispatch is loud on purpose — `ret` there runs a tool.
+//
+// To add a mode of your own: a row here, a table for it in `keymap()`
+// (with a way out — `esc` to `normal_mode`), a binding or a `:enter_mode
+// NAME` to get in, and a branch in `on_submit` if `ret` should mean
+// something new there. `enter_mode` with no name is a picker over this
+// table.
+
+pub fn modes() {
+    #{
+        "normal":   mode("normal", "NOR", "blue"),
+        "insert":   mode("insert", "INS", "green"),
+        "select":   mode("select", "SEL", "magenta"),
+        "dispatch": sigil(style("DISP", "red"), "!"),
+        // Trace mode is normal-kinded — nothing is typed there — and
+        // wears a colour nothing else does. Cyan would have read well
+        // and is the command line's; orange is free, and a mode that
+        // takes the whole keyboard should not borrow another's badge.
+        "trace":    mode("normal", "TRACE", "#ff8800"),
+        "command":  sigil(style("CMD", "cyan"), ":"),
+        // One sigil, two directions: a backward search wears `?` for
+        // the `/` this row names, because which way `n` goes is not a
+        // mode. Drop the sigil and neither is drawn.
+        "search":   sigil(style("FIND", "yellow"), "/"),
+        // The dialogs, by kind. They own the keyboard while they are up
+        // and take their keys from the tables of the same names below.
+        "confirm":  style("ASK?", "yellow"),
+        "choose":   style("CHOOSE", "yellow"),
+        "pick":     style("PICK", "yellow"),
+        "ask":      style("ASK", "yellow"),
+        // A page of text (`:help`, `:context`, `:tree`, `:messages`):
+        // read, scrolled and closed, on the `page` table below.
+        "page":     style("PAGE", "yellow"),
+        "vault":    style("VAULT", "yellow"),
+    }
+}
+
+// ----------------------------------------------------------------- labels
+//
+// What tools are called on the transcript, as against their wire names —
+// `wait_for` draws as "Waiting", `choices_user`'s question box is titled
+// "Options". Cosmetic by construction: dispatch, the log, search and the
+// fold summary all read the wire name, so a label changes what a call
+// says and never what it is. A tool not named here draws under its own
+// name, which is right for most calls.
+
+pub fn labels() {
+    #{
+        "wait_for": "Waiting",
+        "choices_user": "Options",
+    }
+}
+
+// A kind core does not watch here is a warning at load; a kind this
+// table leaves out draws under its own name.
+
+pub fn wait_tags() {
+    #{
+        "bg": "bg",
+        "peer": "peer",
+        "file": "file",
+        "log": "log",
+        "vault": "vault",
+    }
+}
+
+// --------------------------------------------------------------- the theme
+//
+// Every colour Rust paints on its own account, by role. What this script
+// draws itself — the status line, a panel — takes its colour inline; this
+// is for the things placed rather than drawn: the search highlight, the
+// letter tags, the popup, a dialog, the tool traffic, the model's
+// markdown. The modes' colours are on their rows above, not here. A
+// colour is a name or `#rrggbb`; a theme need only name what it changes.
+
+pub fn theme() {
+    #{
+        hit: "yellow",        // a search match, and the count on a fold that hides one
+        tag: "magenta",       // a letter tag, and the offer to open what hides a match
+        menu: "yellow",       // the which-key popup and command completion
+        dialog: "yellow",     // an approval, question or picker
+        ok: "green",          // the allow key on an approval
+        error: "red",         // a failed tool, a search with no match, the deny key
+        user: "green",        // your own messages
+        peer: "lightgreen",   // a message from another session on this project
+        tool: "magenta",      // the arrows and names on tool traffic
+        faint: "dim",         // notes, captions, folded output: the terminal's own dimming
+        text: "default",      // secondary text that is not faint: the terminal's foreground
+        sent: "lightcyan",    // what a call sent: the command, the path, the pattern
+        gutter: "dim",        // a code block's line numbers: a darker shade of the foreground
+        comment: "darkgray",  // a comment inside a code block
+        string: "green",      // a quoted string inside a code block
+        number: "magenta",    // a number inside a code block
+        keyword: "blue",      // a language's reserved word inside a code block
+        block: "#262336",     // behind a fenced block — a light theme wants its own
+        added: "#1c3a28",     // behind a line a diff puts in
+        removed: "#3a1f26",   // behind a line a diff takes out
+        cursor: "yellow",     // the streaming caret
+        focus: "reversed",    // the block the trace cursor is on: the terminal's inversion, softened
+        code: "cyan",         // inline code and fenced blocks
+        heading: "yellow",    // level one and two headings
+        link: "blue",         // link labels
+    }
+}
+
+fn left(s) {
+    // No session name here: sixteen digits of epoch, and the notices need the room.
+    // While a turn runs the pulse stands where the model name does —
+    // one line either way, and a row of its own was a row the
+    // transcript gave up on every turn.
+    let out = [badge(s), dim(" "), bold(s.model, "cyan")];
+    // Who is speaking, next to what is speaking. Empty means nobody is
+    // pinned, which is the ordinary case and draws nothing — and it is
+    // drawn here rather than further down because a persona is not an
+    // event in the session, it is a standing fact about every turn in it,
+    // the same kind of thing the model key beside it is.
+    if s.persona != "" {
+        out.push(dim(" · "));
+        out.push(bold(s.persona, "magenta"));
+    }
+    // The gate is answering for you. Everything else on this line is a
+    // fact about the session; this is a fact about what is no longer
+    // happening to it, so it is loud and it is early. It is also the only
+    // thing that says so — a yolo yes draws nothing in the transcript,
+    // deliberately, because a line per waived call in the mode built to
+    // stop interrupting is the interruption again.
+    if s.yolo {
+        out.push(bold(" · YOLO", "red"));
+    }
+    if s.mode == "dispatch" {
+        out.push(bold(` · ${s.dispatch}`, "red"));
+    }
+    if s.tracing {
+        // Where in the transcript the cursor is standing, what it is
+        // standing on, and whether there is a fold here to open. A
+        // cursor you cannot locate is a cursor you scroll to find.
+        out.push(bold(` · ${s.trace_at}/${s.trace_blocks}`, "#ff8800"));
+        out.push(dim(` ${s.trace_kind}`));
+        if s.trace_filter != "" {
+            // The word the walk is narrowed to, in the cursor's own
+            // colour: a filtered 3/7 should say why it is seven and
+            // not seventy.
+            out.push(bold(` · ${s.trace_filter}`, "#ff8800"));
+        }
+        if s.trace_open {
+            out.push(dim(" · l opens"));
+        }
+        if s.trace_extend {
+            out.push(bold(` · EXT ${s.trace_span}`, "magenta"));
+        }
+    }
+    if s.pending != "" {
+        out.push(bold(` · ${s.pending}`, "yellow"));
+    }
+    if s.queued > 0 {
+        out.push(dim(` · ${s.queued} queued`));
+    }
+    if !s.following {
+        out.push(dim(" · ↑ scrolled"));
+    }
+    if s.copied {
+        out.push(dim(" · copied"));
+    }
+    // Folded is the resting step and says so on the transcript itself
+    // ("Ran 3 shell commands"); the other two are the unusual state, so
+    // they are the ones worth a word here.
+    if s.detail != "folded" {
+        out.push(dim(` · ${s.detail}`));
+    }
+    return out;
+}
+
+/// The pulse: a strip of Conway's Life above the prompt while the model
+/// runs — `s.life`, stepped by the harness on its tick, with a shape
+/// thrown in by every tool call. The word turns over every eight calls
+/// and the folded thinking line wears the same one. Then the clock, and
+/// what went in and has come out so far.
+/// The prompt frame's title: the mode's name, and the agent after it.
+/// At rest the agent is two cells standing still; while a turn runs it
+/// is the strip those cells grow into, from the same column, so the
+/// figure starts moving from where it already was.
+fn titled(s) {
+    let out = [bold(` ${s.mode} `, s.mode_colour)];
+    if s.working {
+        for span in agent(s) {
+            out.push(span);
+        }
+    } else {
+        out.push(bold(ui::agent_icon(), "#ffd43b"));
+    }
+    return out;
+}
+
+fn agent(s) {
+    let secs = s.elapsed_ms / 1000;
+    let clock = if secs >= 60 { `${secs / 60}m${secs % 60}s` } else { `${secs}.${(s.elapsed_ms / 100) % 10}s` };
+    let sent = if s.context_tokens >= 0 { `⇡ ${ui::k(s.context_tokens)} ` } else { "" };
+    let gauge = ` ${clock} · ${sent}⇣ ${ui::k(s.turn_out)}`;
+    // The strip is shaded along its length: `#ff922b` at the left, `#ffd43b`
+    // at the right where the word picks it up.
+    let hex = |n| format!("{:02x}", n);
+    let width = s.life.chars().count();
+    let out = [];
+    for (x, cell) in s.life.chars().enumerate() {
+        out.push(bold(`${cell}`, `#ff${hex(0x92 + 0x42 * x / width)}${hex(0x2b + 0x10 * x / width)}`));
+    }
+    out.push(bold(`  ${ui::cogitation(s.tools_run)}`, "yellow"));
+    out.push(dim(gauge));
+    out
+}
+
+fn right(s) {
+    // `142.3k/200.0k (71%)`, and a bare count where the model declares no
+    // window. This was roman numerals over a thousand — `ctx XII k` —
+    // which was charming at a glance and useless at the only moment the
+    // gauge is read: a long session, where the question is how much room
+    // is left and the answer arrived as something to decode, against no
+    // denominator to decode it against.
+    // `spend` is already a dollar string, and empty until a turn on a
+    // model whose definition declares rates has settled — so nothing is
+    // drawn for a session whose cost the harness cannot know.
+    let spend = if s.spend != "" { ` · ${s.spend}` } else { "" };
+    [dim(`ctx ${ui::context(s.context_tokens, s.context_limit)} · in ${ui::k(s.usage_in)} out ${ui::k(s.usage_out)}${spend} · tools ${s.tools_run} `)]
+}
+
+pub fn on_submit(s, text) {
+    // Dispatch mode answers first, and answers on the *mode* rather than on
+    // anything in the text: the prompt was aimed at a classifier before a
+    // word of this line was typed, so every character of it — a leading
+    // colon included — is part of the utterance.
+    if s.mode == "dispatch" {
+        return dispatch(text);
+    }
+    // `parse_command` returns a real Option: match the variant, never
+    // compare against unit (see the vault's Rune gotchas note). It takes
+    // `:name` and nothing else — `/` is reserved, so a line beginning with
+    // a slash is ordinary text and goes to the model like any other.
+    //
+    // The name it hands back is resolved against the one command registry,
+    // so `:` reaches the prompt's own commands (`:goto_buffer_end`) as
+    // readily as the harness's (`:compact`). `ui::commands()` is that
+    // table, if a script wants to build its own menu from it.
+    match ui::parse_command(text.clone()) {
+        Some(cmd) => command(cmd.name, cmd.arg),
+        None => send(text),
+    }
+}
+
+// ------------------------------------------------------------- the keymap
+//
+// Fitted to the operator's own Helix and yazi keymaps (~/.config/nix), so
+// the three tools agree about what a key means. What was taken from there:
+//
+//  * **Shift-arrows, in every mode.** `S-up`/`S-down` page, `S-left` goes
+//    to the first non-blank and `S-right` past the end of the line — and
+//    the Helix config clones all four into insert and select rather than
+//    leaving them to normal mode. That is not just taste: `foot` binds
+//    `Page_Up`/`Page_Down` to its own scrollback, so the bare page keys
+//    never reach a program running in it. They stay bound here anyway, for
+//    a terminal that does pass them through.
+//  * **`^` is the hard start of the line and `$` the position past its
+//    end**, which is Helix's `goto_line_start` / `goto_line_end_newline`
+//    and the reverse of vim's `^`. First-non-blank is `S-left` and `gs`.
+//  * **`space q` quits and `space w` sends**, after `:q` and `:w`.
+//  * **`space r` resumes and `space n` starts a session** — `r` for
+//    resume, and `n` beside it for the other half of the same question.
+//    Both are on the leader rather than at top level: moving between
+//    sessions is deliberate, and `n` at top level is the search's.
+//  * **`K` shows more**, where Helix has it on `hover`: here the nearest
+//    thing under the cursor is the transcript, so it puts a cursor on it
+//    — trace mode. It used to step the *global* detail knob, which
+//    answered "show me this" by opening every fold in the session; the
+//    knob is still on `space o`, where a preference belongs.
+//  * **A `desc` on every binding**, as in the yazi keymap — which is what
+//    fills the popup, so nothing has to be remembered to be found.
+//  * **`T T` and `T R` open another window**, which is the one chord the
+//    helix and yazi keymaps *share* — the same two keys spawn a terminal
+//    and a yazi from either of them, so they have stopped being two
+//    programs' bindings and become the hands'. A third tool in that
+//    rotation that answered `T` with `till_prev_char` would be the only
+//    place the rotation broke, so it answers with the window instead, and
+//    `till_prev_char` follows the same key to `C-t` that it took in the
+//    Helix config for the same reason. `T H` and `T E` complete the set
+//    in the direction the other two cannot go: back to the editor, and to
+//    a second harness.
+//
+// One thing in that config has no counterpart here: the `C-`/`C-S-arrow`
+// view jumps want splits, which this has none of.
+
+// ## Where a binding lives
+//
+// **A key is bound in the mode where it means something, and nowhere
+// else.** That is the whole point of a modal keymap: the popup under
+// `space` is a promise about what these keys do *now*, and an entry that
+// needs state the mode cannot see turns the promise into a guess.
+//
+// The search line is the case that forces the rule. It borrows the
+// keyboard in front of this table — it is not one of the modes below —
+// so its keys (`tab` to tag the matches, `S-tab` to open whatever hides
+// one, `esc`, `ret`) live in `search_key` on the Rust side. What follows
+// is that `goto_hit` and `reveal_match` are *not* bound here, however
+// useful they sound: both are meaningless without a live search, so
+// binding them in normal mode would advertise an action that usually
+// cannot run. They stay reachable by name, because `:` reaches the whole
+// registry by design.
+//
+// `n`, `N` and `*` are the apparent exception and are not one: those are
+// Helix's own normal-mode search keys, they are what an operator's hands
+// already expect there, and with no search they say so rather than doing
+// nothing.
+
+pub fn keymap() {
+    // Select mode is normal mode with the motions extending. Only the two
+    // ways *out* differ, so override those rather than repeat the table.
+    // (`select` is a Rune keyword; the binding cannot be called that.)
+    let extend = normal_keys();
+    extend.insert("esc", cmd("normal_mode", "normal mode"));
+    extend.insert("v", cmd("normal_mode", "normal mode"));
+
+    #{
+        "normal": normal_keys(),
+        "select": extend,
+        "insert": insert_keys(),
+        "command": command_keys(),
+        "dispatch": dispatch_keys(),
+        "trace": trace_keys(),
+        // The search line and the dialogs: not modes on the buffer, but
+        // modes to the hands, so they are tables here rather than keys
+        // hard-wired in Rust — which is what lets the popup promise what
+        // `tab` does on the search line, and lets you rebind `n`.
+        "search": search_keys(),
+        "confirm": #{
+            "y": cmd("submit", "allow"),
+            "ret": cmd("submit", "allow"),
+            "n": cmd("dialog_deny", "deny"),
+            "esc": cmd("cancel", "dismiss"),
+        },
+        // The question dialog is a picker of a different shape: the
+        // options are paragraphs, `j`/`k` move, a digit picks its option
+        // outright, and `ret` takes the one under the arrow.
+        "choose": #{
+            "up": cmd("move_line_up", "previous"),
+            "down": cmd("move_line_down", "next"),
+            "k": cmd("move_line_up", "previous"),
+            "j": cmd("move_line_down", "next"),
+            "ret": cmd("submit", "choose"),
+            "esc": cmd("cancel", "dismiss"),
+        },
+        "pick": pick_keys(),
+        "ask": ask_keys(),
+        "page": page_keys(),
+        "vault": vault_keys(),
+    }
+}
+
+/// A page of text: the transcript's own scroll keys, `y` to copy the
+/// whole of it, `q` or `esc` to close. Vault pages also take tab/shift-tab
+/// and enter for links, backspace for the note history. Nothing here types.
+fn page_keys() {
+    return #{
+        "tab": cmd("link_next", "next vault link"),
+        "S-tab": cmd("link_prev", "previous vault link"),
+        "ret": cmd("link_open", "open vault link"),
+        "backspace": cmd("link_back", "previous vault note"),
+        "j": cmd("scroll_line_down", "down a line"),
+        "k": cmd("scroll_line_up", "up a line"),
+        "down": cmd("scroll_line_down", "down a line"),
+        "up": cmd("scroll_line_up", "up a line"),
+        "A-down": cmd("scroll_half_down", "half a page down"),
+        "A-up": cmd("scroll_half_up", "half a page up"),
+        "S-down": cmd("scroll_page_down", "a page down"),
+        "S-up": cmd("scroll_page_up", "a page up"),
+        "pagedown": cmd("scroll_page_down", "a page down"),
+        "pageup": cmd("scroll_page_up", "a page up"),
+        "g": group("goto", #{
+            "g": cmd("transcript_top", "the top"),
+            "e": cmd("transcript_bottom", "the end"),
+        }),
+        "y": cmd("yank", "copy the page"),
+        "q": cmd("cancel", "close"),
+        "esc": cmd("cancel", "close"),
+    };
+}
+
+/// The reader borrows normal's editor/leader vocabulary; only navigation differs.
+fn vault_keys() {
+    let m = normal_keys();
+    for (key, value) in page_keys() { m.insert(key, value); }
+    m.insert("q", cmd("link_close", "return to the conversation"));
+    m.insert("g", group("goto", #{
+        "w": cmd("goto_word", "tag visible words and links"),
+        "g": cmd("transcript_top", "the top"),
+        "e": cmd("transcript_bottom", "the end"),
+    }));
+    return m;
+}
+
+/// The plain picker: type to filter, arrows to walk, enter to choose.
+fn pick_keys() {
+    return line_keys(#{
+        "up": cmd("move_line_up", "previous"),
+        "down": cmd("move_line_down", "next"),
+        "ret": cmd("submit", "pick"),
+        "esc": cmd("cancel", "dismiss"),
+    });
+}
+
+/// A single masked field: type, `ret` to store it, `esc` to cancel. No
+/// list to walk, so it takes only the readline keys `pick` also takes.
+fn ask_keys() {
+    return line_keys(#{
+        "ret": cmd("submit", "store the key"),
+        "esc": cmd("cancel", "dismiss"),
+    });
+}
+
+/// The search line. `tab` and `S-tab` live here and nowhere else — see
+/// "where a binding lives" — and everything else is insert's, because
+/// the pattern is a minibuffer: an ordinary buffer on the prompt's
+/// bottom border, which selects, yanks and undoes like the prompt does.
+fn search_keys() {
+    let m = insert_keys();
+    // The editor chord is the prompt's — see insert_keys — and a search
+    // pattern is not the prompt.
+    m.remove("C-x");
+    m.insert("esc", cmd("cancel", "drop the search"));
+    m.insert("ret", cmd("submit", "keep the search"));
+    m.insert("tab", cmd("goto_hit", "tag the matches"));
+    m.insert("S-tab", cmd("reveal_match", "open what hides the match"));
+    // A pattern is one line, so `up`/`down` have nothing to walk in it —
+    // they step through the patterns typed before, which is the search
+    // history and is what the keys mean in every other search field.
+    m.insert("up", cmd("history_prev", "previous pattern"));
+    m.insert("down", cmd("history_next", "next pattern"));
+    return m;
+}
+
+/// A one-line field's motions, shared by the pickers and the dialogs
+/// that have one. The search line and the `:` line no longer come
+/// through here: they are minibuffers, which is to say ordinary
+/// [`Buffer`]s, so they take insert's whole table.
+fn line_keys(m) {
+    m.insert("left", cmd("move_char_left", "left"));
+    m.insert("right", cmd("move_char_right", "right"));
+    m.insert("home", cmd("goto_line_start", "line start"));
+    m.insert("end", cmd("goto_line_end_newline", "line end"));
+    m.insert("backspace", cmd("delete_char_backward", "delete back"));
+    return readline(m);
+}
+
+/// **The readline keys**, on every surface text is typed into.
+///
+/// The harness is modal and Helix-shaped, and that is not in tension
+/// with this: `C-a` and `C-e` are not a second modal vocabulary, they
+/// are what *every* unix text field has done since the eighties, and the
+/// hands that reach for them are not in Helix at the time — they are in
+/// a shell, a browser bar, a readline prompt. A modal editor that made
+/// them mean nothing would be asking the operator to unlearn the one set
+/// of bindings they cannot avoid elsewhere.
+///
+/// So they are bound where text is typed, and nowhere else. Normal and
+/// select mode keep the Helix keyboard exactly as it was: `^`, `$`, `w`,
+/// `b`, `d`, `c` already say all of this in one keystroke, and a control
+/// key there would be a second way to spell a motion rather than a
+/// second place to reach one.
+///
+/// The four kills fill the register, so `C-y` puts back what the last
+/// one took — readline's kill ring, in the one slot the buffer has.
+fn readline(m) {
+    m.insert("C-a", cmd("goto_line_start", "line start"));
+    m.insert("C-e", cmd("goto_line_end_newline", "line end"));
+    m.insert("C-b", cmd("move_char_left", "left"));
+    m.insert("C-f", cmd("move_char_right", "right"));
+    m.insert("A-b", cmd("move_prev_word_start", "word back"));
+    m.insert("A-f", cmd("move_next_word_end", "word forward"));
+    // The arrows with ctrl, which is what every text field on the machine
+    // does with them. They are *spelled* like GUI word-jumps and *meant*
+    // like readline's word motion — the same two commands `A-b`/`A-f` run
+    // — because a hand that is already on the arrows is not reaching for
+    // a different convention, only for the same one without leaving home
+    // row. `C-left` in a terminal that cannot tell it from anything else
+    // never arrives; that is the terminal's loss, not a broken key.
+    m.insert("C-left", cmd("move_prev_word_start", "word back"));
+    m.insert("C-right", cmd("move_next_word_end", "word forward"));
+    // And the ends of the whole buffer, which is what ctrl says on home
+    // and end everywhere else. A prompt is usually one line, but `S-ret`
+    // exists, and a multi-line draft is exactly the thing you want the
+    // top or bottom of.
+    m.insert("C-home", cmd("goto_buffer_start", "buffer start"));
+    m.insert("C-end", cmd("goto_buffer_end", "buffer end"));
+    m.insert("C-h", cmd("delete_char_backward", "delete back"));
+    m.insert("C-d", cmd("delete_char_forward", "delete forward"));
+    m.insert("C-u", cmd("delete_to_line_start", "kill to line start"));
+    m.insert("C-k", cmd("delete_to_line_end", "kill to line end"));
+    m.insert("C-w", cmd("delete_word_backward", "kill word back"));
+    m.insert("A-d", cmd("delete_word_forward", "kill word forward"));
+    // The kills at word size, on the keys a browser and a text field use
+    // for it: `C-backspace` and `C-del` behind and in front, and
+    // `A-backspace` because that is the same gesture said the other way.
+    // A terminal without the kitty protocol folds `C-backspace` into
+    // `C-h` — one character, which is what that terminal can say — so
+    // nothing here can shadow anything.
+    m.insert("C-backspace", cmd("delete_word_backward", "kill word back"));
+    m.insert("C-del", cmd("delete_word_forward", "kill word forward"));
+    m.insert("A-backspace", cmd("delete_word_backward", "kill word back"));
+    m.insert("C-y", cmd("paste_before", "put back what was killed"));
+    // Readline's undo. The slash is what the key says under the kitty
+    // protocol, which the loop asks for; the underscore is what readline
+    // itself names, and both arrive as themselves — in a legacy terminal
+    // they are one byte, `C-7`, and undo is the least of what that
+    // terminal has lost.
+    m.insert("C-/", cmd("undo", "undo"));
+    m.insert("C-_", cmd("undo", "undo"));
+    // Readline's transpose: drag the character behind the caret over the
+    // one at it. Normal mode keeps `C-t` for the till it displaced — the
+    // two never share a table, so the letter means one thing per mode.
+    m.insert("C-t", cmd("transpose_chars", "transpose"));
+    return m;
+}
+
+/// Dispatch mode types exactly like insert; where the line *goes* is
+/// decided in `on_submit`, not here. So the table is insert's, with
+/// three keys changed: `tab` picks the surface, `esc` takes the line
+/// down (it is a minibuffer now, not the prompt in another mode), and
+/// `up`/`down` walk the utterances typed before rather than the
+/// messages sent.
+fn dispatch_keys() {
+    let m = insert_keys();
+    // The editor chord is the prompt's — see insert_keys — and an
+    // utterance is not the prompt.
+    m.remove("C-x");
+    m.insert("tab", cmd("dispatch_surface", "next surface"));
+    m.insert("esc", cmd("cancel", "drop the utterance"));
+    m.insert("up", cmd("history_prev", "previous utterance"));
+    m.insert("down", cmd("history_next", "next utterance"));
+    return m;
+}
+
+/// The command line is the prompt in insert with a `:` in it, so its
+/// table is insert's — plus completion, which means something here and
+/// nowhere else (see "where a binding lives"). A script without this
+/// table gets insert's for the `:` line, so leaving it out costs only
+/// `tab`.
+fn command_keys() {
+    let m = insert_keys();
+    // The editor chord is the prompt's — see insert_keys — and a command
+    // is not the prompt.
+    m.remove("C-x");
+    m.insert("tab", cmd("complete_next", "next completion"));
+    m.insert("S-tab", cmd("complete_prev", "previous completion"));
+    m.insert("esc", cmd("cancel", "drop the line"));
+    // The arrows walk the popup here. A `:` line is one line, so the
+    // vertical motion they carry in insert has nothing to move through —
+    // and the list hanging over the prompt is the one thing on screen
+    // that up and down obviously mean.
+    m.insert("down", cmd("complete_next", "next completion"));
+    m.insert("up", cmd("complete_prev", "previous completion"));
+    m.insert("C-n", cmd("complete_next", "next completion"));
+    m.insert("C-p", cmd("complete_prev", "previous completion"));
+    // The commands typed before, since the arrows are spoken for. The
+    // `:` line has a history of its own now — it used to leave every
+    // command in the *message* history, because it was the prompt.
+    m.insert("A-p", cmd("history_prev", "previous command"));
+    m.insert("A-n", cmd("history_next", "next command"));
+    return m;
+}
+
+/// The four shift-arrows, which the Helix config clones into every mode.
+/// Anything bound here is bound in all three.
+fn shared(m) {
+    m.insert("S-up", cmd("scroll_page_up", "page up"));
+    m.insert("S-down", cmd("scroll_page_down", "page down"));
+    m.insert("S-left", cmd("goto_first_nonwhitespace", "first non-blank"));
+    m.insert("S-right", cmd("goto_line_end_newline", "past line end"));
+    // Bound for terminals that do not eat them; foot does.
+    m.insert("pageup", cmd("scroll_page_up", "page up"));
+    m.insert("pagedown", cmd("scroll_page_down", "page down"));
+    m.insert("A-up", cmd("scroll_half_up", "half page up"));
+    m.insert("A-down", cmd("scroll_half_down", "half page down"));
+    return m;
+}
+
+fn normal_keys() {
+    return shared(#{
+        // Leaving normal mode.
+        "i": cmd("insert_mode", "insert"),
+        "a": cmd("append_mode", "append"),
+        "I": cmd("insert_at_line_start", "insert at line start"),
+        "A": cmd("insert_at_line_end", "append at line end"),
+        "o": cmd("open_below", "open line below"),
+        "O": cmd("open_above", "open line above"),
+        "v": cmd("select_mode", "select mode"),
+        ":": cmd("command_line", "command line"),
+        // `!` for a dispatch, after the shell's own "run this". It is a
+        // top-level key and not only a leader chord because it is a *mode*,
+        // and the other three ways into a mode (`i`, `a`, `v`) are one key.
+        "!": cmd("dispatch_mode", "dispatch mode"),
+        "ret": cmd("submit", "send"),
+        // Esc cancels a turn in flight; with nothing running it just drops
+        // the selection. It is the only panic button there is.
+        "esc": cmd("cancel", "cancel turn"),
+
+        // Motion. Every one of these extends instead of reselecting when
+        // the mode is select — same command, different mode.
+        "h": cmd("move_char_left", "left"),
+        "l": cmd("move_char_right", "right"),
+        "left": cmd("move_char_left", "left"),
+        "right": cmd("move_char_right", "right"),
+        "up": cmd("move_line_up", "line up"),
+        "down": cmd("move_line_down", "line down"),
+        "w": cmd("move_next_word_start", "next word"),
+        "b": cmd("move_prev_word_start", "prev word"),
+        "e": cmd("move_next_word_end", "word end"),
+        "W": cmd("move_next_long_word_start", "next WORD"),
+        "B": cmd("move_prev_long_word_start", "prev WORD"),
+        "E": cmd("move_next_long_word_end", "WORD end"),
+        // `^` is column zero and `$` the slot past the last char, matching
+        // the operator's Helix overrides rather than Helix's own defaults.
+        "^": cmd("goto_line_start", "line start"),
+        "$": cmd("goto_line_end_newline", "past line end"),
+        "0": cmd("goto_line_start", "line start"),
+        "home": cmd("goto_line_start", "line start"),
+        "end": cmd("goto_line_end_newline", "past line end"),
+        "f": cmd("find_next_char", "find char"),
+        "t": cmd("till_next_char", "till char"),
+        "F": cmd("find_prev_char", "find char back"),
+        // `T` is the window prefix below, exactly as in the operator's
+        // helix and yazi keymaps, so Helix's `T` moves to the key Helix's
+        // own config moved it to. It is the harness's only control
+        // binding and is not a precedent: it is one displaced motion
+        // following its own config, not a second vocabulary.
+        "C-t": cmd("till_prev_char", "till char back"),
+        "T": window(),
+
+        // The transcript's search, on Helix's keys. `/` is safe here for
+        // the same reason `:` is: this is normal mode, where letters are
+        // commands. A message beginning with a slash is typed in insert,
+        // where it is text and stays text.
+        "/": cmd("search", "search the transcript"),
+        "?": cmd("rsearch", "search backwards"),
+        "n": cmd("search_next", "next match"),
+        "N": cmd("search_prev", "previous match"),
+        "*": cmd("search_selection", "search for the selection"),
+
+        // Selection.
+        "x": cmd("select_line", "select line"),
+        "X": cmd("extend_to_line_bounds", "take whole lines"),
+        "A-x": cmd("shrink_to_line_bounds", "snap back to whole lines"),
+        "%": cmd("select_all", "select all"),
+        ";": cmd("collapse_selection", "collapse"),
+        "A-;": cmd("flip_selections", "flip anchor and cursor"),
+
+        // Change. Each acts on the selection a motion just made.
+        "d": cmd("delete_selection", "delete"),
+        "A-d": cmd("delete_selection_noyank", "delete, register left alone"),
+        "c": cmd("change_selection", "change"),
+        "A-c": cmd("change_selection_noyank", "change, register left alone"),
+        // Helix master dropped these two from its defaults, but the hands
+        // kept them — the till the muscle memory asks for when a line's
+        // tail has to go.
+        "D": cmd("delete_to_line_end", "delete to line end"),
+        "C": cmd("change_to_line_end", "change to line end"),
+        "y": cmd("yank", "yank"),
+        "p": cmd("paste_after", "paste after"),
+        "P": cmd("paste_before", "paste before"),
+        "R": cmd("replace_with_yanked", "replace with yanked"),
+        "r": cmd("replace", "replace char"),
+        "~": cmd("switch_case", "switch case"),
+        "`": cmd("switch_to_lowercase", "to lowercase"),
+        "A-`": cmd("switch_to_uppercase", "to uppercase"),
+        "J": cmd("join_selections", "join lines"),
+        ">": cmd("indent", "indent"),
+        "<": cmd("unindent", "unindent"),
+        "C-a": cmd("increment", "number up"),
+        "C-x": cmd("decrement", "number down"),
+        ".": cmd("repeat_last_insert", "the last typing, again"),
+        "A-.": cmd("repeat_last_motion", "the last find, again"),
+        "u": cmd("undo", "undo"),
+        "U": cmd("redo", "redo"),
+
+        // The transcript. j/k here rather than in the prompt: see above.
+        // `K` is Helix's hover key — more detail about what is in front of
+        // you — so it steps the tool traffic up: folded runs, every call,
+        // then uncapped output, and back.
+        "j": cmd("scroll_line_down", "down a line"),
+        "k": cmd("scroll_line_up", "up a line"),
+        // Helix has `K` on hover — more about the thing in front of you
+        // — and here the thing in front of you is the transcript. It
+        // used to step the *global* detail knob, which answered "show
+        // me this" by opening every fold in the session; now it puts a
+        // cursor on the transcript instead. The knob is still on
+        // `space o`, where a preference belongs.
+        "K": cmd("trace_mode", "trace the transcript"),
+
+        "g": group("goto", #{
+            "h": cmd("goto_line_start", "line start"),
+            "l": cmd("goto_line_end_newline", "past line end"),
+            "s": cmd("goto_first_nonwhitespace", "first non-blank"),
+            "g": cmd("goto_buffer_start", "prompt start"),
+            "e": cmd("goto_buffer_end", "prompt end"),
+            "t": cmd("transcript_top", "transcript top"),
+            "b": cmd("transcript_bottom", "follow the tail"),
+            // Helix's `gw`, on what Helix aims it at: the text on the
+            // screen. `W` is the same gesture at the bigger unit —
+            // lowercase the smaller thing and uppercase the larger one,
+            // as `w`/`W` and `e`/`E` already are — because a screenful
+            // is a couple of hundred words and about a dozen blocks, and
+            // one set of labels cannot be both.
+            //
+            // Both belong here and their search-side twin (`goto_hit`)
+            // does not: there is always something on screen to tag,
+            // whereas tagging *matches* presupposes a search. See "where
+            // a binding lives" above.
+            "w": cmd("goto_word", "tag words"),
+            "W": cmd("goto_block", "tag blocks"),
+            // With a count, the column; bare, the line start `0` already
+            // names — the count is what makes the chord worth its keys.
+            "|": cmd("goto_column", "column N"),
+        }),
+
+        // Helix's `G`: line N, or the last line when no count was typed.
+        "G": cmd("goto_line", "line N, or the last"),
+
+        // Match mode: brackets, the objects they and the quotes make,
+        // and the surround verbs that work on them. `miw`, `ma(`, `ms"`,
+        // `mr(`, `md"` — the sub-keys say which.
+        "m": group("match", #{
+            "m": cmd("match_bracket", "matching bracket"),
+            "i": cmd("select_object_inner", "inside"),
+            "a": cmd("select_object_around", "around"),
+            "s": cmd("surround_add", "surround with CHAR"),
+            "r": cmd("surround_replace", "swap pair for pair"),
+            "d": cmd("surround_delete", "take the pair off"),
+        }),
+
+        // The unimpaired pair: paragraphs are the break a draft has that
+        // is bigger than a line, and a blank line is room made without
+        // going to insert.
+        "[": group("prev", #{
+            "p": cmd("goto_prev_paragraph", "previous paragraph"),
+            "space": cmd("add_newline_above", "add a line above"),
+        }),
+        "]": group("next", #{
+            "p": cmd("goto_next_paragraph", "next paragraph"),
+            "space": cmd("add_newline_below", "add a line below"),
+        }),
+
+        "space": leader(),
+    });
+}
+
+/// **Another window**, on the chord the operator's other two tools share.
+///
+/// `T T` is a terminal and `T R` a file manager in both helix and yazi,
+/// which is what makes them worth copying: two programs binding the same
+/// two keys to the same two things is no longer either program's keymap,
+/// it is the hands'. This is the third program, so the set closes: `T E`
+/// reaches a harness from all three, `T H` reaches the editor from the
+/// two that are not it, and `T R` and `T T` mean here what they already
+/// meant there.
+///
+/// Every one of them opens **here**, and the word does the work: in
+/// normal mode *here* is the session's working directory, and in trace
+/// mode it is wherever the cursor is standing — the file the call under
+/// it read, wrote or edited. So `K`, `j` to the write, `T H` is the
+/// whole gesture for *open what it just changed*, and the same three
+/// keys with `R` hands that file to yazi instead.
+///
+/// A function rather than a literal for the reason [`leader`] is one:
+/// trace mode wants exactly this table, and it is in trace mode that the
+/// cursor makes it interesting.
+///
+/// Select mode gets it too, by inheriting normal's table — which is one
+/// step further than the Helix config went, where `T` is rebound in
+/// normal alone and select keeps `extend_till_prev_char`. Following that
+/// exactly would mean `T` meaning two different things a keystroke
+/// apart, which is worse than the small loss: `C-t` is bound in select as
+/// well, and motions extend there, so the displaced till is still one
+/// chord away and still extends.
+fn window() {
+    return group("window", #{
+        "T": cmd("terminal", "a terminal here"),
+        "R": cmd("files", "the file manager here"),
+        "H": cmd("editor", "the editor here"),
+        "E": cmd("harness", "another eidolon here"),
+    });
+}
+
+/// The leader. Everything that used to be a control key is here, and the
+/// popup lists it, so nothing is unfindable. `w` sends and `q` quits,
+/// after `:w` and `:q`. These are not a second kind of binding: `m`
+/// names the same `model` command `:model` runs, and `p` opens the
+/// palette, which is the whole list of them.
+///
+/// A function rather than a literal because trace mode wants the same
+/// one: the leader is the harness's vocabulary, and a mode that made
+/// `space q` mean nothing would be a mode you have to leave to quit.
+fn leader() {
+    return group("eidolon", #{
+        "w": cmd("submit", "send"),
+        "m": cmd("model", "model picker"),
+        "L": cmd("login", "provider login"),
+        // The fork point is a cursor, not a dialog: bare, `fork` moves the
+        // head to the record the trace cursor stands on (`K`, `j`, here),
+        // because the rows a picker would list are the rows `K` walks.
+        "f": cmd("fork", "fork at the cursor"),
+        "t": cmd("tree", "session tree"),
+        "r": cmd("sessions", "resume a session"),
+        "n": cmd("new_session", "new session"),
+        // A group for the reason `d` and `a` are groups: context is a
+        // small vocabulary and the popup should teach all of it from one
+        // keystroke. Compaction keeps a path one key deeper than it had
+        // rather than moving somewhere unguessable.
+        "c": group("context", #{
+            "c": cmd("compact", "compact"),
+            "i": cmd("context", "inspect the context"),
+            "n": cmd("note", "session note"),
+            "p": cmd("pin", "pin a file"),
+            "f": cmd("fresh", "fresh eyes"),
+        }),
+        // A group rather than a leaf, because the submodes land here:
+        // one key per surface, once there is more than one.
+        //
+        // `s` is here as well as on `tab` inside the mode, and that is
+        // not a violation of "where a binding lives": the surface is
+        // *sticky* UI state, not something the mode holds, so aiming
+        // from normal mode and then pressing `!` is a real sequence
+        // and the popup's promise is kept. It is `n`/`N`'s case, not
+        // `reveal_match`'s — with one bundle configured it says so
+        // rather than doing nothing.
+        "d": group("dispatch", #{
+            "d": cmd("dispatch_mode", "dispatch mode"),
+            "s": cmd("dispatch_surface", "next surface"),
+        }),
+        // Images do not need a leader sub-vocabulary of their own: the
+        // common case is `C-v`, which attaches what is on the clipboard.
+        // The file and clear commands stay on the `:` line for the rarer
+        // cases where a literal path or an explicit unstage is wanted.
+        "o": cmd("cycle_detail", "more tool detail"),
+        "K": cmd("trace_mode", "trace the transcript"),
+        // `yolo` is deliberately **unbound**. It was `space y`, one key
+        // deep, on the reasoning that a switch you reach for after the
+        // fourth question in a row is one you reach for in a hurry — but
+        // `y` is yank, in normal mode and in trace mode, and one letter
+        // meaning both "copy this" and "stop asking me about anything"
+        // is the one overload worth refusing. It is `:yolo` now, and a
+        // binding of your own if you want one.
+        // The `:` line, on the leader as well as on its own key. It is
+        // the whole vocabulary, filtered and completed, and it shows you
+        // the command it resolved to before you run it — which is what
+        // the command palette that used to be here could not do.
+        "p": cmd("command_line", "command line"),
+        // The status line's four numbers, unfolded: which turn cost
+        // what, and why.
+        "u": cmd("usage", "usage: what the session has spent"),
+        "?": cmd("help", "help"),
+        "q": cmd("quit", "quit"),
+    });
+}
+
+/// **Trace mode**: a cursor on the transcript rather than on the prompt.
+///
+/// Helix's own shape, pointed at the other surface. `j`/`k` walk the
+/// blocks, `l`/`h` go a level down and a level up, `v` extends and `y`
+/// yanks — the same four verbs the prompt has, so nothing has to be
+/// learned twice. What is different is what a block *is*: a message, a
+/// note, or a whole **cluster** — everything the model did between one
+/// piece of prose and the next, drawn as one line and opened with `l`.
+///
+/// The search keys are here because the search is how you get to a block
+/// you cannot see, and `*` searches for what the transcript has selected
+/// rather than what the prompt has. `n` moves the cursor and opens
+/// nothing: the fold it lands on already says how many matches it is
+/// hiding, and `l` is one key.
+///
+/// The leader is here too. A mode you have to leave in order to quit, or
+/// to change model, is a mode you resent.
+///
+/// The cursor is also a *fork point*: `space f` moves the head to the record
+/// under it. That is what the tree picker used to list, and the rows are the
+/// ones this mode already walks.
+fn trace_keys() {
+    return shared(#{
+        // Out. `K` is the key that got you in, so it is the key that
+        // gets you out; `esc` and `i` are the two ways out of every
+        // other mode and mean the same here.
+        "esc": cmd("normal_mode", "leave trace"),
+        "K": cmd("trace_mode", "leave trace"),
+        "!": cmd("dispatch_mode", "dispatch mode"),
+        "backspace": cmd("link_back", "previous vault note"),
+        "q": cmd("link_close", "return to the conversation"),
+        "i": cmd("insert_mode", "write a message"),
+        ":": cmd("command_line", "command line"),
+
+        // The cursor.
+        "j": cmd("trace_next", "next block"),
+        "k": cmd("trace_prev", "previous block"),
+        "down": cmd("trace_next", "next block"),
+        "up": cmd("trace_prev", "previous block"),
+        "l": cmd("trace_open", "open this block"),
+        "right": cmd("trace_open", "open this block"),
+        "h": cmd("trace_close", "close the fold"),
+        "left": cmd("trace_close", "close the fold"),
+        "ret": cmd("link_open", "open vault link"),
+        "tab": cmd("link_next", "next vault link"),
+        "S-tab": cmd("link_prev", "previous vault link"),
+
+        // Selection, exactly as in the prompt: `v` extends, `y` takes
+        // what is selected. `y` fills the prompt's register as well as
+        // the clipboard, so `p` pastes a tool's output back at the model.
+        "v": cmd("trace_extend", "extend the selection"),
+        "y": cmd("trace_yank", "yank the selection"),
+        "Q": cmd("trace_quote", "quote vault selection by address"),
+        // Strike what the cursor covers from the context. A toggle: a
+        // selection that is already struck comes back.
+        "x": cmd("trace_strike", "strike from the context"),
+
+        // Finding things. The search line takes the keyboard while it is
+        // up and hands the cursor whatever it lands on.
+        "/": cmd("search", "search the transcript"),
+        "?": cmd("rsearch", "search backwards"),
+        "n": cmd("search_next", "next match"),
+        "N": cmd("search_prev", "previous match"),
+        "*": cmd("search_selection", "search for the selection"),
+
+        "g": group("goto", #{
+            "w": cmd("goto_word", "tag visible words and links"),
+            "g": cmd("trace_first", "first block"),
+            "e": cmd("trace_last", "last block"),
+            "t": cmd("trace_first", "first block"),
+            "b": cmd("trace_last", "last block"),
+        }),
+        // Helix's fold chord, on the folds this transcript has.
+        "z": group("folds", #{
+            "o": cmd("trace_open_all", "open every fold"),
+            "c": cmd("trace_close_all", "close every fold"),
+            "z": cmd("trace_toggle", "open or close this one"),
+        }),
+        // The window chord means more here than it does in normal mode,
+        // and is the reason it is a function: `T H` on a call opens the
+        // editor on the file that call touched, and `T R` hands the same
+        // file to the file manager. In normal mode both fall back to the
+        // session's directory, which is what they do in helix and yazi.
+        "T": window(),
+        "o": cmd("cycle_detail", "more tool detail"),
+        "space": leader(),
+    });
+}
+
+fn insert_keys() {
+    return readline(shared(#{
+        // A pasted image should be the easy chord and plain text the
+        // explicit one, matching Claude Code and the common terminal
+        // convention: `C-v` tries the clipboard as an image, `C-S-v`
+        // forces a literal text paste.
+        "C-v": cmd("attach_clipboard", "attach what you copied"),
+        "C-S-v": cmd("paste_before", "paste text"),
+        // **The draft, in your editor** — readline's `C-x C-e`, one chord
+        // deep the way bash and zsh spell it. It is a prefix rather than a
+        // leaf because `C-x` is the prefix readline itself keeps for
+        // "special, deliberate things", and because a whole control key
+        // spent on one command is more than the keyboard should pay. The
+        // minibuffers derive this table and take the chord back off: the
+        // editor takes the prompt, and the prompt only.
+        "C-x": group("editor", #{
+            "e": cmd("edit_prompt", "the draft in your editor"),
+        }),
+        "esc": cmd("normal_mode", "normal mode"),
+        "ret": cmd("submit", "send"),
+        "S-ret": cmd("insert_newline", "newline"),
+        "A-ret": cmd("insert_newline", "newline"),
+        // On the prompt this deletes and no more. On a one-line buffer — a
+        // `:` line, a pattern, an utterance — a backspace with nothing
+        // left in front of it takes the line down instead, because
+        // emptied is how such a line is usually left. `esc` still does it
+        // from anywhere on it, and a script that binds some other verb
+        // here loses the shortcut and nothing else.
+        "backspace": cmd("delete_char_backward", "delete back"),
+        "del": cmd("delete_char_forward", "delete forward"),
+        "left": cmd("move_char_left", "left"),
+        "right": cmd("move_char_right", "right"),
+        "home": cmd("goto_line_start", "line start"),
+        "end": cmd("goto_line_end_newline", "past line end"),
+        // Up/down walk the history here; the prompt's own line motion is
+        // in normal mode, where a multi-line draft is edited anyway.
+        "up": cmd("history_prev", "previous message"),
+        "down": cmd("history_next", "next message"),
+        "C-p": cmd("history_prev", "previous message"),
+        "C-n": cmd("history_next", "next message"),
+        // Mid-burst undo boundary: `C-s` closes the run, so what is typed
+        // next undoes on its own. Readline leaves the key to flow control,
+        // which a raw terminal has long since stopped meaning.
+        "C-s": cmd("commit_undo_checkpoint", "undo checkpoint"),
+    }));
+}

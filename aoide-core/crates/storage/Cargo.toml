@@ -1,0 +1,39 @@
+[package]
+name = "aoide-storage"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+description = "Aoide durable session data: stage-file records, atomic stage I/O, the a2a roster, time."
+
+[lib]
+name = "aoide_storage"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+aoide-protocol = { workspace = true }
+libc = { workspace = true }
+# `identity` — the pairing workstream's instance keypair (P-P1,
+# docs/architecture/PAIRING.md). See the workspace Cargo.toml's own
+# comment for the version/feature reasoning; this crate is the sanctioned
+# dependent, per that comment's "consumer" note.
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
+# `pairing` — the P-P2 ceremony's SAS transcript hash (`docs/architecture/
+# PAIRING.md` decision 1 names `sha2` explicitly). Same sanctioned-break
+# scope as `ed25519-dalek`/`getrandom` above — see the workspace
+# Cargo.toml's own comment.
+sha2 = { workspace = true }
+# `config` — the portable runtime config file (task #135 P-C,
+# `$AOIDE_ROOT/config.toml`). `toml` reads it into the typed schema,
+# `toml_edit` rewrites one key in place so `aoide config set` keeps an
+# operator's comments; see the workspace Cargo.toml's own comment for the
+# split and the pure-Rust closure note.
+toml = { workspace = true }
+toml_edit = { workspace = true }
+
+[dev-dependencies]
+# The commands tests share the workspace rig (scratch dirs, EnvSaver,
+# `env_lock`) — dev-only edge.
+aoide-test-support = { workspace = true }

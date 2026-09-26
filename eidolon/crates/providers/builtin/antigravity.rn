@@ -1,0 +1,301 @@
+//! Google's Antigravity surface — the AI Pro plan's entitlement — spoken
+//! natively, with no proxy. Ships with the harness like `deepseek.rn` and
+//! `zai.rn`: a file of the same name in `providers_dir`, or a
+//! `[[providers]]` table called `antigravity`, replaces it whole (the
+//! `[[providers]]` form is a *patch* and is the way to move the key).
+//!
+//! The surface is `daily-cloudcode-pa.googleapis.com`'s `v1internal` API —
+//! the same one the Google Antigravity IDE plugin speaks. The harness's
+//! `Wire::Gemini` carries the request wrapper (project, requestId, agent
+//! labels), the `response` envelope unwrap and the thought-signature
+//! round trip, so this script declares the wire and the project and no
+//! more. Setting `project` here is what turns the bare generateContent
+//! body into the Code Assist wrapper and adds the client-identity headers
+//! the surface gates on.
+//!
+//! The credential is a **Google OAuth refresh token**, not a static key —
+//! run `eidolon google-login` once and it writes
+//! `~/.config/eidolon/antigravity.json` (and the same credential into
+//! gcli2api's SQLite layout, since the proxy is being retired). The
+//! Gemini wire reads a token_file as a refresh-token source and mints an
+//! access token from it per lifetime, so no token file ever goes stale.
+//!
+//! The model list is LIVE and rotates server-side (a flash id "retired"
+//! and back within the hour on 2026-09-09), and each row carries its
+//! context and whether it thinks — so `models()` pulls
+//! `fetchAvailableModels` and maps those, keeping only the agent-facing
+//! rows (tab, image and deprecated ids dropped). The pull is a POST, and at
+//! load the host answers it from a cache and refreshes behind the prompt
+//! (see `script.rs`): the network is `eidolon models` (Live) and the
+//! launch after it, never the way to a first frame. The declared rows are
+//! the fallback for a dead gateway at launch, not the catalog, and the
+//! loader keeps a declared row over a discovered one of the same id.
+//!
+//! The same call carries the quota: each model's `quotaInfo` has a
+//! `remainingFraction` and a `resetTime`. `quota()` reports the *binding*
+//! row — the smallest remaining fraction in the list, which is the one
+//! that would refuse next — as one window labelled with that model.
+//! Honest limits: the free tier's chat rows expose no fraction (their 4h
+//! window is enforced server-side as a 429 carrying the reset), so while
+//! that tier binds the gauge reads nothing; the paid tier's rows do carry
+//! one, which is where the reading becomes a reading. The account is on a
+//! plan and prices as unpriced, never as free.
+
+pub fn provider() {
+    #{
+        name: "antigravity",
+        wire: "gemini",
+        base_url: "https://daily-cloudcode-pa.googleapis.com",
+        project: "aicode-consumers",
+        token_file: "~/.config/eidolon/antigravity.json",
+        models: [
+            // The stable core as of 2026-09-09, from the surface's own
+            // listing. Rows rotate; this list is only what a launch with
+            // no network offers, and `models()` below refreshes it.
+            #{ id: "gemini-3.8-flash-high", reasoning: true, context: 1048576 },
+            #{ id: "gemini-2.5-flash", context: 1048576 },
+            #{ id: "gemini-2.5-pro", reasoning: true, context: 1048576 },
+            #{ id: "claude-sonnet-4-6", reasoning: true, context: 250000 },
+            #{ id: "claude-opus-4-6", reasoning: true, context: 250000 },
+            #{ id: "gpt-oss-120b-medium", reasoning: true, context: 131072 },
+        ],
+    }
+}
+
+/// Everything the surface offers for an agent turn, from
+/// `fetchAvailableModels`. The reply's `models` is a map of id to a row
+/// carrying the id, its context (`maxTokens`), whether it thinks
+/// (`supportsThinking`) and its quota — so the row is the unit and the
+/// reply's side tables say which ids are tab/image/deprecated and not for
+/// an agent. A failed fetch is an empty list: the declared rows stand in.
+pub fn models() {
+    let body = match eidolon::http_post("/v1internal:fetchAvailableModels", "{}") {
+        Ok(b) => b,
+        Err(_) => return [],
+    };
+    return read_models(body);
+}
+
+fn read_models(body) {
+    let out = [];
+    let reply = match json::from_string(body) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    if !(reply is Object) {
+        return out;
+    }
+    let models = match reply.get("models") {
+        Some(m) => m,
+        None => return out,
+    };
+    if !(models is Object) {
+        return out;
+    }
+    for row in models.values() {
+        if !(row is Object) {
+            continue;
+        }
+        let id_obj = match row.get("model") {
+            Some(id) => id,
+            None => continue,
+        };
+        if !(id_obj is String) {
+            continue;
+        }
+        let id = id_obj;
+        if skipped(reply, id) {
+            continue;
+        }
+        let reasoning = false;
+        let thinks_obj = match row.get("supportsThinking") {
+            Some(t) => t,
+            None => (),
+        };
+        if thinks_obj is bool {
+            reasoning = thinks_obj;
+        }
+        let ctx_obj = match row.get("maxTokens") {
+            Some(c) => c,
+            None => (),
+        };
+        let m = if ctx_obj is i64 || ctx_obj is u64 {
+            #{ id: id, context: ctx_obj, reasoning: reasoning }
+        } else {
+            #{ id: id, reasoning: reasoning }
+        };
+        out.push(m);
+    }
+    return out;
+}
+
+/// The rows the surface lists but an agent turn should not be offered:
+/// the tab-completion and image-generation sets, anything deprecated (the
+/// surface maps the old id to its replacement), and ids that smell like
+/// one of those by name.
+fn skipped(reply, id) {
+    let tab = match reply.get("tabModelIds") {
+        Some(t) => t,
+        None => (),
+    };
+    if tab is Vec {
+        for t in tab {
+            if id == t {
+                return true;
+            }
+        }
+    }
+    let img = match reply.get("imageGenerationModelIds") {
+        Some(t) => t,
+        None => (),
+    };
+    if img is Vec {
+        for t in img {
+            if id == t {
+                return true;
+            }
+        }
+    }
+    let dep = match reply.get("deprecatedModelIds") {
+        Some(t) => t,
+        None => (),
+    };
+    if dep is Object {
+        for k in dep.keys() {
+            if id == k {
+                return true;
+            }
+        }
+    }
+    if id.contains("tab_") || id.contains("image") {
+        return true;
+    }
+    return false;
+}
+/// What the account has left, as the row that would refuse first: the
+/// smallest `remainingFraction` across the list, its used share as the
+/// percent and its `resetTime` as when the window turns over.
+pub fn quota() {
+    let body = match eidolon::http_post("/v1internal:fetchAvailableModels", "{}") {
+        Ok(b) => b,
+        Err(e) => return #{ error: e },
+    };
+    return read_quota(body);
+}
+
+fn read_quota(body) {
+    let reply = match json::from_string(body) {
+        Ok(v) => v,
+        Err(_) => return #{ error: "the quota reply was not JSON" },
+    };
+    if !(reply is Object) {
+        return #{ error: "the quota reply was not an object" };
+    }
+    let models = match reply.get("models") {
+        Some(m) => m,
+        None => return #{ error: "the quota reply lists no models" },
+    };
+    if !(models is Object) {
+        return #{ error: "the quota reply lists no models" };
+    }
+    let best = ();
+    let found = false;
+    for row in models.values() {
+        if !(row is Object) {
+            continue;
+        }
+        let qi = match row.get("quotaInfo") {
+            Some(q) => q,
+            None => continue,
+        };
+        if !(qi is Object) {
+            continue;
+        }
+        let frac = match qi.get("remainingFraction") {
+            Some(f) => f,
+            None => continue,
+        };
+        // No measurable share (the free tier's chat rows): not a candidate
+        // for the binding window.
+        if !(frac is f64) && !(frac is i64) {
+            continue;
+        }
+        if !found {
+            best = row;
+            found = true;
+        } else {
+            let best_qi = match best.get("quotaInfo") {
+                Some(q) => q,
+                None => continue,
+            };
+            let best_frac = match best_qi.get("remainingFraction") {
+                Some(f) => f,
+                None => continue,
+            };
+            if frac_less(frac, best_frac) {
+                best = row;
+            }
+        }
+    }
+    if !(found is bool) || !found || !(best is Object) {
+        // Nothing carries a fraction to measure. An empty windows list —
+        // the reading exists and has nothing to say, rather than a gauge
+        // that lies at zero.
+        return #{ windows: [] };
+    }
+    let id_obj = match best.get("model") {
+        Some(id) => id,
+        None => return #{ windows: [] },
+    };
+    if !(id_obj is String) {
+        return #{ windows: [] };
+    }
+    let id = id_obj;
+    let qi = match best.get("quotaInfo") {
+        Some(q) => q,
+        None => return #{ windows: [] },
+    };
+    let frac = match qi.get("remainingFraction") {
+        Some(f) => f,
+        None => return #{ windows: [] },
+    };
+    let used = used_percent(frac);
+    let reset_obj = qi.get("resetTime");
+    let reset = match reset_obj {
+        Some(rt) => if rt is String {
+            eidolon::epoch_ms(rt)
+        } else {
+            ()
+        },
+        None => (),
+    };
+    return #{
+        windows: [ #{ label: id, percent: used, resets_ms: reset } ],
+    };
+}
+
+fn frac_less(a, b) {
+    if a is f64 {
+        if b is f64 {
+            return a < b;
+        }
+        return a < (b as f64);
+    }
+    if b is i64 {
+        return a < b;
+    }
+    return (a as f64) < b;
+}
+
+/// The share *used* (the harness draws used, and the surface reports the
+/// share remaining): `100 − 100·fraction`. Whole fractions come back as
+/// integers from the wire, hence the two paths.
+fn used_percent(frac) {
+    if frac is f64 {
+        return 100.0 - frac * 100.0;
+    }
+    if frac is i64 {
+        return (100 - frac * 100) as f64;
+    }
+    return ();
+}

@@ -1,0 +1,372 @@
+//! Z.ai (GLM), shipped with the harness.
+//!
+//! The second embedded provider, on the same contract as the first: an
+//! ordinary provider script that happens to live in the binary, loaded
+//! before `config.toml` and `providers_dir`, replaced whole by a `zai.rn`
+//! of your own, and patched a field at a time by a `[[providers]]` table
+//! called `zai`. Nothing here is privileged.
+//!
+//! ## The coding endpoint, not the metered one, not the Anthropic shim
+//!
+//! z.ai answers on three surfaces: `…/api/paas/v4`, its own chat-completions
+//! wire billed per token; `…/api/coding/paas/v4`, the same wire entitled by
+//! a GLM Coding Plan subscription; and `…/api/anthropic`, a translation shim
+//! documented for pointing Claude Code at GLM. This takes the second.
+//!
+//! All three were probed with a real key on 2026-09-06. The coding path
+//! answered `200` on `glm-5.3`, `glm-4.7` and `glm-4.6`; the metered path
+//! answered `429`, code `1113`, *insufficient balance or no resource
+//! package*, on all three — because a Coding Plan key funds the plan and
+//! not a token balance, and the two are separate purchases. Defaulting to
+//! the surface a subscriber's key does not cover would be a built-in that
+//! reaches nothing, which is the one thing a built-in is for. Going the
+//! other way — an account with API credits and no plan — is a
+//! `[[providers]]` patch naming `base_url`, and the prices below are
+//! already that surface's.
+//!
+//! The shim is the more tempting third option on paper, since the Anthropic
+//! wire carries `thinking` and cache breakpoints as fields rather than as
+//! quirks. What rules it out is the auth header. On `Wire::Anthropic` the
+//! harness sends one of two things and neither is what z.ai documents:
+//! `auth: "bearer"` adds `anthropic-beta: oauth-2025-04-20` beside the
+//! bearer — a claim about Anthropic's own OAuth beta, meaningless to a
+//! translator — and `auth: "api_key"` sends `x-api-key` instead of the
+//! `Authorization: Bearer` every z.ai surface asks for. On `Wire::OpenAi`
+//! the bearer is unconditional and `auth` is never read, which is why
+//! there is no `auth` line below.
+//!
+//! ## Thinking arrives without being asked for, and has to go back
+//!
+//! `compat.reasoning_effort` is off, deliberately: the harness sends
+//! `"medium"` for it and z.ai's enum is `max|high|low`, so the one flag
+//! that looks made for this endpoint would put an invalid value on every
+//! turn that asked to think. GLM's own spelling is `thinking: #{ type }`,
+//! which this wire has no field for — so the harness's `thinking_budget`
+//! does not reach the model here.
+//!
+//! That costs less than it sounds, and the cost was measured rather than
+//! guessed: an ordinary turn asking for no thinking at all came back with
+//! 41 `reasoning_content` deltas and `reasoning_tokens: 27` in its usage.
+//! GLM thinks on its own default, harnox turns those deltas into
+//! `ThinkingDelta`, and the reasoning is on screen folded into a cluster
+//! like anything else. What is missing is the *switch*, not the thinking. A `request(body)`
+//! hook is where that would go if it is ever wanted: turn
+//! `compat.reasoning_effort` on to mark the turns that asked for it, then
+//! rewrite that field into `thinking` before it reaches the wire.
+//!
+//! What *does* have to be said is `compat.reasoning_content`. z.ai's
+//! thinking-mode page: preserved thinking is on by default on the Coding
+//! Plan endpoint — this one — and in that mode "you must return the
+//! complete, unmodified reasoning_content back to the API", "together
+//! with the tool results", or "performance may degrade and cache hit
+//! rates may be affected". The chat-completions body harnox builds leaves
+//! thinking out, so without the flag every continuation call in a tool
+//! loop handed GLM a transcript with its own reasoning cut out, on the
+//! one surface whose default mode says not to. It was noticed on a
+//! 2026-09-06 session whose continuation replies came back with no
+//! reasoning at all and whose last one wrote its drafts into the visible
+//! channel until it looped — not proven to be the cause, but the
+//! documented degradation, and the flag is what the documentation asks
+//! for.
+//!
+//! ## The numbers, which this endpoint does not charge
+//!
+//! Prices are dollars per million tokens from z.ai's pricing page,
+//! 2026-09-06 — the *metered* rates. A Coding Plan turn is billed against
+//! the plan's quota and not per token, so what the session meter shows on
+//! this base URL is not a bill: it is what the same turns would have cost
+//! on the API, which is the number worth having when the question is
+//! whether the plan earns its subscription. A patch moving `base_url` to
+//! `…/api/paas/v4` turns them back into money without touching this file.
+//!
+//! There is no separate cache-write rate because z.ai caches on its own
+//! account and bills only the hit — the same shape as DeepSeek, and the
+//! reason `cache_write` is zero rather than absent. It caches without
+//! being asked and reports the hit where harnox already looks first —
+//! `prompt_tokens_details.cached_tokens`, which read 2048 on the second
+//! turn of a session and 2112 on the third — so no `compat` flag is needed
+//! to get a prefix reused here, and none is set. The flash row is a
+//! standing 50% promotion and is the first thing to check when an estimate
+//! looks wrong.
+//!
+//! Context windows are the ones z.ai's own listing reports through
+//! OpenRouter, whose model pages state them and whose own do not; where
+//! that listing gives two numbers the smaller is taken.
+//!
+//! Two more things this endpoint spells its own way, neither set here:
+//! `temperature` runs 0.0–1.0 rather than OpenAI's 0–2, so a
+//! `[[models]] temperature` above 1 is a `400`, and `max_tokens` has a
+//! per-model ceiling — 262144 on `glm-5.3`, 131072 on most, and 32768 on
+//! `glm-4.6v`, which is under the harness's own 64000 default and is what
+//! `request` below is for.
+//!
+//! `vision: false` on the text rows is a positive claim and not a shrug —
+//! it is what turns an attached screenshot into a line of text on the way
+//! out rather than a rejected request for the rest of the branch. The two
+//! rows that can see say so. A row added here that nobody has checked
+//! should say nothing at all.
+//!
+//! ## What the plan has left
+//!
+//! A Coding Plan is two allowances on two clocks — so much every five
+//! hours, so much a week — and on this surface those, not the dollar
+//! estimate above, are what decide whether the next turn runs. `quota()`
+//! reads them from `…/api/monitor/usage/quota/limit`, the call z.ai's own
+//! subscription page makes: undocumented, but the same bearer as the chat
+//! surface, and a shape that has held across the clients that watch it.
+//! Probed with a real Lite key on 2026-09-06:
+//!
+//! ```json
+//! { "code": 200, "success": true, "data": { "level": "lite", "limits": [
+//!   { "type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 2000,
+//!     "currentValue": 158, "remaining": 1841, "percentage": 7,
+//!     "nextResetTime": 1788693968953 },
+//!   { "type": "CREDIT_LIMIT", "unit": 6, "number": 1, "usage": 10000,
+//!     "currentValue": 158, "remaining": 9841, "percentage": 1,
+//!     "nextResetTime": 1789280653997 } ] } }
+//! ```
+//!
+//! A window is a `(unit, number)` pair — `3` hours, `4` days, `6` weeks,
+//! `5` months, the numbering z.ai's page uses — so `(3, 5)` is the
+//! five-hour window and `(6, 1)` the weekly one, and the label the
+//! harness shows is made from the pair rather than assumed, so a plan
+//! metered differently reads correctly without an edit here. `usage` is
+//! the allowance and `currentValue` what is used, in a quantity the
+//! documentation never names (a Lite window is 2000 of it), which is
+//! why the reading passes them on as bare counts and leads with the
+//! percentage. Older plans spelled the same entry `TOKENS_LIMIT`; both
+//! are taken. A `TIME_LIMIT` entry is the monthly web-search count and
+//! is left out — nothing here searches the web through z.ai. A key with
+//! no plan behind it answers `success: false` with a sentence and no
+//! `data`, and that sentence is what the reading reports.
+//!
+//! The URL is absolute because `base_url` is the chat surface and this
+//! path lives beside it, not under it.
+//!
+//! The key: `eidolon secret set zai < key.txt`, or `ZAI_API_KEY` in the
+//! environment. The store wins; the variable is the fallback.
+
+pub fn provider() {
+    #{
+        name: "zai",
+        wire: "openai",
+        base_url: "https://api.z.ai/api/coding/paas/v4",
+        token_secret: "zai",
+        token_env: "ZAI_API_KEY",
+        compat: #{ reasoning_content: true },
+        models: [
+            #{
+                id: "glm-5.3",
+                name: "GLM 5.3",
+                context: 1048576,
+                reasoning: true,
+                vision: false,
+                cost: #{ input: 1.4, output: 4.4, cache_read: 0.26, cache_write: 0.0 },
+            },
+            #{
+                id: "glm-5.3-flash",
+                name: "GLM 5.3 Flash",
+                context: 1048576,
+                reasoning: true,
+                vision: true,
+                cost: #{ input: 0.075, output: 0.25, cache_read: 0.015, cache_write: 0.0 },
+            },
+            #{
+                id: "glm-4.7",
+                name: "GLM 4.7",
+                context: 202752,
+                reasoning: true,
+                vision: false,
+                cost: #{ input: 0.6, output: 2.2, cache_read: 0.11, cache_write: 0.0 },
+            },
+            #{
+                id: "glm-4.6v",
+                name: "GLM 4.6V",
+                context: 131072,
+                reasoning: true,
+                vision: true,
+                cost: #{ input: 0.3, output: 0.9, cache_read: 0.05, cache_write: 0.0 },
+            },
+            // The rest of the catalogue — glm-5.2, glm-5.1, glm-5,
+            // glm-4.7-flash, glm-4.6, glm-4.5-air, glm-4.5v and the free
+            // flash rows — is reachable by adding a row here in your own
+            // zai.rn. These four are the ones worth a picker slot: the
+            // flagship, the cheap one, the last generation's workhorse and
+            // a pair of eyes.
+        ],
+    }
+}
+
+/// The largest `max_tokens` a model here will accept, or zero for the ones
+/// that take whatever the harness asks for.
+///
+/// `glm-4.6v` answers `400`, code `1210` — *the max_tokens parameter is
+/// illegal, 限制数值范围[1,32768]* — to anything above 32768, and the
+/// harness's default is 64000 (`config::default_max_tokens`, raised there
+/// because the current models write far past the old 8192 ceiling). So
+/// without the clamp below the vision row is not a slow path or an
+/// occasional failure: it is a `400` on the first turn of every session
+/// that has not lowered `max_tokens` by hand, which is a dead row in the
+/// picker wearing the look of a live one.
+fn output_cap(model) {
+    if model == "glm-4.6v" {
+        return 32768;
+    }
+    return 0;
+}
+
+/// Bring `max_tokens` down to what the model in play will take.
+///
+/// The escape hatch the `compat` flags cannot reach, for the same reason
+/// OpenRouter's script needs one: every flag up there is a claim about the
+/// whole provider, and this is a claim about one model. It only ever
+/// *lowers* the number — a cap is the endpoint's limit, not an opinion
+/// about how long an answer should be — so a config that already asks for
+/// less than the cap is left alone, and a model with no cap is untouched.
+pub fn request(body) {
+    let model = match body.get("model") {
+        Some(m) => m,
+        None => return body,
+    };
+    let cap = output_cap(model);
+    if cap == 0 {
+        return body;
+    }
+    let want = match body.get("max_tokens") {
+        Some(n) => n,
+        None => return body,
+    };
+    if want > cap {
+        body["max_tokens"] = cap;
+    }
+    return body;
+}
+
+/// Where the plan's meters are read from. See the module docs.
+fn quota_url() {
+    "https://api.z.ai/api/monitor/usage/quota/limit"
+}
+
+/// What the plan has left, read from the account now.
+///
+/// The harness runs this live and off its own thread (never at load), so
+/// there is nothing to cache and no launch waiting on it. The reply is a
+/// reading or `#{ error }`; a failed GET is reported with the harness's
+/// own sentence about it.
+pub fn quota() {
+    let body = match eidolon::http_get(quota_url()) {
+        Ok(b) => b,
+        Err(e) => return #{ error: e },
+    };
+    return read_quota(body);
+}
+
+/// The reading in a quota reply, or a sentence about why there is none.
+///
+/// Apart from `quota()` so it can be run against a captured body with no
+/// network in the way — which is how the harness tests it.
+fn read_quota(body) {
+    let reply = match json::from_string(body) {
+        Ok(v) => v,
+        Err(_) => return #{ error: "the quota reply was not JSON" },
+    };
+    if !(reply is Object) {
+        return #{ error: "the quota reply was not an object" };
+    }
+    let data = match reply.get("data") {
+        Some(d) => d,
+        None => return #{ error: reply_message(reply) },
+    };
+    if !(data is Object) {
+        return #{ error: reply_message(reply) };
+    }
+    let limits = match data.get("limits") {
+        Some(l) => l,
+        None => return #{ error: "the quota reply lists no limits" },
+    };
+    if !(limits is Vec) {
+        return #{ error: "the quota reply lists no limits" };
+    }
+    let windows = [];
+    for entry in limits {
+        if !(entry is Object) {
+            continue;
+        }
+        if !is_allowance(entry) {
+            continue;
+        }
+        let unit = int_field(entry, "unit");
+        let count = int_field(entry, "number");
+        if !(unit is i64) || !(count is i64) {
+            continue;
+        }
+        windows.push(#{
+            label: window_label(unit, count),
+            percent: percent_of(entry),
+            used: int_field(entry, "currentValue"),
+            limit: int_field(entry, "usage"),
+            resets_ms: int_field(entry, "nextResetTime"),
+        });
+    }
+    let plan = match data.get("level") {
+        Some(l) => l,
+        None => (),
+    };
+    if !(plan is String) {
+        plan = ();
+    }
+    return #{ plan: plan, windows: windows };
+}
+
+/// Whether a `limits` entry is one of the percentage windows.
+fn is_allowance(entry) {
+    let kind = match entry.get("type") {
+        Some(t) => t,
+        None => return false,
+    };
+    if !(kind is String) {
+        return false;
+    }
+    return kind == "CREDIT_LIMIT" || kind == "TOKENS_LIMIT";
+}
+
+/// The name of a `(unit, number)` window: `5h`, `week`, `2w`, `month`.
+/// An unknown unit is spelled as the pair rather than dropped, so a new
+/// window z.ai adds is still a row with a reset time on it.
+fn window_label(unit, count) {
+    match unit {
+        3 => `${count}h`,
+        4 => if count == 1 { "day" } else { `${count}d` },
+        6 => if count == 1 { "week" } else { `${count}w` },
+        5 => if count == 1 { "month" } else { `${count}mo` },
+        _ => `${count}×unit${unit}`,
+    }
+}
+
+/// An integer field, or `()` — *the endpoint did not say* — when it is
+/// absent or not a whole number. The reading's optional fields take
+/// `()` as absent.
+fn int_field(entry, key) {
+    match entry.get(key) {
+        Some(v) => if v is i64 { v } else { () },
+        None => (),
+    }
+}
+
+/// The share used, as the endpoint reports it; zero when it does not.
+fn percent_of(entry) {
+    match entry.get("percentage") {
+        Some(p) => if p is i64 || p is f64 { p } else { 0 },
+        None => 0,
+    }
+}
+
+/// The endpoint's own sentence, for a reply with no reading in it: a
+/// valid key with no Coding Plan behind it answers `success: false` with
+/// a `msg` and no `data`.
+fn reply_message(reply) {
+    match reply.get("msg") {
+        Some(m) => if m is String { m } else { "the quota reply carried no reading" },
+        None => "the quota reply carried no reading",
+    }
+}

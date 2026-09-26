@@ -1,0 +1,1524 @@
+# AGENTS.md — aoide-secrets
+
+## Invariants
+
+- Timeout fixtures hold `crate::env_lock()` before changing
+  `BACKEND_TIMEOUT_ENV` and before starting elapsed-time measurements.
+  The order is test environment lock, then broker `put_lock`; temporary
+  homes do not isolate the shared timeout or deliberately hanging puts.
+
+- **A secret's VALUE never appears on a `Serialize`/`Deserialize` type in
+  this crate.** `policy::Policy` is still the only such type, and it holds
+  no value. P-V2's resolve response and both audit lines are the exact
+  place this rule was written down FOR: `broker::handle_resolve` and
+  `broker::audit_resolve` build `serde_json::Value`s directly (via the
+  `json!` macro) at the point of use, never a named struct with a `value`
+  field — check any new `#[derive(Serialize)]` type added to this crate
+  against this line before it lands. A value belongs in a client-process
+  env var and nowhere else (README's release-to-client flow); `client::
+  resolve` extracts it straight out of the reply's `serde_json::Value`
+  into a local `String`, never a struct field.
+- **Audit happens BROKER-SIDE ONLY** (`broker::audit_resolve`), on every
+  resolve attempt, granted or denied. The CLIENT (`client.rs`) never calls
+  `aoide_protocol::audit` itself — it only ever learns granted/denied from
+  the wire reply. Don't add a second audit call on the client side "for
+  completeness"; it would double-log every resolve and the client doesn't
+  have the policy-gate reasoning to log honestly anyway.
+- **`EventClass::Secret` (the mirrored aoide-log event) forbids
+  `untrusted_data`** — enforced in `aoide_protocol::audit::append_audit`
+  itself (strips it, `eprintln!`s), not only by this crate's discipline.
+  Don't set `untrusted_data` on a Secret-classed `AuditRecord` expecting it
+  to ride through; it won't, and the strip is the safety net, not the
+  design.
+- **`requireTotp` is UNRESOLVABLE only when no enrollment exists on this
+  host, never a silent downgrade to a standing grant in either
+  direction.** `broker::resolve_gate`/`verify_totp_gate` (P-V3): no
+  `totp.secret` -> reject outright, same wording as before P-V3;
+  enrolled -> verify the wire's `totp` code (`totp::verify`, `±1` window)
+  and consume the matched timestep in the persisted
+  `replay::ReplayLedger` — a missing/wrong/already-used code is an
+  ordinary denial, the backend never runs. Don't let a `requireTotp`
+  policy fall back to treating itself as a standing grant just because an
+  enrollment exists; the code (or its absence) is what decides.
+- **`put` (P-V4c) is NEVER gated by `requireTotp`, and carries no
+  `consumer` field at all.** `broker::put_gate` is a SEPARATE function from
+  `resolve_gate` — it never calls `verify_totp_gate`, on ANY policy,
+  `requireTotp` or not. This is deliberate, not an oversight: `secrets put`
+  is CLI-only/admin-side (`commands::handle_secrets_put`'s `require_cli`
+  gate), never agent-facing, so there is no separate consumer identity to
+  authorize and no code check to run — see `broker.rs`'s module doc for the
+  full reasoning. Don't add a TOTP or consumer check to `put_gate` "for
+  symmetry with resolve"; the two ops have different threat models on
+  purpose.
+- **The "does this secret already have a value" check is BROKER-SIDE ONLY,
+  never the client's** (P-67, "warn before overwrite" — the User's own
+  live complaint: `put` silently overwrote). `broker::has_value`-backed
+  `put_gate` probes existence by running the SAME `get` template `resolve`
+  would; the CLIENT never fetches a value to find out (that would be a
+  `resolve`-shaped leak on an op that isn't `resolve`) and a client-side
+  file peek would break the uid boundary outright (the client doesn't run
+  as the secrets uid — it can't see the backing store at all). Don't add a
+  client-side existence check "to save a round trip"; the whole point is
+  that only the broker is allowed to know.
+- **The `put` overwrite refusal is a MACHINE-READABLE flag
+  (`"exists":true`), never inferred from `error` text** (P-67). Don't add a
+  new `put` denial reason whose message text a caller (or this crate's own
+  `client::put`) would need to string-match to distinguish "already has a
+  value" from every other kind of denial — a new distinct case gets its
+  own flag field the same way, not a string convention.
+- **NO CACHE, EVER.** A secret's value exists ONLY between a `get`/`set`
+  template's own invocation and the wire write that immediately follows —
+  nothing in `broker`/`client`/`backend` may hold a value across requests,
+  in memory or on disk, for any reason. `resolve` runs the backend fresh on
+  EVERY call so revocation is immediate; don't introduce a warm cache, a
+  TTL, or a "remember the last resolve for this secret" optimization —
+  that would make revocation lag behind `secrets rm`/backend rotation,
+  which is exactly the property this crate exists to hold. **This binds
+  `client::resolve_bounded` (task #84) exactly as it binds `resolve`** —
+  it is the same client-side function family, just with a caller-supplied
+  read timeout and `wait:false` on the wire instead of the interactive
+  park path, exported so `aoide-server`'s A2A door and `aoide-client`'s
+  outbound node client can resolve their own bearer token as ordinary
+  wire callers (consumers `a2a-door`/`a2a-client`) rather than duplicating
+  the wire protocol in either crate (the workspace's "no cross-crate
+  copying" rule, `pkgs/aoide/crates/AGENTS.md`). Neither caller may hold
+  the resolved value past its own request/verification — don't add a
+  memoizing wrapper around `resolve_bounded` in this crate OR either
+  downstream one "to save a round trip"; a bounded, uncached, fresh-per-call
+  resolve is the entire contract a new machine consumer of this wire
+  inherits by construction.
+- **ONE VALUE PER SECRET is the contract, not an implementation detail.**
+  `policy::Policy` models exactly one backend-fetched value per policy
+  entry; a credential with multiple fields is multiple named secrets, each
+  its own policy with its own `consumers[]`/`requireTotp` (the `sops`
+  preset's per-field JSONPath `key`, README's "Backend presets", already
+  shows this). Don't add a multi-field resolve/put op, and don't let a
+  single `Policy` grow a second value-bearing field "for convenience" —
+  per-field grants and per-field TOTP are the whole point of keeping
+  secrets one-per-policy.
+- **Per-backend environment is INLINE IN THE TEMPLATE — no structured
+  `env` map on `Backend`, ever.** A backend needing `BW_SESSION` or similar
+  sets it as part of its own `sh -c` template text. Don't add an `env:
+  BTreeMap<String,String>` field to `backend::Backend` "to avoid repeating
+  the var in every template" — the whole adapter surface is deliberately
+  ONE string per direction (`get`, `set`).
+- **`ReplayLedger` keys on timestep ALONE, never on consumer** (ruling,
+  Fable, 2026-08-22, P-V1 review escalation — plan file's SECRETS §Policy
+  section). The resolve wire's `consumer` field is self-asserted; a
+  per-consumer ledger would let one typed code redeem once per invented
+  label. Don't reintroduce a consumer dimension to `replay::ReplayLedger`
+  without authenticated consumer identity landing first (#51-adjacent,
+  not planned).
+- **`SO_PEERCRED` (task #73) gives kernel-truth CALLER identity — it does
+  NOT authenticate the wire's `consumer` field, which stays self-asserted
+  exactly as the ruling above states.** `handle_conn` reads `SO_PEERCRED`
+  (`peercred::peer_cred`, hand-rolled over `libc::getsockopt` since `std`'s
+  own accessor is unstable) ONCE per connection, at connection start, and
+  threads the same value into every op that connection sends — never
+  re-read per line. A read failure is an UNIDENTIFIED connection (`None`),
+  never a panic, never a fabricated uid. `park::ParkedAsk::peer_uid` stamps
+  the parking connection's peer uid at park time (shown additively in
+  `pending`'s `peerUid`); `broker::handle_dismiss` is the one place this
+  fact gates a decision (`dismiss_authorized`, pure and unit-tested): an
+  ordinary caller may only dismiss an ask whose stamped `peer_uid` matches
+  its OWN connection's peer uid, or the broker's own effective uid
+  (`home::effective_uid()`) may always dismiss any ask. **Fail closed on
+  any missing kernel fact** — an unidentified dismisser is NEVER
+  authorized, even against an ask whose own `peer_uid` is also
+  unidentified; there is nothing to match, so the safe default is refusal.
+  `approve` is UNCHANGED — it stays open to any local caller, gated by the
+  TOTP code alone, never by identity. Every `audit_resolve`/`audit_park`/
+  `audit_approve`/`audit_dismiss`/`audit_put` call now also carries the
+  acting connection's peer uid, alongside (never replacing) the
+  self-asserted name it already carried. Don't read this as closing the
+  `consumer`-self-assertion gap the ruling above and `CONTRACTS.md`'s
+  honesty note describe — that gap is authenticated CONSUMER identity,
+  which `SO_PEERCRED` cannot provide (it identifies the connecting
+  PROCESS, not which of possibly many self-asserted consumer names that
+  process is claiming); don't wire `SO_PEERCRED`'s uid into
+  `automation.consumers`/policy `consumers[]` matching as if it were an
+  authenticated consumer name — it isn't one.
+- **The broker socket is the single writer for every admin CRUD mutation
+  when a daemon is listening (task #79, built on #73's peer-cred gate) —
+  direct-write-to-`policy.json` survives ONLY as the no-daemon fallback.**
+  `crate::admin` is the ONE module holding every command's actual
+  read-modify-write logic (`add`/`rm`/`grant`/`revoke`/`set_totp`/
+  `expose`/`automate_toggle`/`automate_consumer`/`migrate`) — typed
+  arguments in, an `AdminOutcome{message,changed}` or `Err(String)` out, no
+  `Invocation`, no `Outcome`, no wire `Value`, so the IDENTICAL function
+  serves two callers with two different gates: `commands.rs`'s direct-write
+  fallback (reached only after `require_admin_identity` already passed) and
+  `broker::handle_admin` (reached only after `admin_gate` already passed).
+  `commands.rs`'s admin commands never read/write `policy.json` themselves any
+  more — `admin_dispatch` is the ONE place that decides which path ran: it
+  sends `{"op":"admin","command":...}` over `client::admin_request` FIRST, and
+  falls back to `require_admin_identity` + a direct `crate::admin` call
+  ONLY on `client::AdminError::NoSocket` (`ENOENT`/`ConnectionRefused` —
+  nothing listening). **Every other socket error is `AdminError::Other`
+  and is reported outright, NEVER silently downgraded into the fallback**
+  — this includes the broker's own authoritative `{"ok":false}` denial (a
+  bad admin-identity peer uid, "no policy for secret x", a poisoned
+  `policy.json`): a live-but-sick daemon, or a daemon that correctly
+  refused the request, must never be bypassed into a direct write racing
+  underneath it. Don't add a command whose direct-write fallback re-derives
+  its own mutation logic instead of calling `crate::admin` — the whole
+  point of this split is that ONE function's behavior is what BOTH paths
+  give a caller, never two implementations that could drift.
+  `broker::admin_gate` is the socket-side identity gate: an `{op:"admin"}`
+  request is accepted ONLY when the CONNECTING peer's own uid is the
+  broker's own effective uid — reusing `home::admin_identity_error`'s exact
+  wording (root's "plain `sudo` runs as root" clause included) by treating
+  the peer's uid as that function's "process euid" argument and the
+  broker's own euid as its "home owner" argument, so a refusal here teaches
+  the IDENTICAL fix the direct path already teaches, never a second
+  wording for the same underlying check aimed at two different processes.
+  An unidentified connection is refused outright, the SAME fail-closed
+  default `dismiss_authorized` holds (invariant above) — there is no uid to
+  compare, so the safe answer is refusal. Every admin mutation — either
+  path — reports WHICH path ran via `Outcome::data`'s `{"path":"broker"}`/
+  `{"path":"direct"}` (`admin_dispatch`'s own job; the broker's OWN audit
+  line, `broker::audit_admin`, is a SEPARATE generic name-only line for the
+  socket path specifically, since that path has no other audit mechanism
+  at all — the direct-write fallback still gets `commands.rs`'s
+  pre-existing generic per-command dispatch audit, plus `migrate`'s own
+  richer `audit_migrate` line, both unchanged by this phase). Don't drop
+  the `path` field from a new admin command's `Outcome` "since it's obvious
+  which one ran" — idempotency discipline (house rule 2) means reporting
+  exactly what happened, and which of two genuinely different write paths
+  executed is part of that.
+- **Clock-as-parameter, everywhere.** Every function in `totp`/`replay`
+  takes `unix_time`/`timestep`/cutoff as an explicit argument. Nothing in
+  `src/` calls `SystemTime::now()` — grep for it before merging a change
+  here; a thin wrapper that reads the real clock belongs in V2's broker,
+  never inside these pure functions. This is what makes the RFC vectors
+  usable as a test suite at all (a fixed `unix_time` input, not "now").
+- **Zero algorithmic dependencies.** `sha1`/`hmac`/`totp` are hand-rolled
+  on purpose (plan mandate) — do not reach for a `sha1`/`hmac`/`totp-lite`/
+  `data-encoding` crate to "simplify" this later; the RFC test vectors are
+  the contract that makes the hand-rolled version trustworthy, and the
+  whole point is that the secrets broker doesn't carry a supply-chain dependency
+  for something ~150 lines of tested Rust does directly. `serde`/
+  `serde_json` are the only exception (record-shape (de)serialization, not
+  cryptography).
+- **RFC vectors are not decorative — a change to `sha1`/`hmac`/`totp` that
+  breaks a named RFC test is never "expected," it's a correctness bug.**
+  Unlike the golden-snapshot discipline elsewhere in this workspace (where
+  a red golden after an intentional command-set change is routine), a red
+  RFC vector test here means the hash/HMAC/TOTP math is wrong.
+- **`policy::valid_secret_name` is deliberately stricter than
+  `aoide_storage::node_store::valid_node_name`**, and this crate does NOT
+  depend on `aoide-storage` to reuse the looser one — see `policy.rs`'s
+  module doc for the exact delta (no leading/trailing hyphen, no `--`
+  run). Don't "consolidate" the two without re-deriving why secrets secret
+  names are held to a tighter bar (they name on-disk backend-store paths
+  under a privileged uid; a node name only names a JSON cache file).
+- **I/O is confined to eight named modules: `broker`, `client`, `store`,
+  `backend`, `enroll` (P-V3), `watch` (tracker #71 Part 1), `peercred`
+  (task #73), and each module's own `#[cfg(test)]` block.** `sha1`/`hmac`/
+  `totp`/`base32`/`uri`/`replay`/`policy` stay pure — no `SystemTime::now()`,
+  no socket, no `exec`, no reads/writes of secrets home in any of them.
+  This is the P-V2 narrowing of the old P-V1 rule ("nothing in this crate
+  performs I/O" — true then because there were no I/O modules yet), widened
+  once more at P-V3 for `enroll`'s `/dev/urandom`/`gethostname`/`qrencode`
+  calls, again for `watch`'s log-tail (`File`/`stat`), socket calls
+  (`client::pending`/`approve`/`dismiss`, reused, never duplicated), and
+  `SIGINT` handling (`libc::signal`), and again at task #73 for
+  `peercred::peer_cred`'s `getsockopt(2)` call — the boundary moves as new
+  I/O concerns earn their own named module, it does not disappear. `peercred`
+  itself never writes anything or touches the secrets home at all — it is
+  a pure READ of one already-open connection's kernel-stamped identity,
+  called once by `broker::handle_conn`. `enroll`
+  itself never writes a secrets-home FILE directly — that stays `store`'s
+  job (`enroll::run` calls `store::save_totp_secret`/`save_replay_ledger`).
+  `watch` itself never writes a secrets-home file OR `policy.json` at all
+  — it only reads the broker-owned events feed (P-G4, task #77; the
+  mirrored aoide log through P-N3 — never the broker's own `audit.log`,
+  which is `0700` broker-uid and unreadable from the operator side anyway)
+  and speaks the SAME three socket ops `pending`/`approve`/`dismiss`
+  already expose, never a new wire op. **`watch::Follower`'s own file-tail
+  mechanics moved to `aoide_protocol::feed::Follower` at P-D1** (`docs/
+  architecture/AOIDED.md`'s "L1 — the event bus" section) — `watch.rs`
+  holds `pub use aoide_protocol::feed::Follower;` at the old path (shim
+  discipline, `pkgs/aoide/crates/AGENTS.md`'s "no cross-crate copying"),
+  so this module remains the ONE place in the crate that ever constructs
+  or polls one; the boundary this bullet states is unchanged, only the
+  type's own implementation now lives one crate down the DAG. Similarly,
+  `broker::append_events_feed`'s own file-write mechanics moved to
+  `aoide_protocol::feed::FeedWriter`, called from `broker` alone.
+- **`watch`'s pure fold (`Event`/`Queue`/`pick_next`/`code_prompt_allowed`)
+  holds the SAME clock-as-parameter discipline this crate's `totp`/`replay`
+  modules already hold** (invariant above), extended here for the identical
+  testability reason: `Queue::apply`/`Queue::reconcile` take an event/
+  `Vec<PendingAsk>` and never call `SystemTime::now()` internally — every
+  timestamp they fold in (`requestedAt` from `client::pending`'s reply, and
+  as of P-G4 task #77, `ts` passed in by the tail loop's own `unix_now()`
+  at the instant a line was READ, since the events feed carries no
+  per-line timestamp of its own — `parse_notify_line`'s own doc) arrives
+  as a parameter. Only `watch::run`'s own outer loop (and its private
+  `unix_now()`) touches the real clock, the same "thin wrapper reads the
+  real clock, never the pure functions" split `broker.rs`'s own P-N2 tests
+  already establish. Don't add a `SystemTime::now()` call inside
+  `Event`/`Queue`/`pick_next`/`code_prompt_allowed`/`narrate_event`/
+  `event_to_json`/`parse_notify_line` — grep for it before merging a
+  change to `watch.rs`'s pure half.
+- **`watch`'s tail is a TRIGGER; `client::pending` is the AUTHORITY** — the
+  SAME rule P-N2's own README section states for `secrets pending`'s poll,
+  extended to this surface: `Queue::reconcile` runs once at `watch::run`
+  startup (so a watcher started AFTER an ask parked still converges) and
+  again on every parsed event plus a 30s safety tick — as of P-G4 (task
+  #77) this tick is purely a RECONCILIATION BACKSTOP, not the primary
+  delivery path (a parked ask now surfaces through the broker-owned events
+  feed in about a second, README's "Watching events"). Don't let a future
+  event kind become load-bearing on its own without a reconcile behind it
+  — the events feed can still miss a line (a truncation between polls, a
+  process restart) in a way the broker's own in-memory `ParkRegistry`
+  cannot.
+- **The dialog substrate (`ZenityResult`/`locked_state`/`is_locked`/
+  `run_entry_dialog`/`zenity_available`/`next_spawn_backoff`/
+  `DISMISS_LABEL`/`strip_one_trailing_newline`) is a SHIM onto
+  `aoide_protocol::dialog` now (P-P5, F5) — never re-add a real body at
+  these names in this crate.** A behavior change to any of them belongs in
+  `aoide-protocol::dialog` (its own `AGENTS.md`), never patched locally
+  "just this once" — `aoide-client`'s own P-P5 popup arm shares the exact
+  same code, and a local fork here would silently drift the two. What
+  stays genuinely local: `spawn_zenity_entry`/`spawn_lyra_entry`/
+  `run_zenity_entry`/`run_lyra_entry`/`run_ask_dialog`/
+  `zenity_error_dialog`/`resolve_lyra_bin`/`popup_loop` — everything that
+  knows THIS crate's own two dialog binaries and their argv, which the
+  generic run-loop never needed to know.
+- **Every admin command that reads/writes `policy.json`/`totp.secret` refuses
+  the wrong effective uid BEFORE touching the file, never after** (P-V4f,
+  the yomi-strix incident, 2026-08-22: plain `sudo aoide secrets add …`
+  ran as euid 0, succeeded, and silently reowned `policy.json` to
+  `root:root`, bricking the broker and every later admin command — including
+  the correctly-spelled `sudo -u aoide-secrets` retry — until a manual
+  `chown`). `home::admin_identity_error(euid, home_owner, home, subcommand)` is
+  the PURE decision (unit-tested on injected uids: matching, root-vs-owner,
+  an arbitrary mismatch); `home::admin_identity_check(home, subcommand)` wires it
+  to a real `std::fs::metadata(home)` stat and a real `home::effective_uid`
+  (`libc::geteuid`, zero new deps — `libc` is already this crate's
+  dependency). `commands::require_admin_identity` calls it right after
+  `require_cli` in `add`/`rm`/`grant`/`revoke`/`set-totp`;
+  `enroll::run` calls it directly (its real work happens from `cli`'s
+  `special` hook, outside `commands.rs`'s own dispatch) — `enroll::show`
+  does NOT carry it (read-only, nothing to corrupt), and neither does
+  `put`/`exec` (socket-side operator commands the guard was never meant to
+  cover). Root is explicitly a REFUSED case, not a bypass: root can always
+  write regardless of file ownership, which is the exact mechanism that
+  corrupted `policy.json` in the field. **A not-yet-existing secrets home
+  is not an unconditional pass either** (P-V4f follow-up, found on review:
+  `store::save_policies`/`store::save_totp_secret` both `create_dir_all`
+  the home on first write, so an unguarded root caller hitting a missing
+  home would CREATE it `root:root` — the identical bricking symptom,
+  just at creation time instead of a reown) — `home::
+  admin_identity_error_for_missing_home(euid, home, subcommand)` is that case's
+  own PURE decision (root refused, any other uid passes), and
+  `admin_identity_check` falls to it whenever the stat fails, rather than
+  passing unconditionally. A non-root uid still creates its own fresh home
+  freely (the dev/test tempdir flow, or an explicit `sudo -u aoide-secrets`
+  first run per the deployment doc) — only root bootstrapping a missing
+  home is refused. Don't add a second, differently-worded identity check
+  elsewhere in this crate; these two pure functions plus
+  `admin_identity_check`'s dispatch between them are the one gate, and a
+  new admin command that touches `policy.json`/`totp.secret` calls it the
+  same way.
+- **The automation gate can only ever RELAX `requireTotp`, never tighten
+  it** (P-N1). `policy::totp_required(policy, consumer)` is the ONE
+  decision point `broker::resolve_gate` routes through — it is `requireTotp
+  AND NOT (automation.enabled AND consumer IS IN automation.consumers)`.
+  `requireTotp: false` returns `false` from `totp_required` in every
+  combination; automation has no ability to IMPOSE a TOTP requirement a
+  policy doesn't already carry, only to name specific consumers who skip
+  one it does. Don't inline `policy.require_totp` back into `resolve_gate`
+  "for clarity" — `totp_required` stayed the ONE call site P-N2's parking
+  change routed through (`GateOutcome::NeedsTotp`, invariant below) rather
+  than a second ad hoc check growing beside it.
+- **`automation.consumers` is checked against the SAME self-asserted
+  `consumer` wire field `resolve`'s `consumers[]` already is** (P-N1,
+  honesty note mirroring the `ReplayLedger` ruling above, for the
+  identical reason). Nothing authenticates the wire's `consumer` field, so
+  an automation-open secret is effectively code-free for any local socket
+  caller claiming a listed name — the sealed session credential (#63,
+  consumed by this crate's own origin gate) authenticates the calling
+  SESSION and its origin CLASS, never this string; consumer-NAME
+  authentication remains a separate, unbuilt axis (#51-adjacent, not
+  planned). Don't treat `automation` as adding
+  any cryptographic boundary beyond what `consumers[]` already has — it's
+  a courtesy label on the same self-asserted field, not a stronger one.
+- **`Policy::remote` (P-N1) gates NOTHING today — that is deliberate, not
+  a gap.** No non-local entry point onto this broker exists yet. This is
+  a forward-looking crate invariant, written down now while the field is
+  new: **every non-local entry point added later (mesh replication, a
+  network door, any future doorway a value could leave this host through)
+  MUST refuse a secret whose `remote` is `false` before ever touching its
+  backend.** Don't add a mesh/network resolve path that skips this check
+  "because it's not implemented as a gate yet" — the field existing with
+  no reader yet is exactly what this note exists to close before it
+  becomes a live gap the way the automation-consumer self-assertion note
+  above already is.
+- **`Policy::allow_remote_origin` (LANE IDENTITY P-ID4) keys ONLY on a
+  POSITIVELY-attested remote origin — never turn it into a gate on
+  unidentified callers.** `broker::resolve_gate`'s origin check refuses a
+  caller whose SEALED session (resolved from the connection's peercred pid
+  via `aoide_storage::attest::attested_caller` — the ONE shared
+  implementation; never copy the walk into this crate, and never trust a
+  wire-asserted origin) carries a `node:*` originClass, unless the secret
+  opted in. `None` — unidentified — falls through untouched: local
+  unidentified callers were always admitted under OQ1-A, refusing them
+  would break every legitimate non-session caller while stopping no
+  same-uid attacker, and the gate's whole honesty is "narrows attested
+  remote-origin sessions, authenticates nothing local." Keep the check
+  BEFORE the TOTP/park branch (a refused remote-origin caller must never
+  park — parking it would invite an approve that bypasses the refusal)
+  and keep `caller` a resolve_gate PARAMETER (clock discipline), never an
+  ambient read inside the gate. The three axes stay distinct: `remote` =
+  transport, `automation` = code, `allowRemoteOrigin` = caller provenance
+  — a change to any one of them updates `policy.rs`'s field docs, the
+  README's "The origin gate" section, and `CONTRACTS.md`'s origin-gate
+  paragraph in the same commit.
+- **A parked ask never stores or touches a value — the same "never store a
+  value" rule above, extended to the registry P-N2 adds.** `park::
+  ParkedAsk` carries only `secret`/`consumer`/`requested_at` and a private
+  send-once channel; `broker::handle_approve` fetches the value fresh
+  through the backend ONLY after a code has already validated
+  (`verify_totp_gate`, the SAME function an inline `resolve` code uses),
+  and sends it straight down that channel — never holding it in the
+  registry, never in `approve`'s own wire reply back to the operator.
+  Don't add a "cache the value once fetched, in case the connection reads
+  slowly" optimization to `ParkedAsk` — the value must exist ONLY inside
+  the one send/receive handoff, same as everywhere else in this crate.
+- **Three production (non-test) locks exist in this crate tree, all
+  poisoned-lock-recovering, all following the SAME convention
+  `park::ParkRegistry`'s established first.** Every earlier `Mutex`/
+  `RwLock` in this crate was test-only env serialization (`env_lock()`);
+  `park::ParkRegistry`'s internal `Mutex` was the first one live code
+  touched (P-N2). Thread-per-connection then exposed two more
+  read-modify-write sections the old SERIAL accept loop used to serialize
+  for free, just by never running two connections' code at once — a
+  reviewer-confirmed race, reproduced empirically before the fix (5/20
+  iterations of a two-thread test double-granted the same TOTP code):
+  `broker::replay_ledger_lock` guards `verify_totp_gate`'s FULL
+  load -> record -> prune -> save of the replay ledger, and
+  `broker::put_lock` guards `put_gate`'s FULL existence-probe -> store
+  (the same newly-exposed TOCTOU shape, one code redeeming twice /
+  one overwrite:false put silently losing the race, respectively — both
+  fixed in the SAME commit as this note, P-N2 review fix). All three
+  locks go through `.lock().unwrap_or_else(|e| e.into_inner())`, never a
+  bare `.lock().unwrap()` — a panic inside one connection's own thread
+  must never poison every OTHER connection's ability to park/list/
+  approve/dismiss/resolve/put, matching this crate's own "one
+  connection's failure is contained to that connection" discipline
+  (`broker.rs`'s module doc). Neither of the two new locks introduces
+  caching — both sections still read fresh from disk every time; the
+  lock only serializes the section, never remembers what it read
+  (this crate's "NO CACHE, EVER" invariant, unchanged). A future
+  production lock elsewhere in this crate follows the SAME recovery
+  pattern, not a bare `.unwrap()` — and, per `replay_ledger_lock`/
+  `put_lock` being TWO separate locks rather than one shared one, a new
+  lock guards exactly the resource it protects rather than reaching for
+  one broad "broker file ops" lock that would serialize unrelated
+  operations against each other for no reason.
+- **`serve`'s accept loop is thread-per-connection, and must never block on
+  a parked one (P-N2, hard constraint).** Before this phase the loop called
+  `handle_conn` INLINE, serially — safe only because nothing ever blocked
+  for long. A parked `resolve` can legitimately hold its connection open
+  for the full timeout (default 300s), so `serve` now does
+  `std::thread::spawn(move || handle_conn(...))` per accepted connection,
+  sharing one `Arc<park::ParkRegistry>`. Don't reintroduce an inline
+  `handle_conn` call in the accept loop, and don't add a SECOND kind of
+  long-lived wait anywhere in `handle_conn` that isn't routed through
+  `park::wait_for_outcome`'s own timeout/completion race — a second
+  ad hoc blocking point would need this same accept-loop guarantee
+  re-proven from scratch.
+- **`resolve_gate` returns a `GateOutcome` (`Granted`/`Denied`/
+  `NeedsTotp`), not a bare `Result` (P-N2 — replaced the old
+  `(bool, Result<String,String>)` tuple).** `NeedsTotp` is the park
+  candidate: `totp_required` is true, an enrollment exists, but no/empty
+  code rode the wire — every OTHER `requireTotp`-true-with-no-enrollment
+  case is still an immediate `Denied` (unchanged wording), never a park,
+  since there is nothing an operator could approve against. Don't collapse
+  `NeedsTotp` back into `Denied` "since both come from the same missing-
+  code condition" — `handle_resolve` is the ONE call site that branches on
+  which variant it got, and that branch is the entire mechanism that turns
+  a no-code resolve into a park instead of a refusal.
+- **`wait:false` is wire-only — no CLI flag exists, and none should be
+  added casually (P-N2).** It exists for a machine caller with no way to
+  ever supply a code (this crate's own `README.md`, "Parking a TOTP
+  resolve"). Adding a `--no-wait`/`--wait=false` CLI flag would need its
+  own justification independent of this one wire escape hatch — don't
+  wire one up "since the field already exists" without a caller that
+  actually needs it from a terminal.
+- **The wire's framing contract is "one request line -> zero or more
+  INTERIM lines -> exactly one FINAL reply line" (P-N2c, FIX 1) — not
+  "one request, one reply."** An interim line is any line whose object
+  carries `"interim":true`; `broker::write_json_line` is the ONE place
+  this crate formats a wire line, shared by `handle_conn`'s final-reply
+  write and `handle_resolve`'s interim-line write, so a change to the line
+  shape can't drift between the two call sites. `client::read_final_reply`
+  is the ONE place a reply is read back — it loops, consuming and
+  surfacing (`announce_interim`) any interim line, returning only the
+  first non-interim line. Don't add a second ad hoc `read_line`+parse
+  anywhere in `client.rs`; a new caller of the wire routes through
+  `read_final_reply` even if it never expects an interim line today. A
+  future mode/op extends the wire with a NEW interim shape or op, never by
+  widening `resolve`'s `wait` field (still a plain bool) into something
+  richer — `wait` is closed on purpose (invariant below, unchanged from
+  P-N2).
+- **`approve` MUST re-run the full authorization gate against the ask's
+  STORED consumer, immediately before fetching — never trust a code alone
+  (P-N2c, FIX 2, hard constraint).** Before this fix, `handle_approve`
+  validated only the TOTP code and then fetched by backend/key, so a
+  `secrets revoke`/policy edit issued WHILE an ask sat parked did nothing
+  to stop that ask's eventual release — and the same gap would have
+  silently bypassed the `remote` gate (invariant above) the day a network
+  door exists. `broker::authorize_release` re-runs the SAME exists +
+  consumers-authorization check `resolve_gate` itself uses; `handle_approve`
+  calls it AFTER the code validates (so it is consumed from the replay
+  ledger either way — deliberate, see the doc comment) and BEFORE any
+  value is fetched. A revoked/removed consumer at that point denies BOTH
+  the approver's own reply and the original parked caller's `resolve`
+  reply with the identical error, and the ask is removed from the registry
+  either way. Don't move a future release-time check to run only against
+  the ask's ORIGINAL policy snapshot "since that's what was approved" — the
+  whole point is to re-read `policy.json` fresh at release time, the same
+  way `resolve`'s own fast path always has.
+- **Park ids are nonce-prefixed (`<4-hex-nonce>-<counter>`), never a bare
+  counter across a broker restart (P-N2c, FIX 4).** `park::ParkRegistry`
+  reads 2 random bytes from `/dev/urandom` once per process start
+  (`park::random_nonce`) and prefixes every id it mints that process with
+  it; the counter still increments per-ask, unreused, within that process.
+  `park::format_id`/`park::parse_id` are the ONE place an id is built or
+  parsed — every public `ParkRegistry` method routes through them. This
+  exists so a held id from a PREVIOUS broker process can never silently
+  address a DIFFERENT ask after a restart (the counter alone restarts at
+  1); an id whose nonce doesn't match the CURRENT process is simply
+  unknown, the same `"unknown pending id"` error a never-existed id gets.
+  Don't reach for `.parse::<u64>()` on a raw id anywhere outside `park.rs`;
+  every caller (broker, client, tests) treats an id as an opaque string.
+- **A registry-wide park cap bounds memory (P-N2c, FIX 3b),** default 32,
+  `AOIDE_SECRETS_PARK_CAP` env override — `park::park_cap()`/
+  `park::PARK_CAP_ENV`/`park::DEFAULT_PARK_CAP`, same tolerant-fallback
+  shape as `park_timeout()`. `ParkRegistry::park_if_room` is the cap-aware
+  entry point (`park` still exists, delegating to `park_if_room(...,
+  usize::MAX)`, which cannot refuse) — it checks `len() >= cap` and inserts
+  under the SAME lock acquisition, never two separate lock calls, so two
+  racing parks can never jointly overrun the cap by one (the same TOCTOU
+  discipline the `put_lock`/`replay_ledger_lock` invariant above already
+  holds). Beyond the cap, `handle_resolve` returns the SAME immediate
+  refusal `wait:false` produces, naming the cap and its env knob. Don't
+  make the cap check a separate `len()` call followed by a separate
+  `insert` — that reintroduces exactly the TOCTOU this fix exists to close.
+- **A connection thread that fails to spawn must drop ONE connection,
+  never crash the broker (P-N2c, FIX 3a/3c, hard constraint).** `serve`'s
+  accept loop uses the FALLIBLE `std::thread::Builder::new().spawn(...)`,
+  never the panicking `std::thread::spawn` — a refused OS thread creation
+  (fd/thread-table exhaustion) `eprintln!`s and continues the loop, rather
+  than unwinding `serve()` and killing the whole broker process (which,
+  under a systemd unit with `StartLimitBurst`, permanently fails the unit
+  with no further restart — the exact crash-to-permanent-outage shape this
+  fix exists to close). The accept loop's `Err` arm (typically `EMFILE`)
+  also sleeps ~250ms before retrying rather than busy-spinning. Don't
+  revert to `std::thread::spawn` "since it's simpler" — the fallibility is
+  the entire point.
+- **`home::secrets_home`/`socket::socket_path` are THE resolution — nothing
+  else re-derives a secrets-home or socket path.** `broker::serve`/
+  `client::resolve`/`client::run_exec` all take the resolved `&Path` as a
+  PARAMETER rather than calling `home`/`socket` internally — this is
+  deliberate (keeps them testable against an explicit tempdir/short
+  socket path with no env-var mutation) and matches how `cli`'s `special`
+  hook calls them: it resolves `home`/`socket` once and passes the result
+  in. Don't have `broker`/`client` read the env directly "for
+  convenience" — that would silently reintroduce the env-mutation
+  test-serialization problem `home`/`socket`'s OWN unit tests already
+  need `env_lock` for.
+- **`emit_notify` is called ONLY after every lock its outcome depended on
+  has already been released (P-N3, hard constraint).** No notification I/O
+  happens while holding `park::ParkRegistry`'s internal `Mutex` or
+  `broker::replay_ledger_lock` — every call site (`handle_resolve`'s
+  `Granted`/`NeedsTotp`-park/`WaitResult::TimedOut` arms, `handle_approve`'s
+  success arm, `handle_dismiss`'s found arm) fires only after the
+  `ParkRegistry` method or `verify_totp_gate` call that produced its
+  id/ask/grant has already returned (their own internal locks are
+  acquire-then-release entirely inside those functions, never held across
+  the return). Don't add a notify call inside a `_guard = ...lock()...`
+  scope; a future call site follows the same rule. **`append_events_feed`
+  (P-G4, task #77) is reached ONLY from inside `emit_notify` and inherits
+  this same guarantee rather than re-earning it** — don't call it from
+  anywhere else without re-deriving the no-lock-held proof this note gives
+  `emit_notify`'s own three call sites.
+- **`released` fires ONLY on a TOTP-free grant, never on a code-verified
+  one (P-N3).** `GateOutcome::Granted`'s `totp_free: bool` field is the ONE
+  place this is decided — set once in `resolve_gate` from the SAME
+  `totp_required` call that already gated the `if` (never a second policy
+  load to re-derive it). A resolve that validated its own inline `--totp`
+  code is granted exactly as before but must never notify — the caller
+  already knows, they just typed the code. Don't collapse `totp_free`
+  back out of `GateOutcome::Granted` "since both grant the same way" — it
+  is the only signal `handle_resolve` has to tell the two apart.
+- **No dedup or throttle on any notify event, deliberately (P-N3, User
+  decision).** Every TOTP-free resolve fires its own `released` line, even
+  a tight loop from the same consumer. Don't add a rate limit, a time
+  window, or a "same secret+consumer within N seconds" collapse ahead of
+  real spam evidence from a live deployment — the same "wait for the field
+  to complain" discipline P-V4d/e/f/g were each born from.
+- **`aoide-secrets` depends on nothing that could reach the desktop herald
+  (P-N3, and stays that way).** `conduct/src/graph/permit.rs`'s summons
+  publishes through `crate::herald::publish`/`crate::shellbridge::send_line`
+  — both live in `aoide-conduct`, a DIFFERENT crate this crate's own
+  `Cargo.toml` does not and must not depend on (`aoide-secrets` depends on
+  `aoide-protocol`/`libc`/`serde`/`serde_json` only). Don't add an
+  `aoide-conduct` (or `aoide-storage`, or `aoide-client`) dependency to
+  reach `herald` "since permit.rs already has the seam" — that crate's own
+  shellbridge socket only exists while a desktop session's bridge daemon is
+  running, and this broker is meant to run headless as a system service
+  with no desktop present at all. A future popup phase reads this crate's
+  own emission (`README.md`'s "Broker notifications", the pickup-point
+  note) from the OUTSIDE — a new adapter in `aoide-conduct`/`lyra`, never a
+  new dependency edge pointing the other way.
+- **The `age` backend's identity is minted ONLY from the `put`/SET path,
+  NEVER from `get`/GET (P-G1, task #70, hard constraint).**
+  `backend::mint_age_identity_if_needed` is called ONLY inside
+  `broker::put_gate`'s own critical section (the SAME `put_lock` that
+  already guards the existence-probe->store section — one lock, not a
+  second one, since a concurrent identity bootstrap has the identical
+  TOCTOU shape); `backend::fetch_value` checks for a missing `age.key` and
+  returns `missing_age_identity_hint`'s taught error instead of ever
+  minting one. Don't add a mint call anywhere on the resolve/GET path
+  "for convenience" — a plain read must never have the side effect of
+  silently provisioning key material nobody asked for.
+- **`age.key` absent is NOT by itself "safe to mint" — a mint over
+  orphaned ciphertext is REFUSED, never silent (judge fix, this commit,
+  hard constraint).** `backend::mint_age_identity_if_needed` checks
+  `backend::has_orphaned_age_ciphertext(secrets_home)` (any `*.age` file
+  under `<home>/values/`) BEFORE ever calling `age-keygen`, and returns
+  `backend::orphaned_age_ciphertext_refusal()` instead of minting when
+  orphans exist — a freshly minted identity can never decrypt ciphertext
+  produced under a DIFFERENT, now-missing one, and minting anyway would
+  silently and permanently orphan every value already encrypted under the
+  lost identity while `has_value` kept reporting them as present.
+  `backend::missing_age_identity_hint` (the `get`-side taught error) runs
+  the SAME check and swaps its advice accordingly — it must never tell an
+  operator to run `secrets put` when orphans exist, since that call would
+  now be refused anyway and the advice would just be wrong twice over.
+  Don't special-case this away for "a fresh `put` should just work" — the
+  refusal exists precisely because the home ISN'T fresh in that case, and
+  the two real fixes (restore `age.key`, or remove the orphaned `.age`
+  files) are the only ways out.
+- **A backend's OPTIONAL `has` template (P-G1, task #70) is `#[serde(default)]`
+  and changes NOTHING for a backend that doesn't carry one.**
+  `backend::has_value` runs `Backend::has` when present (treating exit 0
+  as "has a value") and falls back to its pre-existing
+  `fetch_value(...).is_ok()` probe when absent — byte-identical to every
+  `has_value` call before this field existed. Don't make `has` load-bearing
+  for a backend that omits it; the fallback is not merely a migration
+  shim, it is the PERMANENT behavior for any backend that never adopts
+  `has`.
+- **`secrets add`'s backend defaults to `age`, not `file`, when
+  `--backend` is omitted (P-G1, task #70, DEFAULT FLIP).**
+  `commands::DEFAULT_BACKEND` is the ONE place this is decided — an
+  ALREADY-recorded policy's `backend` field is never touched by this flip
+  (only a brand-new `add` with the flag omitted is affected), and an
+  explicit `--backend` still wins outright. Don't special-case an
+  "upgrade an old `file` policy to `age`" migration anywhere — this flip
+  changes a future default, never a past record.
+- **`pass`/`gopass`/`bw`/`sops` are documentation-only presets, and stay
+  that way (P-G1, task #70, restated as a crate stance).** `file`/`age`
+  are this crate's only SUPPORTED backend implementations — `backend.rs`
+  itself still carries no per-backend knowledge of any of the four
+  documentation-only presets, and no test in this crate exercises them.
+  Don't add code that assumes `pass`/`gopass`/`bw`/`sops` behave a
+  particular way (parsing their stdout beyond the generic trim-one-newline
+  rule, special-casing their exit codes, etc.) — a preset row in
+  "Backend presets" is the full extent of this crate's involvement with
+  any of them.
+- **`backend::backfill_missing_backends` (P-G2, task #72) only ever ADDS a
+  missing built-in BY NAME — it never touches an entry already present,
+  built-in or not, and never compares content.** An `age` (or `file`) key
+  already in `backends.json` — even one an operator hand-customized under
+  that name — is left completely alone; only an ABSENT key gets the
+  built-in's default shape inserted. This is the additive backfill the
+  P-G1 review fix's own note left open ("An EXISTING deployment's
+  `backends.json`... this does NOT backfill" — that invariant above, now
+  superseded by this one closing the gap it named). Don't make this
+  function overwrite or "repair" an existing entry under a built-in's
+  name — presence of the key is the only test, forever. **Corollary
+  (judge fix, this commit, doc correction): a hand-edited entry that is
+  merely INCOMPLETE — missing `has`, say, but still present under the key
+  `age`/`file` — is invisible to this function for the exact same reason,
+  and so is a future CHANGE to a built-in's own template text
+  (`AGE_BACKEND_GET`/`FILE_BACKEND_SET`/etc.).** Presence of the top-level
+  NAME is the whole test; this function has no path that ever re-derives
+  or corrects the SHAPE of an already-present entry, and this stays true
+  after task #82 below — `backfill`/`seed_default_backends` still never
+  rewrite an already-present entry's STORED bytes, full stop. **What
+  changed at task #82: a built-in's template text no longer needs the
+  file's bytes rewritten to take effect.** `backend::resolve_backend` (the
+  invariant below) makes `file`/`age`'s stored `get`/`set`/`has` text
+  irrelevant at USE TIME — every read/write goes through this binary's own
+  current compiled default regardless of what backfill/seeding left on
+  disk under those two names. Don't read this bullet as saying a built-in
+  template change is still unreachable; it is reachable, just through a
+  different seam than this function ever gained.
+- **Backfill writes NOTHING when nothing was missing (P-G2, task #72) —
+  checked before ever opening a temp file, not merely a same-content
+  rewrite.** A `backends.json` that already carries both built-ins must
+  come out of `backfill_missing_backends` with its mtime UNCHANGED — don't
+  turn this into an unconditional "reserialize and rewrite" that happens
+  to produce the same bytes; the write itself must not happen at all when
+  the `added` flag stays false.
+- **Backfill runs at the SAME startup site as seeding, immediately after
+  it, and never instead of it (P-G2, task #72).** `broker::serve` calls
+  `seed_default_backends` then `backfill_missing_backends`, both non-fatal
+  on error, same posture. Seeding owns the ABSENT-file case exclusively
+  (unchanged since P-V4c); backfill owns the EXISTING-file case
+  exclusively — on a fresh home, seeding writes both built-ins and the
+  backfill call that follows is then a guaranteed no-op (nothing missing).
+  Don't merge the two into one function or reorder them; a caller
+  (`broker::serve`, and only `broker::serve` — the ONE seeding/backfill
+  site) always calls both, in that order.
+- **`secrets migrate` is an EXPLICIT, operator-invoked action — never an
+  automatic upgrade of an old policy's `backend` field (P-G2, task #72).**
+  This does not contradict the DEFAULT-FLIP invariant above ("this flip
+  changes a future default, never a past record... don't special-case an
+  upgrade migration anywhere") — that invariant forbids `secrets add`'s
+  default flip from silently rewriting an EXISTING policy; `secrets
+  migrate` is the opposite of silent: a named admin command an operator runs
+  on purpose, against a name they typed, gated by the same admin-identity
+  check every other CRUD command holds. Don't wire anything (a startup hook,
+  a `set-totp`/`automate`/`expose` side effect, `backfill_missing_backends`
+  itself) to call migrate's logic automatically for any policy — every
+  migration is a deliberate, one-secret, operator-typed command.
+- **`secrets migrate`'s value NEVER crosses a wire and lives ONLY as a
+  local `String` inside `commands::handle_secrets_migrate` (P-G2, task
+  #72).** Unlike `put`/`resolve`/`approve`, migrate is a DIRECT-HOME admin
+  command (mirrors `add`/`rm`/`grant` exactly, `commands.rs`'s own door
+  taxonomy) — it never touches the broker's unix socket at all, so there
+  is no wire reply to keep value-free the way `put`'s/`resolve`'s own
+  replies must be; the discipline here is instead that the value never
+  becomes an `Outcome` field, an audit line, or an error string, from the
+  `backend::fetch_value` call that produces it straight through to the
+  `backend::store_value` call that consumes it and drops it.
+- **`secrets migrate`'s ordering is: fetch → (maybe mint) → store on the
+  TARGET → flip + save `policy.json` → remove the OLD value LAST, and ONLY
+  ever in that order (P-G2, task #72, hard constraint).** Any failure
+  BEFORE the policy save leaves everything untouched — the old value in
+  place, `policy.json` unflipped. Removing the old value only ever happens
+  AFTER the policy flip has already durably saved; a removal failure (or a
+  source backend this crate can't derive a path for) is reported honestly
+  in the success message but never rolls back the already-successful
+  migration and never blocks it. Don't reorder this — removing the old
+  value before the new one is confirmed stored, or before the policy flip
+  is saved, would leave a WINDOW where neither backend has a value the
+  policy can resolve.
+- **A migrate onto `age` warns, in the success message itself, that
+  `age.key` is now the ONLY decryptor of the moved value (judge fix, this
+  commit).** `commands::handle_secrets_migrate` appends one fixed sentence
+  whenever `target == "age"` — never on a migrate landing anywhere else,
+  since it isn't the backend the value just moved onto. This is a message
+  addition only: it changes no ordering, no gating, no wire shape: don't
+  fold it into a bigger "warn before any key-lifecycle-risky op" mechanism
+  — the whole crate has exactly one such op today (`migrate` onto `age`),
+  and a generic middleware for one call site is the wrong size.
+- **Old-value removal is BUILT-IN-SOURCE-ONLY and PATH-DERIVED, never a
+  guess (P-G2, task #72).** `backend::remove_builtin_value` recognizes
+  exactly two source backend names — `file` (`<home>/store/<key>`) and
+  `age` (`<home>/values/<key>.age`), the SAME paths `FILE_BACKEND_SET`/
+  `AGE_BACKEND_SET` themselves write to — and returns `None` for any other
+  backend name, built-in or not (a `pass`/`gopass`/`bw`/`sops` row, or an
+  operator-custom entry). `<key>` is the policy's own `key` field (what a
+  template's `{name}` placeholder substitutes — `backend.rs`'s module
+  doc), never the secret's display `name`. Don't add a third built-in path
+  here without also adding a real seeded backend for it (`backend.rs`'s
+  own "the only backend IMPLEMENTATIONS this crate supports" stance) —
+  this function must never derive a path for a backend the crate doesn't
+  actually seed and know the on-disk shape of.
+- **Every admin CRUD command — `add`/`rm`/`grant`/`revoke`/`set-totp`/
+  `automate`/`expose`/`migrate` — routes through the LIVE BROKER FIRST
+  (task #79), executed inside the SAME `broker::put_lock` critical section
+  a `put` already runs under: one process, one writer, one lock guarding
+  every `policy.json`/backend-store read-modify-write this crate makes.**
+  `commands.rs`'s own handlers (`admin_dispatch`) send an
+  `{"op":"admin","command":...}` request over the socket FIRST; `broker::
+  handle_admin` peer-cred-gates it (`admin_gate`, ONLY the broker's own
+  effective uid — root and an unidentified connection both refused, the
+  identical taught error `home::admin_identity_error` already gives on the
+  direct path, since this reuses that exact function rather than a second
+  wording) and runs the mutation via `crate::admin`'s typed functions
+  (`add`/`rm`/`grant`/`revoke`/`set_totp`/`expose`/`automate_toggle`/
+  `automate_consumer`/`migrate` — the SAME logic the direct-write path
+  calls, never duplicated) inside `put_lock`. This is what closes the
+  TOCTOU the daemon-running case used to have: a `secrets migrate` (or any
+  other admin command) racing a live `secrets put`/`secrets exec` against the
+  same secret now serializes behind the identical lock, exactly the way two
+  concurrent `put`s already did before this phase.
+  **KNOWN LIMITATION, narrowed by task #79, deliberate, not fixed here:**
+  the direct-write path (`crate::admin`'s functions called straight from
+  `commands.rs`, no socket, no lock) is reached ONLY as a fallback, and
+  ONLY on `AdminError::NoSocket` (`client::admin_request`'s own doc —
+  `ENOENT`/`ConnectionRefused`, nothing listening; any OTHER socket error
+  is reported outright, never silently downgraded into this fallback, so a
+  live-but-sick daemon can never be bypassed into a TOCTOU). With NO daemon
+  running at all, two CONCURRENT direct-write admin processes racing each
+  other against the same secret still have no cross-process lock to
+  serialize behind — a `static Mutex` is per-process memory, and there is
+  no daemon process for either of them to route through in the first
+  place. This is now the ENTIRE remaining gap (was: any admin command racing
+  the live daemon at all); closing it for real needs a genuine
+  cross-process primitive (a file lock) this crate does not have today —
+  out of scope here, flagged for whoever picks it up next. Don't paper over
+  it by acquiring `broker::put_lock` from `commands.rs`'s own fallback
+  branch "for symmetry" — there is no daemon process alive to hold that
+  lock's state, so doing so would protect nothing while implying a
+  guarantee that doesn't exist.
+- **Both built-in `set` templates are ATOMIC — `.tmp`-then-`mv`, matching
+  `storage::fs::atomic_write`'s temp-then-rename shape (task #82).**
+  `FILE_BACKEND_SET`/`AGE_BACKEND_SET` write to a `.tmp`/`.age.tmp` sibling
+  in the SAME directory first, then `mv` it over the real destination —
+  `mv` within one directory is `rename(2)`, so the real path is at every
+  instant either fully the OLD value or fully the NEW one, never torn,
+  even if the broker is killed mid-write or the template fails partway
+  (a failure now leaves the OLD value completely untouched instead of
+  possibly truncating it on the way to failing). These templates run as
+  SHELL TEXT under the broker uid (module doc, house rule 7) — there is no
+  Rust I/O call to make atomic here, so the atomicity has to live in the
+  template text itself. A stale orphaned `.tmp`/`.age.tmp` left by an
+  interrupted run is harmless clutter, overwritten the same atomic way by
+  the next successful `set` to that key. A future built-in `set` template
+  (there are none planned) follows this same `.tmp`-then-`mv` shape — never
+  a direct write to the live path.
+- **`backend::resolve_backend` makes `file`/`age`'s STORED template text
+  advisory, never authoritative (task #82) — the ONE seam
+  `fetch_value`/`has_value`/`store_value` route through instead of reading
+  a loaded `Backends` map directly.** For a name it recognizes as built-in
+  (`file`, `age` — [`builtin_backend_defaults`]'s match, the SAME two names
+  `seed_default_backends`/`backfill_missing_backends` ever insert by name),
+  the `get`/`set`/`has` text actually loaded from `backends.json` is
+  IGNORED in favor of this binary's OWN CURRENT compiled constant
+  (`FILE_BACKEND_GET`/`AGE_BACKEND_SET`/etc.) — closing the gap the
+  bullet above (backfill/seeding) used to name as a queued follow-up: a
+  template fix now reaches every already-deployed `backends.json` the
+  moment the broker restarts, with NO file rewrite and NO migration step.
+  **Presence of the name in `backends.json` is UNCHANGED by this** — a
+  `file`/`age` entry still has to exist there (seeding/backfill's own job,
+  untouched) or resolution still fails with `unknown backend`, exactly as
+  before this function existed; only the on-disk TEXT under those two
+  names stops being read. Any name `builtin_backend_defaults` does NOT
+  recognize (`pass`/`gopass`/`bw`/`sops`, any operator-custom entry) is
+  returned from `backends.json` EXACTLY as stored — this crate has and
+  makes no opinion about a non-built-in entry's template text, unchanged.
+  Don't add a third recognized name to `builtin_backend_defaults` without
+  also giving it a real seeded default the way `file`/`age` have one
+  (`backend.rs`'s own "the only backend IMPLEMENTATIONS this crate
+  supports" stance, restated above) — this function must never resolve a
+  name to compiled-in text the crate doesn't actually own the shape of.
+- **Every `client.rs` socket op bounds its CONNECT, not only its reads
+  (rider task).** `client::connect_bounded` is the ONE place this crate
+  opens a connection to the broker's socket — `resolve`/`resolve_bounded`/
+  `put`/`pending`/`approve`/`dismiss` all route through it (a fixed 5s
+  bound, no env override) instead of a bare `UnixStream::connect`, since
+  `std`'s `UnixStream` has no `connect_timeout` and a saturated accept
+  backlog (plausible when many callers legitimately hold a parked
+  connection open for up to `park::park_timeout()`, default 300s) could
+  otherwise block the connect syscall itself, past any read-side bound a
+  caller thought it had. Hand-rolled via `libc`, over TWO genuinely
+  different failure shapes — this is load-bearing, not incidental (a
+  review-bounce fix, this commit, proved it with a raw-libc probe on this
+  kernel): `EINPROGRESS` (a real half-open connection — waited out with
+  `poll(POLLOUT)` then `SO_ERROR`, the same pattern `std` itself uses
+  internally for `TcpStream::connect_timeout`) and `EAGAIN` (a SATURATED
+  `AF_UNIX` listen backlog — Linux returns this IMMEDIATELY, never
+  `EINPROGRESS`, so there is no half-open state to `poll()` at all, only a
+  rejected ATTEMPT; handled by retrying the `connect(2)` SYSCALL ITSELF on
+  a short interval, `CONNECT_RETRY_INTERVAL`, bounded by the same overall
+  budget). **Don't collapse `EAGAIN` back into the `EINPROGRESS`/`poll()`
+  path "for simplicity"** — the first version of this function did exactly
+  that (fell through to an immediate hard error), which made the
+  saturated-backlog scenario this function exists for WORSE than the old
+  blocking `UnixStream::connect` it replaced. No new dependency
+  (`socket2` was considered and rejected — zero new deps is the house
+  rule, and `libc` was already present). Returns the identical
+  `io::Result<UnixStream>` shape `UnixStream::connect` always did, so
+  `describe_connect_error` needed no change. A new client op added to this
+  module connects through `connect_bounded`, never a bare
+  `UnixStream::connect` — that would silently reopen this exact gap for
+  just that one op.
+
+## Extension points
+
+- **A new hash/HMAC primitive** (this crate has none planned — SHA-1 is
+  fixed by RFC 6238's default and this crate's whole TOTP surface) would
+  get its own module beside `sha1`/`hmac`, same zero-dependency rule, same
+  RFC-vector-as-test-suite discipline.
+- **`secrets enroll` + real TOTP verification LANDED at P-V3** —
+  `broker::verify_totp_gate` wires `totp::verify`/`replay::ReplayLedger`
+  into `resolve_gate`'s `requireTotp` branch, and `store::
+  load_replay_ledger`/`save_replay_ledger` give the ledger its secrets-home
+  file.
+- **Deployment LANDED at P-V4** — `broker::bind_socket` chmods the socket
+  to `0660` on bind (group-connectable is the DESIGN; group OWNERSHIP is
+  `modules/nucleus/secrets.nix`'s job via the service's `Group=`, never this
+  crate's — see `broker.rs`'s module doc and this file's own invariant
+  below). The real `/var/lib/aoide-secrets` path and a real `aoide-secrets`
+  system user are provisioned by that nix module (nix-dependent by design
+  — root `AGENTS.md`'s HARD CONSTRAINT carves out systemd packaging) or by
+  the non-nix `useradd`/`groupadd` path in `README.md`'s "Deployment"
+  section (any init, or none — the broker binary itself never gained a nix
+  dependency). Only P-V5 (mesh pairing, gated on #51) is still ahead.
+- **P-V4d fixed two bugs the first live deployment (yomi-strix) found that
+  the sandboxed gates could not see.** `socket::socket_path()`'s default is
+  now the fixed `/run/aoide-secrets/secrets.sock` (never derived from
+  `home::secrets_home()` — see `socket.rs`'s module doc), so an env-less
+  client shell (`aoide secrets exec`/`put` run by hand) resolves the real
+  deployed socket with no export needed. `modules/nucleus/secrets.nix`'s
+  service gained `path = [ pkgs.bash pkgs.coreutils ]` (a systemd unit's
+  default `PATH` carries no `sh`, and every backend template — including
+  the built-in `file` backend's own `get`/`set` — runs via `sh -c`) and
+  `environment.systemPackages` gained `pkgs.qrencode` (the first live
+  `secrets enroll` found it missing from the operator's own shell). Don't
+  reintroduce a secrets-home-relative socket default; the whole point of
+  P-V4d was that the client and the service must agree on the socket path
+  without per-shell env.
+- **Backend adapter DOC PRESETS** (`pass`/`gopass`/`bw`/`sops`) landed at
+  P-V3 in `README.md`'s "Backend presets" section — `backend.rs` itself is
+  unchanged (it never gained backend-specific knowledge, by design). QR-
+  code rendering for `secrets enroll`'s URI lives in `enroll::render_qr`
+  (`qrencode` shell-out, feature-detected, not a Cargo dependency).
+- **The built-in `file` backend + the write half LANDED at P-V4c** —
+  `backend::Backend` gained an optional `set` template and the `{home}`
+  placeholder (`backend::expand_template`, a single left-to-right scan —
+  never a sequential two-pass `.replace()`, module doc); `backend::
+  seed_default_backends` seeds `backends.json` with `file` when absent,
+  called once from `broker::serve`'s startup (the one seeding site, that
+  function's own doc); `broker::handle_put`/`put_gate`/`audit_put` are the
+  broker-side `put` op (policy-exists + backend-has-`set` gate only, no
+  `requireTotp`, no `consumer`); `client::put`/`run_put` and `commands::
+  handle_secrets_put` are the client-side flow, registered as a PLAIN
+  handler (not a `special`-hook case — `commands.rs`'s own module doc
+  explains why `exec`/`enroll` needed that escape and `put` doesn't). A
+  NEW backend preset with its own `set` template follows the exact same
+  table-row shape "Backend presets" already documents — no code changes
+  needed for one, `file` was the one exception because it ships SEEDED,
+  not merely documented.
+- **Secrets pairing / mesh replica sharing** (P-V5, gated on #51) is a new
+  module beside `broker`, not a growth of `broker`'s own resolve path —
+  see the plan's "Mesh sharing" section for the separate loopback channel.
+- **The admin-identity guard LANDED at P-V4f** — see the invariant above
+  for the shape; the next admin command that touches `policy.json`/
+  `totp.secret` calls `commands::require_admin_identity` (or, if its real
+  work lives outside `commands.rs`'s own dispatch the way `enroll::run`'s
+  does, `home::admin_identity_check` directly) right after its `require_cli`
+  gate, before any read-modify-write.
+- **Two live UX gaps closed at P-V4e** — `secrets set-totp <name> on|off`
+  (`commands::handle_secrets_set_totp`) flips an existing policy's
+  `require_totp` bit through `store::load_policies`/`save_policies`, the
+  same round trip `add`/`grant`/`revoke` already use; it is the replacement
+  for hand-editing `policy.json` with a `jq` one-liner as the secrets user.
+  `secrets enroll --show` (`enroll::show`) reprints an EXISTING
+  enrollment's URI/base32/QR through the SAME `enroll::print_enrollment`
+  tail `run` uses, calling neither `generate_secret` nor `store::
+  save_totp_secret`/`save_replay_ledger` — there is nothing in it that
+  could rotate anything. `commands::handle_secrets_enroll` rejects
+  `--force`+`--show` together as a usage error; `cli`'s `special` hook
+  dispatches to `run` or `show` from the SAME `["secrets", "enroll"]` arm,
+  never a second one. A new read-only reprint of some OTHER already-
+  persisted secret-adjacent state (not TOTP) follows this same shape: a
+  sibling function beside the mutating one, sharing its rendering tail,
+  called from the SAME special-hook arm behind a flag, never a new path.
+- **Denials name the cause and teach the fix, P-V4g (this commit).**
+  `home::describe_home_file_error(home, file, &io_err)` is the ONE seam
+  EVERY `policy.json`/`totp.secret`/`totp-replay.json`/`backends.json`
+  load/save call site in this crate routes a `PermissionDenied` through —
+  not only the admin CRUD commands (`commands.rs`'s CRUD quintet via its
+  local `policy_io_error` wrapper, `enroll::run`/`enroll::show` directly),
+  but also the broker's own AGENT-facing gates (`broker::resolve_gate`/
+  `put_gate`, reached by `secrets exec`/`put` — the primary agent-facing
+  path, and the one the User actually hit live) and `backend::
+  load_backends` — the poisoned-file case: the admin-identity guard
+  already proved this process's euid owns the secrets HOME directory, but
+  an individual file inside it can still be owned by a stale uid from
+  before that guard existed, and a bare `format!("policy.json: {e}")` gave
+  zero indication why at ANY of those sites, not only the admin ones. It
+  teaches `sudo chown --reference=<home> <file>` rather than a literal
+  `chown aoide-secrets: ...` — this crate only ever learns uids, never a
+  username, and `--reference` sidesteps needing one. Don't add a NEW
+  policy.json/backends.json-adjacent read/write path that skips this seam
+  "because it's not an admin command" — the broker gap this note replaces was
+  exactly that mistake. `client::describe_connect_error`
+  is the client-side sibling: `resolve`/`put`'s `UnixStream::connect`
+  failure maps `PermissionDenied` to "this session isn't in
+  `aoide-secrets-access` yet" (teaching BOTH `sg aoide-secrets-access -c
+  '<cmd>'` and a fresh login — group membership is login-scoped) and
+  `NotFound`/`ConnectionRefused` to "the broker isn't running" (teaching
+  `systemctl status aoide-secrets-serve` and the `AOIDE_SECRETS_SOCKET`
+  override). Both functions are PURE given an injected `io::Error` — no
+  real stat/socket needed to unit-test them — and every OTHER
+  `io::ErrorKind` rides through unenriched, exactly as before this commit;
+  don't widen either match arm to a kind it hasn't been proven to mean.
+  Client-side messages only — neither function self-invokes `sudo`/`sg`,
+  and neither prompts interactively; they only print what to run. A new
+  admin-command file or a new client socket op reuses these two functions
+  rather than hand-rolling a third diagnosis.
+- **`secrets put`'s stdin intake grew a tty branch at P-V4e**
+  (`client::stdin_is_tty`/`client::read_hidden_line`) — when stdin is a
+  terminal, `run_put` prompts on stderr and reads with echo disabled
+  instead of requiring a pipe. **P-I1**: the echo-disable mechanism is
+  `aoide_protocol::pick::hidden_input` (`inquire::Password`) — before this
+  phase, `read_hidden_line` cleared `ECHO` on stdin's own `libc::termios`
+  by hand and restored it unconditionally, even on a read error; that
+  hand-rolled dance is retired, `read_hidden_line`'s name/signature/call
+  sites are unchanged. A piped/redirected stdin is BYTE-IDENTICAL to
+  before — `run_put`'s non-tty branch is the original `read_to_string`
+  call, untouched by either phase. Don't let the tty branch's prompt logic
+  leak into the pipe branch "for consistency"; they are deliberately two
+  separate code paths with different contracts (a script's piped bytes are
+  the value verbatim, never trimmed; a human's typed line comes back from
+  `hidden_input` with no trailing newline to strip at all — Enter submits
+  the prompt, it was never part of the value — unlike the OLD
+  `read_line`-based path, which needed `client::strip_one_trailing_newline`
+  to remove the one that key press produced — that function still exists
+  and is still exercised: `watch.rs`'s `--popup` zenity-entry reader is
+  its other reuse, untouched by this phase).
+- **`secrets put` warns and confirms before an overwrite, P-67 (this
+  commit).** The wire's `put` op gained an optional `overwrite` bool
+  (absent means `false`); `broker::put_gate` probes existence via
+  `backend::has_value` (just `fetch_value(...).is_ok()` — no new
+  per-backend primitive) and refuses with the distinct `{"exists":true}`
+  reply when `overwrite` is false and a value already exists, never
+  touching the backend's `set` template on that path. `client::put` now
+  returns `Result<bool, PutError>` (`bool` = `replaced`,
+  `PutError::Exists` = the wire's flag, `PutError::Other` = everything
+  else); `client::run_put` takes a `force` bool (the CLI's new `--force`
+  flag) that rides as `overwrite` on the FIRST attempt, and on a tty
+  `PutError::Exists` refusal, prompts `y/N` and retries with the SAME
+  in-memory value + `overwrite:true` on yes — a non-tty stdin gets
+  `client::non_tty_exists_message` (a pure function) instead, since there
+  is no one to confirm with. `broker::audit_put` carries the same
+  `replaced` distinction into both audit logs, names only. A future op
+  that could similarly clobber existing state follows this same shape: a
+  broker-side existence/state probe, a machine-readable flag on the
+  refusal (never string-matched prose), and the client-side confirm/force
+  split living in that op's own client function — not a generic
+  "confirm before mutation" middleware, since each op's own gate already
+  knows its own state.
+- **Two per-secret policy gates + their admin commands landed at P-N1.**
+  `Policy` gained `automation: {enabled, consumers[]}` and `remote: bool`,
+  both `#[serde(default)]` so an existing `policy.json` predating this
+  phase loads cleanly as automation-disabled/empty and `remote: false` —
+  see `policy.rs`'s round-trip tests for both the old and new shape.
+  `policy::totp_required(policy, consumer)` is the new single decision
+  point (invariant above) `broker::resolve_gate` calls instead of reading
+  `policy.require_totp` directly. `secrets automate <name> on|off|grant|
+  revoke` and `secrets expose <name> on|off` are plain handlers
+  (`commands::handle_secrets_automate`/`handle_secrets_expose`) — same
+  `require_cli` + `require_admin_identity` gate, same idempotent
+  "unchanged" reporting as `set-totp`, appended LAST in `register()`
+  (golden 61 -> 63).
+- **A `totp_required` `true` result with no code PARKS instead of refusing
+  outright, landed at P-N2 (golden 63 -> 66).** `broker::resolve_gate`
+  returns `GateOutcome::NeedsTotp` (invariant above) instead of an
+  immediate denial when a code is required, enrolled, but absent/empty on
+  the wire; `handle_resolve` registers the ask in `park::ParkRegistry` and
+  blocks the CONNECTION'S OWN THREAD on `park::wait_for_outcome`, which is
+  why `serve`'s accept loop moved to thread-per-connection this phase
+  (invariant above — a hard constraint, not a style choice). Three new
+  CLI-only, `require_cli`-but-NOT-`require_admin_identity` commands complete
+  or refuse a parked ask over the socket, same operator-side-not-admin-side
+  shape `put`/`exec` already draw: `secrets pending` (lists asks, never a
+  value), `secrets approve <id> --totp <code>` (validates with the SAME
+  `verify_totp_gate` an inline code uses, fetches fresh, releases down the
+  ORIGINAL connection — an invalid code leaves the ask parked, ledger
+  unburned), `secrets dismiss <id>` (clean refusal to the original caller,
+  no code needed). `resolve` gained one optional wire field, `wait`
+  (default `true`) — `wait:false` is the wire-only (no CLI flag) escape
+  hatch back to the pre-P-N2 immediate refusal. Timeout is
+  `AOIDE_SECRETS_PARK_TIMEOUT` (default 300s, env-only — no config-file
+  knob exists in this crate for numeric settings, and none was invented for
+  this). A future phase adding a code-entry UI (a popup, a notification)
+  reads `secrets pending`/calls `secrets approve`/`secrets dismiss` the
+  SAME way an operator's terminal does — this phase is explicitly the
+  substrate for that, not a preview of it; no UI code lives in this crate.
+- **P-N2c (this commit) — four judge-pass fixes on the P-N2 park/approve/
+  dismiss lifecycle, all landed together:** the interim-line framing +
+  STDERR park announcement (FIX 1, invariant above), `approve`'s release-
+  time re-gate against the ask's stored consumer (FIX 2, invariant above,
+  hard constraint), the fallible `Builder::spawn` + accept-loop backoff +
+  registry-wide park cap (FIX 3a/3b/3c, invariants above), and
+  nonce-prefixed ids (FIX 4, invariant above). Two small honesty fixes rode
+  the same commit: the dismissed-caller message no longer claims "by an
+  operator" (any group member reaching the socket can dismiss, not only an
+  operator), and `park::wait_for_outcome`'s doc comment no longer claims
+  its lost-race `recv()` is "provably prompt" — a hung backend shell-out
+  breaks that promise (see the note below, closed at task #74 — bounded,
+  not eliminated), so the comment now states the assumption instead of
+  overclaiming it.
+- **Broker event notifications LANDED at P-N3.** `emit_notify` (`broker.rs`)
+  fires a name-only line for five events (`released`/`parked`/`completed`/
+  `dismissed`/`expired`) into the SAME two destinations every `audit_*`
+  function already writes to — see `README.md`'s "Broker notifications" for
+  the exact shapes and the mechanism reasoning (the `herald`-publish seam
+  `conduct/src/graph/permit.rs` uses was checked FIRST and ruled out: it
+  lives in `aoide-conduct`, a dependency this crate must not gain — invariant
+  above). No adapter tails either destination yet, so this phase is
+  emission-only, the identical "substrate now, UI later" relationship P-N2's
+  own park/approve/dismiss lifecycle already has to a future popup (P-N2's
+  own extension-point note above). The next phase that builds that
+  tail/adapter lives in `aoide-conduct`/`lyra`, reading FROM this crate's
+  logs — never a new edge pointing the other way.
+- **The tail/adapter P-N3 left for a future phase LANDED at tracker #71
+  Part 1, IN THIS crate, not `aoide-conduct`/`lyra`** — `watch.rs` (one of
+  the seven I/O modules, invariant above) tail-follows the SAME mirrored
+  log P-N3 writes to and narrates its five events, plus prompts inline for
+  a parked ask when stdin is a terminal. This does NOT contradict the P-N3
+  note above ("never a new edge pointing the other way"): `watch` adds NO
+  new dependency edge — it lives inside `aoide-secrets` itself and reaches
+  `client::pending`/`approve`/`dismiss` the same way `commands.rs` already
+  does, never a socket into `aoide-conduct`/`herald`. See `README.md`'s
+  "Watching events" section for the full mechanism. **Correction, tracker
+  #71 Part 2: the graphical popup ALSO landed IN THIS
+  crate**, not as an `aoide-conduct`/`lyra`-side subscriber of `secrets
+  watch --json` the way this note originally anticipated — see the
+  invariant immediately below for why, and `README.md`'s "Popup mode"
+  section for the full mechanism.
+- **The mirrored `~/Aoide/log` tail LANDED at tracker #71 Part 1 was
+  ITSELF REPLACED at P-G4 (task #77): `watch.rs` now tail-follows a
+  broker-owned EVENTS FEED instead, not the mirrored aoide log.** Found
+  live on yomi-strix (2026-08-23): the deployed broker unit runs with
+  `ProtectHome=true` (`modules/nucleus/secrets.nix`), so `emit_notify`'s
+  best-effort mirror into the operator's `~/Aoide/log` silently failed
+  there — `secrets watch` received ZERO event lines and fell back to its
+  30s pending-reconcile tick for EVERY popup, turning the "about a second"
+  design intent into "up to 30s late, and a stale dialog can linger up to
+  30s after resolution." `broker::append_events_feed`/`socket::events_path`
+  are the fix: a THIRD `emit_notify` destination beside the broker's own
+  socket (`/run/aoide-secrets/events.jsonl` by default, env override
+  `AOIDE_SECRETS_EVENTS`), inside the SAME `RuntimeDirectory` the socket
+  itself already lives in, so it survives `ProtectHome=true` the same way
+  the socket does. `watch::parse_notify_line` now parses THIS feed's bare
+  `{"event": "<kind>", ...}` lines directly (no `AuditRecord` wrapper, no
+  `message`-as-JSON-string indirection — that shape only ever existed on
+  the mirrored-log side) and takes its `ts` as a PARAMETER rather than
+  reading one from the line (clock-as-parameter invariant above) since
+  none of `emit_notify`'s payload shapes carry a timestamp field. The
+  mirrored `~/Aoide/log` write in `emit_notify` is UNCHANGED — it still
+  serves the audit trail; only `secrets watch`'s own tail moved off it.
+  Capped at 1 MiB (`broker::EVENTS_MAX_BYTES`) since it is ephemeral cues
+  on `/run`'s tmpfs, not a second audit trail — past the cap, the next
+  append truncates the file to empty first rather than rotating it, which
+  `watch::Follower::poll`'s pre-existing `len() < pos` reopen-at-0 branch
+  (needed since P-N2c's own broker-restart case) already makes
+  transparent to a live tail with no changes needed there. Don't revert
+  `watch`'s tail source back to `dispatch::audit_log_path`/
+  `aoide_protocol::default_audit_log()` "for consistency with the other
+  audit-trail readers" — that mirror is exactly the path this fix moved
+  off of, for a proven, live reason.
+- **`--popup` (tracker #71 Part 2) is CORE, not a `lyra`/
+  desktop feature, and stays inside `watch.rs` — no new module, no new
+  crate dependency.** The root `AGENTS.md`'s own boundary line ("a
+  capability that works with only a shell and touches no paint is Aoide")
+  is why: `zenity` is a shell-out declared by NAME (`watch::ZENITY_CMD`),
+  the SAME feature-detection shape `enroll::render_qr` already uses for
+  `qrencode` — it is reachable from ANY shell with `zenity` on `PATH`, not
+  only a Quickshell/AoideOS session, so it belongs beside the tty prompt it
+  is an alternative to, not in `lyra`. A future RICE-SHAPED popup (matching
+  the desktop's own look, replacing zenity's default GTK chrome) would be
+  the `lyra`-side consumer of `secrets watch --json` this note originally
+  anticipated — `--popup` itself is not that, and does not block it.
+  **Codes never touch argv, in this popup path either** — `watch::
+  spawn_zenity_entry`'s `Command::new(zenity_cmd).args([...])` carries only
+  the dialog's TITLE and TEXT (secret name, consumer, remaining seconds,
+  all name-only, `README.md`'s own display-fields rule extended here); the
+  typed code arrives back over the CHILD's stdout pipe
+  (`run_zenity_entry`'s `child.stdout.take()`), never a command-line
+  argument, never a second process, never a temp file. Don't add a
+  `--totp`-shaped flag or an intermediate shell wrapper to this spawn path
+  that would put a code anywhere argv-visible — `client::approve` is
+  called with the code exactly the way the tty prompt already does.
+  **Popups are PARKED-ONLY, deliberately (User-flagged default)** —
+  `popup_loop` is only ever entered from a `parked` ask picked off the
+  SAME `Queue`/`pick_next` the tty prompt uses; `released`/`completed`/
+  `dismissed`/`expired` narrate on stdout in every mode (unchanged) but
+  never drive a dialog in ANY mode, popup included. Don't wire a second
+  event kind into `popup_loop`'s dialog trigger without re-deriving why
+  parked-only was chosen (the open Part-1 design question about a toast
+  storm from undeduped `released` events, resolved here by simply never
+  popping one up).
+  **Unlock gating is an OR of two probes, `watch::locked_state`, pure and
+  unit-tested with injected `Option<bool>`/`bool` — the two REAL probes
+  (`watch::probe_loginctl_locked`/`watch::probe_locker_running`) are thin
+  I/O wrappers this function never calls itself**, the same
+  clock-as-parameter split `unix_now()` already holds for the rest of this
+  module. `probe_locker_running` scans `/proc/<pid>/comm` for a name
+  configured by `AOIDE_SECRETS_LOCKER` (default `hyprlock`) — load-bearing,
+  not a redundant fallback, since the design doc verified hyprlock 0.9.6
+  sets no `LockedHint` at all; `probe_loginctl_locked` is still checked
+  first (OR'd, not replaced) so a locker that DOES set `LockedHint` is
+  still honored. An unanswerable probe (no session id, no `loginctl`, a
+  failed scan) reads as "not locked," never as "locked" — don't flip that
+  default; a false negative here only delays a dialog by one poll tick, a
+  false positive would silently show a code-entry dialog to whoever is
+  physically at a supposedly-locked screen.
+  **`watch::popup_action` orders near-expiry ahead of lock-wait, never the
+  reverse** — a dialog must not open below [`LOCKOUT_SECS`] EVEN IF the
+  screen happens to be unlocked at that instant, and an ask already too
+  late to show must never sit "waiting for unlock" either, since that
+  would only spend the time that's left doing nothing. Don't reorder this
+  check without re-deriving why (the pure `popup_action` unit tests assert
+  the ordering directly).
+  **A dialog left open for an ask that resolves ELSEWHERE gets killed by
+  its EXACT pid** — `watch::run_zenity_entry` holds the `std::process::
+  Child` it spawned and calls `child.kill()` on it directly (never a
+  re-derived pid from a stored integer, never a name/argv match) the
+  moment its own `should_cancel` closure (checking the SAME `Queue` the
+  tail thread mutates) reports the ask is gone. Don't replace this with a
+  polling check that merely stops WAITING for the child without killing
+  it — an orphaned zenity window left open for a completed ask is exactly
+  the failure mode this exists to close.
+  **`watch::run`'s zenity spawn path takes the binary name as a
+  parameter — never a hardcoded `Command::new("zenity")` inline at the
+  call site** — production passes the `watch::ZENITY_CMD` constant; this
+  crate's OWN tests pass a fake shim script's full path instead, so
+  `--popup`'s tests need no `PATH` mutation and no `env_lock` (unlike
+  `enroll::render_qr`'s older `PATH`-shim test). Don't inline
+  `Command::new("zenity")` into a new call site "since it's just one
+  string" — go through the same parameterized functions
+  (`spawn_zenity_entry`/`run_zenity_entry`/`zenity_available`) so a future
+  test can fake it the same way.
+- **The entry dialog is VISIBLE, and `lyra` is a SECOND feature-detected
+  dialog binary ahead of zenity's own (this commit, P3).** `--hide-text` is
+  gone from `spawn_zenity_entry`'s argv — a TOTP code is a 30-second secret
+  the operator is about to read off an authenticator, not a password worth
+  hiding; don't re-add it "for consistency with a password prompt," this
+  crate's own tty path (`client::read_hidden_line`) hides ADMIN input like
+  `secrets put`'s value, never a short-lived code. `watch::resolve_lyra_bin`
+  decides whether `lyra secrets ask --secret <name> --consumer <who>
+  --seconds <n>` replaces `zenity --entry` for a given dialog — it mirrors
+  `cli::commands::onboard::lyra_bin_if_resolved`'s exact env-tier/
+  sibling-tier/bare-name-on-`PATH` check (`aoide_protocol::bin::rice_bin` +
+  `on_path`) rather than importing it, since this crate cannot depend on
+  `aoide-cli` (no cross-crate copying invariant, `pkgs/aoide/crates/
+  AGENTS.md` — only the THREE-LINE "is it actually there" wrapper is
+  repeated; the resolver itself, `aoide-protocol::bin`, is not). **Presence
+  of `lyra` IS the choice — no `AOIDE_SECRETS_*` env var, no CLI flag, picks
+  between them** (plugin philosophy, root `AGENTS.md` house rule 7): don't
+  add one "for an operator who wants zenity even with lyra installed" without
+  a real complaint driving it, the same "wait for the field" posture this
+  crate's other UX knobs were all born from. `watch::spawn_lyra_entry`/
+  `watch::spawn_zenity_entry` are BOTH thin `Command::new(bin).args([...])`
+  builders feeding the SAME `watch::run_entry_dialog` wait/parse loop — this
+  is what makes the CONTRACT load-bearing rather than incidental: `lyra
+  secrets ask` (P3, `crates/lyra`) MUST print the code on stdout with exit 0
+  on submit, the literal string `Dismiss ask` on stdout with exit 1 on
+  dismiss, and any other non-zero exit for a bare cancel — byte-identical to
+  zenity's own `--extra-button` contract — because `run_entry_dialog` and
+  `popup_loop`'s kill-by-pid expiry path never branch on which binary
+  answered. Don't let a future `lyra secrets ask` change (a new flag, a
+  different exit code for some case) drift from this contract without
+  updating it here AND in `README.md`'s "Popup mode" section in the same
+  commit — the two binaries are interchangeable ONLY as long as this holds.
+  `run`'s own startup gate (`zenity_available`/`resolve_lyra_bin`) now
+  refuses to enter `--popup` only when NEITHER binary is available — `lyra`
+  resolved alone is sufficient, `zenity` missing in that case is simply
+  never consulted (mirrors the "the env tier is trusted unconditionally"
+  reasoning `resolve_lyra_bin`'s own doc comment gives).
+- **On the `lyra` path, `run_entry_dialog`'s `child.kill()` (near-expiry,
+  resolved-elsewhere) only ever reaches the `lyra` PROCESS — the quickshell
+  GRANDCHILD it spawned is a separate process this crate never sees a
+  handle to, and `SIGKILL` (what `.kill()` sends) is UNTRAPPABLE, so `lyra`'s
+  own cleanup code (`aoide_lyra::commands::secrets::spawn_and_wait_for_
+  marker`'s own `child.kill()` on quickshell) never runs when THIS is what
+  killed it (review fix, ownership-chain note; `crates/lyra/AGENTS.md`
+  carries this crate's own half in full).** This crate's own kill-by-EXACT-
+  pid discipline (this file's `run_zenity_entry`/`run_lyra_entry` invariant,
+  above) is still correct and still necessary — it is what stops a `lyra`
+  process (and everything under it) from lingering — but it is NOT what
+  closes the quickshell WINDOW in that case; `lyra`'s own `spawn_quickshell`
+  arms `PR_SET_PDEATHSIG` on the quickshell child specifically so the KERNEL
+  closes that gap the instant `lyra` itself dies, no cooperation from either
+  process's own code required at the moment of death. Don't read a future
+  `lyra secrets ask` rewrite that drops `PR_SET_PDEATHSIG` as "this crate's
+  problem to solve from the `watch.rs` side" — `aoide-secrets` has no
+  visibility into `lyra`'s own process tree (no pid, no process-group
+  handle) to kill a grandchild it never held even a handle to; the fix has
+  to live where the grandchild is actually spawned.
+- **A `lyra` infrastructure failure is NEVER folded into `ZenityResult::
+  Cancelled` — it gets its own variant, its own reserved exit code, and an
+  IMMEDIATE zenity retry for the same ask (live-incident fix, this commit —
+  `watch.rs`'s own module doc has the full incident).** `lyra secrets ask`
+  reserves exit `3` (`aoide_lyra::commands::secrets::EXIT_INFRA_FAILURE`,
+  that constant's own doc carries the matching half of this same incident)
+  for "the dialog infrastructure itself broke" — `run_entry_dialog` checks
+  `status.code() == Some(LYRA_INFRA_FAILURE_EXIT)` BEFORE falling through to
+  `Cancelled`, returning `ZenityResult::DialogFailure` instead. Don't widen
+  `Cancelled`'s own match arm to "catch" this case "since it's still a
+  non-zero exit" — that collapse is EXACTLY the original incident (a killed
+  dialog silently read as a user Cancel, the ask sitting parked with no
+  operator-visible signal until its own timeout). `run_ask_dialog` reacts to
+  `SpawnError`/`DialogFailure` from a `lyra` attempt by retrying the SAME
+  ask through `zenity` immediately (`zenity_available` permitting) — never
+  leaving the ask with no dialog attempt at all just because the fancy
+  surface broke (plugin philosophy, root `AGENTS.md` house rule 7). A
+  `lyra`-failed ask that still has no fallback available (or whose fallback
+  also failed) is deliberately NEVER added to `popup_loop`'s own `ignored`
+  set — `Queue::reconcile`'s 30s tick has NO opinion on that set at all (it
+  only syncs which asks EXIST, never re-drives a dialog attempt), so
+  `popup_loop`'s own loop, backed off by the pre-existing `spawn_backoff`
+  mechanism, is what actually keeps retrying such an ask. Don't add an
+  `ignored.insert(...)` to either failure arm "since it already got its
+  retry" — that would silently strand the ask exactly the way the original
+  incident did, one layer up. `spawn_lyra_entry` now inherits `lyra`'s own
+  stderr (was `Stdio::null()`) specifically so `lyra`'s own failure
+  `eprintln!`s reach the journal at all — don't revert that to a piped or
+  null stream "to keep stdout/stderr symmetric with zenity's own spawn";
+  zenity has no equivalent internal-failure-narration contract to preserve.
+- **A parked ask carries an OPTIONAL "context block" — `reason` (free-text,
+  self-asserted) and `origin` (best-effort, kernel-traced) — for a popup/
+  prompt surface to show WHY and FROM WHERE an ask exists, not just which
+  secret/consumer (this commit, P3).** `park::ParkedAsk` gained `reason:
+  Option<String>` (the wire's `resolve.reason`, `secrets exec`'s `--reason`
+  or `client::derive_reason`'s auto-derivation from the wrapped command,
+  space-joined and truncated to ~60 chars — the SAME "display-only, never a
+  value" discipline `argv0` already holds) and `origin: park::AskOrigin`
+  (`{username, pid, comm, hostname}`, ALL best-effort). Don't add a THIRD
+  field to this pair "for completeness" without checking whether it's
+  actually WHY/WHERE context or something else entirely — `reason`/`origin`
+  are deliberately narrow, not a general-purpose metadata bag.
+  **`AskOrigin` is captured EXACTLY ONCE, at park time, from the SAME
+  `SO_PEERCRED` stamp `peer_uid` itself is stamped from
+  (`broker::capture_origin`, called right where `park_if_room` is called) —
+  never re-read later.** A pid can exit and be reused long before an ask
+  resolves or a dialog renders it, so `peercred::read_comm`/`peercred::
+  username_for_uid` (both best-effort, `None` on any failure, never a panic
+  — the SAME fail-to-`None` posture `peer_cred` itself holds) run ONCE here;
+  don't move either call to a later render-time read "since it's simpler" —
+  that would silently start attributing origins to the WRONG process the
+  moment pids wrap. `hostname` (`enroll::local_hostname`) is the ONE field
+  that's genuinely constant across every ask on one broker process, carried
+  per-ask anyway rather than assumed by a remote surface, future-proofing
+  the day a non-local entry point exists (`Policy::remote`'s own note above
+  — today every asker is local, so this is always the broker's own host).
+  **`comm` is PROCESS-CONTROLLED, UNTRUSTED text** (`prctl(PR_SET_NAME,
+  ...)` lets any process rename itself to anything) — rendered verbatim by
+  every surface, never interpreted, the identical posture `consumer`/
+  `reason` already hold; don't special-case it as "more trustworthy than
+  `reason`" just because it traces back to a kernel-verified pid — the PID
+  is kernel-truth, the STRING that process chose to report is not.
+  **The ride is `resolve` request -> `park::ParkedAsk` registry row ->
+  `pending` reply -> `parked` events-feed line -> three rendered surfaces**
+  (`watch::format_reason_line`/`watch::format_origin_line`, the ONE place
+  each line's wording is built): the tty prompt (`format_prompt_header`),
+  zenity's `--text` (`popup_loop`), and `lyra secrets ask`'s own `--reason`/
+  `--from` argv (`spawn_lyra_entry` — `reason` rides RAW since `lyra`'s own
+  QML owns that surface's layout, `from` rides PRE-FORMATTED by
+  `format_origin_line` so the wording never drifts between the three
+  surfaces). Don't reformat `origin` a fourth time inside `lyra`'s own QML;
+  `--from` already carries the finished line. Both are absent-safe
+  end-to-end — an ask with neither renders EXACTLY as it did before this
+  phase on every surface (`format_reason_line`/`format_origin_line` both
+  return `None` when there's nothing to show, and every call site treats
+  `None` as "add nothing," never a placeholder line).
+- **P-N4 (task #76) closes three popup gaps the field/an Opus-judge review
+  found, all landed together, none touching the `--json` machine feed
+  (byte-stable throughout).** (1) **The near-expiry policy is now TWO
+  coherent thresholds, stated in ONE place** (`watch::LOCKOUT_SECS`'s own
+  doc comment — every other mention, this file included, restates it,
+  never redefines it): `LOCKOUT_SECS` (10s) still governs BEFORE-OPEN (no
+  dialog opens, no `[a]` prompt reads a code, below it); `watch::
+  POPUP_KILL_LOCKOUT_SECS` (`LOCKOUT_SECS + POPUP_KILL_MARGIN_SECS` = 15s,
+  a DERIVED constant, never an independently-tuned second magic number)
+  is the NEW already-open half — `zenity --entry`'s own `--text` bakes
+  "Ns left" at spawn time and cannot be updated in place, so an open
+  dialog can go stale while the operator is still looking at it.
+  `popup_loop`'s `should_cancel` closure now ORs `popup_kill_already_open`
+  (pure, unit-tested the same way `code_prompt_allowed` is) alongside the
+  pre-existing "vanished from the queue" check — the SAME
+  `ZenityResult::CancelledExternally` kill idiom fires either way, never a
+  second kill mechanism. `popup_loop` disambiguates the two causes
+  AFTERWARD (is the ask still in the queue?) only to pick the right
+  narration line and to add the ask's id to `ignored` on the near-expiry
+  branch — "don't respawn for that ask" is `ignored`, the same mechanism
+  a Cancel/close already uses, not a new one. (2) **Phantom-ask reaping**:
+  `Queue::reconcile` already dropped an ask no longer in `pending` with no
+  event (P-N2/tracker #71's own doc); this phase pins that `popup_loop`'s
+  kill closure reacts to THAT removal identically to an explicit
+  Completed/Dismissed/Expired event, since it only ever asks the queue "is
+  this id still here," never "did an event say so." (3) **Spawn-retry
+  backoff**: `watch::next_spawn_backoff` doubles from `SPAWN_BACKOFF_INITIAL`
+  (1s) to `SPAWN_BACKOFF_MAX` (60s) on consecutive `ZenityResult::
+  SpawnError`s, reset to the floor on the next successful spawn —
+  `popup_loop`'s own `spawn_failing`/`spawn_backoff` locals, narrated ONCE
+  per state transition (entering the failing state, and recovering from
+  it), never once per attempt. Don't reach for a `SystemTime::now()` call
+  inside `popup_kill_already_open`/`next_spawn_backoff` — both stay pure,
+  clock/timing-as-parameter, the same discipline every other pure fold in
+  this module already holds (`watch.rs`'s own module doc).
+- **The built-in `age` backend + the per-backend `has` template + the
+  `secrets add` default flip LANDED at P-G1 (task #70, this commit).**
+  `Backend` gained an OPTIONAL `has: Option<String>` field, `#[serde(default)]`
+  so an existing `backends.json` predating this phase loads unchanged (see
+  the invariant above); `backend::has_value` runs it when present,
+  otherwise falls back to its pre-existing `get`-probe behavior byte-for-
+  byte. `backend::seed_default_backends` now seeds TWO built-ins, `file`
+  (unchanged) and `age` (new) — the SAME seeding site, same "an existing
+  `backends.json` is never touched" rule. `age`'s `get`/`set` templates
+  (`AGE_BACKEND_GET`/`AGE_BACKEND_SET`, `backend.rs`) shell out to
+  `age`/`age-keygen` exactly like `file`'s templates shell out to
+  `cat`/`install` — house rule 7, no special-cased Rust reads or writes a
+  secret's ciphertext. `backend::mint_age_identity_if_needed` is the ONE
+  exception: real Rust I/O (two `age-keygen` shell-outs, not templates)
+  that lazily bootstraps `age.key`/`age.recipient` on the FIRST
+  `age`-backed `put`, called from `broker::put_gate`'s own `put_lock`
+  critical section (never from a `get` path — invariant above) and
+  audited as a NAME-ONLY `age-identity-minted` `emit_notify` event
+  (`README.md`'s "Broker notifications") — `handle_put` fires it, not
+  `put_gate` itself, so it happens with no crate lock held (P-N3's own
+  "no lock held" rule, invariant above, extended to this new call site). A
+  missing `age`/`age-keygen` binary is a taught error naming the package
+  to install (`backend::missing_age_binary_hint`), the same
+  "diagnose and teach the fix" idiom `home::describe_home_file_error`/
+  `client::describe_connect_error` already hold in this crate — grep
+  `describe_`/`missing_age_` for the precedent before hand-rolling a new
+  one. `commands::handle_secrets_add`'s `--backend` flag is now OPTIONAL
+  (it was a hard requirement before this phase, not merely defaulted),
+  defaulting to `age` (`commands::DEFAULT_BACKEND`) — a stored policy's
+  `backend` field is untouched either way, only what a BRAND-NEW `add`
+  with the flag omitted records. `pass`/`gopass`/`bw`/`sops` stay
+  documentation-only presets, restated as an explicit crate stance
+  (invariant above): `file`/`age` are the only backend IMPLEMENTATIONS
+  this crate supports. No new command, no wire-op change, no golden-count
+  change — this phase is entirely inside the existing `add`/`put`
+  surfaces.
+- **P-G1 review fix (task #70, this commit): `age`-NAMED is not the same
+  as `age`-CONFIGURED.** An existing deployment's `backends.json` predates
+  P-G1 (`file` only, no `age` entry — `seed_default_backends` never
+  touches an already-present file, invariant above) and `secrets add`'s
+  new default (previous bullet) records `backend: "age"` regardless, so a
+  brand-new policy on such a home names a backend that isn't configured
+  anywhere. Two call sites gained a "is `age` actually known" check ahead
+  of anything `age`-specific: `backend::fetch_value` now runs its ordinary
+  `unknown backend` lookup BEFORE the missing-identity check — an
+  unconfigured `age` policy's GET reports `unknown backend \`age\`` (the
+  true cause), never `missing_age_identity_hint`'s "run `secrets put` to
+  mint" (actively wrong advice there — `put` hits the identical wall);
+  `broker::put_gate` calls the new `backend::backend_is_known(secrets_home,
+  "age")` before `mint_age_identity_if_needed`, so a doomed `put` against
+  an unconfigured `age` policy never mints a REAL identity (real
+  `age-keygen` calls, real `age.key`/`age.recipient` files) before failing
+  anyway. This does NOT backfill an existing `backends.json` with the
+  `age` entry — that remained the documented, deliberate "seed once, never
+  touch an existing file" contract (invariant above) at THIS phase — it
+  only made the failure that follows name its true cause instead of a
+  misleading age-specific one, and stopped that failure from having a real
+  side effect first. **Superseded at P-G2 (task #72, below): the backfill
+  gap this bullet names is now closed, additively.**
+- **The deployment gap LANDED at P-G1/P-G1-review is CLOSED at P-G2 (task
+  #72, this commit), two ways, both additive.** `backend::
+  backfill_missing_backends` (invariants above) runs at `broker::serve`'s
+  startup immediately after `seed_default_backends` — an EXISTING
+  `backends.json` now gains any missing built-in entry by name on every
+  broker start, with no operator action, and no entry (built-in or
+  custom) already present is ever touched. `secrets migrate <name>
+  [--backend <target>]` (`commands::handle_secrets_migrate`, default
+  target `age`, `commands::DEFAULT_BACKEND` reused) is the per-secret
+  companion: an admin command (euid-guarded exactly like `add`/`rm`/`grant`,
+  direct-home, no socket) that fetches a secret's value via its policy's
+  CURRENT backend and stores it via a TARGET backend, flips the policy
+  row, and removes the old value when the source is a built-in with a
+  derivable path (`backend::remove_builtin_value`) — see the invariants
+  above for the exact ordering/removal/locking rules, and `README.md`'s
+  "Migrating a secret between backends" for the full flow. Registered
+  LAST in `commands::register()` (golden discipline — append, never
+  reorder), golden 67 → 68.
+
+**CLOSED at task #74 (this commit): every backend `get`/`set`/`has`
+shell-out is now BOUNDED, through one shared choke point
+(`backend::run_backend_command`).** Before this phase (the KNOWN GAP this
+note used to describe, left deferred at P-N2c), `backend::fetch_value`/
+`store_value`/`has_value`'s own `run_has_template` each spawned `sh -c`
+independently with NO timeout at all — a wedged backend command blocked
+its calling thread indefinitely, and on the `put` path that meant
+`broker::put_lock` (the invariant above) was held across the hang,
+serializing every OTHER `put` on this broker behind it for as long as it
+lasted. `run_backend_command` now bounds every one of those three call
+sites: `AOIDE_SECRETS_BACKEND_TIMEOUT` (`backend::BACKEND_TIMEOUT_ENV`,
+default 10s, `backend::DEFAULT_BACKEND_TIMEOUT_SECS`), same
+tolerant-fallback env parsing as `park::park_timeout`. A template still
+running past the deadline has its WHOLE PROCESS GROUP `SIGKILL`ed
+(`CommandExt::process_group(0)` at spawn + `libc::kill(-pid, SIGKILL)` at
+timeout — never just the immediate `sh`, so a pipeline the template itself
+forked can't survive as an orphan) and reaped (`Child::wait`, never a
+zombie), and the caller gets a taught error naming the backend, the op
+(`get`/`set`/`has`), and the env knob — never the template text, which
+can't carry a secret value in the first place (`store_value`'s `value`
+only ever reaches its child over stdin, never interpolated into the
+command string `expand_template` builds). See `README.md`'s "Bounded
+backend shell-outs" for the full mechanism and the invariant immediately
+below for the hard rule this establishes going forward.
+
+- **Every backend TEMPLATE shell-out this crate makes — present or
+  future — MUST route through `backend::run_backend_command`, never spawn
+  `sh -c` directly (task #74, hard constraint).** This is what makes the
+  timeout in the note above actually cover EVERY template execution rather
+  than needing a per-call-site fix the way the pre-task-#74 gap did: `age`
+  (P-G1) and `secrets migrate` (P-G2) already multiplied the CALL SITES
+  onto `fetch_value`/`store_value`/`has_value` without multiplying the
+  spawn logic itself, and that discipline is exactly why bounding it was a
+  one-function fix. A future backend-adjacent addition (a new template
+  kind, a new per-backend probe) that spawns its own `Command::new("sh")`
+  instead of calling `run_backend_command` silently reopens the unbounded-
+  hang gap this note exists to keep closed — don't. The timeout wait
+  itself is wall-clock via polling `Child::try_wait`, never a per-child
+  watchdog thread and never `SIGALRM` (`run_backend_command`'s own doc) —
+  a future change to the wait mechanism holds the same restriction.
+
+**P-G3 review fix (same task #74, follow-up commit): the task #74 commit
+above closed every TEMPLATE shell-out but missed one non-template one —
+`backend::mint_age_identity_if_needed`'s two `age-keygen` calls ran
+through a plain blocking `Command::output()`, exempt from the whole-crate
+bound the note above claimed to establish "in full." Since minting runs
+inside the SAME `broker::put_lock` critical section a hung `set` template
+used to wedge (the invariant just above the task #74 note, "P-G1... a
+`policy.backend == \"age\"` put also lazily mints... inside the SAME
+`put_lock` critical section"), a hung `age-keygen` would have reopened the
+exact `put_lock`-wedging failure task #74 exists to close — just for the
+`age` backend's own bootstrap instead of a `set` template. Closed by
+extracting the poll/drain/kill/reap loop `run_backend_command` used
+internally into its own function, `backend::wait_bounded` — generic over
+an already-spawned `Child` plus its taken stdout/stderr pipes, so it
+carries no backend name, no op, no template/command string — and giving
+`age-keygen` its own thin caller, `backend::run_age_keygen`, that builds
+the plain argv `Command` (no `sh -c`, no template) and calls
+`wait_bounded` the same way `run_backend_command` now does.
+`run_backend_command`'s own external behavior (every message it can
+return) is BYTE-IDENTICAL before and after this refactor — proven by the
+full existing suite passing unchanged.** A future non-template shell-out
+this crate adds (there is currently exactly one, `age-keygen`) bounds
+itself through `wait_bounded` the same way, never a bare blocking
+`Command::output()`/`.status()` — the "every backend shell-out" framing in
+the note above was never meant to exempt a shell-out just because it isn't
+a TEMPLATE; `run_backend_command` is the template-specific caller of
+`wait_bounded`, not the whole bound itself. Two new tests prove this from
+both sides, same PATH-shim technique `enroll.rs`'s `render_qr` tests
+already establish (a fake, sleeping `age-keygen` script on `PATH`, no real
+`age` binary needed): `backend::tests::
+mint_age_identity_against_a_hung_age_keygen_returns_within_bounds` (the
+unit-level bound) and `broker::tests::
+a_hung_age_keygen_mint_no_longer_wedges_put_lock_forever` (the SAME
+put_lock-freed-for-the-next-caller proof the task #74 commit's own
+`a_hung_set_template_no_longer_wedges_put_lock_forever` test gives a `set`
+template, now given to a hung mint too).
+
+## Docs update required in the same commit
+
+- This `README.md` when a new module, wire shape, or dependency is added.
+- `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants (registry
+  order, golden discipline, per-crate tests) — not restated here.
+- The workspace `Cargo.toml`'s `aoide-secrets` member comment and
+  `crates/cli/README.md`'s golden-path count when the command set changes.
+- `CONTRACTS.md §3` (the core schema's command count) and its "Secrets
+  wire" subsection (§4, the machine-consumer contract — P-V4c) when the
+  wire shape (any op) or file layout changes; that subsection restates
+  this crate's own wire docs (`README.md`'s "The wire", `broker.rs`'s
+  module doc) for a reader who never opens this crate's Rust — update the
+  crate docs FIRST, `CONTRACTS.md` follows in the same commit.
+- `tests/vm-boot.nix`'s `cmd_count` tripwire and its nearby count-history
+  comment when the command set changes (same commit as the golden snapshot).

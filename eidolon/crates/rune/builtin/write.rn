@@ -1,0 +1,22 @@
+//! Built-in `write`: create or overwrite a whole file via `fs_write`.
+
+pub fn manifest() {
+    #{
+        name: "write",
+        description: "Write content to a file, creating it and any parent directories, or overwriting it if it exists.",
+        prompt: "Writing a file is not evidence that it works. After writing code, check it with `bash` and fix what it reports before you say the work is done. Use a command that exits on its own — a syntax check (`node --check`, `python -m py_compile`, `cargo check`) or the project's test command. Starting a process alone is not verification.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "path": #{ "type": "string", "description": "File path, absolute or relative to the working directory" },
+                "content": #{ "type": "string", "description": "The complete new contents of the file" },
+            },
+            "required": ["path", "content"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::fs_write(input.path, input.content).await
+}

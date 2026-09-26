@@ -1,0 +1,101 @@
+[package]
+name = "harnox"
+version = "0.3.8"
+edition = "2024"
+description = "The shared Rust foundation under Mneme, Melete, and the interactive harness — OAuth 2.1 server + browserless client, the custodied secret store, Claude credential acquisition — feature-gated so each consumer compiles only what it uses."
+license = "MIT"
+publish = false
+
+# Every feature is ADDITIVE: it only adds modules, never changes the behaviour
+# of one that is already compiled. Cargo unifies features across a dependency
+# graph, so a feature that altered behaviour would let one consumer's choice
+# silently reconfigure another's. Default is empty on purpose — a consumer names
+# exactly what it uses (`default-features = false` is then redundant but
+# harmless).
+[features]
+default = []
+# The OAuth 2.1 authorization + resource server that guards an MCP transport
+# (Mneme, Melete).
+oauth-server = ["dep:axum", "dep:percent-encoding", "dep:serde", "dep:serde_json", "dep:subtle", "tokio/sync"]
+# The browserless, passphrase-gated OAuth client that talks to that server
+# (Melete → Mneme, the harness → both). `tokio/time` is the backoff between
+# mint attempts when the server is not answering the socket at all.
+oauth-client = ["dep:reqwest", "dep:serde", "dep:serde_json", "tokio/time"]
+# The XChaCha20-Poly1305 custodied secret store with no read path (Melete).
+secrets = ["dep:chacha20poly1305", "dep:zeroize", "dep:serde", "dep:serde_json", "dep:subtle"]
+# Driving `claude setup-token` under a PTY to mint a long-lived Anthropic
+# bearer (Melete, the harness).
+provider-auth = ["dep:portable-pty", "dep:vt100", "tokio/sync", "tokio/time", "tokio/rt"]
+# The model layer: the canonical (Anthropic-shaped) conversation model, the
+# `Provider` trait an agent loop consumes, the two wire clients (the harness;
+# Melete once its own provider client is deleted), and `llm::consume` — the
+# shared retry/assembly every consumer of a stream needs. `tokio/time` is the
+# backoff between those retries.
+rusqlite = ["dep:rusqlite"]
+llm = ["dep:reqwest", "reqwest/stream", "dep:async-stream", "dep:bytes", "dep:futures-util", "dep:tokio-util", "dep:serde", "dep:serde_json", "rusqlite", "tokio/macros", "tokio/rt", "tokio/time"]
+# Adds `bitcode::Encode`/`Decode` derives to the `llm` message model, for a
+# consumer whose session log is bitcode. Trait impls only — additive.
+bitcode = ["dep:bitcode"]
+# The command safety classifier: shell decomposition algebra (parse, compose,
+# scope-check, fail closed) with the leaf Allow/Flag/Deny table left to the
+# consumer as a trait. Ported from Melete's `src/policy/` (Melete, the harness).
+policy = ["dep:conch-parser", "dep:serde"]
+# Driving the headless `claude` CLI (`-p --output-format json`) as a model
+# backend — the argv contract, the result JSON, the error taxonomy retries hang
+# on, and a default runner (Melete; the harness if a setup-token bearer turns
+# out to bill differently from the CLI).
+claude-cli = ["dep:serde", "dep:serde_json", "tokio/process", "tokio/io-util", "tokio/rt"]
+full = ["oauth-server", "oauth-client", "secrets", "provider-auth", "llm", "bitcode", "claude-cli", "policy"]
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"    # base64url for PKCE challenges and token encoding
+getrandom = "0.4"  # OS CSPRNG for tokens / codes / client ids / nonces
+sha2 = "0.10"      # SHA-256 for PKCE S256 and at-rest token hashing
+tracing = "0.1"
+
+# oauth-server
+axum = { version = "0.8", optional = true }
+percent-encoding = { version = "2.3", optional = true }
+subtle = { version = "2", optional = true }  # constant-time comparison of secrets
+# tokio is only ever pulled in by a feature; the core is sync.
+tokio = { version = "1", default-features = false, optional = true }
+
+# oauth-client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"], optional = true }
+
+# secrets — XChaCha20-Poly1305 straight from the RustCrypto crate. Melete
+# evaluated `cocoon` and rolled the ~150 lines instead: same primitives, no
+# single-maintainer layer, and the 192-bit fresh-per-write nonce makes nonce
+# reuse (RUSTSEC-2023-0068's class) statistically impossible. `zeroize` wipes
+# the key and plaintext buffers.
+chacha20poly1305 = { version = "0.10", optional = true }
+zeroize = { version = "1", optional = true }
+
+# provider-auth — `claude setup-token` is a raw-mode TUI that refuses a non-TTY
+# stdin, so it is driven under a real PTY; vt100 renders the raw byte stream so
+# the minted token is read off the screen rather than scraped (see
+# src/setup_token.rs for the hard-won recipe).
+portable-pty = { version = "0.9", optional = true }
+vt100 = { version = "0.16", optional = true }
+
+# llm — streamed HTTP (reqwest `stream`), an SSE parser over the byte stream,
+# `async-stream` for the event streams, `tokio-util` for CancellationToken.
+async-stream = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true }
+tokio-util = { version = "0.7", optional = true }
+bitcode = { version = "0.6", optional = true }
+
+# policy — a real shell grammar, so quoted metacharacters are data and a
+# composite command can be taken apart stage by stage. Nothing else parses
+# shell here; a regex over the command text is exactly the mistake this avoids.
+conch-parser = { version = "0.1.1", optional = true }
+
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+uuid = { version = "1.26.0", features = ["v4"] }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"] }

@@ -1,0 +1,82 @@
+//! Builders for the widget vocabulary, so a UI script reads as layout.
+//! Compiled into the same namespace as the user's `ui.rn`.
+
+pub fn column(children) { #{ kind: "column", children: children } }
+pub fn row(children) { #{ kind: "row", children: children } }
+pub fn fill(child) { #{ size: "fill", child: child } }
+pub fn fixed(n, child) { #{ size: n, child: child } }
+pub fn min(n, child) { #{ size: `min:${n}`, child: child } }
+// A node that sizes itself to its content, clamped to `lo..=hi` rows.
+// Only the prompt measures — everything else answers one row — and only
+// inside a `column`, where a child's width is the parent's.
+pub fn grow(lo, hi, child) { #{ size: `grow:${lo}:${hi}`, child: child } }
+pub fn pct(n, child) { #{ size: `pct:${n}`, child: child } }
+pub fn panel(title, child) { #{ kind: "panel", title: title, child: child } }
+pub fn panel_fg(title, fg, child) { #{ kind: "panel", title: title, child: child, fg: fg } }
+pub fn transcript() { #{ kind: "transcript" } }
+pub fn prompt(title) { #{ kind: "prompt", title: title } }
+pub fn status(left, right) { #{ kind: "status", left: left, right: right } }
+pub fn text(spans) { #{ kind: "text", spans: spans } }
+pub fn centered(spans) { #{ kind: "text", spans: spans, align: "center" } }
+// Overlays. Both float over the finished frame rather than taking a row of
+// it, so placing one in a column costs no space and needs no size.
+pub fn dialog() { #{ kind: "dialog" } }
+/// The which-key popup: what the half-typed chord can still become. Draws
+/// nothing while no chord is open, so it costs nothing to leave in a layout.
+pub fn menu() { #{ kind: "menu" } }
+pub fn empty() { #{ kind: "empty" } }
+
+pub fn styled(text, fg) { #{ text: text, fg: fg } }
+pub fn bold(text, fg) { #{ text: text, fg: fg, bold: true } }
+pub fn dim(text) { #{ text: text, dim: true } }
+pub fn on(text, bg) { #{ text: text, fg: "black", bg: bg, bold: true } }
+
+pub fn send(text) { #{ action: "send", text: text } }
+pub fn command(name, arg) { #{ action: "command", name: name, arg: arg } }
+/// Resolve `text` on the dispatch surface the prompt is aimed at and run
+/// the call it makes — no model turn. What `ret` means in dispatch mode.
+pub fn dispatch(text) { #{ action: "dispatch", text: text } }
+/// Type `text` into the prompt where the cursor is.
+pub fn insert(text) { #{ action: "insert", text: text } }
+/// A line in the transcript.
+pub fn info(text) { #{ action: "info", text: text } }
+pub fn cancel() { #{ action: "cancel" } }
+pub fn quit() { #{ action: "quit" } }
+
+// A row of the `commands()` table: a command of the script's own, run by
+// the function named `run` as `fn(state, arg) -> action`. Bound, typed,
+// completed and listed beside the built-ins; a built-in's name is refused.
+//
+// `arg` names the argument in the usage line the way the built-ins' do —
+// `TEXT` is required, `[TEXT]` is optional, and the palette hands a
+// required one back as a half-written `:` line rather than running it
+// with nothing. `custom_fill` adds where the argument's *values* come
+// from, so the `:` line completes it: "path", "dir", "mode", "model",
+// "session", "attachment", "record", "struck", "pin", "surface" — or
+// "free" (the default) for prose, which gets its shape said and nothing
+// offered. A name that is none of those is refused at load, because a
+// script asking for "paths" and silently getting nothing looks exactly
+// like completion being broken.
+pub fn custom(run, desc) { #{ run: run, desc: desc } }
+pub fn custom_arg(run, arg, desc) { #{ run: run, desc: desc, arg: arg } }
+pub fn custom_fill(run, arg, fill, desc) { #{ run: run, desc: desc, arg: arg, fill: fill } }
+
+// Keymap entries. A binding is a bare command name, a `cmd` with a label
+// for the which-key popup, or a `group` — a submap, which turns its key
+// into a chord prefix.
+pub fn cmd(name, desc) { #{ cmd: name, desc: desc } }
+/// A binding that carries an argument, for the commands that take text:
+/// `cmd_arg("enter_mode", "review", "review mode")`.
+pub fn cmd_arg(name, arg, desc) { #{ cmd: name, arg: arg, desc: desc } }
+pub fn group(desc, keys) { #{ desc: desc, keys: keys } }
+
+// Rows of the `modes()` table. A `mode` is one the prompt can be in —
+// `kind` is "normal", "insert" or "select", and says how the buffer
+// behaves there; `label` is the badge and `colour` the frame's. A
+// `style` row has a look but no kind: the command line and the search
+// line, which are modes to the hands without being modes on the buffer.
+// `sigil` puts one character at the head of the line while the mode is
+// on, drawn rather than stored — dispatch's `!`.
+pub fn mode(kind, label, colour) { #{ kind: kind, label: label, colour: colour } }
+pub fn style(label, colour) { #{ label: label, colour: colour } }
+pub fn sigil(m, ch) { m.sigil = ch; m }

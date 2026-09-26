@@ -1,0 +1,43 @@
+[package]
+name = "eidolon-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eidolon-core.workspace = true
+eidolon-tools.workspace = true
+eidolon-rune.workspace = true
+eidolon-swarm.workspace = true
+eidolon-remote.workspace = true
+eidolon-tui.workspace = true
+eidolon-claude.workspace = true
+eidolon-providers.workspace = true
+eidolon-verba.workspace = true
+eidolon-web.workspace = true
+harnox = { workspace = true, features = ["llm", "secrets"] }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+async-trait.workspace = true
+toml.workspace = true
+dirs.workspace = true
+percent-encoding = "2.3"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+# The version stamp on the unpacked system files (`system.rs`).
+crc32fast.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "eidolon"
+path = "src/main.rs"

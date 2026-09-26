@@ -1,0 +1,53 @@
+[package]
+name = "eidolon-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eidolon-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+# The HTTP server. hyper is already in the graph as reqwest's engine, so
+# this adds features to a crate the lock file has (1.11.1), not a crate.
+# `server` + `http1` only: no http2, since the one client is a browser on
+# loopback and the event stream is SSE, which is HTTP/1.1 chunking and
+# nothing more. Not a framework — the route table here is four entries and
+# a `match` on `(Method, path)` reads them all at once.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+# The pieces hyper 1.x moved out of itself: `TokioIo` to wrap the accepted
+# socket, and the http1 connection builder. `server-graceful` so a quit
+# drains open SSE streams instead of resetting them mid-frame. Already in
+# the lock (0.1.20) on reqwest's account, same as hyper.
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server", "server-graceful", "http1"] }
+# `Full` for a JSON or empty body and `StreamBody` for the event stream —
+# the two body shapes this crate ever builds. Transitive via reqwest today
+# (0.1.5).
+http-body-util = "0.1"
+# `Bytes` is what an SSE frame is by the time it reaches the socket. In the
+# lock at 1.12 under everything else.
+bytes = "1"
+# The event stream is a `stream!` block: subscribe, replay the branch, then
+# forward the bus until the socket goes away. `eidolon-providers` already
+# uses it (0.3.6) for the same reason — an async loop that yields is
+# clearer than a hand-written `Stream` impl with a state enum.
+async-stream = "0.3"
+# The token: `crypto::random_token` (256 bits from the OS CSPRNG) and the
+# atomic `0600` file write it lands through. `eidolon-core` re-exports
+# harnox's message and provider types, not these two, and a second mint of a
+# secret is exactly what harnox's `crypto` module exists to prevent. No
+# features: both modules are ungated.
+harnox.workspace = true
+# Constant-time comparison of the presented token — the same primitive harnox
+# compares its own bearer secrets with. Already in the lock (2.6.1) as
+# harnox's dependency; this names it directly rather than reaching through.
+subtle = "2"
+
+[dev-dependencies]
+tempfile = "3"

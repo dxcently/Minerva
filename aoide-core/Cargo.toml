@@ -1,0 +1,127 @@
+# Virtual workspace root (Phase 9 restructure,
+# docs/architecture/PACKAGE-LAYOUT.md): NO [package], NO src/ — the app crate
+# lives at `crates/cli`, single-charter crates under `crates/*`.
+[workspace]
+resolver = "2"
+members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/conductor", "crates/test-support", "crates/cli", "crates/upkeep", "crates/secrets"]
+
+# The one release-version source for the whole workspace (User-directed:
+# prebeta is 0.0.X, the patch bumps by one at the end of each completed
+# major phase — CONTRACTS.md's "Release version" section). Every crate's own
+# `[package]` inherits via `version.workspace = true` rather than repeating
+# the literal, `pkgs/aoide/default.nix` reads this file for its own
+# derivation version, and `aoide_protocol::registry::AOIDE_VERSION` (the
+# schema/MCP/A2A runtime-readable version) derives from the app crate's
+# inherited manifest version via `env!("CARGO_PKG_VERSION")` — a bump is ONE
+# edit here and nothing downstream can drift from it.
+[workspace.package]
+version = "0.0.23"
+
+# ONE version source for the whole workspace (the monorepo standard): every
+# crate inherits via `{ workspace = true }` — no per-manifest version repeats.
+# Versions match the pre-centralization manifests exactly; Cargo.lock must
+# not shift. `crossterm`/`ratatui` carry the conductor TUI's pinning notes:
+# ratatui 0.30 pins crossterm 0.29 (the rig's TUI standard — no hand-rolled
+# ANSI); default-features = false + only `events` on the direct dep keeps the
+# surface minimal and the offline lock on ONE crossterm (Phase 6b).
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+crossterm = { version = "0.29", default-features = false, features = ["events"] }
+ratatui = "0.30"
+aoide-protocol = { path = "crates/protocol" }
+aoide-storage = { path = "crates/storage" }
+aoide-conduct = { path = "crates/conduct" }
+aoide-client = { path = "crates/client" }
+aoide-server = { path = "crates/server" }
+aoide-conductor = { path = "crates/conductor" }
+aoide-test-support = { path = "crates/test-support" }
+# `aoide soundcheck` — the mechanical-integrity command's WORKING-tree half
+# (soundcheck design doc, FORK 3, advisor-confirmed new crate: repo hygiene
+# is not `aoide-storage`'s "durable session data" charter).
+aoide-upkeep = { path = "crates/upkeep" }
+# `ed25519-dalek`/`getrandom` — the pairing workstream's instance identity
+# (P-P1, `docs/architecture/PAIRING.md`'s "Identity" section, consumer
+# `aoide-storage::identity`): cryptography is never hand-rolled here (User
+# ruling, 2026-08-25, PAIRING.md's kill-list) — the ONE sanctioned break of
+# this workspace's zero-new-deps discipline, scoped to cryptographic
+# primitives specifically. PAIRING.md's design grill named "ed25519-dalek
+# 2.x" as the illustrative candidate; verified against the live crates.io
+# index at land time, `2.x` topped out at 2.2.0 (2025-07-09) and `3.0.0`
+# (dalek-cryptography, the same maintainers, RC'd twice before a
+# 2026-07-06 stable release) is the current line — used here instead, on
+# the "verify current versions" instruction the design doc itself gives
+# the executor. Default features only (`fast`, `zeroize` — precomputed
+# tables and drop-time key scrubbing, both wanted, neither new work to
+# justify). The `rand_core` feature is deliberately NOT enabled: rand_core
+# 0.10 dropped `OsRng` entirely (a real ecosystem restructuring, not an
+# oversight — confirmed by reading its own source), so keygen instead
+# seeds a 32-byte array via `getrandom::fill` and builds the key with
+# `SigningKey::from_bytes` — one primitive (`fill`), no `rand_core`
+# dependency, no extra feature edge. `getrandom` needs no feature flag for
+# this either (`fill` is unconditional; `std`/`sys_rng` gate unrelated
+# surface). `sha2` was already in the resolved tree transitively (EdDSA's
+# own SHA-512 internals) before it became a direct dependency at P-P2 (the
+# pairing ceremony's SAS derivation, `docs/architecture/PAIRING.md`
+# decision 1 names it explicitly) — pinned to `0.11`, the exact version
+# `ed25519-dalek 3.0.0` already resolves, so this direct dependency adds no
+# second `sha2` version to the tree. Consumer: `aoide-storage::pairing`.
+# `sha2`'s default `oid` feature, unified onto the pre-existing `digest`
+# crate, pulls one new small crate into the resolved tree: `const-oid`
+# 0.10.2. Named here so a future `cargo tree` audit doesn't mistake it
+# for an unexplained addition.
+ed25519-dalek = "3"
+getrandom = { version = "0.4", default-features = false }
+sha2 = "0.11"
+# `toml`/`toml_edit` — the portable runtime config substrate (task #135 P-C,
+# `$AOIDE_ROOT/config.toml`, consumer `aoide-storage::config`). Core is
+# portable, so config INTENT cannot live in NixOS module options; the one
+# runtime file is TOML because it is the one file a human edits and the
+# reasoning behind a grant has to live beside it. Two crates from the same
+# maintainers over one shared parser/writer stack (`toml_datetime`,
+# `toml_parser`, `toml_writer`, `winnow`, `serde_spanned`), split by
+# direction: `toml` deserializes into the typed schema (`deny_unknown_fields`
+# turns a typo in a GRANTS file into a named, loud failure instead of a
+# silently-ignored key), `toml_edit` rewrites one key in place for `aoide
+# config set` so an operator's comments survive the write that a plain
+# re-serialize would erase. Pure Rust, no C dependency — core's portability
+# guarantee (`checks.nix-independence`, `checks.portability`) rests on the
+# closure staying Rust + libc.
+toml = "1"
+toml_edit = "0.25"
+# `aoide-secrets` — Workstream SECRETS's secrets broker (named "vault"
+# until the P-V4b rename — same crate, no split-brain): TOTP, policy
+# types, replay ledger, otpauth:// URI construction (P-V1); the
+# unix-socket broker daemon, the client `secrets exec`, and the admin CLI
+# commands (P-V2); `secrets enroll` + the live requireTotp gate +
+# backend-preset docs (P-V3); the socket chmod'd 0660 on bind, deployed
+# via modules/nucleus/secrets.nix or the non-nix install path (P-V4 — no
+# new command, binary stays nix-independent); the built-in `file` backend +
+# the write half, `secrets put` (P-V4c — golden +1); `secrets set-totp`,
+# `secrets enroll --show`, and a tty-hidden-input prompt for `secrets put`
+# (P-V4e — golden +1, only `set-totp` is a new path); the per-secret
+# automation gate (`Policy::automation`, relaxes requireTotp for LISTED
+# consumers only) and the `remote` reachability flag (no behavior change
+# yet — lands ahead of any non-local entry point), plus `secrets automate`
+# (on/off/grant/revoke) and `secrets expose` (on/off) (P-N1 — golden +2);
+# a TOTP-gated `resolve` with no code now PARKS (holds the connection,
+# releases the value once completed) instead of refusing outright — the
+# broker moved from a serial accept loop to thread-per-connection so a
+# parked connection never blocks another, and `secrets pending`/`secrets
+# approve`/`secrets dismiss` complete or refuse a parked ask over the
+# socket, operator-side like put/exec (P-N2 — golden +3).
+# `aoide-cli` depends on this crate as of P-V2 (`secrets serve`/`exec`/
+# `add`/`rm`/`grant`/`revoke`/`enroll`/`put`/`set-totp`/`automate`/
+# `expose`/`pending`/`approve`/`dismiss` register into its `Registry`).
+# `aoide-server` and `aoide-client` also depend on it (task #84): the A2A
+# door resolves its inbound bearer token, and the outbound node client
+# resolves a per-node bearer to present, both through this crate's
+# `client::resolve_bounded` — the first real machine consumers of the
+# unix-socket wire this crate's own docs call a first-class API. Neither
+# edge introduces a cycle (`aoide-secrets` depends on nothing in
+# `aoide-server`/`aoide-client`/`aoide-storage`/`aoide-conduct`).
+aoide-secrets = { path = "crates/secrets" }
+
+[profile.release]
+opt-level = "s"

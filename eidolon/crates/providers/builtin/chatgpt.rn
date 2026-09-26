@@ -1,0 +1,231 @@
+//! ChatGPT — the subscription's Codex backend, shipped with the harness.
+//!
+//! Declared, not coded: an ordinary provider script that happens to be
+//! embedded in the binary, so it loads before `providers_dir` and a file of
+//! the same name there — or a `[[providers]]` table called `chatgpt` —
+//! replaces it whole. Nothing here is privileged. The wire is native
+//! (`Wire::Codex` in harnox): OpenAI's Responses shape against
+//! chatgpt.com/backend-api/codex, the surface the Codex CLI itself rides,
+//! with the client masquerade that surface expects.
+//!
+//! There is no API key. `eidolon chatgpt-login` runs the device flow against
+//! auth.openai.com and writes `~/.config/eidolon/chatgpt.json` — an access
+//! token, the refresh token that mints the next one, and the account id.
+//! The harness refreshes on demand and writes the rotated refresh token
+//! back; two clients sharing one account (this and OpenCode, say) rotate
+//! each other out, and the fix is running the login again.
+//!
+//! Billing is the subscription's message quota, not tokens — the *governing*
+//! number is the quota gauge `quota()` reads, and the backend says `402`
+//! when the window is spent, which surfaces as that HTTP error and nothing
+//! worse. The rates below are the models' *official metered prices*
+//! (standard tier, as cut 2026-07-30): on a plan they are what the turns
+//! **would have cost**, not a bill — the z.ai Coding Plan's own rows carry
+//! the same reading. Two simplifications, both noted where they bite: the
+//! >272k-input long-context band (2× input and cache, 1.5× output) is not
+//! modeled, so a very long session's dollars *understate*; and the rows
+//! older than the 5.6 family declare no cache-write rate, so a write there
+//! prices as input — an upper bound, never a surprise.
+//!
+//! The account's own list (GET /models) is authoritative and wants a
+//! `client_version` in the *desktop* scheme (`26.901.51231`; the CLI's
+//! `0.55.0` answers an empty list, and no param at all is a 400). On the
+//! account this was built against it served gpt-6-astra, gpt-5.6-sol,
+//! -terra, -luna, gpt-5.5, gpt-reserve and codex-auto-review; the last two
+//! are the backend's own machinery and deliberately have no rows here.
+//!
+//! Reasoning: `reasoning: true` on a row plus a session `thinking_budget`
+//! picks the effort (≤1024 low, ≤8192 medium, ≤24k high, ≤98k xhigh, beyond
+//! max). The model list is the account's, not this file's: an id the plan
+//! doesn't serve answers "not supported when using Codex with a ChatGPT
+//! account", and a newer id than any row here still resolves — it just has
+//! no declared context window until a row is added.
+//!
+//! `quota()` reads GET /codex/usage: the plan type, and a window per
+//! allowance with its share used and reset time. Which window is "primary"
+//! is the account's business — on the plan this was built against the
+//! primary is the *week* and there is no secondary — so the reading is
+//! labeled and ordered by the window's own length, never by its slot.
+
+pub fn provider() {
+    #{
+        name: "chatgpt",
+        wire: "codex",
+        base_url: "https://chatgpt.com/backend-api/codex",
+        token_file: "~/.config/eidolon/chatgpt.json",
+        // The client identity the backend's gate reads — needed on the
+        // quota GET below as much as on a completion, since a bearer alone
+        // answers 403 HTML. The wire adds these too; naming them here
+        // means `http_get` carries them, and a def header wins over the
+        // wire's default rather than being sent beside it.
+        headers: #{
+            "originator": "codex_cli_rs",
+            "User-Agent": "codex_cli_rs/0.55.0 (Ubuntu 26.04; x86_64) Linux",
+        },
+        models: [
+            #{
+                id: "gpt-6-astra",
+                name: "GPT-6 Astra",
+                context: 1050000,
+                reasoning: true,
+                vision: true,
+                cost: #{ input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
+            },
+            #{
+                id: "gpt-5.6-sol",
+                name: "GPT-5.6 Sol",
+                context: 400000,
+                reasoning: true,
+                cost: #{ input: 5, output: 30, cache_read: 0.5, cache_write: 6.25 },
+            },
+            #{
+                id: "gpt-5.6-terra",
+                name: "GPT-5.6 Terra",
+                context: 400000,
+                reasoning: true,
+                cost: #{ input: 2, output: 12, cache_read: 0.2, cache_write: 2.5 },
+            },
+            #{
+                id: "gpt-5.6-luna",
+                name: "GPT-5.6 Luna",
+                context: 400000,
+                reasoning: true,
+                cost: #{ input: 0.2, output: 1.2, cache_read: 0.02, cache_write: 0.25 },
+            },
+            #{
+                id: "gpt-5.5",
+                name: "GPT-5.5",
+                context: 400000,
+                reasoning: true,
+                cost: #{ input: 5, output: 30, cache_read: 0.5 },
+            },
+            #{
+                id: "gpt-5.4-mini",
+                name: "GPT-5.4 Mini",
+                reasoning: true,
+                cost: #{ input: 0.75, output: 4.5, cache_read: 0.075 },
+            },
+        ],
+    }
+}
+
+/// The reading, live. The endpoint counts in percents only — no messages,
+/// no tokens — so the windows carry a share used and a reset time and
+/// nothing else: what the endpoint does not count is absent, not guessed.
+pub fn quota() {
+    let body = match eidolon::http_get("/usage") {
+        Ok(b) => b,
+        Err(e) => return #{ error: e },
+    };
+    return read_quota(body);
+}
+
+/// The reading in a usage reply, or a sentence about why there is none.
+/// Split from `quota()` so it can be run against a captured body with no
+/// network, the way `zai`'s is.
+///
+/// A window is *this account's* primary or secondary — the plan decides
+/// which slots exist — so the label comes from the window's own length and
+/// the reading is ordered shortest first, whatever order the reply lists
+/// them in.
+fn read_quota(body) {
+    let reply = match json::from_string(body) {
+        Ok(v) => v,
+        Err(_) => return #{ error: "the usage reply was not JSON" },
+    };
+    if !(reply is Object) {
+        return #{ error: "the usage reply was not an object" };
+    }
+    let rl = match reply.get("rate_limit") {
+        Some(l) => l,
+        None => return #{ error: "the usage reply lists no rate_limit" },
+    };
+
+    let primary = window_of(rl, "primary_window", false);
+    let secondary = window_of(rl, "secondary_window", false);
+    let windows = match primary {
+        Some(p) => match secondary {
+            Some(s) => {
+                if window_secs(s) < window_secs(p) { [s, p] } else { [p, s] }
+            }
+            None => [p],
+        },
+        None => match secondary {
+            Some(s) => [s],
+            None => return #{ error: "the usage reply lists no windows" },
+        },
+    };
+
+    // The code-review allowance rides behind the ordinary windows when the
+    // account has one.
+    let all = windows;
+    match reply.get("code_review_rate_limit") {
+        Some(cr) => {
+            if cr is Object {
+                match window_of(cr, "primary_window", true) {
+                    Some(w) => all.push(w),
+                    None => (),
+                }
+            }
+        }
+        None => (),
+    }
+
+    let plan = match reply.get("plan_type") {
+        Some(p) => { if p is String { p } else { () } },
+        None => (),
+    };
+    return #{ plan: plan, windows: all };
+}
+
+/// One window object, from the raw reply. `review` labels the code-review
+/// allowance, whose length is not the operator's to care about.
+fn window_of(parent, key, review) {
+    let w = match parent.get(key) {
+        Some(w) => w,
+        None => return None,
+    };
+    if !(w is Object) {
+        return None;
+    }
+    let secs = int_or(w, "limit_window_seconds", 0);
+    return Some(#{
+        label: if review { "review" } else { window_label(secs) },
+        percent: num_or(w, "used_percent", 0),
+        resets_ms: match w.get("reset_at") {
+            Some(r) => { if r is i64 { r * 1000 } else { () } },
+            None => (),
+        },
+    });
+}
+
+fn window_secs(w) {
+    int_or(w, "limit_window_seconds", 0)
+}
+
+/// What a window of this length is called. The plans observed so far meter
+/// in weeks and 5-hour windows; a day is the code-review shape.
+fn window_label(secs) {
+    if secs == 604800 { "week" }
+    else if secs == 18000 { "5h" }
+    else if secs == 86400 { "day" }
+    else if secs == 3600 { "hour" }
+    else { "window" }
+}
+
+/// An integer field, or the default when it is absent or not whole.
+fn int_or(v, key, fallback) {
+    match v.get(key) {
+        Some(x) => { if x is i64 { x } else { fallback } },
+        None => fallback,
+    }
+}
+
+/// A number field, or the default — the endpoint's percents are integers
+/// today, but a share is a share.
+fn num_or(v, key, fallback) {
+    match v.get(key) {
+        Some(x) => { if x is i64 || x is f64 { x } else { fallback } },
+        None => fallback,
+    }
+}

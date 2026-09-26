@@ -1,0 +1,55 @@
+#!/bin/sh
+# No push lands while the pinned harnox is red.
+#
+# Why this exists: the flake's `harnox` input is the harnox the Nix build
+# compiles — nix/eidolon.nix copies it in as `../harnox`, where the workspace's
+# `[patch]` picks it up. So `nix build` here is the only local check that sees
+# the *pinned* rev; `cargo check` sees the sibling checkout and stays green
+# while the pin is behind it. A commit that uses an unreleased harnox API builds
+# locally, fails Nix, and fails every git consumer resolving the pin's tag —
+# which is how crates/core came to match on StopReason::Dismissed against a tag
+# that predates the variant (see the vault: Trackers/Eidolon Harnox Pin Drift
+# Tracker).
+#
+# Committed here so it survives a re-clone; activate it once per checkout:
+#     git config core.hooksPath .githooks
+set -u
+
+cd "$(git rev-parse --show-toplevel)" || exit 0
+
+if [ "${EIDOLON_SKIP_PIN_CHECK:-}" = "1" ]; then
+  echo "pre-push: pin check skipped (EIDOLON_SKIP_PIN_CHECK=1)" >&2
+  exit 0
+fi
+
+# Reminder, never a gate: the flake locks a rev of its own, and while an
+# unreleased harnox commit is in use it deliberately differs from Cargo.toml's
+# pin. Consumers resolve the pin, so a mismatch is the state that leaves *them*
+# broken while this build is green.
+locked=$(python3 -c 'import json;print(json.load(open("flake.lock"))["nodes"]["harnox"]["locked"]["rev"])' 2>/dev/null || true)
+pin=$(python3 -c '
+import re, sys
+t = open("Cargo.toml").read()
+m = re.search(r"^harnox\s*=\s*\{[^}]*tag\s*=\s*\"([^\"]+)\"", t, re.M)
+sys.stdout.write(m.group(1) if m else "")
+' 2>/dev/null || true)
+if [ -n "${locked:-}" ] && [ -n "${pin:-}" ]; then
+  pinrev=$(git ls-remote https://github.com/noah427/harnox "refs/tags/${pin}^{}" 2>/dev/null | awk '{print $1}')
+  if [ -n "$pinrev" ] && [ "$pinrev" != "$locked" ]; then
+    echo "pre-push: NOTE — flake.lock's harnox rev ${locked} is not what Cargo.toml's pin ${pin} resolves to (${pinrev})." >&2
+    echo "          Legitimate only while an unreleased harnox commit is in use: a git consumer gets ${pin} and not this rev." >&2
+  fi
+fi
+
+echo "pre-push: nix build --no-link .#eidolon (the pinned-harnox view)…" >&2
+log=/tmp/eidolon-pre-push-build.log
+if nix build --no-link .#eidolon >"$log" 2>&1; then
+  echo "pre-push: green" >&2
+  exit 0
+fi
+
+echo "pre-push: BLOCKED — nix build .#eidolon failed on this commit. Log: $log" >&2
+tail -n 15 "$log" >&2
+echo "pre-push: if the cause is the pinned harnox rev, the harnox tag has to move first, then flake.lock." >&2
+echo "pre-push: EIDOLON_SKIP_PIN_CHECK=1 git push … overrides this." >&2
+exit 1

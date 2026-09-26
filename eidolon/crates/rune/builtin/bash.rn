@@ -1,0 +1,30 @@
+//! Built-in `bash`: run a shell command via the `shell` primitive. The
+//! command runs in its own process group and is killed as a group on
+//! timeout or cancellation. `background` detaches instead: the call
+//! returns at once with the pid and the log path, the command outlives
+//! the call and the turn, and the log file is how it is followed — there
+//! is deliberately no id, no poll and no stop.
+
+pub fn manifest() {
+    #{
+        name: "bash",
+        description: "Run a shell command with bash in the working directory and return its output. Non-zero exit codes and stderr are reported inline. Set `background` for anything that does not exit on its own — a server, a watcher, a long build: the call returns immediately with the pid and a log path, the command keeps running, and reading the log file is how you follow it.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "command": #{ "type": "string", "description": "The command line to run" },
+                "timeout_s": #{ "type": "integer", "description": "Seconds before the process group is killed (default 120)" },
+                "background": #{ "type": "boolean", "description": "Run detached and return at once with the pid and the log path instead of waiting; `timeout_s` does not apply" },
+            },
+            "required": ["command"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    if input.get("background") == Some(true) {
+        return eidolon::shell_background(input.command).await;
+    }
+    eidolon::shell(input.command, input.get("timeout_s")).await
+}

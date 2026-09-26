@@ -1,0 +1,222 @@
+//! Ollama's cloud, shipped with the harness.
+//!
+//! Declared, not coded: an ordinary provider script that happens to be
+//! embedded in the binary, so it loads before `providers_dir` and a file of
+//! the same name there — or a `[[providers]]` table called `ollama` —
+//! replaces it whole. Nothing here is privileged.
+//!
+//! ## Direct cloud Anthropic Messages API
+//!
+//! This is ollama.com, not the local daemon. The Anthropic client appends
+//! `/v1/messages` to the root base URL and authenticates with a bearer key.
+//! Direct cloud model ids keep their existing spelling, without `:cloud`.
+//! Thinking, tool calls and tool results use native Anthropic blocks;
+//! unsigned thinking survives continuation and journal replay. The live
+//! probe in `examples/ollama_anthropic_probe.rs` exercises that round trip.
+//! `max_tokens` covers thinking and prose together. Endpoint compatibility
+//! and measured behavior are recorded in the vault's provider contracts.
+//!
+//! ## The prices, and the six hours a day that double the deepseek rows
+//!
+//! Dollars per million tokens from `ollama.com/pricing`, 2026-09-14. The
+//! deepseek rows here carry their **peak** rates — peak pricing runs
+//! 12:00–18:00 UTC, Monday to Friday, and every other hour is exactly half
+//! of each — so a session estimate is a ceiling and never a surprise, for
+//! the same reason the first-party `deepseek` built-in lists its peaks. No
+//! other model in Ollama's table has a peak rate. `cache_write` is zero
+//! everywhere: Ollama caches on its own account and bills only the hit.
+//!
+//! Cache hits are reported in real cloud sessions, including the Anthropic
+//! probe. Cache controls being accepted does not prove their semantics;
+//! TTL, eviction and cross-session isolation remain provider behavior.
+//!
+//! Three rows below share ids with other built-ins (`glm-5.3` with `zai`,
+//! the deepseek ids with `deepseek`), so a bare id names more than one
+//! provider and the harness asks which — `ollama:glm-5.3` says so. That is
+//! the point of names: same model, different account to bill.
+//!
+//! ## `quota()`: the month's credits as a share, from `/api/usage`
+//!
+//! Measured with a real key on 2026-09-12 (nothing is documented — the
+//! OpenAPI spec still covers the local daemon only):
+//! `GET https://ollama.com/api/usage` accepts the API-key bearer — no web
+//! session — and answers with `limits.monthly.usage`, a **fraction of the
+//! month's included credits**: the reply said `0.022` while the settings
+//! page read $1.31 of $60, and 1.31/60 = 0.0218 → 0.022. Beside it ride a
+//! per-model request-count table and a rolling four-week `activity.cost`
+//! in *billed* dollars, which stayed `"0.00000"` while included credits
+//! covered everything — two units in one reply, which is how `usage`
+//! first got misread as money. Every sibling path (`/api/keys`,
+//! `/api/limits`, `/api/plan`, …) 404s and `/api/me` is POST-only, so
+//! that object is the whole key-authenticated account surface.
+//!
+//! The share is the only one of those the harness shows — the shape
+//! chatgpt's windows already have: percent, no counts. The ceiling, the
+//! plan, and the reset date are not published on this wire even on Pro
+//! (dollars live on the settings page behind a browser session), so the
+//! window carries no `used`/`limit` and no reset; a share over `1.0` —
+//! drawing from the extra-usage balance — clamps to a full gauge. The
+//! reading is the *account's*: every lane of a key pool sees the same
+//! month. Deriving dollars from a ceiling the operator typed in would
+//! print `1.32 of 60` against the page's `$1.31` and lose a cent to
+//! rounding; the share never disagrees with the page. If Ollama ever
+//! publishes the ceiling or the anniversary, `read_quota` should read
+//! them and this note shrink.
+//!
+//! Still unknown, both worth knowing before stacking plans: whether
+//! multiple subscriptions pool their credits or meter separately, and
+//! what a top-up beyond the included amount costs — the 3× multiplier is
+//! verified for included credits only.
+//!
+//! The key: `eidolon secret set ollama < key.txt`, or `OLLAMA_API_KEY` in
+//! the environment — the variable Ollama's own docs name. The store wins;
+//! the variable is the fallback.
+//!
+//! ## More than one key: a pool, not a choice
+//!
+//! Ollama's prefix caches are scoped **per API key** (measured, not
+//! documented: cross-key there is no contention, within one key the key's
+//! own traffic evicts warm entries), so an account that minted several
+//! keys has several isolated cache lanes and no way to say which this
+//! session should ride. The harness does: a `token_secrets` list on the
+//! definition — a `[[providers]]` patch naming `ollama` with
+//! `token_secrets = ["ollama", "ollama2", …]`, the keys in the store —
+//! turns the single key into a pool. At session start the harness claims
+//! the first lane no live session holds and keeps it for the session's
+//! lifetime; a crashed session's lane is reclaimed because liveness is
+//! the presence registry's socket, asked when a new session wants a lane.
+//! The claim is journaled in the session's log (`eidolon log` shows
+//! `note: key pool: ollama lane ollama2`), and each settled turn carries
+//! `cached=`, so per-lane hit rates group straight out of the logs. Two
+//! trades are accepted: more concurrent sessions than keys share the
+//! first key again, and sessions with similar large prefixes on different
+//! keys each pay the cold-start admission once — isolation, not
+//! deduplication.
+
+pub fn provider() {
+    #{
+        name: "ollama",
+        wire: "anthropic",
+        base_url: "https://ollama.com",
+        auth: "bearer",
+        token_secret: "ollama",
+        token_env: "OLLAMA_API_KEY",
+        models: [
+            #{
+                id: "deepseek-v4.1-flash",
+                name: "DeepSeek V4.1 Flash (Ollama)",
+                context: 1000000,
+                reasoning: true,
+                vision: true,
+                // Peak rates; off-peak is half. Cached input at peak $0.006.
+                cost: #{ input: 0.30, output: 1.20, cache_read: 0.006, cache_write: 0.0 },
+            },
+            #{
+                id: "deepseek-v4-pro",
+                name: "DeepSeek V4 Pro (Ollama)",
+                context: 1000000,
+                reasoning: true,
+                cost: #{ input: 1.32, output: 3.96, cache_read: 0.044, cache_write: 0.0 },
+            },
+            #{
+                id: "glm-5.3",
+                name: "GLM 5.3 (Ollama)",
+                context: 1048576,
+                reasoning: true,
+                vision: false,
+                cost: #{ input: 1.4, output: 4.4, cache_read: 0.26, cache_write: 0.0 },
+            },
+            #{
+                id: "glm-5.3-flash",
+                name: "GLM 5.3 Flash (Ollama)",
+                context: 1048576,
+                reasoning: true,
+                vision: true,
+                cost: #{ input: 0.15, output: 0.5, cache_read: 0.03, cache_write: 0.0 },
+            },
+            #{
+                id: "kimi-k2.7-code",
+                name: "Kimi K2.7 Code (Ollama)",
+                context: 262144,
+                reasoning: true,
+                vision: true,
+                cost: #{ input: 0.95, output: 4.0, cache_read: 0.19, cache_write: 0.0 },
+            },
+            #{
+                id: "qwen3.5:397b",
+                name: "Qwen 3.5 397B (Ollama)",
+                reasoning: true,
+                // No cached rate published; a cache read prices as input.
+                cost: #{ input: 0.6, output: 3.6, cache_write: 0.0 },
+            },
+            #{
+                id: "gpt-oss:120b",
+                name: "GPT-OSS 120B (Ollama)",
+                reasoning: true,
+                cost: #{ input: 0.15, output: 0.6, cache_read: 0.014, cache_write: 0.0 },
+            },
+            #{
+                id: "nemotron-3-super",
+                name: "Nemotron 3 Super (Ollama)",
+                reasoning: true,
+                cost: #{ input: 0.015, output: 0.6, cache_read: 0.015, cache_write: 0.0 },
+            },
+            // The rest of the cloud catalogue is reachable by adding a row
+            // here in your own ollama.rn — prices at ollama.com/pricing:
+            // deepseek-v4-flash (0.22/0.007/0.66 — beaten by v4.1-flash on
+            // every rate here), gemma4:31b, glm-5.2, glm-5.1, gpt-oss:20b,
+            // kimi-k3, kimi-k2.6, minimax-m3, minimax-m2.7,
+            // mistral-large-3:675b, nemotron-3-nano:30b and -ultra. The
+            // fleet rotates — July 2026 alone retired a dozen ids — so a
+            // row that starts answering "model not found" has probably been
+            // retired, and ollama.com's retirements table names the
+            // replacement.
+        ],
+    }
+}
+
+/// The month's credits as a share, read from the account now. See the
+/// module docs for what `/api/usage` says and deliberately does not.
+pub fn quota() {
+    // Keep the account endpoint independent of the model wire.
+    let body = match eidolon::http_get("https://ollama.com/api/usage") {
+        Ok(b) => b,
+        Err(e) => return #{ error: e },
+    };
+    return read_quota(body);
+}
+
+/// The reading in a usage reply, or a sentence about why there is none.
+///
+/// Apart from `quota()` so it can be run against a captured body with no
+/// network in the way — which is how the harness tests it.
+fn read_quota(body) {
+    let reply = match json::from_string(body) {
+        Ok(v) => v,
+        Err(_) => return #{ error: "the usage reply was not JSON" },
+    };
+    if !(reply is Object) {
+        return #{ error: "the usage reply was not an object" };
+    }
+    let monthly = match reply.get("limits") {
+        Some(l) => match l.get("monthly") {
+            Some(m) => m,
+            None => return #{ error: "the usage reply lists no monthly usage" },
+        },
+        None => return #{ error: "the usage reply lists no monthly usage" },
+    };
+    if !(monthly is Object) {
+        return #{ error: "the usage reply lists no monthly usage" };
+    }
+    let usage = match monthly.get("usage") {
+        Some(u) => u,
+        None => return #{ error: "the usage reply lists no monthly usage" },
+    };
+    if !(usage is i64 || usage is f64) {
+        return #{ error: "the usage reply lists no monthly usage" };
+    }
+    // A fraction of the month: the share is what the endpoint counts. The
+    // cast matters — a fresh month's integer `0` would otherwise meet
+    // `100.0` in integer arithmetic and fail rather than promote.
+    return #{ windows: [ #{ label: "month", percent: (usage as f64) * 100.0 } ] };
+}

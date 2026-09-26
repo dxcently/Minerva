@@ -1,0 +1,753 @@
+# aoide-storage
+
+`SessionRecord.project` is an optional explicit project name; absence selects
+automatic cwd anchoring. UPSERT preserves it. The exit ledger stores it as
+`project` (null on old/unassigned records) so resurrection can retain membership.
+
+Durable session data + memory persistence: stage-file record shapes, atomic
+stage I/O, session/hook upsert ops, the staging/declarative mode marker, the
+node-federation registry + pull cache (CONTRACTS.md §7), and the one INTENT
+file among all that state — the portable runtime config (`config`). File-first
+by decision — no embedded database yet
+(`docs/architecture/PACKAGE-LAYOUT.md`, "storage backend" open question).
+
+## Named seams (what it exposes)
+
+- `letter` defines optional `AOIDE-LETTER/1` content within the existing
+  signed envelope text: Subject, To, Cc, body, and optional threadId/replyTo.
+  Absent thread metadata preserves the four-field format. It performs no I/O
+  or delivery.
+  Exact-schema decoding preserves legacy or malformed bodies as raw text at
+  the caller; envelope headers and signatures keep their existing wire shape.
+
+- `config::Context` holds optional `context.agents` and `context.vaults` maps:
+  an enduring key names persona/memory note paths and a logical vault; that
+  vault resolves to an MCP endpoint, server-local vault name, and `tokenEnv`
+  variable name. Values are validated, like dynamic `mesh` declarations,
+  outside the static `config set` table. Credentials are never config values.
+- `session::bind_enduring_agent` binds an existing executor to an explicit
+  opaque key without consulting Mneme configuration. The optional
+  `SessionRecord.enduring_agent_id` survives UPSERT and projects into
+  `LedgerEntry.enduring_agent_id` at exit. It conveys continuity, not access.
+
+- `records`/`fs`/`stage` — the stage-file record shapes and atomic
+  read/write I/O every stage consumer (this crate's own `commands`, `conduct`,
+  `song`, `conductor`) goes through instead of touching JSON on disk directly.
+  Every runtime tree `fs` resolves hangs off ONE root, `fs::root` —
+  `$AOIDE_ROOT` (absolute-path-wins), default `<home>/.aoide`, nix-free
+  (L-C2, lyra-carrier lane, task #107) — EXCEPT `fs::flake_root`, which
+  stays pinned to the dev git checkout (`$AOIDE_FLAKE_ROOT`, default
+  `<home>/Aoide`) since that is not a runtime tree. `fs` resolves TWO stage
+  roots off that one root, not one (command-defrag lane S1, 2026-08-27,
+  CONTRACTS.md §4): `stage_dir` — unchanged, `$AOIDE_ROOT/song/stage/`,
+  rice/paint (`livery.json`/`mode.json`, lyra's tree) — and
+  `conducting_stage_dir` — new, `$AOIDE_ROOT/state/stage/`, core
+  orchestration state (`stage`'s own four path helpers, plus
+  `aoide-conduct`'s `herald::herald_path`/`graph::pending_path`). Both honor
+  `$AOIDE_STAGE_DIR` (absolute-path-wins) as one combined override, same as
+  before the split; `conducting_stage_dir`'s own no-override fallback is
+  `state_dir().join("stage")` instead of `stage_dir`'s `song/stage`.
+  `conducting_stage_dir`'s first no-override resolution in a process also
+  drives `fs::migrate_conducting_stage`: a one-shot, idempotent move of the
+  six core files off their pre-split `song/stage/` location, never
+  clobbering a fresher `state/stage/` file and never touching a rice file.
+  `fs::migrate_root_once` is the SIBLING one-shot migration for the L-C2
+  root move itself (a pre-L-C2 host's `~/Aoide/{song/stage,state,log}` into
+  the new root's equivalents) — deliberately NOT wired into `fs::root`'s own
+  resolution the way `migrate_conducting_stage` is wired into
+  `conducting_stage_dir`'s: `root`/`stage_dir`/`state_dir` are reached by
+  `with_stage_lock`, the shared lock primitive nearly every stage-file
+  writer across the whole workspace routes through regardless of which file
+  it is actually touching, so hanging a migration off that path made an
+  ordinary `state_dir()`-only test capable of silently migrating the
+  operator's real `$HOME` (a live incident during this lane's own
+  development). `migrate_root_once` is `pub` and idempotent instead — the
+  three real binaries (`aoide`, `aoided`, `lyra`) call it once, explicitly,
+  at the top of their own `main()`; see `fs::root`'s own doc for the full
+  reasoning. `fs::repo_root` is GONE (its one caller, `aoide-upkeep`'s
+  `soundcheck`, now reads `fs::flake_root` directly — a runtime root is not
+  a repo, so deriving a checkout path from stage-dir parentage stopped
+  making sense the moment the two could diverge). `fs::song_templates_dir`
+  (L-C3, same lane) is a THIRD, sibling path seam alongside `root`/
+  `flake_root`: the shipped SCORE TEMPLATES dir a repo-less host's `rice
+  compose --from <song>` and `aoide-song::widgets`'s registry/manifest
+  regeneration both fall back to when `songbook_dir`/`flake_root` have
+  nothing. Two tiers — `$AOIDE_SONG_TEMPLATES` (absolute-wins, same
+  discipline as every override above), else a sibling of `current_exe()`'s
+  directory (`<exe_dir>/../share/lyra/songbook`, gated on that directory
+  actually existing) — the same shape `aoide_protocol::bin`'s sibling-binary
+  resolver uses, applied to a directory instead of an executable. Returns
+  `None` (never a default that might not exist) when neither resolves; the
+  caller turns that into a taught error naming both locations.
+- `records::Project` — a project is a set of anchor roots, not one
+  directory: `path` is always the first root, mirrored at `roots[0]`;
+  `roots` is the FULL ordered root list, always written by
+  `project add`/`project edit`/`project remove` (ROOTS SERIALIZED
+  COMPLETE — never omitted, never "just the extras"). `Project::roots()` is
+  the one enumeration path every reader uses (path first, then `roots`,
+  deduplicated) — a legacy record predating `roots`, or a hand-edited one
+  whose `path` disagrees with `roots[0]`, is read as given, never silently
+  rewritten. `Project.hosts: Vec<ProjectHost>` (P-14 M1) is a SEPARATE,
+  additive list of other registered nodes this project ORGANIZATIONALLY
+  belongs to, each carrying its own verbatim (unvalidated, uncanonicalized)
+  root list — absent/empty stays off the wire, so a project no `--host`
+  invocation ever touched round-trips byte-identical. `Project::roots()`
+  never reads it: local anchoring and host membership are two disjoint
+  facts about a project.
+- `records::SessionRecord.sources` — an optional, additive
+  `field name -> "<absolute path>#<record ordinal>"` provenance map (wire
+  name `sources`, serialised only when `Some`, CONTRACTS.md §4), for a
+  record some reader captured off a native source rather than aoide's own
+  hooks. One producer today: `aoide-conduct::graph::codex_app`'s
+  desktop-Codex capture, pointing each field it sets back at the exact line
+  of the thread's own rollout it came from. A general `SessionRecord` field,
+  not a Codex-only one — but a second producer wanting the same shape earns
+  its own slice, never a second field (P-CX-5, codex seq 228 ruling R3).
+- `records::SessionRecord.native_role` — an optional, additive string (wire
+  name `nativeRole`, serialised only when `Some`, root order seq 404): the
+  native harness's own thread-role label, verbatim (`session_meta.
+  thread_source`'s `user`/`subagent`/`guardian_review` off a desktop-Codex
+  rollout, today's one producer — `aoide-conduct::graph::codex_app`'s
+  capture merge). A published FACT, not a reclassification: `kind` is
+  untouched by it, so a record this crate calls `"app"` stays `"app"`
+  regardless of what native harness role it also carries.
+- `config` — the portable runtime config (task #135 P-C, CONTRACTS.md §4's
+  `config.toml` subsection): `$AOIDE_ROOT/config.toml`, the one file here
+  that records INTENT rather than state. It exists because core is portable
+  — `aoide`/`aoided` are cargo-buildable on any Linux with no NixOS
+  assumption (root `AGENTS.md`), so a CORE command's configuration cannot
+  live in a NixOS module option: on a non-nix host that option does not
+  exist, and "rebuild to change a grant" is not an operation. Nix is ONE
+  authoring front-end (`modules/nucleus/config.nix`) that renders the whole
+  file to a READ-ONLY store path and points `$AOIDE_CONFIG` at it —
+  immutability IS the provenance, so there is no marker field to go stale
+  and the two worlds never write the same path. `source` resolves in two
+  tiers, absolute-path-wins like every other override in `fs`:
+  `$AOIDE_CONFIG` (MANAGED — `set` refuses it and names it), else
+  `$AOIDE_ROOT/config.toml` (UNMANAGED, writable). One function, so the CLI,
+  the daemon, and the stdio MCP façade have no per-door variant to drift. A
+  missing file is every default, never an error (`advertise::enabled`'s own
+  tolerate-missing stance); a file that EXISTS but carries an unknown key,
+  an unknown section, or a value outside its vocabulary is a LOUD error
+  naming the offence — this file carries grants, so silent tolerance of a
+  typo is the exact failure the format choice refuses (TOML, because the
+  reasoning behind a grant has to live beside it, which JSON has nowhere to
+  put; not YAML, whose implicit coercion is the opposite of failing loudly).
+  `SCHEMA` is a walkable const TABLE of the SETTABLE surface — sections,
+  their keys, each key's value vocabulary, and a `read` fn projecting that
+  key off a typed `Config` — and `validate`, `set`, and `aoide config`'s own
+  listing all walk it rather than restating it in match arms. v0 carries
+  exactly one section: `[pairing]`'s `defaultGrant`, whose vocabulary IS
+  `node_store::NODE_CAPABILITIES` (the same closed set `node allow`
+  enforces, never a second list). `set` is the only writer: it refuses a
+  managed config, an unknown key, a value outside its vocabulary, and a
+  config already on disk that does not load — each with a taught error, and
+  nothing written in any of them — then edits the file's own text through
+  `toml_edit` so an operator's comments survive, re-parses the result
+  through the same gate the next `load` will apply, and commits it with
+  `fs::atomic_write`.
+
+  `[mesh.<name>]` (task #135 P4) is the one DECLARED-but-not-SETTABLE
+  section: zero or more operator-named meshes, each a `grant`/`sameOperator`
+  pair plus a `nodes` map (`name -> ssh hop`, `tunnel::parse_via`'s own
+  shape). `validate` fully type- and vocabulary-checks it — same closed
+  `NODE_CAPABILITIES` grant vocabulary, `node_store::valid_node_name`-shaped
+  names, no node name declared in two meshes — but it never joins `SCHEMA`:
+  the section's KEYS are the operator's own mesh/node names, not a static
+  table `&'static str` can enumerate, so `config set` structurally cannot
+  reach into it (`SetRefusal::UnknownKey` for any `mesh.*` key, same as a
+  typo). Writing a mesh is a text edit to `config.toml` — reading what it
+  implies about the live node registry is `aoide mesh`, and acting on it
+  (pairing the declared nodes, stamping the declared `grant`) is `aoide mesh
+  pair`; both live in `aoide_client::mesh`, never this crate.
+- `session` — pure session/hook upsert operations.
+- `node_store` — the node-federation registry + pull cache (CONTRACTS.md §7).
+  `Node` carries two independent, opposite-direction credential fields:
+  `tokenFile` (inbound — what a node presents TO US, read from a local
+  file) and `bearerSecret` (outbound — what WE present TO a node, a
+  secrets-broker secret NAME resolved fresh at request time by
+  `aoide-client`, task #84). Both are optional and independently settable
+  via `node add`; neither implies the other. `hub` (P-D5,
+  `docs/architecture/AOIDED.md`) marks AT MOST ONE registered node as the
+  standing orchestrator address resolution falls back to — additive,
+  `#[serde(default)]`, omitted from the wire when `false`
+  (`SessionRecord::headless`'s precedent, `records.rs`). `set_hub`/
+  `clear_hub` hold the "at most one" and idempotence invariants; nothing
+  else writes the field directly. `pubkey`/`verified` (P-P2,
+  `docs/architecture/PAIRING.md`, CONTRACTS.md §7's "Node record" note) are
+  the pairing ceremony's own additive fields — set ONLY by
+  `upsert_paired_node`, never by `node add`; a legacy record predating them
+  loads with `pubkey: None`/`verified: false` unchanged.
+  `default_node_name_from_url` sanitizes a bare URL host into the same
+  nickname shape `valid_node_name` requires, for `aoide pair`'s url arm's
+  no-`--name` default. `url_path` (P-P4) extracts just the path component
+  from a node's `url` (`"http://host:port/foo?x"` → `"/foo"`, `""` when
+  none) — the ONE function both `aoide-client`'s signer and
+  `aoide-server`'s HTTP request parser derive a wire path from, so a
+  signature's canonical string binds to the exact same string on both
+  ends. `allows` (P-P3, `docs/architecture/PAIRING.md`
+  decision 5) is a CLOSED capability set (`NODE_CAPABILITIES`: `"read"`,
+  `"spawn"`, `"message"` — the third joined at P-M2, gating
+  `aoide/mailDeposit` the way `"spawn"` gates `message/send`'s spawn arm) —
+  never a per-capability serde bool scatter — additive,
+  empty for every unpaired/legacy node; `upsert_paired_node` stamps the
+  grant its CALLER resolved (`config.toml`'s `[pairing] defaultGrant`, or a
+  `--allow` typed on that one commit — never a literal here) the moment a
+  node FIRST becomes verified, and leaves it untouched on a later key rotation (a
+  revoked capability survives re-pairing). `set_node_allow` (`node allow
+  <name> <cap> on|off`'s library half) is the only OTHER writer —
+  idempotent, refuses an unknown node or an unknown capability (the
+  capability check runs first). `resolve_node` (decision 6) is the
+  caller-identity ladder the A2A door keys off, returning WHICH `NodeRung`
+  matched alongside the `Node`: a presented bearer against a node's own
+  `token_file` first (`NodeRung::Token`), an origin address against that
+  node's `url` second (`NodeRung::Addr`) — unlike `is_autogated_node_token`/
+  `is_autogated_node_addr` above, it looks at EVERY registered node, not
+  only `autogate`-marked ones, since resolving WHICH node is calling is a
+  different question from "should this node skip the pending queue."
+  `NodeRung` carries a THIRD variant, `Signature` (P-P4) — the strongest
+  rung, never produced by `resolve_node` itself (it has no access to the
+  raw HTTP request a signature needs); it is yielded only by
+  `aoide-server::a2a::verify_signed_request`, which resolves the caller BY
+  the stored `pubkey` that verifies the request's `X-Aoide-*` signature
+  headers (#63 P-ID5: identity is the key; the claimed name is attribution
+  only — see `wire_auth` below, CONTRACTS.md §6's P-P4 amendment for the
+  full wire shape). None of the three rungs are interchangeable strength:
+  `aoide-server`'s spawn arm (`spawn_admitted`) accepts ONLY
+  `NodeRung::Signature` — a bare address match carries no possession
+  proof, and a bare token match is replayable and identical across every
+  request the real node or an impersonator ever sends; both remain fine
+  for attribution/origin-stamping and the ordinary autogate question, just
+  never for Spawn. Ambiguity resolves deterministically: `node add` refuses only a
+  duplicate NAME (CONTRACTS.md §7), so two nodes can share a URL host or
+  hold byte-identical `token_file` contents, and `resolve_node` then
+  answers with whichever matches FIRST in registry (array) order — not
+  the last, not random. `via` (P-S4, ssh-transport lane) is the
+  `Option<String>` transport marker `aoide-client`'s dial resolution reads
+  before every outbound POST to this node (an `ssh://[user@]host[:port]`
+  string, `crate::tunnel::parse_via`'s own shape) — additive,
+  `#[serde(default)]`+`skip_serializing_if`, the `hub` discipline verbatim:
+  absent for every node registered before this field existed, and `None`
+  means direct dial (today's behavior, unchanged). `set_node_via` is the
+  ONLY writer — a SIBLING to `upsert_paired_node` rather than a new
+  parameter on it, since that function's signature is also called from
+  `aoide-server`'s own pairing integration tests, outside this field's
+  blast radius.
+- `pairing` — the pairing ceremony's own park-and-approve state (P-P2,
+  `docs/architecture/PAIRING.md`, CONTRACTS.md §4's `state/node-pairing-
+  inbound.json`/`-outbound.json` subsection): two disk-persisted queues,
+  one per direction (`InboundPairingRequest` on the approver, generated by
+  `aoide/pairRequest`'s handler; `OutboundPairingRequest` on the requester,
+  written by `aoide pair`), keyed by STABLE 8-hex-char ids (never
+  `state/stage/pending.json`'s array-position ids — a pairing correlation
+  must survive both processes exiting and an async callback arriving
+  arbitrarily later). Expiry is swept lazily on every `list_inbound`/
+  `list_outbound`/`take_inbound`/`take_outbound` call, never a timer
+  (`pairing_timeout_secs`, `AOIDE_PAIRING_TIMEOUT` env, 4-hour default).
+  `derive_sas` is the FIRST of two SAS (short authentication string)
+  derivations — SHA-256 over the four public transcript values (both
+  pubkeys, both nonces, NUL-separated, order-sensitive), pinned by
+  stability test vectors so it renders identically on both boxes forever.
+  `derive_reply_sas` (the mutual-code redesign, R1) is the SECOND, over
+  the SAME four fields in the SAME order plus a leading domain-separation
+  tag (`"aoide-pair-reply"`, NUL-separated the same way) so the two codes
+  can never collide even transcript-for-transcript — the approver's own
+  reply code, which the requester's operator types back to complete its
+  own leg, never the code `derive_sas` already produced for the approver's
+  side; also pinned by stability test vectors. `derive_commit`
+  is a SEPARATE, one-way, untruncated SHA-256 over just a pubkey + a
+  nonce — the
+  requester commits to its own nonce (`park_inbound`'s `commit_hex`) BEFORE
+  ever revealing it (`reveal_inbound`, verified against the parked
+  commitment; a mismatch DROPS the entry, a match stores the now-revealed
+  `requester_nonce_hex: Option<String>` — `None` until revealed, and a
+  caller MUST check that before deriving a SAS). `park_inbound` is capped
+  (`pairing_park_cap`, `AOIDE_PAIRING_PARK_CAP` env, default 32,
+  check-then-insert under one `PARK_LOCK` acquisition, same discipline
+  `aoide-secrets::park::park_if_room` holds); `park_outbound`
+  is uncapped (operator-created, one per `aoide pair` call). Every
+  mutator of either park file runs its whole load-modify-write under
+  `fs::with_stage_lock` — the same flock `mail`'s writer resolves for a
+  `state/` file — so the `a2a serve` process and a concurrent CLI never
+  race each other's read-modify-write on
+  `state/node-pairing-{inbound,outbound}.json`. One live parked request
+  per requester identity (R3): `park_inbound` SUPERSEDES — never refuses —
+  any entry already parked for the SAME `pubkey_hex` (approved-but-unpolled
+  included), evicted under the same `PARK_LOCK` acquisition BEFORE the cap
+  check runs; it returns `(InboundPairingRequest, Option<String>)`, the
+  second element the evicted id for the caller (`aoide-server::a2a::
+  pair_request`) to audit — never reported on the wire. `park_outbound`
+  mirrors this on the requester's own side: replaces by id OR by the
+  approver's own `pubkey_hex`, one live outbound entry per far identity.
+  A cross-direction pair (an inbound entry FROM X alongside an outbound
+  entry TO X) is left alone — the two files never reference each other.
+  `OutboundPairingRequest.state` (`AwaitingApproval` → `AwaitingConfirm`,
+  `mark_outbound_awaiting_confirm`) defers the REQUESTER's own node-record
+  commit until its own operator confirms a second time, after this
+  instance's own `aoide/pairPoll` (Design A, task #119 — REPLACES the old
+  `aoide/pairApprove` reverse callback: the requester polls the approver's
+  door instead of the approver ever dialing back) comes back `approved` —
+  the approver has already committed its own side, purely locally, by
+  then — both humans confirm the same code before either end calls itself
+  paired. `InboundPairingRequest.approved` (Design A, additive,
+  `#[serde(default)]`) is the mirror image on the approver's side: set by
+  `mark_inbound_approved` (called ONLY from `aoide-client::commands::approve_inbound`,
+  never from a wire handler) once that instance's own operator confirms —
+  the entry stays PARKED (never taken) so `aoide/pairPoll` can still find
+  and release it, cleaned up only by the ordinary expiry sweep.
+  `InboundPairingRequest.tries` (task #120 P3, additive,
+  `#[serde(default)]`) counts wrong pairing codes typed against the entry,
+  cumulatively across invocations — bumped by `record_inbound_code_try`
+  (same `MarkApprovedError` refusal shape), while the auto-deny at 3 is
+  the CLI caller's own `take_inbound`, never a state written here. A crash
+  between the third increment's save and the deny can persist a value at
+  the limit; the approve path denies such an entry up front on next sight,
+  so it is never approvable.
+  `OutboundPairingRequest.tries` (the mutual-code redesign, R1, additive,
+  `#[serde(default)]`) is the exact mirror on the requester's own leg —
+  counts wrong REPLY codes typed against the entry, bumped by
+  `record_outbound_code_try` (same `MarkApprovedError` refusal shape,
+  same cumulative-across-invocations discipline), while the auto-abort at
+  3 is the CLI caller's own `take_outbound`, never a state written here.
+  `OutboundPairingRequest.via` (P-S4, additive, `#[serde(default)]`) carries
+  the ssh-transport marker THIS instance resolved at request time (an
+  explicit `--via`, or `pair`'s hostname arm/bare `pair`'s src_addr-derived
+  default) forward to
+  the SEPARATE, later `aoide pair` invocation that actually commits
+  the node record — the only place that commit happens, so the value has
+  nowhere else to ride between the two.
+  `InboundPairingRequest.self_via` (task #131, additive, `#[serde(default,
+  skip_serializing_if = "Option::is_none")]`) is the mirror image on the
+  APPROVER'S side: the requester's own OPTIONAL `selfVia` claim off
+  `aoide/pairRequest`'s wire params, carried through `park_inbound` with no
+  validation here (never eagerly parsed — only ever consumed, later, at
+  `aoide pair`'s own commit, same as any other recorded `via`
+  string). It exists for the same reason `OutboundPairingRequest.via`
+  does, from the OTHER direction: a request that reaches the approver over
+  the requester's own ssh tunnel arrives, as far as the approver can
+  observe, from loopback, so `origin_addr` (§0.7) is never a usable source
+  for a working `via` — the requester has to claim one itself.
+- `mode` — the staging/declarative mode marker, read by `shellbridge`
+  (which stays in `conduct`, see that crate's charter-smudge note).
+- `ledger` — the durable, append-only session HISTORY (`state/
+  session-ledger.jsonl`, under `fs::state_dir` — real disk, never tmpfs;
+  P-D8, `docs/architecture/AOIDED.md`'s "L5"). `sessions.json` is the live
+  roster; this is what survives its pruning. One `LedgerEntry` line per
+  session, written at the exact moment it leaves the roster (`aoide-conduct`
+  owns the single shared call site both `session end` and `reap` route
+  through — never two independently-written appenders); every field
+  serializes unconditionally, unlike `records::SessionRecord`'s additive
+  optional fields, since a ledger line is a closed historical shape, not a
+  growing live record. `append_ledger_entry`/`read_ledger` are the only
+  I/O; a malformed line is skipped on read rather than failing the file.
+  `records::Project.autoResume` and `records::SessionRecord.resumedFrom`
+  (both additive/v0-safe, `skip_serializing_if`) are this same phase's
+  other two wire-shape additions — the daemon's boot-time auto-resume flag
+  and the mark a resurrected session's own record carries.
+  `records::SessionRecord.origin`/`LedgerEntry.origin` (P-P3,
+  `docs/architecture/PAIRING.md` decision 7; write-authority tightened at
+  LANE IDENTITY P-ID0, G16/G5, review round 1) are the provenance pair:
+  `"node:<name>"` for a session an identified, paired node's A2A spawn
+  created, additive on the live record (`skip_serializing_if`), always
+  present (possibly `null`) on the closed ledger line — `SessionRecord`'s
+  own value is projected verbatim into the `LedgerEntry` at exit, the same
+  "additive live field, always-serialized ledger field" shape `resumedFrom`
+  already set the precedent for, AND `aoide-conduct`'s
+  `graph/resurrect.rs::origin_to_carry` now reads the ledger field back on
+  revival to carry a LOCAL-class session's own provenance forward onto its
+  fresh record (G6 — the ledger wrote `origin` on every exit long before
+  anything read it back), REFUSING to carry a `node:*` shape found there
+  (eprintln, never carried) — `state/session-ledger.jsonl` is a plain,
+  same-uid-writable, append-only file, so a same-uid process could append a
+  line claiming `origin:"node:X"` and drive the ungated local `aoide
+  resurrect`, which has no door and no seal behind it to re-mint that
+  authority. `origin` is still attribution, not an authenticated
+  credential — the invariant `aoide-conduct`'s `stamp_origin` (`pub`,
+  crossing the crate boundary) now holds is by SHAPE, not caller count: a
+  `node:<name>` value may be stamped from exactly one place,
+  `aoide-server`'s `a2a::do_spawn`, DIRECTLY on the record from the door
+  that authenticated the node name; every other caller
+  (`session_conduct`'s env read, `origin_to_carry`'s ledger read) may
+  stamp a LOCAL-CLASS value but refuses a `node:*` shape from its own
+  untrusted source. **This closes the STAMP paths, not the files** — a
+  hand-crafted `sessions.json`/ledger line claiming `node:X` is still a
+  readable, unflagged string on disk; nothing here makes the files
+  tamper-evident, that is P-ID1 (the daemon-signed credential) minted and
+  stored, verified on the per-session control socket's own accept and
+  consumed by the send gate as of P-ID2 — the remaining two sockets
+  (shellbridge, `aoided`'s own dispatch socket) get a peercred floor of
+  their own as of P-ID3 (cross-uid only; see `aoide-conduct`'s own
+  README/AGENTS and CONTRACTS.md's identity section for the honest
+  accounting of what that does and does not close). A same-uid process
+  can still forge a LOCAL-class origin as a raw string, so nothing gates a
+  security decision on the field as read off disk — the authenticated form
+  is `sealed_id`'s credential (below), whose VERIFIED `originClass` is
+  what the send gate and the secrets broker's origin gate (P-ID4,
+  `attest`) consume; the consumer NAME presenting a request stays
+  unauthenticated either way (a separate, unbuilt axis — CONTRACTS.md's
+  identity-lane accounting). What P-ID0 closes: every
+  record-STAMP path this codebase drives now refuses a `node:*` shape it
+  didn't mint itself at the door — env AND the unsealed ledger both.
+  `records::RestoreSnapshot`/`SessionRecord.restore`/`LedgerEntry.restore`
+  (P-C5, durable-sessions plan) are a conducted TERMINAL's continuously-
+  captured `{cwd, idle, argv, typed}` snapshot — the SAME `RestoreSnapshot`
+  type embedded on both, `origin`'s "additive live field, always-serialized
+  ledger field" shape again, except `RestoreSnapshot`'s OWN fields never use
+  `skip_serializing_if` in EITHER home, so a populated snapshot reads the
+  identical complete shape whichever file it's read from. `idle` is its own
+  field rather than inferred from `state`, deliberately: the reap sweep
+  overwrites `state` to `"done"` before its ledger write, so idleness would
+  otherwise be unrecoverable by the time `ledger_session_exit` runs.
+  `aoide-conduct` is the sole writer (its PTY tick, ~1 Hz) and the sole
+  reader of `typed`'s raw keystroke stream — this crate only holds the
+  shape, never the capture logic.
+- `undying` — the undying mark (durable-sessions plan, P-C1; renamed from
+  "carry" at command-defrag lane U1, 2026-08-27): `state/undying.json`, the
+  set of session ids marked durable so a project's whole undying set can be
+  resurrected together (`session grant undying on|off`). Mirrors `node_store`
+  exactly — `load_undying`/`save_undying` tolerate a missing/corrupt file as
+  empty and write atomically via `fs::atomic_write` (not
+  `atomic_write_private`: a session id is the same class of data
+  `sessions.json`/`nodes.json` already keep at default mode).
+  `set_undying`/`is_undying` are pure list operations; `set_undying` returns
+  whether the undying/not-undying TRANSITION changed, and separately
+  refreshes `markedAt` on every `on` call including a re-mark of an
+  already-undying id. `load_undying` also folds in a one-shot migration off
+  the pre-rename `state/carry.json`, idempotent by construction (a cheap
+  `exists()` check, no process-wide `Once` needed for a single file) —
+  narrated, never a clobber of a fresher `undying.json`.
+- `manifest` — a project's own `.aoide/project.json` (v0, command-defrag
+  lane U1): host-local SESSION SPECS (`{host, dir, agent, command?}`, `dir`
+  always PROJECT-RELATIVE, never a session id or timestamp), so `resurrect`
+  (U2) can bring a project's intended sessions up on the host that conducts
+  them without a `projects.json` registration first. Distinct from
+  `undying` in every way that matters except one — both are host-local,
+  neither committed; see this module's own doc for the full contrast.
+  `load_manifest`/`save_manifest` are this project root's read/write pair
+  (missing file → `None`; unreadable/corrupt → narrated then `None`;
+  `save_manifest` refuses an absolute `dir` in any spec BEFORE writing
+  anything). `.aoide/` self-ignores on first `save_manifest` into a project
+  root (`.gitignore` seeded with `*\n`, never overwritten if one already
+  exists) — the manifest never syncs via git the way the project's own
+  source does. `resolve_spec_dir` (U2) is the read-side containment guard:
+  joins a spec's `dir` onto the project root and normalizes LEXICALLY,
+  refusing any `..` that would resolve outside the root. `walk_up` is the
+  pure, explicit-`start`-argument discovery seam `resurrect`'s bare mode
+  calls: git-style nearest-wins search up through parent directories,
+  stopping at the filesystem root — a lexical walk, never realpath-resolving
+  (a manifest reached through a symlinked directory is still found; the walk
+  never resumes from the symlink's own target ancestry).
+- `tunnel` — the ssh tunnel registry (ssh-transport lane, P-S2,
+  `docs/architecture/PAIRING.md`'s forthcoming Transport section): a cross-box
+  client action that cannot reach a node's loopback-bound door directly opens
+  an ssh `-L` forward and records it at `$XDG_RUNTIME_DIR/aoide/tunnel/
+  <sessionId>/<key>.json` (`TUNNEL_VERSION` "0" — two path levels, since
+  both components may carry `-` and a flat joined name could collide two
+  distinct pairs onto one record), the same runtime-dir
+  convention `aoide_conduct::graph::conduct_socket_path` resolves its own
+  `session-<id>.sock` into — re-derived here (`runtime_dir`), not imported,
+  since this crate sits below `conduct` in the DAG. `parse_via` reads a
+  `--via`/`Node.via` marker (`ssh://[user@]host[:port]`, `ssh` scheme only,
+  user and port both optional, a present port bounded `1..=65535`) into a
+  `Via`; `default_via` builds one directly from an observed IP + login with
+  no string round trip. `dial_url` rewrites a logical node url's authority to
+  `127.0.0.1:<local port>` while preserving BOTH the scheme and the PATH
+  verbatim — the path half delegates to `node_store::url_path` rather than
+  re-deriving it, since `sign_headers_for_node`'s canonical string
+  (`aoide-client`) is bound to that exact same path; a divergent cut here
+  would make every signed call through the tunnel fail on the far end with an
+  opaque `-32007`. `record_path` refuses a traversal-shaped `sessionId` or
+  `key` before either ever reaches a path join — `key` through
+  `node_store::valid_node_name`, `sessionId` through this module's own looser
+  `is_safe_id` (a session id is not an operator-typed nickname, so it can't
+  reuse `valid_node_name` verbatim). `save`/`load`/`remove` are the CRUD
+  (`atomic_write_private`, `0600` — module doc's own note on why a
+  non-secret record still gets that discipline; `load` additionally
+  refuses a record whose own fields name a different pair than the path it
+  was read from); `list_records` walks only `tunnel/*/*.json`, the same
+  `sweep_orphan_sockets` scoping
+  (`aoide-conduct::reap`) that lets a sibling convention's files
+  (`session-*.sock`, `aoided.sock`) share the same runtime directory without
+  ever being mis-parsed. No process is ever spawned here — the ssh child
+  itself lives in `aoide-client::tunnel` (P-S3), the same `node_store`
+  (storage) / `commands` (client) split this crate already holds for node
+  transport.
+- `takes` — the take store behind `rice back`/`rice take`, hanging off
+  `songbook/<song>/takes/` when staged directly or
+  `songbook/<song>/drafts/<name>/takes/` when routed into a draft
+  (`lyra reload` design, settled 2026-08-31 — the staging-mode take/back
+  reach; every function takes `draft: Option<&str>`, `None` selecting the
+  song-scoped root). `TakeRecord` also carries `widgets: Value` — the
+  song's widget QML bodies at mint time.
+- `petname`/`display` — the adjective-noun petname mint and its
+  render-time-only display grammar.
+- `addr` — the pure address resolver (messaging/presence plan, P-C1),
+  inverting `display::session_label`'s grammar to turn a typed query back
+  into a local session id or a deferred `node/<rest>` remote query. Zero
+  I/O, agnostic of any call site — bare `session`/`--hosts`
+  (`aoide-conduct::graph::who`, C2 — the roster core, formerly the standalone
+  `who` command) and `send --to` (`aoide-conduct::graph::send`, C3) both call
+  `resolve` directly. `resolve_with_hub` (P-D5) composes it with the hub
+  preference (`node_store::Node.hub`): a hub-designated node is offered as
+  one last, least-specific `Remote` candidate only on `resolve`'s own
+  `NotFound` — every earlier precedence tier is untouched. As of P-D5 it is
+  a tested library function only; `send --to`'s live call site still
+  calls plain `resolve` (the same "land the function, wire a caller later"
+  order this module's own tier-5 `node/<rest>` grammar went through).
+- `mail` — the addressed, signed, append-only mailbase (messaging plan
+  P-M1, `docs/architecture/MAIL.md`, CONTRACTS.md §4's `state/mail/`
+  subsection): `base.jsonl`/`cursors.json`/`seen.jsonl` under
+  `state/mail/`, one entry per envelope (header, text, ed25519 `sig`,
+  sha256 `msgid` over the signed bytes — MAIL.md's "The envelope" is the
+  formula). Every write funnels through one `with_lock` choke point —
+  under `fs::try_stage_lock`, migrate a legacy `inbox.json` if not yet
+  done (skipping any row whose `msgid` is already in `seen.jsonl`, so a
+  retry after a crash mid-migration never re-files one), truncate any torn
+  tail, append, fsync, then append `seen.jsonl` — so a crash between the
+  two appends is re-accepted next time, never lost. `mail::file_receipt` is the shared seam both `conduct`'s
+  `deliver_local` and the A2A door's `spawn_inject_prompt` file a
+  delivered message through; `mail::file_letter` is `mail send`'s own
+  engine. Keep-all: `mail rm --older-than` is the only pruning, and it
+  never touches `seen.jsonl`.
+
+  P-M2 adds the wire for directly-paired nodes: `mint_outbound_letter`/
+  `mint_ack` seal a fresh envelope with THIS instance's own identity key
+  (`from.node` always `display::local_host_name()` — `self` never crosses
+  the wire); `verify_origin_signature` is the OTHER lookup a P-P4 caller
+  doesn't need — not the connection's signer (`ctx.signed_node_name`, a
+  door concern) but `header.from.node`'s own key, tried against the ONE
+  entry `node_store` has on record under that exact name, never every
+  verified node's key (a paired node signing as another paired node's
+  name must not verify); `deposit` is the receiving side's whole admitted
+  policy in one function — recompute `msgid`, verify the origin
+  signature, dedup against `seen.jsonl` (a filed `letter`'s duplicate
+  reports whether it was ever filed, so the caller knows to re-spool the
+  ack), then file via the new `file_received_entry`. Both mint functions
+  and `deposit` carry neither `mesh` nor `transit` — P-M2's envelope is
+  exactly P-M1's shape, addressed at a real node instead of `self`.
+
+  P-M5a-1 adds the doorbell's own state and its safety floor: `arms(kind)`
+  is the one place that decides which entry kinds ring (`letter` only,
+  until P-M5b's `fetched`); `ring_targets(name)` reads who is armed under
+  a name and which real readers are enrolled at all (`RingTargets {
+  armed, enrolled }`, MAIL.md "Delivery and the doorbell") — `enrolled`
+  is the full roster of reader keys, not a count (the count is
+  `.len()`), so a caller can ask not just how many but which, and the
+  pseudo-reader (cursor key == `name`) is excluded from both `armed` and
+  `enrolled`; `stamp_rung`/`enrol_reader` are its paired mutations,
+  latching an already-enrolled reader and enrolling a fresh one
+  respectively, never the other's job; `armed_names_for_reader` is the
+  same armed rule run for one reader across every name, the shape the
+  Stop-hook replay reads. Storage stays read-only about liveness: whether
+  an enrolled reader is still alive is a session-store question
+  `ring_targets` cannot answer, so `RingTargets` hands back keys, not a
+  verdict — `aoide-conduct`'s `graph::doorbell` is the one place with
+  both the roster and the session records to judge it.
+  `file_letter`/`mint_outbound_letter` refuse a `to_name` outside
+  `^[a-z0-9][a-z0-9-]*$` (`node_store::valid_node_name`) before taking
+  the lock — validated, never clamped; a letter already on disk under an
+  off-grammar name from before this rule stays filed and readable.
+
+  P-M5a-2 adds `with_ring_lock` — a dedicated `.ring.lock` file in
+  `mail_dir()`, `flock`ed by `fs::lock_path` (the same primitive
+  `try_stage_lock` itself now calls, generalized rather than duplicated)
+  for the WHOLE select-inject-stamp sequence a ring runs in
+  `aoide-conduct`'s `graph::doorbell`. This is a SEPARATE file from
+  `.stage.lock` on purpose: a ring holds its lock across a real socket
+  connect, write, and submit-keystroke delay (tens of milliseconds), while
+  every `.stage.lock` holder in this crate takes it only for a brief
+  in-memory read-modify-write — asking the mailbase's ordinary writers to
+  wait behind a socket op would be a real regression, not a refactor.
+- `outbox` — the per-node BSO-style spool (P-M2): `state/outbox/<node>/`,
+  one JSON file per pending envelope plus each link's own backoff state
+  (`link.json`), guarded by the same crate-wide stage lock `mail` uses for
+  file mutations and a SEPARATE, non-blocking per-node `.bsy` flock a
+  drain holds across its whole dial cycle — two locks, two jobs, never
+  conflated (this module's own doc has the full reasoning). Pure spool
+  CRUD only: `write_entry`/`list_entries`/`remove_entry`, `retire_by_ack`
+  (spec item 7's two checks — verified signer is the entry's `to.node`,
+  text names the entry's `msgid` — folded into ONE path lookup: an entry
+  is always spooled under its own `to.node`, so indexing by the ack's
+  already-origin-verified `from.node` IS the signer check, and keying by
+  `msgid` makes a wrong `text` a plain miss) and the link-state
+  trio (`read_link_state`/`back_off`/`clear_link_state`, backoff off a
+  `DRAIN_BACKOFF_FLOOR_SECS` floor doubling up to its own
+  `BACKOFF_CEILING_SECS` (15 min) ceiling — deliberately not
+  `aoide_protocol::dialog::SPAWN_BACKOFF_MAX`, which is sized for a
+  respawned process, not a link stuck on a permanent transport failure).
+  `write_ack_if_absent` is the ack-redelivery gate the outbox fix (mail
+  register §26) adds: it spools a freshly minted ack only when no ack for
+  the same `(node, acked_msgid)` pair is ALREADY sitting undelivered in
+  that node's spool, so a duplicate letter redelivered while its ack is
+  still in flight mints nothing new. It is deliberately not a permanent
+  ledger — once the pending ack is actually delivered and its entry
+  retired, the next redelivery finds nothing pending and correctly
+  respools, preserving MAIL.md item 5 (a duplicate re-sends the ack
+  because the sender's earlier one evidently never arrived). The pending
+  check is a single `exists()` stat on a per-`acked_msgid` marker file
+  (`<node>/.ack/<acked_msgid>`, zero bytes, never data) — NOT a directory
+  scan (review round 2): a live spool can hold tens of thousands of
+  entries, and walking/parsing every file in it under the crate-wide
+  stage lock on every ack deposit would itself become a fresh
+  latency/contention incident on exactly the node this fix is for. The
+  marker is written in the same locked section as the ack entry
+  (`write_ack_if_absent`) and cleared in the same locked section as that
+  entry's own removal (`remove_entry`, which reads the ONE file it is
+  about to delete — never the directory — to decide whether to clear a
+  marker), so every retirement path (a drain's delivery confirmation, an
+  explicit `mail outbox rm`) keeps the marker's presence exactly in sync
+  with the entry's. No network,
+  no HTTP, no tunnel — the actual dial+POST lives in
+  `aoide-client::mail_wire` (bounded to `DRAIN_BATCH_CAP` entries per
+  `drain_node` call, and recording `tries`/`lastOutcome`/`lastTryAt` on
+  the entry a transport failure actually hit before backing off), a thin
+  bridge in `aoide-conduct::mail_bridge`, the same split `tunnel` above
+  already holds between record CRUD (here) and the ssh child process
+  (`client`).
+- `identity` — this instance's lazily-minted ed25519 keypair (pairing
+  workstream P-P1, `docs/architecture/PAIRING.md`, CONTRACTS.md §4's
+  `state/identity/` subsection): `state/identity/ed25519.key` (the raw
+  32-byte private seed, `fs::atomic_write_private`'s 0600 discipline,
+  written once) plus a `created_at` sidecar. `Keypair` holds the private
+  key and is never `Serialize`/`Deserialize` — `IdentityInfo` (pubkey hex,
+  fingerprint, mint time) is the only serializable shape this module
+  emits, and a source-scanning test in `identity.rs` mechanically holds
+  that boundary. The pairing ceremony (`aoide pair`, P-P2) builds on this
+  directly (`node_store`/`pairing` above); the `allows` set + A2A spawn-gate
+  flip (P-P3, `node_store::allows`/`resolve_node` above) also build on it;
+  so does `wire_auth` below (P-P4) — `Keypair::sign`/`Keypair::verify` are
+  its ONLY two entry points into `ed25519_dalek`, so neither
+  `aoide-client` nor `aoide-server` needs that dependency directly.
+- `sealed_id` — the daemon-sealed session credential (LANE IDENTITY P-ID1,
+  `docs/architecture/CONTRACTS.md` §4's `seal` field, plan file "LANE
+  IDENTITY (#63)"): `SealedIdentity{sessionId, pid, pidStarttime,
+  originClass, issuedAt}`, `canonical_seal_string` (the same NUL-separated
+  five-field shape `wire_auth::canonical_string` established, but
+  **`sessionId`/`originClass` ride VERBATIM — no trim, no case-folding**;
+  review fix, since `sessionId` is the session store's own case-sensitive
+  primary key and `originClass` is about to be P-ID4's origin-gate lookup
+  key, folding either would let a seal minted for one exact identity
+  verify against a differently-cased one), and `mint_seal`/`verify_seal` —
+  thin wrappers over `wire_auth::sign_hex`/`verify_signature_hex`, so this
+  module never touches `ed25519_dalek` directly either. **The signing key
+  is NOT `identity::load_or_mint`'s on-disk node-wire key** — under OQ1-A
+  (the plan file's User-answered threat-model question) a same-uid
+  attacker can read any file the operator owns, so an on-disk key is not
+  secret against it; `identity::mint_ephemeral` (this crate's other new
+  P-ID1 entry point) mints a SEPARATE keypair that lives only in the
+  calling process's memory, never touching disk, so its secrecy rests on
+  process liveness plus Yama `ptrace_scope` instead (see `identity.rs`'s
+  own doc on `mint_ephemeral`, and CONTRACTS.md §4's `seal` paragraph, for
+  the full reasoning and the Yama-off degrade note). A `pidStarttime` of
+  `0` (the documented degrade for a pid that vanished before mint) is
+  self-consistent but UNVERIFIABLE against any later live `/proc` read —
+  no genuine read is ever `0` — a caller must treat it as "cannot
+  revalidate," never as "verified." `records::SessionRecord.seal`/
+  `sealedIssuedAt` (both additive, `skip_serializing_if`, one lifecycle —
+  always `Some` together) are where a minted seal is stored — stamped by
+  `aoide-conduct::graph::session_store::stamp_seal`, this crate's own
+  sibling to `stamp_origin`. `sealedIssuedAt` exists because `issuedAt` has
+  no live fact a verifier can re-derive it from the way `pidStarttime` does
+  (a fresh `/proc` read) — without it, checking a signature means
+  brute-forcing every plausible mint instant, which is exactly what this
+  module's OWN P-ID1 test suite did before this field existed. **P-ID2 is
+  the first phase to read `seal`**: `attest::verify_seal_over` (below)
+  reconstructs the exact signed `SealedIdentity` from a record (never
+  trusting a stored `pidStarttime`, always a fresh `/proc` read) and calls
+  this module's `verify_seal` against the daemon's LIVE public key. This
+  module's own test suite (verify TRUE on a genuine seal, FALSE on any
+  single tampered field including a case-only-different `sessionId`, FALSE
+  under a different keypair) still proves the mechanism in isolation; the
+  consumers' tests prove the wiring.
+- `attest` — the kernel-attested caller resolution (LANE IDENTITY P-ID4's
+  seam lift; bodies moved from `aoide-conduct::graph::{window,identity}`
+  and `aoide-client::daemon`, which all delegate here): the bounded
+  `/proc` ancestry walk (`pid_ancestry`, self-first/nearest-first) and
+  starttime read (`pid_starttime`), `verify_seal_over` (fresh-starttime
+  reconstruction — the pid-reuse defense), `attested_session` (the
+  verified nearest-ancestor walk the send gate keys on), the daemon
+  seal-pubkey channel (`daemon_socket_path`/`connect_bounded`/
+  `daemon_seal_pubkey_hex` — a LIVE `ping` round trip, never a file), and
+  `attested_caller` — the secrets broker's one-stop: peercred pid →
+  verified `(sessionId, originClass)`, `None` = UNIDENTIFIED. Lives here
+  because the crate DAG forbids every other shared home (`aoide-secrets`
+  may never depend on `aoide-conduct`/`aoide-client`) and every ingredient
+  — `records::SessionRecord`, `stage::sessions_path`, `sealed_id`,
+  `identity` — already does; resolution only, never a policy decision
+  (this crate's `AGENTS.md`).
+- `wire_auth` — per-request signed wire authentication for paired nodes
+  (P-P4, `docs/architecture/PAIRING.md`'s "Wire authentication (paired
+  nodes)" section, CONTRACTS.md §6's own amendment for the full wire
+  shape and pinned vectors). `canonical_string(method, path, timestamp,
+  nonce, body)` is the ONE function both ends build independently (never
+  a wire-carried canonical string) — five fields, each trimmed+lowercased,
+  NUL-separated after every field including the last (P-P2's
+  `derive_sas`/`derive_commit` style, reused verbatim), with only the body
+  digested (`sha2`) rather than riding the string whole. `sign_hex`/
+  `verify_signature_hex` are thin hex-in/hex-out wrappers around
+  `identity::Keypair`'s two entry points — neither `aoide-client` nor
+  `aoide-server` touches `ed25519_dalek` types directly.
+  `signature_skew_secs` (`AOIDE_SIGNATURE_SKEW_SECS` env, 120s default)
+  and `within_skew` are the replay guard's timestamp half; the OTHER half
+  (the nonce cache) is deliberately NOT here — it is ephemeral,
+  process-local, per-`a2a serve` runtime state with no durable file behind
+  it at all, unlike everything else this crate persists, so it lives in
+  `aoide-server::a2a` next to its one consumer instead (this module's own
+  doc comment states the reasoning). `HEADER_NODE`/`HEADER_TIMESTAMP`/
+  `HEADER_NONCE`/`HEADER_SIGNATURE` are the four wire header names — always
+  present together or not at all, never independently optional.
+- `advertise` — the discovery advertisement's wire format and the
+  advertise switch (P-P6 + task #120, `docs/architecture/PAIRING.md`'s
+  "Discovery (advertise-but-locked)" section, CONTRACTS.md §6's
+  "Discovery advertisement" subsection): the one-line
+  `{v, name, host, user}` JSON shape `a2a serve` may emit by UDP
+  broadcast (`BROADCAST_ADDR`/`PORT`, `255.255.255.255:8711`, pinned here
+  so both ends of the wire agree without a handshake — name + ssh hop
+  claim ONLY, never a door URL or a key: rendezvous, not
+  authentication), every validator a hearer applies BEFORE trusting a
+  field (`valid_host`/`valid_user` for bounded metacharacter-free
+  shapes, and `MAX_LINE_BYTES` checked on the raw bytes before any JSON
+  parse — house rule 4's discipline, an advertisement is untrusted
+  network data), and `enabled`/`set_enabled`, the `state/advertise.json`
+  switch `aoide node advertise on|off` flips (default OFF,
+  tolerate-missing, atomic write). No socket I/O lives here
+  (`aoide-server::discovery` sends, `aoide-client::discover` listens)
+  and no write path into `node_store` — discovery grants nothing, by
+  construction, since this module cannot write a node record even if a
+  caller wanted it to.
+- `commands` — this crate's CLI commands: `usage` (local token/cost
+  rollup), `identity` (the module above's CLI surface), and
+  `config`/`config set` (the config module's — `config` prints the
+  effective values, the path they resolved from, and whether it is
+  managed or unmanaged; `config set` is the one schema-validated write).
+  `aoide pair`/`pair reject`/`pair watch` lives in `aoide-client` instead
+  (outbound transport crosses the `client → storage` DAG edge; this crate
+  exposes `pairing`/`node_store` as the library, `client` drives the
+  wire). `mail`'s CLI surface (`mail send|read|show|mark|rm|outbox|outbox
+  rm`) moved there too at P-M2, for the same reason: a directly-paired
+  node's mail dials out through the outbox drain, which only
+  `aoide-client` can reach.
+
+## What it consumes
+
+`aoide-protocol` (plus `aoide-test-support` as a dev-dependency), and — as
+of P-P1 — `ed25519-dalek`/`getrandom` for `identity`, joined at P-P2 by
+`sha2` for `pairing::derive_sas`: sanctioned exceptions to this workspace's
+zero-new-deps discipline, scoped to cryptographic primitives specifically
+(User ruling 2026-08-25, `docs/architecture/PAIRING.md`'s kill-list and
+decision 1; see the workspace `Cargo.toml`'s own comment on those entries
+for the version/feature reasoning). `toml`/`toml_edit` join them at P-C for
+`config` — the second sanctioned break, scoped to the one runtime format,
+split by direction (`toml` deserializes into the typed schema, `toml_edit`
+rewrites one key in place so comments survive); both are pure Rust over one
+shared parser/writer stack, which is what keeps `checks.portability`'s
+static-musl artifact buildable. It is the second-lowest crate in the DAG —
+everything that persists state sits above it.
+
+## How it composes
+
+`client`, `conduct`, `server`, `song`, `conductor`, and both app crates
+depend on it for durable state. **Charter smudge**: `takes` and `mode` live
+here rather than in a paint-adjacent crate — zero dependency weight, and
+`mode` is read by `shellbridge`, which itself stays core-crate-resident in
+`conduct` (see `docs/architecture/PACKAGE-LAYOUT.md`, "Charter exceptions").

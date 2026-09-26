@@ -1,0 +1,64 @@
+[package]
+name = "aoide-cli"
+version.workspace = true
+edition = "2021"
+description = "Aoide CLI + daemon — an API that happens to be typeable."
+license = "MIT"
+
+# The app crate (Phase 9 restructure, docs/architecture/PACKAGE-LAYOUT.md):
+# the composition root that assembles every domain crate's
+# `commands::register()` into the one Registry — the DAG sink (depends on all
+# crates, nothing depends on it). Two binaries share the same schema +
+# handler code, so the CLI door, the MCP door, and the daemon can never
+# drift. The lib keeps the historical name `aoide` so no `use aoide::…`
+# caller (bins, integration tests) changes.
+
+[[bin]]
+name = "aoide"
+path = "src/bin/aoide.rs"
+
+[[bin]]
+name = "aoided"
+path = "src/bin/aoided.rs"
+
+[lib]
+name = "aoide"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+aoide-protocol = { workspace = true }
+aoide-storage = { workspace = true }
+aoide-conduct = { workspace = true }
+aoide-client = { workspace = true }
+aoide-server = { workspace = true }
+# `aoide-song`/`aoide-screen` (the rice/livery engine and the screen command
+# family) moved out of core's dependency list at P-A5 of the binary-split
+# workstream — the graphical bundle they back now lives ONLY in `crates/lyra`
+# (docs/architecture/PACKAGE-LAYOUT.md, CONTRACTS.md §3). Core is
+# nix-independent; song/screen carry lyra's nix-eval and heavy
+# wayland-client/wayland-protocols-wlr/image deps, which must never reach
+# this crate's dependency tree again (the P-A5 `cargo tree -p aoide-cli`
+# gate).
+# `aoide conductor` — the interactive terminal frontend, its own crate
+# (Phase 6b restructure, docs/architecture/PACKAGE-LAYOUT.md).
+aoide-conductor = { workspace = true }
+# `aoide soundcheck` — the mechanical-integrity command (working-tree half).
+aoide-upkeep = { workspace = true }
+# `aoide secrets` — the secrets broker's CLI surface (Workstream SECRETS,
+# P-V2): `serve`/`exec`/`add`/`rm`/`grant`/`revoke`. New at P-V2 — the
+# workspace `Cargo.toml` comment on `aoide-secrets` used to say nothing
+# depended on it; that's this commit.
+aoide-secrets = { workspace = true }
+
+[dev-dependencies]
+# `tests/conductor_integration.rs` drives the conductor's app/ui layer
+# directly (crossterm key events, a ratatui `TestBackend`) to exercise real
+# dispatch end to end — versions inherit from `[workspace.dependencies]`.
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+# `tests/node_connectivity.rs` (CONTRACTS.md §7) needs the shared
+# process-wide env lock (`env_lock`) to serialise its env-mutating tests —
+# the same rig every domain crate's own tests already share.
+aoide-test-support = { workspace = true }

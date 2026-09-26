@@ -1,0 +1,28 @@
+[package]
+name = "eidolon-rune"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harnox = { workspace = true, features = ["policy", "secrets"] }
+eidolon-core.workspace = true
+eidolon-tools.workspace = true
+eidolon-remote.workspace = true
+eidolon-swarm.workspace = true
+# The search key is held the way the secret store hands it out: in a value
+# that wipes itself when the session is done with it (as `eidolon-providers`
+# holds a provider token).
+zeroize = "1"
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+rune.workspace = true
+rune-modules.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

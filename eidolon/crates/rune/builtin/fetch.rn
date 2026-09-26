@@ -1,0 +1,29 @@
+//! Built-in `fetch`: one URL over the `web_fetch` primitive. HTML comes
+//! back as the text it was wrapping, with links kept, so a page can be
+//! read without spending the context window on its markup.
+
+pub fn manifest() {
+    #{
+        name: "fetch",
+        description: "Fetch a URL over HTTP(S) and return its content. HTML is reduced to readable text with links kept as [text](url), so following one means calling this again; JSON, plain text and source come back verbatim. Anything that is not text is reported as its type and size rather than returned.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "url": #{ "type": "string", "description": "An http:// or https:// URL" },
+                "max": #{ "type": "integer", "description": "Maximum characters to return (default 40000); raise it for a page that is really that long" },
+                "timeout_s": #{ "type": "integer", "description": "Seconds to wait for the response (default 30)" },
+                "raw": #{ "type": "boolean", "description": "Return the HTML as it arrived instead of reducing it to text (default false)" },
+            },
+            "required": ["url"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let raw = match input.get("raw") {
+        Some(b) => b == true,
+        None => false,
+    };
+    eidolon::web_fetch(input.url, input.get("max"), input.get("timeout_s"), raw).await
+}

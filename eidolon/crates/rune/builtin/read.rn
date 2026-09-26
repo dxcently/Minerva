@@ -1,0 +1,24 @@
+//! Built-in `read`: numbered file contents via the `fs_read` primitive.
+//! A thin wrapper by design — the tool the model sees is this script, on
+//! the same contract as any user skill.
+
+pub fn manifest() {
+    #{
+        name: "read",
+        description: "Read a file and return its contents with line numbers. Use offset and limit to page through large files.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "path": #{ "type": "string", "description": "File path, absolute or relative to the working directory" },
+                "offset": #{ "type": "integer", "description": "1-based line to start from (default 1)" },
+                "limit": #{ "type": "integer", "description": "Maximum number of lines to return (default 2000)" },
+            },
+            "required": ["path"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::fs_read(input.path, input.get("offset"), input.get("limit")).await
+}

@@ -1,0 +1,23 @@
+//! Built-in `search`: a web search through the key the session was assembled
+//! with. The endpoint is not the model's to name — the primitive takes none —
+//! so the key can only ever reach the one endpoint the harness knows.
+
+pub fn manifest() {
+    #{
+        name: "search",
+        description: "Search the web and return results as title, URL and snippet. Follow a result with `fetch` to read the page itself.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "query": #{ "type": "string", "description": "What to search for" },
+                "count": #{ "type": "integer", "description": "Results to return (default 5, max 20)" },
+            },
+            "required": ["query"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::web_search(input.query, input.get("count")).await
+}

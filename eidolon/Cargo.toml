@@ -1,0 +1,87 @@
+# Eidolon — an interactive coding harness. Named 2026-09-04; the crates carry
+# the `eidolon-` prefix and the binary is `eidolon`. Design record in the vault
+# under `wiki/projects/Eidolon/`.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+eidolon-core = { path = "crates/core" }
+eidolon-tools = { path = "crates/tools" }
+eidolon-rune = { path = "crates/rune" }
+eidolon-remote = { path = "crates/remote" }
+eidolon-tui = { path = "crates/tui" }
+eidolon-claude = { path = "crates/claude" }
+eidolon-providers = { path = "crates/providers" }
+eidolon-verba = { path = "crates/verba" }
+eidolon-swarm = { path = "crates/swarm" }
+eidolon-web = { path = "crates/web" }
+# The shared Rust+LLM foundation, `harnox`, pinned to a release tag. `llm` =
+# message model + providers; `bitcode` = log derives on the message types;
+# `oauth-client` = the browserless passphrase flow for Mneme/Melete.
+#
+# A git dep here rather than `path = "../harnox"` because this workspace is
+# itself a git dependency of Melete, and Cargo cannot follow a path that
+# leaves a git dependency's checkout. The everyday path workflow survives in
+# the `[patch]` table at the bottom: a build of THIS workspace takes the
+# sibling checkout, a consumer of it takes the tag. Bump the tag together with
+# Melete's — the two share `SecretStore` and the message model by type, and
+# two harnox revisions in one graph are two unrelated types.
+harnox = { git = "https://github.com/noah427/harnox", tag = "v0.3.8", default-features = false }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Session log encoder. bitcode first, postcard as the fallback if its unstable
+# wire format bites (vault decision 2026-09-03). The log framing is encoder-
+# independent, so swapping means re-encoding bodies, not redesigning the file.
+bitcode = "0.6"
+crc32fast = "1"
+# Matches Melete's pin exactly (rustls, no openssl) so the provider client can
+# lift into the shared crate without a TLS-stack change.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+rune = { version = "0.14.2", features = ["std", "alloc"] }
+# Only `json` — never fs/http/process, which would let a script bypass the
+# host-primitive surface entirely (same posture as Melete's SkillScope).
+rune-modules = { version = "0.14.2", default-features = false, features = ["json"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+# Round-trip TOML for `/set`: the config file is hand-written and commented,
+# and a serialize pass over `Config` would drop every comment in it.
+toml_edit = "0.22"
+glob = "0.3"
+regex = "1"
+ignore = "0.4"
+dirs = "6"
+# The OSC 52 clipboard escape carries its payload base64-encoded.
+base64 = "0.22"
+# Decoding an attached image: its real dimensions for the placard, and its
+# pixels for the terminals that can draw them. Formats only — no `rayon`
+# (a thread pool for a thumbnail is a worse trade than the thumbnail) and
+# no `default-formats`, which pulls in TIFF, EXR, HDR, DDS and the rest
+# for a set of files nobody pastes into a chat.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+
+[profile.release]
+opt-level = 2
+strip = "symbols"
+
+# Editing harnox and eidolon together is the everyday workflow, so a build of
+# this workspace takes the sibling checkout in place of the tag above. A
+# consumer that links these crates by git never sees this table (Cargo reads
+# `[patch]` from the root manifest only) and resolves the tag. Nix does the
+# same thing by putting `../harnox` back beside the source (nix/eidolon.nix).
+[patch."https://github.com/noah427/harnox"]
+harnox = { path = "../harnox" }

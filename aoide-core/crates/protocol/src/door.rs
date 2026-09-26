@@ -1,0 +1,1495 @@
+//! The CLI arg-parser and the parse -> dispatch -> render run loop, shared by
+//! every aoide binary (Phase 3 restructure, docs/architecture/PACKAGE-LAYOUT.md).
+//!
+//! Hand-rolled (no clap) to keep the offline cargo lock tiny and the build
+//! pure. The command tree is read from a caller-supplied [`Registry`], so the
+//! parser and the schema can never disagree about what commands exist.
+//!
+//! [`run`] drives the standard loop (parse, render a parse error uniformly,
+//! else dispatch the matched command and render its [`Outcome`]) — but a
+//! command tree always has a handful of commands that are NOT one-shot dispatch:
+//! a raw-stdout tool, a long-running server launch, anything that needs to
+//! bypass the `Outcome` envelope entirely. Those are per-binary — the core
+//! `aoide` binary launches `mcp serve --stdio`/`a2a serve`/`conductor`,
+//! lyra (P-A4) launches its own smaller set and never touches `a2a serve` or
+//! `conductor` — so `run` takes a `special` hook: a closure given the parsed
+//! [`Invocation`] and the `--json` flag, run AFTER a successful parse and
+//! BEFORE the generic dispatch. `Some(code)` short-circuits with that exit
+//! code; `None` falls through to the uniform dispatch+render path. This is
+//! how one parser + one run loop serves binaries with different special-case
+//! command sets without duplicating either.
+//!
+//! **External subcommands (task #138, the git/cargo pattern).** Immediately
+//! BEFORE `parse` runs, `run` probes raw argv for a fallthrough to an
+//! executable `<bin_name>-<name>` on `PATH` — `aoide deploy` becomes
+//! `aoide-deploy` the same way `git foo` becomes `git-foo`:
+//!
+//! ```text
+//!   1. argv.first() absent          → parse   (bare `aoide`)
+//!   2. name starts with '-'         → parse   (--help, -h, --json)
+//!   3. name is a RESERVED HEAD      → parse   (a built-in always wins;
+//!      reserved := every registered command's path[0] ∪ every ALIASES head)
+//!   4. probe `<bin_name>-<name>` on PATH, executable
+//!        miss  → parse                        (did-you-mean survives)
+//!        hit   → audit, spawn argv[1..] verbatim, return the child's own
+//!                exit code unchanged
+//! ```
+//!
+//! This is why the probe reads RAW argv rather than hooking in after
+//! `parse`: by the time `parse` has split flags into a `BTreeMap`, a
+//! wrapped command's own flag order/repeats/`--f=v` vs `--f v` spelling is
+//! already destroyed, and an external command must receive its argv
+//! byte-for-byte. Step 3's reservation is a first-SEGMENT check, not a
+//! full-path check, so `aoide graph vie` (a typo of the built-in `graph`
+//! group) never probes `aoide-graph` — it lands in `parse`'s own
+//! `unknown_command_outcome` with `did_you_mean` intact, same as before this
+//! existed. The trust boundary is structural, not a guard: `run` is called
+//! from exactly the two CLI entry points (`aoide-cli`'s `run_cli`, lyra's
+//! `run_lyra`), so an external command is reachable from `Door::Cli` only —
+//! no `Door` check is added here, because there is nothing else to check.
+//! MCP/A2A/the aoided socket reach `dispatch()` directly, never `run`, and
+//! `dispatch()` has no PATH-probing logic of its own (`crates/cli/src/
+//! dispatch.rs`'s `an_unregistered_path_on_a_non_cli_door_is_still_unknown_
+//! command` test is the tripwire: the probe must never migrate into
+//! `dispatch()`'s own `None =>` arm). An external command never becomes a
+//! [`Command`] — it is never gated, never enters the MCP tool list or the
+//! A2A `AgentCard`, and the golden command-path snapshot never sees it
+//! (CONTRACTS.md §3 states the "never gated" rule as permanent, by
+//! construction, not merely by omission today).
+
+use crate::audit::{audit, default_audit_log, Door, EventClass};
+use crate::invocation::Invocation;
+use crate::output::{exit, Outcome};
+use crate::registry::{Command, Registry};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::process::{Command as Process, Stdio};
+
+/// CLI-only ergonomic shorthands for a canonical command path, resolved HERE
+/// — before the greedy path match below — so a shorthand never becomes a
+/// second registered command: the registry, `schema --json`, and every
+/// golden snapshot see only the canonical path. Add a row here for a new
+/// shorthand, never a second `register()` call for the same command.
+const ALIASES: &[(&[&str], &[&str])] = &[(&["node", "rm"], &["node", "remove"])];
+
+/// Rewrite a leading alias prefix of `positionals` to its canonical form, in
+/// place. A no-op when no alias prefix matches (the common case).
+fn resolve_aliases(positionals: &mut Vec<String>) {
+    for (from, to) in ALIASES {
+        if positionals.len() >= from.len() && positionals.iter().zip(*from).all(|(p, f)| p == f) {
+            positionals.splice(0..from.len(), to.iter().map(|s| s.to_string()));
+            return;
+        }
+    }
+}
+
+/// All known command paths (from the registry), longest-first for greedy match.
+fn known_paths(registry: &Registry) -> Vec<Vec<String>> {
+    let mut paths: Vec<Vec<String>> = registry
+        .commands()
+        .map(|c| c.path.iter().map(|s| s.to_string()).collect())
+        .collect();
+    paths.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    paths
+}
+
+/// Parse argv (excluding the program name) into an [`Invocation`].
+///
+/// `bin_name` is the invoking binary's name (`"aoide"` for core, `"lyra"`
+/// for the graphical binary, P-A5 of the binary-split workstream) — every
+/// usage/help/did-you-mean string below names it instead of a hardcoded
+/// `"aoide"`, so lyra's own usage errors say `lyra`, not `aoide`.
+///
+/// Returns `Err(Outcome)` for a usage error (`--help`, unknown command) so the
+/// caller can render it as JSON or text uniformly.
+pub fn parse(argv: &[String], door: Door, bin_name: &str, registry: &Registry) -> Result<(Invocation, bool), Outcome> {
+    // First split off flags anywhere; positionals keep order.
+    let mut positionals: Vec<String> = Vec::new();
+    let mut flags: BTreeMap<String, String> = BTreeMap::new();
+    let mut json = false;
+    let mut help = false;
+
+    let mut i = 0;
+    while i < argv.len() {
+        let a = &argv[i];
+        // A bare `--` ends flag parsing: everything after it is positional,
+        // verbatim — the wrapped-command seam (`conduct -- codex --model x`
+        // must not have the child's flags eaten as aoide's).
+        if a == "--" {
+            positionals.extend(argv[i + 1..].iter().cloned());
+            break;
+        }
+        // `--help`/`-h` anywhere is a request for usage, never a command flag.
+        if a == "--help" || a == "-h" {
+            help = true;
+            i += 1;
+            continue;
+        }
+        if let Some(name) = a.strip_prefix("--") {
+            // `--flag=value` or `--flag value` or bare boolean `--flag` —
+            // whether the spaced form may consume a value is decided by the
+            // registry's declared flag type (`declared_flag_kind`), below.
+            if let Some((k, v)) = name.split_once('=') {
+                if k == "json" {
+                    json = true;
+                }
+                flags.insert(k.to_string(), v.to_string());
+            } else if name == "json" {
+                json = true;
+                flags.insert("json".into(), "true".into());
+            } else {
+                // The registry decides whether this flag takes a value: a
+                // declared-bool flag NEVER consumes the next token (#111 —
+                // `node add --no-verify alice` used to swallow `alice` as
+                // no-verify's value). Only a valued (or undeclared — rejected
+                // by name later anyway) flag peeks ahead.
+                match declared_flag_kind(name, &positionals, registry) {
+                    DeclaredFlag::Bool => {
+                        flags.insert(name.to_string(), "true".into());
+                    }
+                    DeclaredFlag::Mixed if i + 1 < argv.len() && !argv[i + 1].starts_with("--") => {
+                        // Declared bool by one candidate command and valued by
+                        // another, with a consumable token following: the token
+                        // genuinely reads both ways. Same convention as the
+                        // path-segment collision below (#48) — refuse loudly,
+                        // never guess.
+                        return Err(mixed_flag_outcome(name, &argv[i + 1], &positionals, bin_name));
+                    }
+                    DeclaredFlag::Mixed => {
+                        // Nothing consumable follows — only the bare-boolean
+                        // reading exists.
+                        flags.insert(name.to_string(), "true".into());
+                    }
+                    DeclaredFlag::Valued | DeclaredFlag::Undeclared => {
+                        // Peek: if the next token is a value (not a flag), consume it.
+                        if i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
+                            if is_command_token(&argv[i + 1], &positionals, registry) {
+                                // The token reads both ways: this flag's value, or the
+                                // next segment of a command path still being spelled
+                                // (`graph session --id start` vs `graph session start
+                                // --id …`). Neither reading is safe to pick silently —
+                                // refuse loudly, naming both.
+                                return Err(ambiguous_flag_outcome(
+                                    name,
+                                    &argv[i + 1],
+                                    &positionals,
+                                    registry,
+                                    bin_name,
+                                ));
+                            }
+                            flags.insert(name.to_string(), argv[i + 1].clone());
+                            i += 1;
+                        } else {
+                            flags.insert(name.to_string(), "true".into());
+                        }
+                    }
+                }
+            }
+        } else {
+            positionals.push(a.clone());
+        }
+        i += 1;
+    }
+
+    if positionals.is_empty() {
+        // `aoide --help` (no command) → the root usage at exit 0; bare `aoide`
+        // is still the usage error (exit 2).
+        return if help {
+            Err(help_outcome(bin_name, usage_root(registry, bin_name).message))
+        } else {
+            Err(usage_root(registry, bin_name))
+        };
+    }
+
+    resolve_aliases(&mut positionals);
+
+    // Greedy longest-prefix match of positionals against known command paths.
+    let paths = known_paths(registry);
+    let matched = paths
+        .iter()
+        .find(|p| p.len() <= positionals.len() && p.iter().zip(&positionals).all(|(a, b)| a == b))
+        .cloned();
+
+    let path = match matched {
+        Some(p) => p,
+        None => {
+            // A `--help` on a partial/unknown path still surfaces the command
+            // list rather than a bare "unknown command".
+            if help {
+                return Err(help_outcome(&positionals.join("."), usage_root(registry, bin_name).message));
+            }
+            return Err(unknown_command_outcome(&positionals, registry, bin_name));
+        }
+    };
+
+    // `--help`/`-h` on a known subcommand → that subcommand's usage (exit 0).
+    if help {
+        return Err(help_outcome(&path.join("."), command_usage(&path, registry, bin_name)));
+    }
+
+    // Reject an unrecognised flag by name (exit 2) — never silently swallow it.
+    if let Some(bad) = unknown_flag(&path, &flags, registry) {
+        return Err(Outcome::usage(
+            path.join("."),
+            format!(
+                "unrecognized flag `--{bad}` for `{bin_name} {}`\n{}",
+                path.join(" "),
+                command_usage(&path, registry, bin_name)
+            ),
+        ));
+    }
+
+    let args = positionals[path.len()..].to_vec();
+
+    // A matched command that declares NO positional args of its own must not
+    // silently swallow leftover positionals as ignored input. Without this,
+    // a parent path that is ALSO a registered leaf (`graph` render, alongside
+    // the longer `graph link`) would let an unregistered child like `graph
+    // nonsense` resolve as the bare parent with a stray arg the handler just
+    // ignores, instead of surfacing `nonsense` as the unrecognised segment it
+    // is. Only fires when `c.args` is empty — commands that declare at least
+    // one positional (`conduct`, `graph spawn`, `graph send`, …) intentionally
+    // consume everything past their first required arg verbatim, and must
+    // keep doing so.
+    if !args.is_empty() {
+        if let Some(c) = command_for(&path, registry) {
+            if c.args.is_empty() {
+                return Err(unknown_command_outcome(&positionals, registry, bin_name));
+            }
+        }
+    }
+
+    Ok((
+        Invocation {
+            path,
+            args,
+            flags,
+            door,
+        },
+        json,
+    ))
+}
+
+/// The registry entry for a matched command path (name-for-name).
+fn command_for<'a>(path: &[String], registry: &'a Registry) -> Option<&'a Command> {
+    registry.get(path)
+}
+
+/// The usage error for an unresolvable invocation. Two shapes, by intent:
+///
+/// * The input is a strict PREFIX of ≥1 known paths (`graph project`) — the
+///   caller found a real group, just not a leaf: list the subgroup's commands
+///   instead of crying "unknown command".
+/// * Anything else is probably a typo — suggest the closest known commands by
+///   edit distance (`graph vie` → `graph view`).
+///
+/// Either way the message ends with the `aoide --help` pointer.
+fn unknown_command_outcome(positionals: &[String], registry: &Registry, bin_name: &str) -> Outcome {
+    let sub: Vec<&Command> = registry
+        .commands()
+        .filter(|c| {
+            c.path.len() > positionals.len()
+                && c.path.iter().zip(positionals).all(|(a, b)| *a == b)
+        })
+        .collect();
+    let message = if !sub.is_empty() {
+        let width = sub
+            .iter()
+            .map(|c| c.path.join(" ").len() + signature(c).len())
+            .max()
+            .unwrap_or(0);
+        let mut m = format!("`{}` is a command group, not a command:\n", positionals.join(" "));
+        for c in &sub {
+            m.push_str(&command_line(c, width));
+            m.push('\n');
+        }
+        m.pop();
+        m
+    } else {
+        let mut m = format!("unknown command: `{}`", positionals.join(" "));
+        let suggestions = did_you_mean(positionals, registry);
+        if !suggestions.is_empty() {
+            m.push_str("\n\ndid you mean:");
+            for s in suggestions {
+                m.push_str(&format!("\n  {bin_name} {s}"));
+            }
+        }
+        m
+    };
+    Outcome::usage(
+        positionals.join("."),
+        format!("{message}\n\nrun '{bin_name} --help' for the full command list"),
+    )
+}
+
+/// The closest known command paths to a typo'd input, nearest first, at most
+/// two. The cutoff scales with the target's length: a one-edit miss on a
+/// short path is worth suggesting, a three-edit miss on anything reads as a
+/// different intent entirely, not a typo.
+fn did_you_mean(positionals: &[String], registry: &Registry) -> Vec<String> {
+    let target = positionals.join(".");
+    let cutoff = (target.len() / 4).max(2);
+    let mut scored: Vec<(usize, String)> = registry
+        .commands()
+        .map(|c| (levenshtein(&target, &c.dotted()), c.path.join(" ")))
+        .filter(|(d, _)| *d <= cutoff)
+        .collect();
+    // Stable sort: ties keep registration order (the schema's own order).
+    scored.sort_by_key(|(d, _)| *d);
+    scored.into_iter().take(2).map(|(_, p)| p).collect()
+}
+
+/// Classic two-row Levenshtein over chars. Hand-rolled (no `strsim` dep) to
+/// keep the hand-rolled-parser ethos of this crate: the lockfile stays
+/// offline-vendored and tiny, and ~70 short paths never justify a crate.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// Flags accepted for a command: the schema-declared ones (which already
+/// include `--json`) plus `--audit-log`, which the dispatcher honours on every
+/// command as the audit-log override.
+fn allowed_flags(path: &[String], registry: &Registry) -> Vec<String> {
+    let mut names: Vec<String> = vec!["json".into(), "audit-log".into()];
+    if let Some(c) = command_for(path, registry) {
+        names.extend(c.flags.iter().map(|f| f.name.to_string()));
+    }
+    names
+}
+
+/// The first flag present that the matched command does not accept, if any.
+fn unknown_flag(path: &[String], flags: &BTreeMap<String, String>, registry: &Registry) -> Option<String> {
+    let allowed = allowed_flags(path, registry);
+    flags
+        .keys()
+        .find(|k| !allowed.iter().any(|a| a == *k))
+        .cloned()
+}
+
+/// An Ok-status outcome carrying a raw usage block. `run` prints an
+/// Ok-status parse result to stdout and exits 0 — the `--help` path.
+fn help_outcome(cmd: &str, message: String) -> Outcome {
+    Outcome::ok(cmd, message)
+}
+
+/// The per-subcommand usage block printed for `--help`/`-h`, built from the
+/// registry so it can never drift from the real arg/flag set.
+fn command_usage(path: &[String], registry: &Registry, bin_name: &str) -> String {
+    let Some(c) = command_for(path, registry) else {
+        return usage_root(registry, bin_name).message;
+    };
+    let mut s = format!(
+        "usage: {bin_name} {}{} [--json]\n\n{}",
+        path.join(" "),
+        signature(c),
+        c.summary
+    );
+    if !c.args.is_empty() {
+        s.push_str("\n\nargs:");
+        for a in c.args {
+            let req = if a.required { "required" } else { "optional" };
+            s.push_str(&format!("\n  <{}>  ({req}) {}", a.name, a.description));
+        }
+    }
+    s.push_str("\n\nflags:");
+    for f in c.flags {
+        s.push_str(&format!("\n  --{}  {}", f.name, f.description));
+    }
+    if !c.examples.is_empty() {
+        s.push_str("\n\nexamples:");
+        for ex in c.examples {
+            s.push_str(&format!("\n  {bin_name} {ex}"));
+        }
+    }
+    s
+}
+
+/// The arg signature shared by `command_usage` and the root help's per-command
+/// lines — one builder, so both can never disagree about `<req>`/`[<opt>]`.
+fn signature(c: &Command) -> String {
+    let mut sig = String::new();
+    for a in c.args {
+        if a.required {
+            sig.push_str(&format!(" <{}>", a.name));
+        } else {
+            sig.push_str(&format!(" [<{}>]", a.name));
+        }
+    }
+    sig
+}
+
+/// What the registry declares `--name` to be at this point in the parse —
+/// judged across every CANDIDATE command, i.e. every registered command whose
+/// path agrees with the positionals collected so far on their common prefix
+/// (covers both orderings: the flag before the path is complete, and the flag
+/// after the full path with args already interleaved). Same position-aware
+/// stance as [`is_command_token`], one struct field over: that helper reads
+/// the candidates' PATHS, this one reads their flag specs.
+enum DeclaredFlag {
+    /// Every candidate that declares the flag declares it `"bool"` — it never
+    /// takes a value token.
+    Bool,
+    /// Every candidate that declares it gives it a non-bool type — it may
+    /// consume the next token as its value.
+    Valued,
+    /// Declared `"bool"` by one candidate and valued by another — with a
+    /// consumable token following, the parse refuses loudly rather than
+    /// guessing (the #48 convention).
+    Mixed,
+    /// No candidate declares it (an alias-spelled path mid-collection, a typo
+    /// rejected by name after the path match, or the dispatcher-level
+    /// `--audit-log` override) — the legacy peek-and-consume applies.
+    /// Consequence for aliases: an alias-spelled invocation of a command
+    /// whose declared BOOL flag precedes positionals falls into this arm
+    /// and re-swallows the next token (the exact #111 shape) — harmless for
+    /// today's one flagless alias (`node rm`), but any future alias for a
+    /// bool-flagged command must resolve aliases BEFORE the flag loop or
+    /// teach this judge the alias table.
+    Undeclared,
+}
+
+/// Resolve `--name` against the candidate commands' flag specs — see
+/// [`DeclaredFlag`] for the verdicts and the candidate definition.
+fn declared_flag_kind(name: &str, prior: &[String], registry: &Registry) -> DeclaredFlag {
+    let mut bool_seen = false;
+    let mut valued_seen = false;
+    for c in registry.commands() {
+        let n = c.path.len().min(prior.len());
+        if !c.path[..n].iter().zip(&prior[..n]).all(|(a, b)| *a == b) {
+            continue;
+        }
+        if let Some(f) = c.flags.iter().find(|f| f.name == name) {
+            if f.ty == "bool" {
+                bool_seen = true;
+            } else {
+                valued_seen = true;
+            }
+        }
+    }
+    match (bool_seen, valued_seen) {
+        (true, true) => DeclaredFlag::Mixed,
+        (true, false) => DeclaredFlag::Bool,
+        (false, true) => DeclaredFlag::Valued,
+        (false, false) => DeclaredFlag::Undeclared,
+    }
+}
+
+/// The usage error for a flag declared `"bool"` by one candidate command and
+/// valued by another, with a consumable token following ([`DeclaredFlag::
+/// Mixed`]) — the token reads both ways and the parser refuses to pick,
+/// naming both spellings, same as [`ambiguous_flag_outcome`].
+fn mixed_flag_outcome(flag: &str, value: &str, prior: &[String], bin_name: &str) -> Outcome {
+    let at = if prior.is_empty() { String::new() } else { format!(" {}", prior.join(" ")) };
+    Outcome::usage(
+        prior.join("."),
+        format!(
+            "ambiguous: `--{flag}` is boolean for one `{bin_name}{at}` command and \
+             takes a value for another — `{value}` could be its value or a positional\
+             \n\ndid you mean:\
+             \n  {bin_name} … --{flag}={value}  (`{value}` as the flag's value)\
+             \n  {bin_name} … --{flag} -- {value}  (`{value}` as a positional, `--{flag}` bare)\
+             \n\nspell the full command path before the flag to disambiguate; \
+             run '{bin_name} --help' for the full command list"
+        ),
+    )
+}
+
+/// Is this token part of a command path (so a preceding `--flag` must not
+/// silently consume it as a value)?
+///
+/// Flag-position-aware (khoa, 2026-08-20): `prior` is the positionals already
+/// collected by the time the parser reaches this token — i.e. how much of a
+/// command path has been built so far, interleaved with whatever flags came
+/// before it. A token only continues a command path if some REGISTERED path
+/// agrees with `prior` exactly up to `prior.len()` and has `tok` as its very
+/// next segment. This is NOT a strict refinement of the old "does `tok`
+/// match ANY command's first segment" check — the two compare the token at
+/// different depths (any path's first segment vs. the segment after
+/// `prior`), so for a non-empty `prior` each accepts tokens the other
+/// rejects. What the position-aware form fixes is the first-segment
+/// collision the old check suffered anywhere in argv: a value like `a2a` (a
+/// real group's first segment) or `shell` broke `--agent a2a` /
+/// `--agent shell` even with the command path fully spelled before the
+/// flag. What it cannot fix is the converse ordering — a flag placed BEFORE
+/// the path is complete, whose value matches the path's next segment
+/// (`graph session --id start`): the token genuinely reads both ways, and
+/// no yes/no answer here picks correctly. `parse` refuses that ordering
+/// loudly ([`ambiguous_flag_outcome`]) instead of guessing.
+fn is_command_token(tok: &str, prior: &[String], registry: &Registry) -> bool {
+    registry.commands().any(|c| {
+        c.path.len() > prior.len()
+            && c.path[..prior.len()].iter().zip(prior).all(|(a, b)| *a == b)
+            && c.path[prior.len()] == tok
+    })
+}
+
+/// The usage error for a flag whose value collides with the next segment of
+/// a command path still being spelled (`graph session --id start`, where
+/// `graph session start` is a registered command). The token reads both ways
+/// and the parser refuses to pick silently: name the flag, the ambiguous
+/// value, and the unambiguous spelling(s).
+fn ambiguous_flag_outcome(
+    flag: &str,
+    value: &str,
+    prior: &[String],
+    registry: &Registry,
+    bin_name: &str,
+) -> Outcome {
+    // A registered command the value would continue — `is_command_token` just
+    // matched one, so a witness always exists (any one makes the suggestion
+    // concrete; the fallback is unreachable belt-and-braces).
+    let full = registry
+        .commands()
+        .find(|c| {
+            c.path.len() > prior.len()
+                && c.path[..prior.len()].iter().zip(prior).all(|(a, b)| *a == b)
+                && c.path[prior.len()] == value
+        })
+        .map(|c| c.path.join(" "))
+        .unwrap_or_else(|| {
+            prior.iter().map(String::as_str).chain([value]).collect::<Vec<_>>().join(" ")
+        });
+    let mut m = format!(
+        "ambiguous: `--{flag} {value}` sits before the command path is complete — \
+         `{value}` could be the flag's value or the next command-path segment (`{full}`)\
+         \n\ndid you mean:\
+         \n  {bin_name} {full} --{flag} <value>  (flags after the full command path)"
+    );
+    // Offer the `--flag=value` spelling only when `prior` is itself a
+    // complete registered command — otherwise that spelling just errors too.
+    if registry.get(prior).is_some() {
+        m.push_str(&format!(
+            "\n  {bin_name} {} --{flag}={value}  (`{value}` as the flag's value)",
+            prior.join(" ")
+        ));
+    }
+    m.push_str(&format!("\n\nrun '{bin_name} --help' for the full command list"));
+    let mut continued = prior.to_vec();
+    continued.push(value.to_string());
+    Outcome::usage(continued.join("."), m)
+}
+
+/// One-line blurbs for the KNOWN command groups, keyed by first path
+/// segment. Deliberately a static table rather than a registry field: a
+/// future group simply renders without a blurb (no drift failure mode, no
+/// amendment needed to add a group).
+fn group_blurb(group: &str) -> Option<&'static str> {
+    Some(match group {
+        "rice" => "the self-ricing loop: compose → mode stage → mode draft → declare",
+        "graph" => "the project/session DAG — bare render + link, the read/analysis lens",
+        "session" => "session lifecycle and hook plumbing for a conducted terminal",
+        "project" => "project anchor roots for the session DAG",
+        "screen" => "screen capture, OCR, and pointer control",
+        "a2a" => "Agent-to-Agent server and agent registry",
+        "node" => "same-network host federation",
+        "livery" => "the design-token engine: resolve, lint, and emit a song's livery",
+        "cover" => "cover-art staging",
+        "mcp" => "the per-session stdio MCP façade",
+        "hooks" => "agent-harness hook installer",
+        _ => return None,
+    })
+}
+
+/// GNU-style terseness for list output: the first sentence of a command's
+/// summary, hard-capped so a chatty opener can't blow out the column. The
+/// registry summaries are deliberate multi-sentence prose; that prose still
+/// lives behind `aoide <cmd> --help` — the root list is a list, not the docs.
+fn short_desc(summary: &str) -> String {
+    const CAP: usize = 60; // chars, not bytes — multibyte-safe by construction
+    let end = summary
+        .find(". ")
+        .map(|i| i + 1) // keep the period
+        .or_else(|| summary.find('\n'))
+        .unwrap_or(summary.len());
+    let s = summary[..end].trim_end();
+    if s.chars().count() <= CAP {
+        return s.to_string();
+    }
+    // Truncate at the last word boundary inside the cap — never mid-word,
+    // never mid-char (chars(), not byte indexing).
+    let prefix: String = s.chars().take(CAP).collect();
+    let cut = prefix.rfind(char::is_whitespace).unwrap_or(prefix.len());
+    format!("{}…", prefix[..cut].trim_end())
+}
+
+/// The aligned `  <path + signature>  <short description>` line used by both
+/// the root help and the partial-path subgroup listing.
+fn command_line(c: &Command, width: usize) -> String {
+    let lhs = format!("{}{}", c.path.join(" "), signature(c));
+    format!("  {lhs:<width$}  {}", short_desc(c.summary))
+}
+
+fn usage_root(registry: &Registry, bin_name: &str) -> Outcome {
+    // Group by first path segment, preserving registration order inside each
+    // group (the registry's own order is load-bearing — registry.rs module
+    // docs). Group order is first-appearance order: no sorting, so a newly
+    // appended group lands at the bottom rather than reshuffling the list.
+    let mut groups: Vec<(&str, Vec<&Command>)> = Vec::new();
+    for c in registry.commands() {
+        let head = c.path[0];
+        match groups.iter_mut().find(|(g, _)| *g == head) {
+            Some((_, cs)) => cs.push(c),
+            None => groups.push((head, vec![c])),
+        }
+    }
+    let width = registry
+        .commands()
+        .map(|c| c.path.join(" ").len() + signature(c).len())
+        .max()
+        .unwrap_or(0);
+
+    let mut s = format!("usage: {bin_name} <command> [args] [--json]\n\ncommands:");
+    for (group, cmds) in &groups {
+        s.push('\n');
+        if let Some(blurb) = group_blurb(group) {
+            s.push_str(&format!("{group} — {blurb}\n"));
+        } else {
+            s.push_str(&format!("{group}\n"));
+        }
+        for c in cmds {
+            s.push_str(&command_line(c, width));
+            s.push('\n');
+        }
+    }
+    // Drop the trailing newline of the last group before the footer.
+    s.pop();
+    s.push_str(&format!(
+        "\n\nRun '{bin_name} <command> --help' for args, flags, and examples. \
+         '{bin_name} guide' prints the tier map."
+    ));
+
+    // A SEPARATE trailing section for external subcommands (task #138,
+    // Fork C) — never interleaved with the built-in groups above, since
+    // interleaving would imply a contract (`--json`, an exit-code map,
+    // `gated`) aoide cannot make for a foreign binary. Deliberately absent
+    // from `aoide guide` (tier-0 onboarding is a fixed narrative about
+    // aoide's own four tiers, not a host-dependent plugin list); `schema
+    // --json`'s own `external` key is the machine-readable form of the same
+    // PATH probe. Empty when nothing is installed, so `--help` on a host
+    // with no plugins is unchanged from before this existed — same
+    // discipline as `schema --json`'s additive `external` key.
+    let external = crate::bin::discover_external(bin_name);
+    if !external.is_empty() {
+        let ext_width = external.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+        s.push_str(&format!("\n\nexternal ({bin_name}-* on PATH, not part of this schema):"));
+        for (name, path) in &external {
+            s.push_str(&format!("\n  {name:<ext_width$}  {}", path.display()));
+        }
+    }
+
+    Outcome::usage(bin_name, s)
+}
+
+/// Every first path segment a registered command begins with, plus every
+/// [`ALIASES`] entry's own first segment — the set an external-command probe
+/// must never shadow (module doc's step 3). A built-in always wins, and a
+/// TYPO of a built-in head still falls through to `parse`'s own
+/// `unknown_command_outcome`/did-you-mean rather than a silent PATH probe
+/// pre-empting it. Today's one alias head (`node`) is already a registered
+/// head on its own, so including `ALIASES` here is free insurance against a
+/// future alias whose head is not itself a command.
+fn reserved_heads(registry: &Registry) -> std::collections::HashSet<&'static str> {
+    let mut heads: std::collections::HashSet<&'static str> = registry.commands().map(|c| c.path[0]).collect();
+    heads.extend(ALIASES.iter().map(|(from, _)| from[0]));
+    heads
+}
+
+/// Step 4 of the module doc's EXTERNAL PROBE: is `argv[0]` an eligible name
+/// (present, not `-`-leading, not a reserved head), and if so, is
+/// `<bin_name>-<name>` an executable file on `PATH`? A hit resolves to the
+/// absolute path to spawn; anything else (ineligible, or nothing found)
+/// returns `None` so `parse`'s ordinary path runs completely unchanged — this
+/// is a filter in front of that path, never a replacement for it.
+fn probe_external(argv: &[String], bin_name: &str, registry: &Registry) -> Option<PathBuf> {
+    let name = argv.first()?;
+    if name.starts_with('-') {
+        return None;
+    }
+    if reserved_heads(registry).contains(name.as_str()) {
+        return None;
+    }
+    crate::bin::resolve_executable_on_path(&format!("{bin_name}-{name}"))
+}
+
+/// Spawn a resolved external command with `args` verbatim and
+/// `Stdio::inherit()` throughout (the `spawn_with_secret` precedent,
+/// `crates/secrets/src/client.rs`), returning the CHILD's own exit code
+/// unchanged — never aoide's own exit-code vocabulary. Audits ONE line at
+/// LAUNCH (right after `spawn` succeeds, before `wait`) so a plugin that
+/// never exits — a watcher, a TUI — still leaves a record, the same
+/// audit-then-block shape `a2a serve` uses for the same reason. The
+/// message carries the resolved path and the argument COUNT, never the
+/// argument VALUES (`crates/secrets/src/client.rs`'s "never argv" rule) —
+/// `aoide deploy --token abc` must never put `abc` in a world-readable log.
+/// A spawn failure (bad binary, permission denied) is audited `"error"` and
+/// exits [`exit::ERROR`], reason on stderr, same shape `session_conduct`
+/// (`crates/conduct/src/graph/conduct.rs`) uses for its own spawn failure.
+fn run_external(path: &std::path::Path, args: &[String], bin_name: &str, name: &str) -> i32 {
+    let log = default_audit_log();
+    let command = format!("external.{name}");
+    let mut child = match Process::new(path)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = audit(&log, Door::Cli, EventClass::Audit, &command, "error", &format!("{}: {e}", path.display()));
+            eprintln!("{bin_name} {name}: spawning `{}`: {e}", path.display());
+            return exit::ERROR;
+        }
+    };
+    let _ = audit(
+        &log,
+        Door::Cli,
+        EventClass::Audit,
+        &command,
+        "ok",
+        &format!("{} ({} arg{})", path.display(), args.len(), if args.len() == 1 { "" } else { "s" }),
+    );
+    match child.wait() {
+        Ok(status) => status.code().unwrap_or(exit::ERROR),
+        Err(_) => exit::ERROR,
+    }
+}
+
+/// Exit code for a usage error surfaced during parsing.
+pub const USAGE_EXIT: i32 = exit::USAGE;
+
+/// Did argv contain `--json` anywhere? (used before full parse for errors).
+fn wants_json(argv: &[String]) -> bool {
+    argv.iter().any(|a| a == "--json" || a == "--json=true")
+}
+
+/// Run one invocation end-to-end: parse against `registry`, offer the result
+/// to `special` first, else dispatch generically through `dispatch` and
+/// render the [`Outcome`]. Returns the process exit code.
+///
+/// `special` is called with the parsed [`Invocation`] and the `--json` flag
+/// AFTER a successful parse — see the module doc for why it exists.
+/// `Some(code)` short-circuits `run` with that exit code (the special case
+/// already did its own printing); `None` falls through to the uniform
+/// dispatch+render path below, unchanged from every other command.
+pub fn run(
+    argv: &[String],
+    door: Door,
+    bin_name: &str,
+    registry: &Registry,
+    dispatch: fn(&Invocation) -> Outcome,
+    special: impl FnOnce(&Invocation, bool) -> Option<i32>,
+) -> i32 {
+    if let Some(path) = probe_external(argv, bin_name, registry) {
+        return run_external(&path, &argv[1..], bin_name, &argv[0]);
+    }
+
+    let (inv, json) = match parse(argv, door, bin_name, registry) {
+        Ok(v) => v,
+        Err(o) => {
+            let json = wants_json(argv);
+            let (body, code) = o.render(json);
+            if code == exit::OK {
+                // Informational (a `--help`/`-h` usage block): to stdout, exit 0.
+                // Text mode prints the raw usage; `--json` still emits the
+                // envelope so a tool reading `--help --json` gets structure.
+                if json {
+                    println!("{body}");
+                } else {
+                    println!("{}", o.message);
+                }
+            } else {
+                eprintln!("{body}");
+            }
+            return code;
+        }
+    };
+
+    if let Some(code) = special(&inv, json) {
+        return code;
+    }
+
+    let outcome = dispatch(&inv);
+    let (body, code) = outcome.render(json);
+    if code == exit::OK {
+        println!("{body}");
+    } else {
+        eprintln!("{body}");
+    }
+    code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::Status;
+    use crate::registry::{Arg, Flag, JSON_FLAG};
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn noop(_inv: &Invocation) -> Outcome {
+        Outcome::ok("noop", "ok")
+    }
+
+    /// Point `PATH` at a fresh, empty scratch dir for the duration of a
+    /// PATH-touching test, returning the dir (for planting fake plugins) and
+    /// the real `PATH` to restore afterward. Callers must hold
+    /// `crate::bin::path_test_lock()` for the whole test — `std::env::
+    /// set_var` is process-global (crates/AGENTS.md). Every existing
+    /// `parse`/`run` test that never plants a plugin still needs this once
+    /// the external probe exists: `usage_root` (root `--help`/bare argv) now
+    /// reads the AMBIENT `PATH` for its own trailing section, so a bare
+    /// `parse(&argv(&[]), ..)` must not depend on what happens to sit there.
+    fn scoped_empty_path(tag: &str) -> (PathBuf, Option<std::ffi::OsString>) {
+        let saved = std::env::var_os("PATH");
+        let dir = std::env::temp_dir().join(format!("aoide_protocol_door_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("PATH", &dir);
+        (dir, saved)
+    }
+
+    fn restore_path(dir: PathBuf, saved: Option<std::ffi::OsString>) {
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write `contents` to `dir.join(name)` and mark it executable —
+    /// `crate::bin::mark_executable` is the shared `PermissionsExt` dance.
+    fn write_executable(dir: &std::path::Path, name: &str, contents: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        crate::bin::mark_executable(&path);
+        path
+    }
+
+    /// A tiny hand-built registry standing in for a real crate's
+    /// `commands::all()` — protocol cannot depend on the domain crates that
+    /// register the real command tree, so these tests exercise the parser's
+    /// own logic (greedy match, flags, `--help`) against a minimal tree
+    /// rather than the golden 87/41 paths (those are covered by the cli/lyra
+    /// crates' own tests, which call through to this same code).
+    fn test_registry() -> Registry {
+        let mut r = Registry::new();
+        r.insert(Command {
+            path: &["graph", "view"],
+            summary: "View the project/session graph.",
+            args: &[],
+            flags: &[JSON_FLAG, Flag { name: "focus", ty: "string", description: "Focus a node." }],
+            gated: false,
+            implemented: true,
+            internal: false,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        });
+        // A bare parent path (`graph`) that is ALSO the prefix of a longer,
+        // separately-registered sibling (`graph link`) — the R1 graph-prefix
+        // cutover shape: `graph` renders, `graph link` records an edge, and
+        // the two must coexist without either shadowing the other.
+        r.insert(Command {
+            path: &["graph"],
+            summary: "Render the project/session graph.",
+            args: &[],
+            flags: &[JSON_FLAG],
+            gated: false,
+            implemented: true,
+            internal: false,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        });
+        r.insert(Command {
+            path: &["graph", "link"],
+            summary: "Record a spawned-by edge.",
+            args: &[
+                Arg { name: "child", ty: "string", required: true, description: "Child session id." },
+                Arg { name: "parent", ty: "string", required: true, description: "Parent session id." },
+            ],
+            flags: &[JSON_FLAG],
+            gated: false,
+            implemented: true,
+            internal: false,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        });
+        r.insert(Command {
+            path: &["graph", "project", "add"],
+            summary: "Register a project anchor root.",
+            args: &[Arg { name: "name", ty: "string", required: true, description: "Anchor name." }],
+            flags: &[JSON_FLAG],
+            gated: false,
+            implemented: true,
+            internal: false,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        });
+        r.insert(Command {
+            path: &["graph", "session", "start"],
+            summary: "Register a running session.",
+            args: &[],
+            flags: &[JSON_FLAG, Flag { name: "id", ty: "string", description: "Session id." }],
+            gated: false,
+            implemented: true,
+            internal: false,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        });
+        r.insert(Command {
+            path: &["node", "remove"],
+            summary: "Deregister a node.",
+            args: &[Arg { name: "name", ty: "string", required: true, description: "Node name." }],
+            flags: &[JSON_FLAG],
+            gated: false,
+            implemented: true,
+            internal: false,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        });
+        // The #111 filed shape: a command with positional args plus a
+        // declared-bool flag AND a declared-valued flag, mirroring the real
+        // `node add <name> <url> [--no-verify] [--via …]`.
+        r.insert(Command {
+            path: &["node", "add"],
+            summary: "Register a node.",
+            args: &[
+                Arg { name: "name", ty: "string", required: true, description: "Node name." },
+                Arg { name: "url", ty: "string", required: true, description: "Node URL." },
+            ],
+            flags: &[
+                JSON_FLAG,
+                Flag { name: "no-verify", ty: "bool", description: "Skip the card fetch." },
+                Flag { name: "via", ty: "string", description: "Tunnel spec." },
+            ],
+            gated: false,
+            implemented: true,
+            internal: false,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        });
+        r
+    }
+
+    #[test]
+    fn help_flag_prints_subcommand_usage_at_exit_zero() {
+        let reg = test_registry();
+        let err = parse(&argv(&["graph", "view", "--help"]), Door::Cli, "aoide", &reg).unwrap_err();
+        assert_eq!(err.status, Status::Ok, "--help is informational, exit 0");
+        assert_eq!(err.render(false).1, exit::OK);
+        assert!(err.message.contains("usage: aoide graph view"));
+        assert!(err.message.contains("--focus"), "lists the command's flags");
+    }
+
+    #[test]
+    fn unknown_flag_is_a_usage_error_naming_the_offender() {
+        let reg = test_registry();
+        let err = parse(&argv(&["graph", "view", "--bogus"]), Door::Cli, "aoide", &reg).unwrap_err();
+        assert_eq!(err.status, Status::Usage, "unknown flag → exit 2");
+        assert_eq!(err.render(false).1, exit::USAGE);
+        assert!(err.message.contains("--bogus"));
+    }
+
+    #[test]
+    fn known_flags_still_parse() {
+        let reg = test_registry();
+        let (inv, _) = parse(&argv(&["graph", "view", "--focus", "session:x"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(inv.path, vec!["graph", "view"]);
+        assert_eq!(inv.flags.get("focus").map(String::as_str), Some("session:x"));
+    }
+
+    /// Regression (#48): a flag placed BEFORE the final path segment, whose
+    /// value collides with that segment's name. `graph session --id start`
+    /// used to parse SILENTLY as path=`graph.session.start`,
+    /// flags={id:"true"} — the value swallowed as a path segment, the flag
+    /// mis-booleaned. The ordering is genuinely ambiguous, so it must be a
+    /// loud usage error naming the flag, the value, and the unambiguous
+    /// spelling.
+    #[test]
+    fn a_flag_before_the_full_path_whose_value_collides_with_a_segment_fails_loudly() {
+        let reg = test_registry();
+        let err = parse(&argv(&["graph", "session", "--id", "start"]), Door::Cli, "aoide", &reg).unwrap_err();
+        assert_eq!(err.status, Status::Usage, "ambiguous ordering → exit 2");
+        assert_eq!(err.render(false).1, exit::USAGE);
+        assert!(err.message.contains("`--id start`"), "names the flag+value: {}", err.message);
+        assert!(err.message.contains("`graph session start`"), "names the colliding command: {}", err.message);
+        assert!(
+            err.message.contains("aoide graph session start --id <value>"),
+            "suggests the flags-after-path spelling: {}",
+            err.message
+        );
+    }
+
+    /// The same value AFTER the full command path is not ambiguous — nothing
+    /// extends `graph session start`, so `--id start` binds normally.
+    #[test]
+    fn the_colliding_value_after_the_full_path_still_binds_as_a_flag_value() {
+        let reg = test_registry();
+        let (inv, _) = parse(&argv(&["graph", "session", "start", "--id", "start"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(inv.path, vec!["graph", "session", "start"]);
+        assert_eq!(inv.flags.get("id").map(String::as_str), Some("start"));
+    }
+
+    /// The R1 graph-prefix cutover shape: a bare parent path (`graph`) that
+    /// is ALSO a registered leaf, coexisting with a longer sibling (`graph
+    /// link`) that extends the same first segment. Longest-match must prefer
+    /// the 2-segment path over the 1-segment one when both are spelled out,
+    /// and the bare path must still resolve to itself when nothing follows.
+    #[test]
+    fn a_bare_parent_path_and_a_longer_sibling_subcommand_coexist() {
+        let reg = test_registry();
+
+        let (inv, _) = parse(&argv(&["graph", "link", "c1", "p1"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(inv.path, vec!["graph", "link"], "the longer sibling wins over the bare parent");
+        assert_eq!(inv.args, vec!["c1", "p1"]);
+
+        let (inv, json) = parse(&argv(&["graph"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(inv.path, vec!["graph"]);
+        assert!(inv.args.is_empty());
+        assert!(!json);
+
+        let (inv, json) = parse(&argv(&["graph", "--json"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(inv.path, vec!["graph"]);
+        assert!(json);
+    }
+
+    /// The boundary this coexistence creates: an unregistered CHILD of the
+    /// zero-arg bare parent must not silently resolve as the parent with a
+    /// stray ignored positional — it must be a loud unknown-command error,
+    /// same as any other typo. `graph` declares no positional args (unlike
+    /// `conduct`/`graph spawn`/`graph send`, which intentionally consume
+    /// everything after their first required arg), so this is the ONE case
+    /// where leftover positionals must reject rather than pass through.
+    #[test]
+    fn an_unregistered_child_of_a_zero_arg_parent_is_a_loud_unknown_command() {
+        let reg = test_registry();
+        let err = parse(&argv(&["graph", "nonsense"]), Door::Cli, "aoide", &reg).unwrap_err();
+        assert_eq!(
+            err.status,
+            Status::Usage,
+            "must not silently resolve to the bare parent with a stray positional"
+        );
+        assert!(
+            err.message.contains("unknown command: `graph nonsense`"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// A command that DOES declare a positional arg (`graph link`, two
+    /// required args) is unaffected by the zero-arg overflow check above —
+    /// its own declared args still bind normally, and a command like
+    /// `conduct`/`graph spawn` that deliberately consumes MORE than its one
+    /// declared arg (the wrapped command's own argv) must keep doing so. The
+    /// zero-arg registry check must never fire for a command with `args`.
+    #[test]
+    fn a_command_declaring_positional_args_is_unaffected_by_the_zero_arg_check() {
+        let reg = test_registry();
+        let (inv, _) = parse(&argv(&["graph", "project", "add", "aoide", "extra"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(inv.path, vec!["graph", "project", "add"]);
+        assert_eq!(inv.args, vec!["aoide", "extra"]);
+    }
+
+    /// `node rm <name>` is an ergonomic alias for `node remove <name>`,
+    /// resolved at the parser level (`ALIASES`/`resolve_aliases`) — the
+    /// invocation it produces must be byte-identical to typing the canonical
+    /// path out, and the trailing arg (the node name) must survive the
+    /// rewrite untouched.
+    #[test]
+    fn node_rm_is_a_parser_level_alias_for_node_remove() {
+        let reg = test_registry();
+        let (aliased, _) = parse(&argv(&["node", "rm", "alice"]), Door::Cli, "aoide", &reg).unwrap();
+        let (canonical, _) = parse(&argv(&["node", "remove", "alice"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(aliased.path, vec!["node", "remove"], "the alias resolves to the CANONICAL path, never a `node.rm` path of its own");
+        assert_eq!(aliased.path, canonical.path);
+        assert_eq!(aliased.args, canonical.args);
+        assert_eq!(aliased.args, vec!["alice"]);
+    }
+
+    /// Regression (#111, filed off the M3 review): a declared-BOOL flag given
+    /// before the positional args swallowed the following token as its value —
+    /// `node add --no-verify alice url` parsed as flags={no-verify:"alice"},
+    /// args=["url"], silently dropping a positional. The registry declares the
+    /// flag's type, so the parser must never let a bool consume a value token.
+    #[test]
+    fn a_bool_flag_before_positionals_never_swallows_the_next_token() {
+        let reg = test_registry();
+        let (inv, _) = parse(
+            &argv(&["node", "add", "--no-verify", "alice", "http://h:7466"]),
+            Door::Cli,
+            "aoide",
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(inv.path, vec!["node", "add"]);
+        assert_eq!(inv.args, vec!["alice", "http://h:7466"], "both positionals survive");
+        assert_eq!(inv.flags.get("no-verify").map(String::as_str), Some("true"));
+    }
+
+    /// The neighboring shapes around the #111 fix: a bool flag at the end and
+    /// between positionals binds bare either way, with every positional kept.
+    #[test]
+    fn a_bool_flag_at_the_end_or_between_positionals_binds_bare() {
+        let reg = test_registry();
+
+        let (inv, _) = parse(
+            &argv(&["node", "add", "alice", "http://h:7466", "--no-verify"]),
+            Door::Cli,
+            "aoide",
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(inv.args, vec!["alice", "http://h:7466"]);
+        assert_eq!(inv.flags.get("no-verify").map(String::as_str), Some("true"));
+
+        let (inv, _) = parse(
+            &argv(&["node", "add", "alice", "--no-verify", "http://h:7466"]),
+            Door::Cli,
+            "aoide",
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(inv.args, vec!["alice", "http://h:7466"]);
+        assert_eq!(inv.flags.get("no-verify").map(String::as_str), Some("true"));
+    }
+
+    /// A bool flag placed before the command path is even complete resolves
+    /// through the same candidate-aware type lookup — the following token
+    /// stays a path segment, never the flag's value.
+    #[test]
+    fn a_bool_flag_before_the_path_is_complete_leaves_the_segment_alone() {
+        let reg = test_registry();
+        let (inv, _) = parse(
+            &argv(&["node", "--no-verify", "add", "alice", "http://h:7466"]),
+            Door::Cli,
+            "aoide",
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(inv.path, vec!["node", "add"]);
+        assert_eq!(inv.args, vec!["alice", "http://h:7466"]);
+        assert_eq!(inv.flags.get("no-verify").map(String::as_str), Some("true"));
+    }
+
+    /// The converse must be untouched by the #111 fix: a genuinely VALUED
+    /// flag before the positionals still consumes exactly its one value.
+    #[test]
+    fn a_valued_flag_before_positionals_still_consumes_its_value() {
+        let reg = test_registry();
+        let (inv, _) = parse(
+            &argv(&["node", "add", "--via", "ssh://h:22", "alice", "http://h:7466"]),
+            Door::Cli,
+            "aoide",
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(inv.args, vec!["alice", "http://h:7466"]);
+        assert_eq!(inv.flags.get("via").map(String::as_str), Some("ssh://h:22"));
+    }
+
+    /// A flag declared `"bool"` by one candidate command and valued by a
+    /// sibling, with a consumable token following, reads both ways — the
+    /// parser refuses loudly (the #48 convention) instead of guessing, and
+    /// names both unambiguous spellings.
+    #[test]
+    fn a_flag_declared_bool_and_valued_by_sibling_commands_fails_loudly() {
+        let mut r = Registry::new();
+        let mk = |path: &'static [&'static str], ty: &'static str| Command {
+            path,
+            summary: "Test.",
+            args: &[Arg { name: "x", ty: "string", required: false, description: "X." }],
+            flags: if ty == "bool" {
+                &[JSON_FLAG, Flag { name: "force", ty: "bool", description: "F." }]
+            } else {
+                &[JSON_FLAG, Flag { name: "force", ty: "string", description: "F." }]
+            },
+            gated: false,
+            implemented: true,
+            internal: false,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        };
+        r.insert(mk(&["thing", "one"], "bool"));
+        r.insert(mk(&["thing", "two"], "string"));
+
+        let err = parse(&argv(&["thing", "--force", "val"]), Door::Cli, "aoide", &r).unwrap_err();
+        assert_eq!(err.status, Status::Usage, "mixed declaration + consumable token → exit 2");
+        assert!(err.message.contains("--force"), "{}", err.message);
+        assert!(err.message.contains("--force=val"), "offers the valued spelling: {}", err.message);
+
+        // With nothing consumable following, only the bare reading exists.
+        let (inv, _) = parse(&argv(&["thing", "one", "--force"]), Door::Cli, "aoide", &r).unwrap();
+        assert_eq!(inv.flags.get("force").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn a_typo_gets_a_did_you_mean_suggestion() {
+        let reg = test_registry();
+        let err = parse(&argv(&["graph", "vie"]), Door::Cli, "aoide", &reg).unwrap_err();
+        assert_eq!(err.status, Status::Usage);
+        assert!(err.message.contains("unknown command: `graph vie`"));
+        assert!(err.message.contains("did you mean:\n  aoide graph view"));
+    }
+
+    /// `bin_name` is not cosmetic: a second binary (lyra, P-A5) must see its
+    /// own name in every usage/help/did-you-mean string, never `aoide`'s.
+    #[test]
+    fn bin_name_names_the_invoking_binary_everywhere() {
+        // Scoped: `usage_root` (the bare-argv branch below) now reads the
+        // ambient `PATH` for its own trailing external section (task #138) —
+        // pin it to empty so this test's `!contains("aoide")` assertion
+        // never depends on what the real machine's PATH happens to hold.
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("bin_name_everywhere");
+
+        let reg = test_registry();
+
+        let root = parse(&argv(&[]), Door::Cli, "lyra", &reg).unwrap_err();
+        assert!(root.message.contains("usage: lyra <command>"), "{}", root.message);
+        assert!(!root.message.contains("aoide"), "{}", root.message);
+
+        let sub = parse(&argv(&["graph", "view", "--help"]), Door::Cli, "lyra", &reg).unwrap_err();
+        assert!(sub.message.contains("usage: lyra graph view"), "{}", sub.message);
+
+        let unknown = parse(&argv(&["graph", "vie"]), Door::Cli, "lyra", &reg).unwrap_err();
+        assert!(
+            unknown.message.contains("did you mean:\n  lyra graph view"),
+            "{}",
+            unknown.message
+        );
+        assert!(unknown.message.contains("run 'lyra --help'"), "{}", unknown.message);
+
+        restore_path(dir, saved);
+    }
+
+    // ── external-command probe (task #138) ──────────────────────────────────
+
+    /// A registered head must never probe `PATH`, no matter what sits
+    /// there — the reservation (module doc's step 3) wins structurally, not
+    /// by luck of what happens to be installed.
+    #[test]
+    fn a_registered_head_never_probes_path_even_with_a_matching_binary_present() {
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("reserved_head");
+        write_executable(&dir, "aoide-graph", "#!/bin/sh\nexit 0\n");
+
+        let reg = test_registry();
+        assert!(
+            probe_external(&argv(&["graph", "vie"]), "aoide", &reg).is_none(),
+            "`graph` is a registered head — it must never reach the PATH probe"
+        );
+
+        restore_path(dir, saved);
+    }
+
+    /// A typo of a registered head (not itself a reserved head) DOES reach
+    /// the PATH probe, misses on an empty `PATH`, and falls through to the
+    /// exact same taught did-you-mean error as before the probe existed —
+    /// the probe is a filter in front of `parse`'s own path, never a
+    /// replacement for it.
+    #[test]
+    fn a_typo_of_a_registered_head_falls_through_to_did_you_mean() {
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("typo_head");
+
+        let reg = test_registry();
+        assert!(
+            probe_external(&argv(&["grph", "view"]), "aoide", &reg).is_none(),
+            "no `aoide-grph` exists on this scoped PATH"
+        );
+        let err = parse(&argv(&["grph", "view"]), Door::Cli, "aoide", &reg).unwrap_err();
+        assert_eq!(err.status, Status::Usage);
+        assert!(err.message.contains("unknown command: `grph view`"), "{}", err.message);
+        assert!(err.message.contains("did you mean:\n  aoide graph view"), "{}", err.message);
+
+        restore_path(dir, saved);
+    }
+
+    /// An eligible, non-reserved name with a matching executable on `PATH`
+    /// resolves to that executable's absolute path.
+    #[test]
+    fn an_eligible_name_with_a_matching_binary_resolves_to_its_absolute_path() {
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("eligible_hit");
+        let plugin = write_executable(&dir, "aoide-deploy", "#!/bin/sh\nexit 0\n");
+
+        let reg = test_registry();
+        assert_eq!(probe_external(&argv(&["deploy", "--env", "prod"]), "aoide", &reg), Some(plugin));
+
+        restore_path(dir, saved);
+    }
+
+    /// `--help`/`-h`-leading argv never probes (module doc's step 2), even
+    /// when a same-named executable exists — flags are never mistaken for a
+    /// plugin name.
+    #[test]
+    fn a_flag_leading_argv_never_probes_path() {
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("flag_leading");
+        write_executable(&dir, "aoide---help", "#!/bin/sh\nexit 0\n");
+
+        let reg = test_registry();
+        assert!(probe_external(&argv(&["--help"]), "aoide", &reg).is_none());
+        assert!(probe_external(&argv(&[]), "aoide", &reg).is_none(), "bare argv never probes");
+
+        restore_path(dir, saved);
+    }
+
+    /// End-to-end through `run`: a hit spawns the child with `argv[1..]`
+    /// VERBATIM and returns the CHILD's own exit code unchanged, never
+    /// aoide's own vocabulary.
+    #[test]
+    fn run_spawns_the_resolved_external_command_with_argv_verbatim_and_returns_its_exit_code() {
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("run_spawn");
+        write_executable(
+            &dir,
+            "aoide-deploy",
+            "#!/bin/sh\n[ \"$1\" = \"--env\" ] && [ \"$2\" = \"prod\" ] && [ \"$3\" = \"x\" ] && exit 42\nexit 99\n",
+        );
+
+        let reg = test_registry();
+        let code = run(&argv(&["deploy", "--env", "prod", "x"]), Door::Cli, "aoide", &reg, noop, |_inv, _json| None);
+        assert_eq!(code, 42, "argv[1..] must reach the child verbatim");
+
+        restore_path(dir, saved);
+    }
+
+    /// A spawn failure (nonexistent binary resolved a moment ago, then
+    /// removed — the realistic TOCTOU shape) exits `exit::ERROR`, not a
+    /// panic and not aoide's usage/not-implemented vocabulary.
+    #[test]
+    fn run_external_reports_a_spawn_failure_as_a_plain_error_exit() {
+        // Scoped: the error arm still audits one line, and this test must
+        // never touch the real machine's `~/.aoide/log`.
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let log = std::env::temp_dir().join(format!("aoide_protocol_door_spawn_failure_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let saved_log = std::env::var_os("AOIDE_AUDIT_LOG");
+        std::env::set_var("AOIDE_AUDIT_LOG", &log);
+
+        let path = std::path::PathBuf::from("/definitely/not/a/real/path/aoide-deploy");
+        let code = run_external(&path, &[], "aoide", "deploy");
+        assert_eq!(code, exit::ERROR);
+
+        match saved_log {
+            Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+            None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+        }
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// The audit line lands at LAUNCH: resolved path + argument COUNT only —
+    /// never an argument VALUE (`crates/secrets/src/client.rs`'s "never
+    /// argv" rule). A secret-looking flag value must never reach the log.
+    #[test]
+    fn run_audits_the_launch_with_path_and_arg_count_never_argument_values() {
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("run_audit");
+        let plugin = write_executable(&dir, "aoide-deploy", "#!/bin/sh\nexit 0\n");
+
+        let log = dir.join("audit.log");
+        let saved_log = std::env::var_os("AOIDE_AUDIT_LOG");
+        std::env::set_var("AOIDE_AUDIT_LOG", &log);
+
+        let reg = test_registry();
+        let code = run(
+            &argv(&["deploy", "--token", "super-secret-value"]),
+            Door::Cli,
+            "aoide",
+            &reg,
+            noop,
+            |_inv, _json| None,
+        );
+        assert_eq!(code, 0);
+
+        let contents = std::fs::read_to_string(&log).unwrap();
+        assert!(contents.contains("\"command\":\"external.deploy\""), "{contents}");
+        assert!(contents.contains(&plugin.display().to_string()), "{contents}");
+        assert!(contents.contains("2 arg"), "carries the argument COUNT: {contents}");
+        assert!(!contents.contains("super-secret-value"), "must never carry an argument VALUE: {contents}");
+
+        match saved_log {
+            Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+            None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+        }
+        restore_path(dir, saved);
+    }
+
+    #[test]
+    fn run_falls_through_to_dispatch_when_special_declines() {
+        let reg = test_registry();
+        let code = run(&argv(&["graph", "view"]), Door::Cli, "aoide", &reg, noop, |_inv, _json| None);
+        assert_eq!(code, exit::OK);
+    }
+
+    #[test]
+    fn run_short_circuits_when_special_claims_the_invocation() {
+        let reg = test_registry();
+        let code = run(&argv(&["graph", "view"]), Door::Cli, "aoide", &reg, noop, |_inv, _json| Some(exit::NOT_IMPLEMENTED));
+        assert_eq!(code, exit::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn short_desc_keeps_the_first_sentence_only() {
+        assert_eq!(short_desc("One sentence. Two sentences."), "One sentence.");
+        // A newline also ends the "sentence"; no dangling whitespace.
+        assert_eq!(short_desc("First line\nsecond line"), "First line");
+        // Short summaries pass through whole.
+        assert_eq!(short_desc("Terse."), "Terse.");
+    }
+
+    #[test]
+    fn short_desc_truncates_a_chatty_opener_at_a_word_boundary() {
+        let long = "This opener runs on and on well past the cap without a single period to stop it anywhere at all.";
+        let out = short_desc(long);
+        assert!(out.ends_with('…'), "ellipsis marks the cut: {out}");
+        assert!(out.chars().count() <= 61, "cap + ellipsis: {}", out.len());
+        let body = out.trim_end_matches('…');
+        assert!(long.starts_with(body), "never invents text: {out}");
+        // Word-boundary cut: the next char in the source after the kept body
+        // is whitespace (nothing half-swallowed).
+        let next = long[body.len()..].chars().next();
+        assert!(next.is_none_or(|ch| ch.is_whitespace()), "mid-word cut: {out}");
+    }
+
+    #[test]
+    fn short_desc_is_multibyte_safe_at_the_cap() {
+        // ▶ is 3 bytes — byte-naive truncation at the cap would panic; the
+        // char-based cut must not.
+        let s = format!("{} watch the ▶ marker glide past the truncation cap without a panic.", "x".repeat(50));
+        let out = short_desc(&s);
+        assert!(out.ends_with('…'));
+        // And a short string containing ▶ passes through untouched.
+        assert_eq!(short_desc("Highlight ▶ node."), "Highlight ▶ node.");
+    }
+}

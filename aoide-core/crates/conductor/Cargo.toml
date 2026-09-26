@@ -1,0 +1,23 @@
+[package]
+name = "aoide-conductor"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+description = "Aoide's interactive terminal frontend: the session-graph conductor TUI (ratatui/crossterm). A frontend over the one dispatcher -- never a second implementation."
+
+[lib]
+name = "aoide_conductor"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+aoide-protocol = { workspace = true }
+aoide-conduct = { workspace = true }
+aoide-storage = { workspace = true }
+# `aoide conductor` — the interactive terminal frontend, built on ratatui.rs
+# over the crossterm backend (the rig's standard for every Aoide TUI: no
+# hand-rolled ANSI). Version pins + feature minimalism are declared once in
+# the root `[workspace.dependencies]` — the rationale comment lives there.
+crossterm = { workspace = true }
+ratatui = { workspace = true }

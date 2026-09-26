@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (every feature combination a consumer uses)
+        run: |
+          for f in "" oauth-server oauth-client secrets provider-auth llm "llm,bitcode" claude-cli policy full; do
+            echo "::group::features=[$f]"
+            cargo clippy --no-default-features --features "$f" --all-targets -- -D warnings
+            echo "::endgroup::"
+          done
+
+      - name: Test
+        run: cargo test --all-features --locked

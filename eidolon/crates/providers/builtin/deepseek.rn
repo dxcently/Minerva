@@ -1,0 +1,109 @@
+//! DeepSeek, shipped with the harness.
+//!
+//! Declared, not coded: this is an ordinary provider script that happens to
+//! be embedded in the binary, so it loads before `providers_dir` and a file
+//! of the same name there — or a `[[providers]]` table called `deepseek` —
+//! replaces it whole. Nothing here is privileged.
+//!
+//! The **Anthropic-compatible** endpoint rather than the OpenAI one: it
+//! takes `thinking` on the wire (the harness's `thinking_budget` reaches
+//! the model, though DeepSeek ignores the budget number), streams, and does
+//! parallel tool calls, so none of the `compat` knobs are needed. Cache
+//! control is ignored there — DeepSeek caches on its own account and bills
+//! the hit rate — which is why `cache_write` is zero.
+//!
+//! The key: `eidolon secret set deepseek < key.txt`, or `DEEPSEEK_API_KEY`
+//! in the environment. The store wins; the variable is the fallback. The
+//! same key serves the listing below.
+//!
+//! The model list is fetched, not memorised: `models()` pulls the
+//! OpenAI-surface `GET /models` — an absolute URL, because the
+//! Anthropic-compatible surface this provider speaks has no listing of its
+//! own — and adds every id DeepSeek currently serves, so a model announced
+//! one morning is a picker row the same day. The reply names ids and
+//! nothing else: no rates, no context, so a row only the listing knows is
+//! unpriced and unwindowed ("nobody said") rather than guessed at, and the
+//! declared rows below stay the priced truth — the loader keeps a declared
+//! row over a discovered one of the same id. A launch answers from the
+//! cached body and refreshes it on a thread; `eidolon models` waits for the
+//! fetch. When DeepSeek retires an id the listing drops it and the
+//! declaration should follow: `deepseek-v4-flash` and its vision experiment
+//! went that way (2026-09-10), both still accepted by the endpoint and
+//! served by Flash at the Flash price.
+//!
+//! Prices are dollars per million tokens at DeepSeek's **peak** rate
+//! (01:00-04:00 and 06:00-10:00 UTC, Mon-Fri); off-peak is half of each, so
+//! a session estimate here is a ceiling and never a surprise.
+
+pub fn provider() {
+    #{
+        name: "deepseek",
+        wire: "anthropic",
+        base_url: "https://api.deepseek.com/anthropic",
+        token_secret: "deepseek",
+        token_env: "DEEPSEEK_API_KEY",
+        auth: "api_key",
+        models: [
+            #{
+                id: "deepseek-v4-pro",
+                name: "DeepSeek V4 Pro",
+                context: 1000000,
+                reasoning: true,
+                vision: false,
+                cost: #{ input: 1.32, output: 3.96, cache_read: 0.044, cache_write: 0.0 },
+            },
+            #{
+                id: "deepseek-flash",
+                name: "DeepSeek Flash",
+                context: 1000000,
+                reasoning: true,
+                cost: #{ input: 0.3, output: 1.2, cache_read: 0.006, cache_write: 0.0 },
+            },
+        ],
+    }
+}
+
+/// Every id DeepSeek serves right now. A failed fetch is an empty list: the
+/// declared rows stand in.
+pub fn models() {
+    let body = match eidolon::http_get("https://api.deepseek.com/models") {
+        Ok(b) => b,
+        Err(_) => return [],
+    };
+    return read_models(body);
+}
+
+/// The listing is the OpenAI shape — `{"object":"list","data":[{"id":…}]}` —
+/// and an id is all a row carries, so a discovered model is a bare id: the
+/// label falls back to it, and cost and context stay unset rather than zero.
+fn read_models(body) {
+    let out = [];
+    let listing = match json::from_string(body) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    if !(listing is Object) {
+        return out;
+    }
+    let data = match listing.get("data") {
+        Some(d) => d,
+        None => return out,
+    };
+    if !(data is Vec) {
+        return out;
+    }
+    for model in data {
+        if !(model is Object) {
+            continue;
+        }
+        let id_obj = match model.get("id") {
+            Some(v) => v,
+            None => continue,
+        };
+        if !(id_obj is String) {
+            continue;
+        }
+        out.push(#{ id: id_obj });
+    }
+    return out;
+}

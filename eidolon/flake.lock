@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "harnox": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790154485,
+        "narHash": "sha256-lavbU6T1N9AsJUgKhp8dz6MQeOwzCgRzFOKY+hNl9KY=",
+        "owner": "noah427",
+        "repo": "harnox",
+        "rev": "3c1fe7d4157210db4cc367655db40e9fc598bb86",
+        "type": "github"
+      },
+      "original": {
+        "owner": "noah427",
+        "ref": "v0.3.8",
+        "repo": "harnox",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1788404924,
+        "narHash": "sha256-lhEhY8X5EgkQ/eg6IFz4cc8jRuSYSvnxx1al7d1dvZ0=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "0968519e14f7aa7d3e9b389682bd74d2b51c8ce8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "harnox": "harnox",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

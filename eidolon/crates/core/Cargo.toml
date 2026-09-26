@@ -1,0 +1,22 @@
+[package]
+name = "eidolon-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harnox = { workspace = true, features = ["llm", "bitcode"] }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+bitcode.workspace = true
+crc32fast.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

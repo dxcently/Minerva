@@ -1,0 +1,520 @@
+//! policy.rn — the harness's leaf table for the command safety classifier.
+//!
+//! The split (see the vault's "The Command Safety Classifier (design)"): Rust
+//! keeps the whole shell decomposition algebra in `harnox::policy` —
+//! tokenization, pipe/`&&`/`||`/`;` decomposition, command-substitution
+//! unwrapping, redirect scoping, the loop-liveness guard, and the rule that a
+//! composite is only ever as permissive as its most restrictive part. This
+//! file owns only the *leaf* table: given an already-decomposed, already
+//! safe-shaped simple command's argv (or a tool's bare name), which tier?
+//!
+//! A table here can only ever narrow or widen which already-decomposed leaf is
+//! silent, asked about, or refused. It never sees a pipe, a substitution or an
+//! unscoped path, so it cannot grant safety by construction.
+//!
+//! ## The three tiers, as this harness means them
+//!
+//! - `allow` — run it silently.
+//! - `flag`  — stop and ask. In Melete this tier means "run, and write it into
+//!   the digest", because nobody is watching an unattended run as it happens.
+//!   Here the transcript already shows every call, so surfacing is free and the
+//!   tier is worth the stronger meaning.
+//! - `deny`  — refuse, with the reason going back to the model as an error.
+//!
+//! `deny` is for what should not happen on this machine at all. Everything the
+//! *algebra* refuses for want of understanding (a subshell, a `for` loop, an
+//! unparseable line, a path outside the working directory) becomes an `ask`
+//! instead, not a refusal — there is a person here, and "I cannot take this
+//! apart, do you want it?" is a fair question where "forbidden" is not.
+//!
+//! ## Editing this
+//!
+//! This file is seeded to `~/.config/eidolon/policy.rn` on first launch and
+//! that copy is the one in force: edit it there, on the same contract as a
+//! built-in tool. Every function Rust calls is `pub`; a missing one, or one
+//! that returns the wrong shape, is reported at startup and the harness
+//! falls back to asking about everything rather than to allowing it. An
+//! upgrade carries the copy forward while it is untouched and leaves it
+//! alone once edited, with the shipped version then in
+//! `~/.config/eidolon/system/policy.rn` to diff against.
+
+const ALLOW = "allow";
+const FLAG = "flag";
+const DENY = "deny";
+
+fn v(decision, reason, read_only) {
+    #{decision: decision, reason: reason, read_only: read_only}
+}
+
+/// Rune has no `pat1 | pat2` alternation in `match`, so every "one of these
+/// strings" check goes through this.
+fn in_list(x, list) {
+    for item in list {
+        if x == item {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether any of `flags` appears anywhere in `argv`.
+fn has_flag(argv, flags) {
+    for a in argv {
+        if in_list(a, flags) {
+            return true;
+        }
+    }
+    false
+}
+
+// ===========================================================================
+// Tools
+// ===========================================================================
+
+/// The input field holding a shell command, for a tool whose argument *is* a
+/// command line — `""` for every other tool.
+///
+/// This is what routes a call into the decomposition algebra rather than the
+/// flat tool table below. It lives here rather than in Rust because a user who
+/// writes their own shell-ish tool needs to be able to say so without a
+/// rebuild; the harness has exactly one such tool today.
+///
+pub fn shell_arg(tool) {
+    match tool {
+        // The harness's own shell tool, and the Claude CLI's, which arrives
+        // through the `PreToolUse` hook under its own name when that backend
+        // runs its own tools.
+        "bash" => "command",
+        "Bash" => "command",
+        _ => "",
+    }
+}
+
+/// The tier for a tool call that is not a shell command, by the tool's name,
+/// its manifest's declared `approval`, and the call's own arguments.
+///
+/// The declaration is an input, never the answer: it is a claim about the tool
+/// made once by its author, without arguments in front of it. `input` is the
+/// call itself, which is where the interesting distinctions live — the same
+/// tool is often ordinary with one argument and worth a question with another.
+/// Where this table has an opinion it wins; where it has none, an unrecognized
+/// tool is **asked about** rather than allowed. That is deliberate — a tool
+/// this file has never heard of is one nobody has thought about here yet, and
+/// adding a line is cheap.
+pub fn classify_tool(tool, approval, input) {
+    match tool {
+        // The engine primitives. `read`/`grep` observe; `write`/`edit` change
+        // files, but they change them where the harness is already pointed and
+        // the transcript shows every one.
+        "read" => v(ALLOW, "read", true),
+        "grep" => v(ALLOW, "search", true),
+        "write" => v(ALLOW, "write a file", false),
+        "edit" => v(ALLOW, "edit a file", false),
+
+        // Fetching a URL is a GET and changes nothing here. It is the one
+        // built-in that brings *untrusted text* into the transcript, which is
+        // a real thing to worry about — and not one a yes/no dialog on the
+        // URL can address, since the operator would be approving a page they
+        // have not read. It gets its own `reason` so a ledger can count it.
+        "fetch" => v(ALLOW, "fetch a URL", true),
+
+        // Searching likewise: a GET, and untrusted text in the answer. It
+        // exists only on a session that has a search key, so a name that
+        // reaches here is one the harness assembled on purpose.
+        "search" => v(ALLOW, "search the web", true),
+
+        // Asking the operator something is not a mutation by any reading.
+        "ask_user" => v(ALLOW, "ask the operator", true),
+        "choices_user" => v(ALLOW, "ask the operator", true),
+
+        // The vault. Mneme's own destructive tier refuses without an explicit
+        // `confirm`, which travels in the call's `args` — so the server is the
+        // gate for what matters here, and duplicating it badly would be worse
+        // than trusting it.
+        "mneme_rpc" => v(ALLOW, "vault call", false),
+        // The vault command channel: a line of prose, resolved locally and
+        // dispatched through `mneme_rpc`. It runs reads, and the three writes
+        // whose payload it carries in a fence (`eidolon_verba::command`'s gate),
+        // so it is no longer read-shaped — declared here as a write so the table
+        // and the tool's own manifest agree about what this tool can do. Without
+        // this line the channel would be a question on every command: an
+        // unclassified tool is flagged, and nobody is at the keyboard in
+        // `eidolon run`.
+        "vv" => v(ALLOW, "vault command", false),
+
+        // The Claude CLI's own tools, seen when `[claude_cli] tools = "own"`
+        // and its `PreToolUse` hook forwards each call here. Its vocabulary is
+        // its own; without these lines every call on that backend would stop
+        // for a question, which is not a gate, it is an outage.
+        "Read" => v(ALLOW, "read", true),
+        "Glob" => v(ALLOW, "search", true),
+        "Grep" => v(ALLOW, "search", true),
+        "LS" => v(ALLOW, "read", true),
+        "NotebookRead" => v(ALLOW, "read", true),
+        "Write" => v(ALLOW, "write a file", false),
+        "Edit" => v(ALLOW, "edit a file", false),
+        "MultiEdit" => v(ALLOW, "edit files", false),
+        "NotebookEdit" => v(ALLOW, "edit a notebook", false),
+        "TodoWrite" => v(ALLOW, "its own scratch list", false),
+        "WebFetch" => v(ALLOW, "fetches a URL", true),
+        // The CLI's own web search, which only exists under
+        // `[claude_cli] tools = "own"` — the harness's own tool is `search`
+        // above, and the two spellings are not interchangeable: in
+        // `tools = "eidolon"` the CLI's built-ins are disabled and its calls
+        // arrive under the harness's names.
+        "WebSearch" => v(ALLOW, "searches the web", true),
+        "BashOutput" => v(ALLOW, "reads a running command's output", true),
+        "KillBash" => v(ALLOW, "stops a command it started", false),
+        "KillShell" => v(ALLOW, "stops a command it started", false),
+        "Task" => v(ALLOW, "its own subagent", false),
+
+        // Session-to-session messaging, which is never asked about. What it
+        // can do is start a turn in a session on this machine, and every one
+        // of those is bounded already — by the recipient's wake budget, which
+        // only its own operator refills. A gate on top of that would ask the
+        // operator to approve each line of a conversation between two agents
+        // they set running on purpose.
+        "peers" => v(ALLOW, "list peer sessions", true),
+        "send" => classify_send(input),
+        // Waiting for something rather than polling for it. It changes
+        // nothing here — what it can do is end this turn and wake the
+        // session again — and it is bounded by its own deadline.
+        "wait_for" => v(ALLOW, "wait on a condition", true),
+
+        // Finding a tool costs nothing and changes nothing; what it finds
+        // is classified when it is called.
+        "tool_search" => v(ALLOW, "tool search", true),
+
+        _ => {
+            // Melete's tools, from the desktop. The connector runs
+            // *attended* for an OAuth client — nothing is held for a
+            // Telegram 👍 — so this table is the only gate on a job
+            // dispatch from a terminal, and the tier the harness derived
+            // from the name is what it reads.
+            if tool.starts_with("melete_") {
+                return classify_melete(tool, approval);
+            }
+            v(FLAG, `unclassified tool (declared ${approval})`, false)
+        }
+    }
+}
+
+/// Melete's tools by their declared tier: observing the box is silent,
+/// starting or steering a job on it is a question (a dispatch spends real
+/// tokens on a real box), cancelling or removing something is one too.
+/// Never a refusal — a job the operator does not want is a `no` at the
+/// prompt, and under yolo every one of these runs, which is what yolo is
+/// for.
+fn classify_melete(tool, approval) {
+    match approval {
+        "read_only" => v(ALLOW, "reads Melete", true),
+        "destructive" => v(FLAG, "cancels or removes something on Melete's box", false),
+        _ => v(FLAG, "starts or steers a job on Melete's box", false),
+    }
+}
+
+/// `send`, allowed either way — the two answers differ only in what the ledger
+/// is told, since `reason` is the unit a `PolicyVerdict` groups by and "who was
+/// this addressed to" is the one thing worth being able to count later.
+fn classify_send(input) {
+    let to = "";
+    if let Some(x) = input.get("to") {
+        to = x;
+    }
+    if to == "channel" {
+        return v(ALLOW, "announces to every peer session on this project", false);
+    }
+    v(ALLOW, "messages another session", false)
+}
+
+// ===========================================================================
+// Shell leaves
+// ===========================================================================
+
+/// The posture for a command matching nothing below.
+///
+/// The harness's default is `allow`, which is a real choice and not a shrug:
+/// every command is on screen as it runs, an unrecognized *program name* is not
+/// by itself evidence of anything, and a gate that asks about every unfamiliar
+/// binary is the gate that gets switched off. The shapes worth stopping —
+/// privilege escalation, code from stdin, an unbounded loop, a write outside
+/// the working directory — are all recognized, by this table or by the algebra
+/// above it. Set `[policy] default = "flag"` to be asked instead.
+pub fn bash_default(posture) {
+    posture
+}
+
+/// Whether an *already in-scope* filesystem verb is destructive.
+///
+/// Only `allow` and `flag` are meaningful: the algebra has already refused
+/// anything pointing outside the working directory. Deleters and overwriters
+/// are asked about; creators and movers are not, because git recovers a tracked
+/// file and the working directory is the operator's own.
+pub fn fs_verb_tier(prog) {
+    if in_list(prog, ["rm", "rmdir", "dd", "truncate", "chmod", "chown"]) {
+        FLAG
+    } else {
+        ALLOW
+    }
+}
+
+/// The tier for one leaf command's argv.
+///
+/// `ctx` is `#{rust, python, node, nix, posture}` — which toolchains the
+/// operator declared, and the fallback posture.
+pub fn classify_program(argv, ctx) {
+    let prog = if argv.len() > 0 { argv[0] } else { "" };
+    let sub = if argv.len() > 1 { argv[1] } else { "" };
+
+    // --- never on this machine ------------------------------------------
+    // Privilege escalation is refused rather than asked about: a harness that
+    // can be talked into `sudo` has no boundary left to defend, and the
+    // operator who genuinely wants it has a terminal of their own.
+    if in_list(prog, ["sudo", "doas", "su", "pkexec"]) {
+        return v(DENY, "privilege escalation", false);
+    }
+    if in_list(prog, ["shutdown", "reboot", "halt", "poweroff"]) {
+        return v(DENY, "powers down the machine", false);
+    }
+    // `mkfs` is a family — `mkfs.ext4`, `mkfs.btrfs` — so it is matched by
+    // prefix. Every other name here is exact.
+    if prog.starts_with("mkfs") || in_list(prog, ["fdisk", "parted", "wipefs", "blkdiscard", "shred"]) {
+        return v(DENY, "destroys a filesystem or device", false);
+    }
+    if in_list(prog, ["useradd", "usermod", "userdel", "passwd", "chsh", "visudo"]) {
+        return v(DENY, "changes accounts on this machine", false);
+    }
+
+    // --- code from stdin or an argument ----------------------------------
+    // This is the arm that makes `curl … | sh` different from `mkdir`. The
+    // pipeline itself is fine and each half is ordinary; what is not ordinary
+    // is a shell whose program text arrives at runtime from somewhere the
+    // classifier cannot see. Composition does the rest: the pipeline takes this
+    // stage's tier.
+    if in_list(prog, ["sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", "."]) {
+        return v(FLAG, "runs shell code from stdin or an argument", false);
+    }
+    if in_list(prog, ["python", "python3", "node", "deno", "ruby", "perl", "php"]) {
+        if has_flag(argv, ["-c", "-e", "--eval", "--command"]) {
+            return v(FLAG, "runs code from an argument", false);
+        }
+        return v(ALLOW, "runs a script", false);
+    }
+
+    // --- reads and inspection -------------------------------------------
+    if in_list(prog, [
+        "ls", "cat", "bat", "head", "tail", "less", "more", "wc", "sort", "uniq",
+        "cut", "tr", "column", "jq", "yq", "file", "stat", "realpath", "basename",
+        "dirname", "readlink", "tree", "find", "fd", "rg", "grep", "ag", "diff",
+        "cmp", "md5sum", "sha256sum", "b2sum", "base64", "xxd", "hexdump", "strings",
+        "echo", "printf", "true", "false", "test", "[", "sleep", "seq", "yes",
+        "pwd", "printenv", "env", "which", "whereis", "type", "man", "tldr", "help",
+        "date", "cal", "uname", "hostname", "whoami", "id", "uptime", "nproc",
+        "lscpu", "lsblk", "df", "du", "free", "ps", "top", "htop", "pgrep", "pidof",
+        "lsof", "ss", "netstat", "ip", "ping", "dig", "host", "nslookup",
+    ]) {
+        return v(ALLOW, "read", true);
+    }
+    // Signals: the operator's own box, and a stuck build is the usual target.
+    if in_list(prog, ["kill", "pkill", "killall"]) {
+        return v(ALLOW, "signals a process", false);
+    }
+    if prog == "eidolon" || prog == "ed" {
+        return v(ALLOW, "the harness itself", false);
+    }
+
+    // --- git --------------------------------------------------------------
+    if prog == "git" {
+        return classify_git(argv, sub);
+    }
+    if prog == "gh" {
+        return classify_gh(argv, sub);
+    }
+
+    // --- toolchains -------------------------------------------------------
+    if prog == "cargo" {
+        if !ctx.rust {
+            return v(ctx.posture, "cargo without a declared rust toolchain", false);
+        }
+        return classify_cargo(argv, sub);
+    }
+    if in_list(prog, ["rustc", "rustup", "rustfmt", "clippy-driver"]) {
+        return v(if ctx.rust { ALLOW } else { ctx.posture }, "rust toolchain", false);
+    }
+    if in_list(prog, ["npm", "pnpm", "yarn", "bun", "npx"]) {
+        if !ctx.node {
+            return v(ctx.posture, "node tooling without a declared toolchain", false);
+        }
+        return classify_node_pm(argv, sub);
+    }
+    if in_list(prog, ["pip", "pip3", "uv", "poetry", "pipx"]) {
+        if !ctx.python {
+            return v(ctx.posture, "python tooling without a declared toolchain", false);
+        }
+        if in_list(sub, ["install", "uninstall", "add", "remove", "sync"]) {
+            return v(FLAG, "changes the python environment", false);
+        }
+        return v(ALLOW, "python tooling", false);
+    }
+    if prog == "nix" || prog == "nix-build" || prog == "nix-shell" || prog == "nix-instantiate" {
+        if !ctx.nix {
+            return v(ctx.posture, "nix without a declared toolchain", false);
+        }
+        if sub == "profile" || sub == "registry" {
+            return v(FLAG, "changes the nix profile", false);
+        }
+        return v(ALLOW, "nix", false);
+    }
+    if in_list(prog, ["nixos-rebuild", "nix-collect-garbage", "nix-env", "home-manager"]) {
+        return v(FLAG, "changes the system's nix state", false);
+    }
+    if in_list(prog, ["make", "just", "task", "ninja", "cmake", "meson", "go", "zig", "gcc", "clang"]) {
+        return v(ALLOW, "build tooling", false);
+    }
+
+    // --- reaching off this machine ---------------------------------------
+    if in_list(prog, ["curl", "wget", "http", "xh"]) {
+        if has_flag(argv, ["-o", "-O", "--output", "--remote-name"]) {
+            return v(FLAG, "downloads to a file", false);
+        }
+        return v(ALLOW, "fetches a URL", true);
+    }
+    if in_list(prog, ["ssh", "scp", "sftp", "rsync"]) {
+        return v(FLAG, "reaches another host", false);
+    }
+    if in_list(prog, ["docker", "podman", "kubectl", "nerdctl"]) {
+        return v(FLAG, "drives a container runtime", false);
+    }
+
+    // --- this machine's services -----------------------------------------
+    if prog == "systemctl" {
+        if in_list(sub, ["poweroff", "reboot", "halt", "kexec"]) {
+            return v(DENY, "powers down the machine", false);
+        }
+        if in_list(sub, ["", "status", "list-units", "list-unit-files", "show", "cat", "is-active", "is-enabled", "is-failed"]) {
+            return v(ALLOW, "systemctl read", true);
+        }
+        return v(FLAG, "changes a service", false);
+    }
+    if prog == "journalctl" {
+        if has_flag(argv, ["--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush"]) {
+            return v(FLAG, "journalctl maintenance", false);
+        }
+        return v(ALLOW, "journalctl read", true);
+    }
+    if in_list(prog, ["crontab", "at", "systemd-run", "batch"]) {
+        return v(FLAG, "schedules work outside this session", false);
+    }
+
+    // --- archives ---------------------------------------------------------
+    if in_list(prog, ["tar", "unzip", "gunzip", "bunzip2", "unxz", "7z", "zstd"]) {
+        // Extraction writes wherever the archive says, and the algebra has no
+        // path argument to scope — the paths are inside the file.
+        return v(FLAG, "extracts an archive", false);
+    }
+    if in_list(prog, ["zip", "gzip", "bzip2", "xz"]) {
+        return v(ALLOW, "creates an archive", false);
+    }
+
+    v(ctx.posture, "unrecognized command", false)
+}
+
+/// git, by subcommand. Reads are silent, ordinary history work is silent, and
+/// the handful of operations that discard work someone might still want are
+/// asked about.
+fn classify_git(argv, sub) {
+    // Pure reads: no argument turns any of these into a write.
+    if in_list(sub, [
+        "status", "log", "diff", "show", "blame", "describe", "rev-parse",
+        "rev-list", "ls-files", "ls-remote", "shortlog", "reflog", "grep",
+        "cat-file", "for-each-ref",
+    ]) {
+        return v(ALLOW, "git read", true);
+    }
+    // Subcommands that read with no argument and write with one. Deleting a
+    // ref is the one that throws work away, so it asks; everything else is
+    // silent but must not claim to be a read, or a `git config --global` would
+    // be counted as an observation.
+    if in_list(sub, ["branch", "tag", "remote", "config", "worktree", "stash"]) {
+        if has_flag(argv, ["-d", "-D", "--delete", "-m", "--move", "remove", "drop"]) {
+            return v(FLAG, "deletes or moves a ref", false);
+        }
+        if argv.len() <= 2 {
+            return v(ALLOW, "git read", true);
+        }
+        return v(ALLOW, "git", false);
+    }
+    if sub == "push" {
+        if has_flag(argv, ["-f", "--force", "--delete", "--mirror"]) {
+            return v(FLAG, "force-pushes or deletes a remote ref", false);
+        }
+        return v(ALLOW, "git push", false);
+    }
+    if sub == "reset" && has_flag(argv, ["--hard"]) {
+        return v(FLAG, "discards working-tree changes", false);
+    }
+    if sub == "clean" && has_flag(argv, ["-f", "-fd", "-fdx", "-x", "-xdf"]) {
+        return v(FLAG, "deletes untracked files", false);
+    }
+    if in_list(sub, ["filter-branch", "gc", "prune", "update-ref", "fsck"]) {
+        return v(FLAG, "rewrites or prunes history", false);
+    }
+    v(ALLOW, "git", false)
+}
+
+/// gh, by subcommand. Reading GitHub is free; the operations that are hard to
+/// take back are asked about, and deleting a repository is not offered.
+fn classify_gh(argv, sub) {
+    if sub == "repo" && argv.len() > 2 && argv[2] == "delete" {
+        return v(DENY, "deletes a repository", false);
+    }
+    let verb = if argv.len() > 2 { argv[2] } else { "" };
+    if in_list(verb, ["list", "view", "status", "checks", "diff", "download"]) {
+        return v(ALLOW, "gh read", true);
+    }
+    // Merging and deleting are hard to take back, and a release is published
+    // the moment it exists. Opening a PR, commenting and editing are not.
+    if in_list(verb, ["merge", "delete"]) {
+        return v(FLAG, "merges or deletes on the remote", false);
+    }
+    if sub == "release" {
+        return v(FLAG, "publishes a release", false);
+    }
+    v(ALLOW, "gh", false)
+}
+
+/// cargo, by subcommand. `build`/`test` are ordinary work here — the hard-deny
+/// Melete carries on that pair is a fact about a 1 vCPU box, not about this
+/// machine, and this is exactly the sort of rule that belongs to a deployment
+/// rather than to a classifier.
+fn classify_cargo(argv, sub) {
+    if in_list(sub, ["publish", "yank", "login", "logout", "owner"]) {
+        return v(FLAG, "publishes or changes crates.io state", false);
+    }
+    if sub == "install" || sub == "uninstall" {
+        return v(FLAG, "changes installed binaries", false);
+    }
+    if sub == "clean" {
+        return v(FLAG, "throws away the build cache", false);
+    }
+    if in_list(sub, ["check", "build", "test", "clippy", "fmt", "run", "doc", "tree", "metadata", "bench", "add", "remove", "update", "fix", "nextest"]) {
+        let read_only = in_list(sub, ["check", "tree", "metadata"]);
+        return v(ALLOW, "cargo", read_only);
+    }
+    v(ALLOW, "cargo", false)
+}
+
+/// npm and friends. Running a project script is ordinary; publishing and
+/// touching the machine's global install set are not.
+fn classify_node_pm(argv, sub) {
+    if sub == "publish" {
+        return v(FLAG, "publishes a package", false);
+    }
+    if in_list(sub, ["install", "i", "add", "remove", "uninstall", "ci", "update"]) {
+        if has_flag(argv, ["-g", "--global"]) {
+            return v(FLAG, "installs globally", false);
+        }
+        return v(ALLOW, "installs project dependencies", false);
+    }
+    v(ALLOW, "node package manager", false)
+}

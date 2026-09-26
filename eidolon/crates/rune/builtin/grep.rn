@@ -1,0 +1,29 @@
+//! Built-in `grep`: regex search over the tree via the `grep` primitive
+//! (gitignore-aware, capped).
+
+pub fn manifest() {
+    #{
+        name: "grep",
+        description: "Search file contents with a regular expression. Respects .gitignore. Returns path:line: text matches, capped.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "pattern": #{ "type": "string", "description": "Rust-syntax regular expression" },
+                "path": #{ "type": "string", "description": "File or directory to search (default: working directory)" },
+                "glob": #{ "type": "string", "description": "Comma-separated file globs to include, e.g. \"*.rs,*.toml\"" },
+                "case_insensitive": #{ "type": "boolean", "description": "Ignore case (default false)" },
+                "max": #{ "type": "integer", "description": "Maximum matches to return (default 200)" },
+            },
+            "required": ["pattern"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let ci = match input.get("case_insensitive") {
+        Some(b) => b == true,
+        None => false,
+    };
+    eidolon::grep(input.pattern, input.get("path"), input.get("glob"), ci, input.get("max")).await
+}

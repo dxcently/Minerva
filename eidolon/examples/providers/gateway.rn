@@ -1,0 +1,64 @@
+//! A provider declared as a Rune script. Drop a file like this into
+//! `~/.config/eidolon/providers/` and it appears in `eidolon models` and
+//! the `space m` picker. The script sees `json` and `eidolon::http_get` only.
+//!
+//! Required: `pub fn provider()` returning the record below.
+//! Optional: `pub fn request(body)` to rewrite the outgoing JSON body per
+//! call, and `pub fn models()` to list models dynamically.
+
+pub fn provider() {
+    #{
+        name: "gateway",
+        // "openai" for chat-completions endpoints, "anthropic" for the
+        // Messages API (Kimi's /anthropic endpoint, Anthropic itself).
+        wire: "openai",
+        base_url: "https://gateway.example/v1",
+        // The credential, one of:
+        //   token_secret: "gateway"           — `eidolon secret set gateway` (preferred)
+        //   token_file: "~/.config/eidolon/gateway.token"   — a 0600 file
+        //   token_env: "GATEWAY_KEY"
+        //   token: "placeholder"              — inline, for non-secrets only
+        token_secret: "gateway",
+        // auth: "api_key" | "bearer"   (Anthropic wire only; bearer = setup-token)
+        headers: #{ "x-gateway-project": "eidolon" },
+        compat: #{
+            max_completion_tokens: false,   // send max_completion_tokens instead of max_tokens
+            stream_options: true,           // include stream_options.include_usage
+            reasoning_effort: false,        // send reasoning_effort when thinking is on
+        },
+        models: [
+            #{ id: "gpt-5.4", name: "GPT-5.4 via gateway", context: 200000,
+               cost: #{ input: 2.5, output: 15.0, cache_read: 0.25 } },
+            #{ id: "some-reasoner", name: "A reasoning model", reasoning: true },
+        ],
+    }
+}
+
+// Rewrite the body before it is sent. `body` is a plain object; return it.
+pub fn request(body) {
+    // Example: a proxy that rejects stream_options.
+    body.remove("stream_options");
+    body
+}
+
+// Discover models at load time. The bearer is added by the harness. Declared
+// entries win on a duplicate id, so names and prices survive the merge. A
+// failed fetch must return the empty list — startup never depends on the
+// gateway being up. (Rune: match every Result; no `?` outside a Result fn.)
+pub fn models() {
+    let out = [];
+    let body = match eidolon::http_get("/models") {
+        Ok(b) => b,
+        Err(_) => return out,
+    };
+    let listing = match json::from_string(body) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    for m in listing.data {
+        let id = m.id;
+        if id.contains("embed") { continue; }
+        out.push(#{ id: id, reasoning: id.contains("reasoning") && !id.contains("non-reasoning") });
+    }
+    return out;
+}

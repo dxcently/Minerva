@@ -1,0 +1,31 @@
+//! Built-in `send`: a message to another session working on this project.
+//!
+//! The message is written into the recipient's inbox and it reads it at
+//! its next turn boundary — so this is a note left for a colleague, not a
+//! function call, and nothing comes back but confirmation that it was
+//! delivered. A direct message also *wakes* an idle recipient, so the
+//! boundary it reads at is usually the next moment; a `channel` fan-out
+//! does not, unless it says `wake` — the parameter means the same thing
+//! for both, only its default differs.
+
+pub fn manifest() {
+    #{
+        name: "send",
+        description: "Send a message to another Eidolon session working on this project. `to` is a session id from `peers`, or \"channel\" for every session on this repository. Use it to claim files before you edit them, to say which files you changed when you are done, and to answer a colleague's question. A message addressed to one session wakes it: if it is idle it answers straight away, so treat a direct message as asking a colleague, not as leaving a note. A `channel` message is an announcement everyone reads at their next turn and wakes nobody. `wake` overrides either default — pass `false` on a direct message to leave a note that can wait, or `true` on `channel` when everyone needs to act now.",
+        prompt: "A peer cannot see your transcript. Answer a peer task by actually calling send to that peer; prose such as \"To eidolon-...\" does not deliver a message. Use wake=false for a final informational reply unless you need the peer to act now. If an id is stale, refresh peers; do not guess or keep messaging dead sessions.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "to": #{ "type": "string", "description": "A session id from `peers`, or `channel` for everyone on this project" },
+                "text": #{ "type": "string", "description": "What to say. Name files in full; the reader has no view of your screen." },
+                "wake": #{ "type": "boolean", "description": "Whether an idle recipient starts a turn on this instead of waiting for its operator. Applies to a `channel` message as much as a direct one; defaults to true for a direct message and false for `channel`, so set it only to override that." },
+            },
+            "required": ["to", "text"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::swarm_call("send", input).await
+}

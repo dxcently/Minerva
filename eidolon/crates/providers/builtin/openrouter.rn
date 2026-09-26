@@ -1,0 +1,112 @@
+//! OpenRouter, shipped with the harness.
+//!
+//! Fetches /models and parses pricing to $/M tokens.
+//!
+pub fn provider() {
+    #{
+        name: "openrouter",
+        wire: "openai",
+        base_url: "https://openrouter.ai/api/v1",
+        token_secret: "openrouter",
+        models: [],
+    }
+}
+
+pub fn models() {
+    let out = [];
+    let body = match eidolon::http_get("/models") {
+        Ok(b) => b,
+        Err(_) => return out,
+    };
+    let listing = match json::from_string(body) {
+        Ok(v) => v,
+        None => return out,
+    };
+    if !(listing is Object) { return out; }
+    let data = match listing.get("data") {
+        Some(d) => d,
+        None => return out,
+    };
+    if !(data is Vec) { return out; }
+    for model in data {
+        if !(model is Object) { continue; }
+        let id_obj = match model.get("id") {
+            Some(v) => v,
+            None => continue,
+        };
+        if !(id_obj is String) { continue; }
+        let id = id_obj;
+        if id.contains("embed") || id.contains("tts") || id.contains("whisper") { continue; }
+        let name_obj = match model.get("name") {
+            Some(v) => v,
+            None => continue,
+        };
+        if !(name_obj is String) { continue; }
+        let name = name_obj;
+        let ctx_obj = match model.get("context_length") {
+            Some(v) => v,
+            None => continue,
+        };
+        if !(ctx_obj is i64) && !(ctx_obj is u64) { continue; }
+        let ctx = ctx_obj;
+        let pricing_obj = match model.get("pricing") {
+            Some(v) => v,
+            None => continue,
+        };
+        if !(pricing_obj is Object) { continue; }
+        let pricing = pricing_obj;
+        let prompt_obj = match pricing.get("prompt") {
+            Some(v) => v,
+            None => continue,
+        };
+        if !(prompt_obj is f64) { continue; }
+        let prompt = prompt_obj;
+        let completion_obj = match pricing.get("completion") {
+            Some(v) => v,
+            None => continue,
+        };
+        if !(completion_obj is f64) { continue; }
+        let completion = completion_obj;
+        let cache_read = match pricing.get("input_cache_read") {
+            Some(cr_obj) => if cr_obj is f64 { cr_obj } else { 0.0 },
+            None => 0.0,
+        };
+        let input_m = prompt * 1000000.0;
+        let output_m = completion * 1000000.0;
+        let read_m = cache_read * 1000000.0;
+        let reasoning = false;
+        if let Some(r_obj) = model.get("reasoning") {
+            if r_obj is Object {
+                if let Some(m_obj) = r_obj.get("mandatory") {
+                    if m_obj is bool {
+                        reasoning = m_obj;
+                    }
+                }
+            }
+        }
+        let vision = false;
+        if let Some(arch_obj) = model.get("architecture") {
+            if arch_obj is Object {
+                if let Some(mods_obj) = arch_obj.get("input_modalities") {
+                    if mods_obj is Vec {
+                        for mo in mods_obj {
+                            if mo is String && mo == "image" {
+                                vision = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.push(#{
+            id: id,
+            name: name,
+            context: ctx,
+            reasoning: reasoning,
+            vision: vision,
+            cost: #{ input: input_m, output: output_m, cache_read: read_m, cache_write: 0.0 },
+        });
+    }
+    out
+}
