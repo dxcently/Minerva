@@ -18,9 +18,12 @@ pub mod agent;
 pub mod clock;
 pub mod config;
 pub mod guard;
+pub mod jev;
+pub mod json;
 pub mod report;
 pub mod run;
 pub mod score;
+pub mod transport;
 pub mod vm;
 
 pub use agent::{AgentRunner, NoopRunner};
