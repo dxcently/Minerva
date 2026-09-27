@@ -1,26 +1,38 @@
 //! The perch: one loopback HTTP server that will front several `eidolon web` doors
 //! so the browser UI (`webui/term`) can tile them without touching upstream.
 //!
-//! This is slice **H1a**, and H1a is only the front door:
+//! This is slice **H1b** on top of H1a's front door. H1a was the process, the token and the
+//! gates; H1b is the **session lifecycle** behind them:
 //!
 //! ```text
-//!   perch [--bind 127.0.0.1:0] [--ui-dir DIR]
+//!   perch [--bind 127.0.0.1:0] [--ui-dir DIR] [--root DIR]... [--eidolon PATH] [--sessions-dir DIR]
 //!
-//!   /            the UI bundle from --ui-dir, no token, `Host` checked
-//!   /hub/...     token-gated, no handler yet  -> 404 (H1b: sessions, spawn, stop)
-//!   /s/...       token-gated, no handler yet  -> 404 (H1c: the proxy, SSE)
+//!   /                    the UI bundle from --ui-dir, no token, `Host` checked
+//!   /hub/sessions        GET the list, POST to spawn one          (this slice)
+//!   /hub/sessions/<id>/resume, /stop                              (this slice)
+//!   /hub/events, /hub/tree, /hub/mesh                             (H2/H3: still 404)
+//!   /s/<id>/api/...      the proxy and its SSE                    (H1c: still 404)
 //! ```
 //!
-//! So an **unauthenticated** request to `/hub` or `/s` is a 401 and an authenticated
-//! one is a 404: the route does not exist yet, but the gate in front of it does. Being
-//! able to tell those two apart is the whole point of this slice.
+//! So an **unauthenticated** request to `/hub` or `/s` is a 401 and an authenticated one to
+//! a route that is not built yet is a 404: the route does not exist yet, but the gate in
+//! front of it does. Being able to tell those two apart is what H1a proved and what every
+//! later slice keeps.
 //!
 //! **The gates, in the order a request meets them** (hub.md §10.2). 0: this bind,
 //! refused unless it is loopback, before a listener exists. 1: the token, on `/hub`,
 //! `/s` and everything under them, before the path is parsed. 2: `Host` against the
 //! bound authority, on every request. 3: `Sec-Fetch-Site`, when present. 4: method and
-//! path shape. 5: the body cap. The refusals are 401, 403, 404/405 and 413; they are
-//! in [`serve`] beside the one `match` that routes, so no route can skip one.
+//! path shape. 5: the body cap. 6: per-route: hub.md §4's id regex, a cwd under a
+//! `--root`, and the session's state. The refusals are 401, 403, 404/405, 413, 409 (two
+//! doors on one log), 422 (a cwd outside every root) and 503 (a door that did not come up);
+//! they are in [`serve`] beside the one `match` that routes, so no route can skip a gate.
+//!
+//! **A door is a child process.** It is spawned with no token in its argv or environment —
+//! it mints its own, prints the path, and the perch reads it from a `0600` file it refuses
+//! to trust without checking owner and mode (§4 steps 3-6, §10.4 row 1). The perch holds its
+//! own `/api/events` stream to each door it owns ([`watch`]), which is how a door becomes
+//! `live` and the stream a stop closes *before* it signals.
 //!
 //! **The token** is 256 random bits per start, written `0600` to
 //! `$XDG_RUNTIME_DIR/minerva/perch-<port>.token`. It is never in argv, never in the
@@ -42,6 +54,9 @@ compile_error!("the perch is Unix only: it needs a 0600 token file, $XDG_RUNTIME
 pub mod files;
 pub mod gate;
 pub mod serve;
+pub mod sessions;
+pub mod spawn;
+pub mod watch;
 
 use std::ffi::OsString;
 use std::net::SocketAddr;
@@ -59,6 +74,15 @@ pub struct Options {
     /// `--ui-dir`, served outside `/hub` and `/s`; see [`files::Static`]. `None`
     /// serves no statics, as the door without the flag does.
     pub ui_dir: Option<PathBuf>,
+    /// `--root`, repeatable: a new session's cwd must sit under one (hub.md Q6, default
+    /// `$HOME`). Canonicalized and checked by [`sessions::Registry::new`], before the bind.
+    pub roots: Vec<PathBuf>,
+    /// `--eidolon`: the door binary to spawn. `eidolon` on `PATH` by default; the tests point
+    /// it at the compiled `fake_eidolon`.
+    pub eidolon: PathBuf,
+    /// `--sessions-dir`: kept logs live here as `<id>.eid`. The door's own default is
+    /// `data_local_dir()/eidolon/sessions`.
+    pub sessions_dir: PathBuf,
 }
 
 /// The perch's own directory under `$XDG_RUNTIME_DIR`, so its token sits beside the
@@ -79,6 +103,11 @@ pub async fn run(opts: Options, cancel: CancellationToken) -> Result<()> {
     let runtime = runtime_dir()?;
     // A UI dir that cannot be served does not come up, as the door's does not.
     let ui = opts.ui_dir.as_deref().map(files::Static::new).transpose()?;
+    // The registry and the thread that forks doors, before the bind for the same reason the
+    // token's directory is: a `--root` that does not exist, or a spawn thread that cannot be
+    // started, must refuse the start rather than the first spawn.
+    let registry = sessions::Registry::new(opts.sessions_dir, runtime.clone(), opts.eidolon, opts.roots)?;
+    let spawner = Arc::new(spawn::Spawner::new()?);
     let listener = TcpListener::bind(opts.bind).await.with_context(|| format!("bind {}", opts.bind))?;
     let bound = listener.local_addr().context("read the bound address")?;
 
@@ -92,13 +121,12 @@ pub async fn run(opts: Options, cancel: CancellationToken) -> Result<()> {
     println!("listening on http://{bound}/");
     println!("token file: {}", token_file.display());
 
-    let ctx = serve::Ctx { bound, token: Arc::from(token.as_str()), ui };
+    let ctx = serve::Ctx { bound, token: Arc::from(token.as_str()), ui, registry, spawner };
     let served = serve::run(ctx, listener, cancel).await;
 
-    // Last, after the drain. H1b's shutdown — close the watcher and pane streams,
-    // SIGTERM each child, wait, then drain — happens *inside* `serve::run`'s cancel
-    // arm, ahead of this line, so a door can never outlive the token that let the
-    // page reach it.
+    // Last, after the drain. The doors' shutdown — close the watcher to each door, SIGTERM
+    // it, wait, SIGKILL what is left and remove its token file — has already happened inside
+    // `serve::run`'s cancel arm, so no door outlives the token that let the page reach it.
     if let Err(e) = std::fs::remove_file(&token_file) {
         tracing::debug!(error = %e, path = %token_file.display(), "perch: token file not removed");
     }

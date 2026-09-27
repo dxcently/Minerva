@@ -23,6 +23,9 @@ cd perch
 cargo build --release
 # the UI bundle it serves is webui/term/ in this repository
 target/release/perch --bind 127.0.0.1:0 --ui-dir ../webui/term
+# …and, for the session lifecycle (H1b), the flags a door needs:
+target/release/perch --bind 127.0.0.1:0 --ui-dir ../webui/term \
+  --root "$HOME" --eidolon eidolon --sessions-dir "$HOME/.local/share/eidolon/sessions"
 ```
 
 It prints exactly two lines and then serves:
@@ -40,13 +43,22 @@ pre-create the directory its secret goes in.
 
 ## What this slice is
 
-This is **H1a**, and H1a is only the front door: the process, its one secret, the gates
-every request passes, and the static UI. Nothing behind the gates is built yet.
+This is **H1b** on top of H1a's front door. H1a was the process, its one secret, the gates
+every request passes and the static UI; **H1b is the session lifecycle behind those gates** —
+spawn a door, resume a kept log, stop a live one, list them — plus the perch's *own* watcher
+stream to every door it owns and the ordered stop that closes that stream **before** it
+signals the door.
+
+What is **not** here, on purpose: the `/s/<id>/api/*` proxy and door SSE handed to a browser
+(H1c), and the idle reaper, `/hub/events`, `/hub/tree`, `/hub/mesh` (H2/H3).
 
 ```text
   /            the UI bundle from --ui-dir: no token, `Host` checked
-  /hub/...     token-gated, no handler yet  ->  404   (H1b: sessions, spawn, stop, tree)
-  /s/...       token-gated, no handler yet  ->  404   (H1c: the proxy and its SSE)
+  /hub/sessions                 GET the list, POST to spawn a new session   (H1b)
+  /hub/sessions/<id>/resume     POST: a door on that kept log                (H1b)
+  /hub/sessions/<id>/stop       POST: close the watcher, then SIGTERM        (H1b)
+  /hub/events, /hub/tree, /hub/mesh        ->  404                           (H2/H3)
+  /s/...                        token-gated, no handler yet  ->  404         (H1c: the proxy)
 ```
 
 An **unauthenticated** request to `/hub` or `/s` is a 401; an authenticated one is a
@@ -74,9 +86,13 @@ on refusals as well as 200s; every response carries `nosniff` and `no-referrer`.
 src/main.rs     argv, SIGINT/SIGTERM -> CancellationToken, the runtime `run` needs
 src/lib.rs      bind, the runtime dir, the token mint and its removal on exit
 src/gate.rs     loopback_only, token_ok (subtle), host_ok, sec_fetch_ok
-src/serve.rs    accept loop, the gate order, the route match, shutdown
+src/serve.rs    accept loop, the gate order, the route match, the session routes, shutdown
 src/files.rs    the static rules, ported from eidolon/crates/web/src/files.rs
-tests/http.rs   a real perch on 127.0.0.1:0, over a real socket
+src/sessions.rs the door table, the list, the id regex, the roster scan, the ordered stop
+src/spawn.rs    argv, the fork (one long-lived thread, PDEATHSIG), the boot lines, the token file
+src/watch.rs    the perch's own /api/events stream to a door, and the handle that closes it
+src/bin/fake_eidolon.rs   the stand-in door the tests drive, `--features test-bins` only
+tests/http.rs   a real perch on 127.0.0.1:0, over a real socket, against a real child door
 ```
 
 `src/files.rs` is a **port, not a dependency**: `eidolon/crates/web/src/files.rs` is the
@@ -89,12 +105,10 @@ too.
 out of the file the child printed, and the child runs at `RUST_LOG=trace` so a token that
 reached a log line would fail the suite.
 
-## Still to come (not in H1a)
+## Still to come (not in H1b)
 
-- **H1b** — spawn, resume and stop `eidolon web` doors, the session list, the idle
-  reaper, `/hub/tree`, `/hub/mesh`. Shutdown grows a step *before* its drain: close the
-  watcher and pane streams, then SIGTERM the children, wait, and only then stop the
-  listener — a door holding an open `/api/events` stream ignores SIGTERM for minutes, and
-  a SIGKILL would leave its token file behind.
+- **H2** — the idle reaper, the running/parked inference off the frames the H1b watcher
+  already reads, `/hub/events`, `/hub/tree`.
+- **H3** — `/hub/mesh`, `/hub/mesh/events`.
 - **H1c** — the `/s/<id>/api/*` proxy with the door's Bearer injected, SSE passed through
   unbuffered, and the `hub-stream-end` frame that tells the page a door is gone.

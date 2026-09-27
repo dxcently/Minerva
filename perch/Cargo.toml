@@ -19,30 +19,41 @@ publish = false
 # so no feature is named here. Noah's crate, not eidolon's.
 harnox = { path = "../harnox", default-features = false }
 
-# The HTTP server, the door's exact stack and feature set. `server` + `http1` only:
-# `client` (the proxy to a door) is H1c and not compiled here, no http2, and not a
-# framework — the route table is a `match` on `(Method, path)`.
-hyper = { version = "1", default-features = false, features = ["server", "http1"] }
-# The pieces hyper 1.x moved out of itself: `TokioIo` to wrap the accepted socket,
-# the http1 connection builder, and `server-graceful` so a quit drains an open
-# response instead of cutting it mid-frame.
+# The HTTP server, the door's exact stack and feature set. `server` + `client` + `http1`,
+# no http2, and not a framework — the route table is a `match` on `(Method, path)`.
+# `client` first mattered to H1b, not to H1c: the perch holds its *own* `/api/events`
+# stream to every door it owns (the watcher, hub.md §4 step 7), and that is an HTTP client.
+# H1c's proxy to the browser reuses the same feature.
+hyper = { version = "1", default-features = false, features = ["server", "client", "http1"] }
+# The pieces hyper 1.x moved out of itself: `TokioIo` to wrap the accepted socket, the
+# http1 connection builder, and `server-graceful` so a quit drains an open response
+# instead of cutting it mid-frame.
+# `hyper-util`'s own client features (`client`, `client-legacy`, `client-pool`, `http1`)
+# are deliberately absent: both the watcher and H1c's proxy speak over one fresh
+# `hyper::client::conn::http1` connection to a known loopback port — hyper's own `client`
+# feature — and a pooled `legacy::Client` is exactly what hub.md §5 refuses (a pool would
+# outlive a dead door).
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server", "server-graceful", "http1"] }
 # `Full` for every body this crate builds, and `Limited` for the 8 MiB cap.
 http-body-util = "0.1"
 # `Bytes` is what a body is by the time it reaches the socket.
 bytes = "1"
 # The runtime, the listener, the signals, and the cancellation token.
-# `process` is deliberately absent: spawning doors is H1b.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "fs", "time", "io-util", "sync", "macros"] }
-# `CancellationToken`, which is how a signal reaches the accept loop.
+# `process` is H1b's: it is what forks a door. `tokio::process::Command::spawn` is
+# synchronous — the fork happens on the *calling thread* — which is what makes hub.md §2's
+# PDEATHSIG hypothesis testable: [`spawn::Spawner`] keeps one long-lived thread whose only
+# job is to fork, so `PR_SET_PDEATHSIG(SIGTERM)` in the child fires when the perch dies and
+# not when some short-lived pool thread goes idle.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "signal", "fs", "time", "io-util", "sync", "macros"] }
+# `CancellationToken`, which is how a signal reaches the accept loop — and, since H1b, how
+# each watcher stream is closed before its door is signalled.
 tokio-util = { version = "0.7", features = ["rt"] }
 # The token comparison, constant time so a token cannot be searched for byte by byte.
 subtle = "2"
-# `getuid` for the runtime-dir ownership check. `prctl(PR_SET_PDEATHSIG)`, the other
-# reason the door names libc, is H1b's and is not used here.
+# `getuid` for the runtime-dir ownership check and the door token file's, `kill` for the
+# stop sequence's SIGTERM/SIGKILL, `open` for `O_NOFOLLOW`, and `prctl(PR_SET_PDEATHSIG)`.
 libc = "0.2"
-# JSON for the `/hub` routes (H1b/H1c). Nothing in H1a serializes yet; the deps are
-# named now so the first route does not have to touch this file.
+# JSON for the `/hub` routes: the session list, the spawn body, `hello`'s fields.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The error convention both the door and harnox hold: `anyhow::Result`, `.context()`
@@ -54,8 +65,20 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
+[features]
+# The stand-in door the tests drive (`src/bin/fake_eidolon.rs`). `cargo build` and
+# `cargo test` without it compile no test double at all; `cargo test --features test-bins`
+# builds it, and `tests/http.rs` reaches it through `CARGO_BIN_EXE_fake_eidolon`.
+test-bins = []
+
+# The fake is a *test* target (hub.md §11), so a normal build never ships it.
+[[bin]]
+name = "fake_eidolon"
+path = "src/bin/fake_eidolon.rs"
+required-features = ["test-bins"]
+
 [dev-dependencies]
-# Test directories for the runtime dir and the UI dir. Under `/tmp` (not the 9p
-# mount Minerva lives on), because the 0600 checks need a filesystem that keeps
-# permissions.
+# Test directories for the runtime dir, the UI dir, the sessions dir and a door's cwd.
+# Under `/tmp` (not the 9p mount Minerva lives on), because the 0600 checks need a
+# filesystem that keeps permissions.
 tempfile = "3"

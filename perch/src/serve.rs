@@ -4,10 +4,16 @@
 //! route can skip a gate — and so the order in which they fire is readable in one
 //! function ([`route`]) rather than spread across handlers.
 //!
-//! **H1a has no route behind the token.** `/hub/...` is H1b (sessions, spawn, stop,
-//! tree) and `/s/<id>/api/...` is H1c (the proxy and its SSE). What exists here is the
-//! gate in front of them: an authenticated request to either gets a 404, and an
-//! unauthenticated one gets a 401 before the path is even looked at.
+//! **H1b is the session lifecycle behind the token**: `GET`/`POST /hub/sessions` and
+//! `POST /hub/sessions/<id>/{resume,stop}` (hub.md §3, §4). `/s/<id>/api/...` is H1c (the
+//! proxy and its SSE) and `/hub/events`, `/hub/tree`, `/hub/mesh` are H2/H3: those are 404s
+//! here, after the same gates, so an authenticated caller can tell "not built yet" from
+//! "not for you" on every one of them.
+//!
+//! **The shutdown arm closes streams before it signals children** (hub.md §2 "Shutdown",
+//! §4 "Stop"): the watcher the perch holds to each door ends first, because a door with an
+//! open SSE stream runs hyper's `GracefulShutdown` and ignores SIGTERM for minutes. The one
+//! `CancellationToken` from H1a is what both a stop and a shutdown hang off.
 //!
 //! **No CORS header is written anywhere, and `OPTIONS` is 405.** There is nothing here
 //! to preflight, and a page that holds the token does not need one; a CORS header could
@@ -15,7 +21,9 @@
 //! a test in this file, so a later route cannot quietly add one.
 
 use std::convert::Infallible;
+use std::ffi::OsString;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +42,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::files::{self, Static};
 use crate::gate;
+use crate::sessions::{self, ExitWatch, Registry};
+use crate::spawn::{self, Spawner};
+use crate::watch::{self, Watcher};
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -43,6 +54,11 @@ pub struct Ctx {
     pub token: Arc<str>,
     /// `--ui-dir`, when there is one.
     pub ui: Option<Static>,
+    /// The doors this perch owns, and the paths every spawn is judged against (H1b).
+    pub registry: Arc<Registry>,
+    /// The one thread that forks doors, so `PR_SET_PDEATHSIG` fires when the perch dies
+    /// and not when a pool thread goes idle (hub.md §2).
+    pub spawner: Arc<Spawner>,
 }
 
 /// Refused at the cap before the rest is buffered. Nothing legitimate to a door comes
@@ -99,15 +115,16 @@ pub async fn run(ctx: Ctx, listener: TcpListener, shutdown: CancellationToken) -
                 });
             }
             _ = shutdown.cancelled() => {
-                // The drain is the last step of a shutdown that H1b and H1c will
-                // lengthen: this arm grows "close the watcher and pane streams, SIGTERM
-                // each child, wait, SIGKILL what is left" *before* these two lines,
-                // because a door holding an open `/api/events` stream ignores SIGTERM
-                // for minutes and a SIGKILL leaves its token file behind. A stream is
-                // closed by this same token reaching its body — `shutdown` is what every
-                // stream body should hold — not by a second mechanism. The listener is
-                // dropped either way, and first: stop accepting, then drain.
+                // Stop accepting first, then the Stop finding for every door this perch
+                // owns, then the drain. The order matters and is hub.md §2's "Shutdown" row:
+                // the watcher stream to each door is closed *before* the child is signalled,
+                // because a door holding an open `/api/events` stream is running hyper's
+                // `GracefulShutdown` and ignores SIGTERM until that stream ends — which a
+                // SIGKILL then cuts short, leaving a `0600` token file behind. It all
+                // happens ahead of `lib.rs` removing the perch's own token file, so a door
+                // can never outlive the token that let the page reach it.
                 drop(listener);
+                ctx.registry.stop_all().await;
                 graceful.shutdown().await;
                 return Ok(());
             }
@@ -240,33 +257,27 @@ async fn route(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, In
         return Ok(status(StatusCode::METHOD_NOT_ALLOWED));
     }
 
-    // 5. The body cap, on every request behind the token (hub.md §10.2, gate 5), and read
-    //    as a stream: `Limited` wraps hyper's body, so a body over the cap is refused
-    //    while it arrives, and nothing over the cap is ever buffered or collected. The
-    //    frames are dropped as they come — H1c's proxy is what will hand this stream to a
-    //    door — so a body at the cap is never held whole here.
+    // 5. The body cap, on every request behind the token (hub.md §10.2, gate 5): the body
+    //    goes through `Limited`, so the first frame past the cap is refused while it
+    //    arrives and nothing over the cap is ever held.
     //    It is its own gate rather than a route's, which is also why it is checked before
     //    the routing `match`: an 8 MiB + 1 POST to `/hub/...` must be a 413, not the 404
     //    that a missing route would otherwise answer with before the body was looked at.
+    //    Behind it, H1b reads the small JSON body a spawn sends; H1c's proxy is what will
+    //    hold the same `Limited` stream and hand it to a door unread.
     //    A 405 for a static path is still the method's answer, and no static body is
     //    read; the door's statics do the same.
     if gated {
-        // `_parts` is what a rebuilt request needs, and the limited body is the stream a
-        // proxy forwards; H1a has no route to give either to, so the cap is the whole of
-        // what this step decides.
         let (_parts, body) = req.into_parts();
-        if let Some(refusal) = capped(body).await {
-            return Ok(status(refusal));
-        }
-    }
-
-    // 6. Per-route. Behind the gate: nothing yet.
-    if gated {
-        // `/hub/...` is H1b and `/s/<id>/api/...` is H1c. 404 is the honest answer for
-        // a route that does not exist, and the point of H1a is that it comes *after*
-        // the 401 — an authenticated caller can tell the difference, an unauthenticated
-        // one cannot.
-        return Ok(status(StatusCode::NOT_FOUND));
+        let body = match capped(body).await {
+            Ok(body) => body,
+            Err(refusal) => return Ok(status(refusal)),
+        };
+        // 6. Per-route. The only routes behind the token are H1b's; `/s/<id>/api/...` is
+        //    H1c's and `/hub/events`, `/hub/tree`, `/hub/mesh` are H2/H3, so they are the
+        //    404 of a route that does not exist — which is what makes a 401 or a 403 the
+        //    only thing an unauthenticated caller can tell apart.
+        return Ok(hub(&ctx, &method, &path, &query, &body).await);
     }
 
     // The static UI. No token (the page loads before it has one, so it cannot present
@@ -290,22 +301,240 @@ const ALLOW: &str = "GET, HEAD";
 /// the perch can type into every session behind it.
 const CSP: &str = "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'";
 
-/// The cap, proven as a stream: every frame is dropped as it arrives, so a body at the cap
-/// is never held whole, and the first frame past it is the refusal. `None` means the body
-/// stayed within [`MAX_BODY`].
+/// The cap, proven at the cap: `Limited` refuses the first frame past [`MAX_BODY`], so a
+/// body over it is never held whole. `Err` is the refusal to answer with.
 ///
-/// H1c's proxy holds this same `Limited` stream and hands it to a door unread; nothing in
-/// H1a has a route to pass a body to, so the only question here is whether the cap holds.
-async fn capped(body: Incoming) -> Option<StatusCode> {
-    let mut body = Limited::new(body, MAX_BODY);
-    while let Some(frame) = body.frame().await {
-        match frame {
-            Ok(_frame) => {}
-            Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => return Some(StatusCode::PAYLOAD_TOO_LARGE),
-            Err(_) => return Some(StatusCode::BAD_REQUEST),
+/// H1b's routes read a small JSON body out of what is collected here. H1c's proxy holds this
+/// same `Limited` stream and hands it to a door unread, which is why nothing in this file
+/// parses a body: the route that wants one asks for it.
+async fn capped(body: Incoming) -> std::result::Result<Bytes, StatusCode> {
+    match Limited::new(body, MAX_BODY).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => Err(StatusCode::PAYLOAD_TOO_LARGE),
+        Err(_) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H1b: the session lifecycle (hub.md §3, §4)
+// ---------------------------------------------------------------------------
+
+/// The `/hub/...` routes. `/hub/sessions` is the list and the spawn; its two verbs are per
+/// session. Everything else behind the token is a 404: `/hub/events`, `/hub/tree` and
+/// `/hub/mesh` are H2/H3 and the proxy under `/s` is H1c's.
+async fn hub(ctx: &Ctx, method: &Method, path: &str, query: &str, body: &Bytes) -> Response<BoxBody> {
+    match (method.as_str(), path) {
+        ("GET", "/hub/sessions") => json(StatusCode::OK, &ctx.registry.list()),
+        ("POST", "/hub/sessions") => new_session(ctx, body).await,
+        ("POST", _) => match session_verb(path, query) {
+            Some((id, Verb::Resume)) => resume(ctx, id).await,
+            Some((id, Verb::Stop)) => stop(ctx, id).await,
+            None => status(StatusCode::NOT_FOUND),
+        },
+        _ => status(StatusCode::NOT_FOUND),
+    }
+}
+
+enum Verb {
+    Resume,
+    Stop,
+}
+
+/// `<id>/resume` and `<id>/stop`, and the id is handed back exactly as it was spelled: it is
+/// checked by [`sessions::id_ok`] and then resolved only as `<sessions dir>/<id>.eid` (§4).
+/// A query string is not part of either route (`/hub/sessions` itself ignores one), and a
+/// path that is not exactly one of these is a 404 — never a 400, so a bad id cannot be told
+/// from a route that does not exist.
+fn session_verb<'a>(path: &'a str, query: &str) -> Option<(&'a str, Verb)> {
+    if !query.is_empty() {
+        return None;
+    }
+    let (id, verb) = path.strip_prefix("/hub/sessions/")?.split_once('/')?;
+    Some((
+        id,
+        match verb {
+            "resume" => Verb::Resume,
+            "stop" => Verb::Stop,
+            _ => return None,
+        },
+    ))
+}
+
+/// §4's spawn sequence, steps 1-7, for a **new** session: `{"cwd": "<dir>", "model": "<m>"?}`.
+///
+/// The 201 carries the id the door named in `hello` (§4 step 7) — a new session's log is
+/// named by the door, so this request does not answer until the door has said which log it
+/// opened. A door that never says is a 503, and the child is stopped first.
+async fn new_session(ctx: &Ctx, body: &Bytes) -> Response<BoxBody> {
+    #[derive(serde::Deserialize)]
+    struct Asked {
+        cwd: String,
+        model: Option<String>,
+    }
+    let Ok(asked) = serde_json::from_slice::<Asked>(body) else {
+        return problem(StatusCode::BAD_REQUEST, "expected a JSON body of {\"cwd\": \"<dir>\", \"model\": \"<m>\"?}");
+    };
+    // §4 step 1, and the reason the perch token is not a licence to start an agent in `/`.
+    let cwd = match ctx.registry.cwd_under_a_root(Path::new(&asked.cwd)) {
+        Ok(cwd) => cwd,
+        Err(_) => return problem(StatusCode::UNPROCESSABLE_ENTITY, "cwd is not a directory under a --root"),
+    };
+    // §4 step 3: the door's own argv, with no token in it and no `--ui-dir`.
+    let argv = spawn::argv(&ctx.registry.eidolon, spawn::Target::New(&cwd), asked.model.as_deref());
+    let up = match door_up(ctx, argv, None).await {
+        Ok(up) => up,
+        Err(why) => return problem(StatusCode::SERVICE_UNAVAILABLE, &why),
+    };
+
+    let Up { pid, port, token, exit, watcher, hello } = up;
+    // A door whose log is not in our sessions dir names no session this perch can list or
+    // resume, so it is not adopted.
+    let Some(id) = sessions::id_from_log(&ctx.registry.sessions_dir, &hello.session) else {
+        let why = format!("the door's session log {} is not in the sessions dir", hello.session.display());
+        give_up(watcher, pid, exit).await;
+        return problem(StatusCode::SERVICE_UNAVAILABLE, &why);
+    };
+    ctx.registry.insert(id.clone(), hello.session, hello.cwd, pid, port, token, watcher, exit);
+    json(StatusCode::CREATED, &serde_json::json!({ "id": id }))
+}
+
+/// §4 step 2's "Resume can spend" is a UI concern and not this route's: the perch never
+/// auto-restarts a door, so a door opens this log only because someone asked for exactly
+/// that, here.
+async fn resume(ctx: &Ctx, id: &str) -> Response<BoxBody> {
+    if !sessions::id_ok(id) {
+        return status(StatusCode::NOT_FOUND);
+    }
+    let log = sessions::log_path(&ctx.registry.sessions_dir, id);
+    // The log has to be a real log *inside* the sessions dir: the id was already checked, and
+    // this is what keeps a symlink at `<id>.eid` from naming a file somewhere else.
+    if !log.is_file() || sessions::id_from_log(&ctx.registry.sessions_dir, &log).as_deref() != Some(id) {
+        return status(StatusCode::NOT_FOUND);
+    }
+    // §4 step 2, both halves: our own children, and the roster — upstream has no `flock`, so
+    // two writers on one log is a corruption the perch can at least refuse to start.
+    if ctx.registry.held(&log) || ctx.registry.roster_holds(&log) {
+        return problem(StatusCode::CONFLICT, "that log is already held by a live session");
+    }
+    // Reserved before the fork, so a second resume in flight cannot pass the check above too.
+    if !ctx.registry.reserve(id, &log) {
+        return problem(StatusCode::CONFLICT, "that log is already held by a live session");
+    }
+    let argv = spawn::argv(&ctx.registry.eidolon, spawn::Target::Kept(&log), None);
+    let up = match door_up(ctx, argv, Some(id)).await {
+        Ok(up) => up,
+        Err(why) => return problem(StatusCode::SERVICE_UNAVAILABLE, &why),
+    };
+    // The door must have opened the log we asked it to. A door that opened another one is
+    // exactly the two-writers case above, wearing a hat.
+    if sessions::id_from_log(&ctx.registry.sessions_dir, &up.hello.session).as_deref() != Some(id) {
+        let why = format!("the door opened {}, not the log we asked for", up.hello.session.display());
+        let Up { pid, exit, watcher, .. } = up;
+        ctx.registry.dead(id);
+        give_up(watcher, pid, exit).await;
+        return problem(StatusCode::SERVICE_UNAVAILABLE, &why);
+    }
+    ctx.registry.mark_live(id, &up.hello.session, &up.hello.cwd);
+    json(StatusCode::OK, &serde_json::json!({ "id": id }))
+}
+
+/// `/hub/sessions/<id>/stop`: 202 once the door has been signalled, and the signals are
+/// [`sessions::Registry::stop`]'s business — the watcher is closed first, because a door with
+/// an open stream does not die on SIGTERM.
+async fn stop(ctx: &Ctx, id: &str) -> Response<BoxBody> {
+    if !sessions::id_ok(id) {
+        return status(StatusCode::NOT_FOUND);
+    }
+    match ctx.registry.stop(id).await {
+        sessions::Stop::Signalled => status(StatusCode::ACCEPTED),
+        sessions::Stop::NotLive => problem(StatusCode::CONFLICT, "that session is not live under this perch"),
+    }
+}
+
+/// A door that reached `live` inside a spawn request, whole. [`Ctx::registry`] takes these
+/// one at a time: see the two callers for why a new session's row is written last and a
+/// resume's as soon as each fact is known.
+struct Up {
+    pid: u32,
+    port: u16,
+    token: Arc<str>,
+    exit: ExitWatch,
+    watcher: Watcher,
+    hello: watch::Hello,
+}
+
+/// §4 steps 3-7 for one door, new or resumed — the two differ only in the argv they are
+/// given. `id` is `Some` for a resume, which is the only case where the perch knows the
+/// session before the door says it; every failure leaves that row `dead` rather than
+/// half-`starting`.
+async fn door_up(ctx: &Ctx, argv: Vec<OsString>, id: Option<&str>) -> std::result::Result<Up, String> {
+    let mut forked = match spawn::fork_door(&ctx.spawner, &ctx.registry, argv).await {
+        Ok(forked) => forked,
+        Err(e) => {
+            dead(ctx, id);
+            return Err(format!("{e:#}"));
+        }
+    };
+    let (pid, exit) = (forked.pid, forked.exit.clone());
+    if let Some(id) = id {
+        ctx.registry.attach(id, pid, exit.clone());
+    }
+    // Steps 5 and 6: the two boot lines, then the token file. A door that never prints them,
+    // or whose token file is not an owner-only regular file where it should be, is stopped
+    // before this returns.
+    let booted = match spawn::boot(&mut forked, &ctx.registry.runtime_dir).await {
+        Ok(booted) => booted,
+        Err(e) => {
+            dead(ctx, id);
+            return Err(format!("{e:#}"));
+        }
+    };
+    if let Some(id) = id {
+        ctx.registry.ready(id, booted.port, booted.token.clone());
+    }
+    // Step 7: the watcher's `hello`. Opening it is also what closes it on this path.
+    match watch::open(booted.port, booted.token.clone(), spawn::HELLO_TIMEOUT).await {
+        Ok((watcher, hello)) => Ok(Up { pid, port: booted.port, token: booted.token, exit, watcher, hello }),
+        Err(e) => {
+            sessions::signal_and_wait(pid, exit, spawn::GIVE_UP_GRACE).await;
+            dead(ctx, id);
+            Err(format!("{e:#}"))
         }
     }
-    None
+}
+
+/// A spawn that will not be adopted: the watcher is closed first, then the door is stopped —
+/// the same order as any stop, and for the same reason.
+async fn give_up(watcher: Watcher, pid: u32, exit: ExitWatch) {
+    watcher.close().await;
+    sessions::signal_and_wait(pid, exit, spawn::GIVE_UP_GRACE).await;
+}
+
+fn dead(ctx: &Ctx, id: Option<&str>) {
+    if let Some(id) = id {
+        ctx.registry.dead(id);
+    }
+}
+
+/// Every JSON answer this crate writes, so the content type is decided in one place. The
+/// body is never a secret: `Entry` has no token field, and a spawn answer is an id.
+fn json<T: serde::Serialize>(code: StatusCode, value: &T) -> Response<BoxBody> {
+    let body = match serde_json::to_vec(value) {
+        Ok(body) => body,
+        // Serializing our own types cannot fail; an empty object is the honest answer rather
+        // than a panic in a request handler.
+        Err(e) => {
+            tracing::warn!(error = %e, "perch: an answer did not serialize");
+            b"{}".to_vec()
+        }
+    };
+    Response::builder().status(code).header("content-type", HeaderValue::from_static("application/json")).body(full(body)).unwrap()
+}
+
+/// A refusal with a reason a caller can act on. Reasons name paths and states, never a
+/// token: nothing in this crate has one to name but [`Ctx::token`] and the doors' own.
+fn problem(code: StatusCode, why: &str) -> Response<BoxBody> {
+    json(code, &serde_json::json!({ "error": why }))
 }
 
 /// The filesystem calls run under `spawn_blocking`, off the reactor. The containment
@@ -392,10 +621,22 @@ mod tests {
         // from pieces.
         let needle = concat!("access", "-", "control");
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        for entry in std::fs::read_dir(&src).unwrap() {
-            let path = entry.unwrap().path();
-            let text = std::fs::read_to_string(&path).unwrap().to_ascii_lowercase();
-            assert!(!text.contains(needle), "{} writes an {needle} header", path.display());
+        // Every `.rs` under `src/`, `src/bin/` included: a test double may write no CORS
+        // header either, and a handler added in a new subdirectory is still scanned.
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap().to_ascii_lowercase();
+                assert!(!text.contains(needle), "{} writes an {needle} header", path.display());
+            }
         }
     }
 }
