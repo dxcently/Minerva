@@ -56,7 +56,7 @@ if [[ $arm = jev ]]; then
 fi
 
 sed -e "s/@RUN@/$run/g" -e "s/@JEV_TOKEN@/$token/g" -e "s/@JEV_PORT@/$port/g" \
-  "$repo/bench/tasks/aeacus-loop-$arm.task.tmpl" > "$task"
+  "${JEV_TASK_TMPL:-$repo/bench/tasks/aeacus-loop-$arm.task.tmpl}" > "$task"
 AGENT_YOLO=1 "$repo/bin/watch-agent.sh" "$task" "$run" "$timeout_s"
 code=$?
 echo "--- $run ($arm, $AGENT_MODEL): $(grep -iE 'final.*score:? [0-9]+/256|score:? [0-9]+/256' "$repo/logs/botforge/$run.md" 2>/dev/null | tail -1)"

@@ -3660,3 +3660,34 @@ Two things this exposed, neither fixed. **The report path assumes a parent that 
 Tiers are data now. `[subagent.tiers]` maps a role to a model key, shipped with the operator's ruling of this date — most of the ladder on `ollama:deepseek-v4.1-flash`, `decisioning` on `ollama:glm-5.3-flash`, deepseek pro cut by name — overridable one row at a time, and a role nobody mapped is refused *by name*, with the roles that exist, rather than quietly answered with the parent's model. A role draws its own glyph beside the row in the strip, and the `↳` now follows the roster's parent instead of the name of a log, which deleted the `subagent-<hash16>` convention and the two tests that pinned it. **Not built: the webui page that edits that table**, which is what the operator asked for, and the four other strip items from the same message — selection style, per-row time and tokens, `k` falling through past the strip's top, and Enter to enter a session (which must be an attach, never the `:sessions` reopen: one journal with two writers is how `chats/5ae3892b-….eid` was corrupted).
 
 One self-inflicted error, disclosed. A roster poll written to watch a child register printed nothing for sixty seconds, which reads as evidence that no child was ever in the roster. It was the poll: the glob `"$TEMP"/eidolon/*/` does not expand in this shell when `TEMP` carries backslashes, so the loop ran over a literal string and every `python -c` inside it died into `2>/dev/null`. Redone with `cd "$TEMP/eidolon"` first; the entries above are what it then showed.
+
+## 2026-09-27 — BotForge bench: 128 → 226 with a known-good checklist
+
+What ran, all on the BotForge practice VM, GLM 5.3 as the scored brain, jev
+(`jev-base-v0`) consulted at every decision, 0 penalties in every round:
+
+| protocol | rounds | best | median |
+|---|---|---|---|
+| v1 (`aeacus-loop-jev.task.tmpl`), jev-05 | 1 | 128 | — |
+| v2 (`aeacus-loop-jev-v2.task.tmpl`) | 169 202 201 188 198 199 178 | 202 | 198 |
+| v3 (`aeacus-loop-jev-v3.task.tmpl`) | 212 206 220 226 220 | 226 | 220 |
+
+- **v2**: jev-05's 29 fixes generalized into a two-band checklist (persistence
+  and accounts first, then config hygiene), applied as `source: prefer` — jev
+  is still called and its probabilities logged, but not obeyed, on a known item;
+  jev's pick is applied only to novel findings. Plus forensics-first
+  (discovery gate at depth, answers written before evidence-destroying fixes,
+  split-JWT join), and "a web-reachable secret is moved, not chmod'ed".
+- **v3**: six items (23–28) from a diff of v2's best round against the key:
+  firewall allow-rule, a named polkit/sudoers sweep, nginx's main-config run
+  user, `PermitEmptyPasswords` and a stray sshd `Port`, finishing the
+  telnet/xinetd/netcat purge, disable-don't-harden for non-critical listeners.
+- `bin/peer-bench.sh` takes `JEV_TASK_TMPL` to pick a template; unset, it runs
+  exactly as before.
+- Rounds were driven unattended by an eidolon (deepseek) outer task calling
+  `peer-bench.sh` once per round. Per-round logs: `logs/botforge/jev-v{2,3}-*`;
+  tables: `logs/botforge/jev-v{2,3}-ROUNDS.md`; designs and the four analysis
+  reports: `logs/botforge/grading/`.
+- Ceiling: ~12–15 points are unreachable under the standing rules (mford's sudo,
+  two offline-blocked apt items, one check the writeup calls bugged). Forensics
+  F2 was wrong in every round; the literal answer was deliberately not seeded.
