@@ -15,5 +15,13 @@ supervisor actually gets, and every gate as it is met by a request.
 - Every response every test looks at is checked for an `Access-Control-*` header before the
   test sees it, so a later route cannot quietly add one.
 
+The **H1b** tests in the same file drive a real child process: `--eidolon` points at
+`src/bin/fake_eidolon.rs`, a stand-in door that speaks the door's contract (two boot lines, a
+`0600` token file it mints itself, `/api/events` behind that token, and SIGTERM that does
+*not* end it while a stream is open, as hyper's `GracefulShutdown` does not). It is a `[[bin]]`
+with `required-features = ["test-bins"]`, so those tests are `#[cfg(feature = "test-bins")]`
+and are run with `cargo test --features test-bins`; `cargo test` alone still passes everything
+that needs no door.
+
 Directories are `tempfile`'s, under `/tmp` rather than the 9p mount this repository lives
 on: the `0600` and `0700` checks need a filesystem that keeps its promises.
