@@ -6157,3 +6157,31 @@ The operator's rulings, taken together:
 - **Members' minimum.** WSL, a Rust toolchain, and either an Ollama Pro key or a model download (`docs/Getting-Started.md`).
 
 **What it cost:** upstream eidolon has no extension host. `extensions/jev`, `extensions/browser` and `extensions/subagent` were written for the fork's host and do not load today (S86). The Minerva `/ext`, `/auth` and `/jev` pages and the OpenAI shim stay on the archived fork line.
+
+## 2026-09-27 - The chooser is not what scores; the checklist is
+
+Replaying all 100 logged decisions against the answer key, `jev-base-v0` picked
+the best option 19% of the time against 28% for a random pick and 68% for the
+brain's own first-listed option, and its confidence ran backwards. The jev
+arm's early win over solo came from fixes-only menus, not from the picks. So
+known-good fixes are applied as `source: prefer` and jev's opinion is recorded
+without being obeyed; jev still decides on novel findings, and every call is
+still a corpus row. A retrained checkpoint has to beat the brain's first pick,
+not only random, before it is trusted with more.
+
+## 2026-09-27 - An orchestrator's instructions do not quote another agent's caution
+
+The first eight-round loop ran one round and stopped. Its task told it to run
+each round as one blocking call, but it also carried the inner template's rule
+about tool timeouts verbatim, and the outer agent backgrounded the round and
+parked on it instead; the park never resumed. The fix was to say, in the
+orchestrator's own words, "do not background this call, do not park on it".
+Loops now also stop on a provider error (an Ollama 429 killed one mid-round)
+rather than retry.
+
+## 2026-09-27 - Using the key: hold out for reports, not for play
+
+The four improvement reports held out every fifth fix and two forensics
+questions, and one cross-reference in the key (V39 pointing at V40) still
+leaked. For real scored iteration the whole key is used; rows from the v3
+template are tagged `template=jev-v3`, and V40 no longer counts as held out.
