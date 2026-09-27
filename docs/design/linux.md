@@ -411,7 +411,7 @@ specified beside it, and `JEVLIKE_CKPT` defaulting there. A checkpoint
 trained on the second box "comes home" by `git push`, with the record that
 says what torch and what platform produced it (R9). `synthetic.pt` moves
 in from the jevlike checkout (it was never that repository's content);
-`wikispeedia.pt` moves in from scratch under the name the record gives it.
+`wikispeedia.pt` moved in as `jev/runs/jev-base-v0.pt`, the name its record gives it.
 Until the calibration record lands (judgement.md step 1), the record is a
 sidecar text file with the fields named in R9.
 
@@ -808,8 +808,8 @@ to fix the two working directories and seed the provider.
 - **1.2 jev paths.** `JEVLIKE_ROOT` required at import with the `is_dir()`
   refusal naming the variable; `OPENJEV_DIR` derived; `JEVLIKE_CKPT`
   in-tree default; copy `synthetic.pt` to
-  `extensions/jev/checkpoints/synthetic.pt` and `wikispeedia.pt` to
-  `extensions/jev/checkpoints/wikispeedia.pt`, each with a sidecar
+  `extensions/jev/checkpoints/synthetic.pt` and `jev-base-v0.pt` (formerly
+  `wikispeedia.pt`) to `extensions/jev/checkpoints/jev-base-v0.pt`, each with a sidecar
   `<name>.record.json` holding sha256, `torch.__version__`, platform,
   epochs, and the top-1/ECE from judgement.md, until S47's calibration
   record replaces the sidecar. Tests in `jev/tests/test_paths.py`:
@@ -928,7 +928,7 @@ stubs do under Linux process semantics — §6(m).
   (b), (c), (e), (f), (g), (h) in that order, then (m) — the acceptance.
 - **3.2** `models.ini` header line and `n-gpu-layers` re-measured: §6(d).
   Until measured, the Windows lines stand and the header says so.
-- **3.3** The parity eval: `jevlike.eval` of `wikispeedia.pt` under env A
+- **3.3** The parity eval: `jevlike.eval` of `jev-base-v0.pt` under env A
   against the recorded numbers — §6(k) sets the tolerance the sidecar
   record then carries.
 

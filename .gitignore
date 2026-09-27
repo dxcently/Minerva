@@ -26,9 +26,10 @@ llama.cpp.prev/
 *.pt
 *.pth
 # jev's vendored chooser checkpoints (169 KB each) ship with the repo; the
-# Wikispeedia one (S56) is the trained baseline the CTF chooser warm-starts from.
+# Wikispeedia-trained one (S56, renamed jev-base-v0) is the trained baseline
+# the CTF chooser warm-starts from; jev/runs/jev-base-v0.record.json says so.
 !jev/runs/synthetic.pt
-!jev/runs/wikispeedia.pt
+!jev/runs/jev-base-v0.pt
 
 # Training corpora are large and rebuildable (jev/get-wikispeedia.sh); never staged.
 /jev/data/

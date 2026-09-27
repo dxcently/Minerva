@@ -1,0 +1,14 @@
+{
+  "name": "jev-base-v0",
+  "formerly": "wikispeedia.pt",
+  "trained_on": "Wikispeedia link choice (jev/get-wikispeedia.sh), not any hardening or CTF data",
+  "role": "base checkpoint every botforge retrain warm-starts from",
+  "sha256": "bee443dc5ba46caf76e32fb0ec80f57ec0f447e786772fde698beac0f46dcdec",
+  "bytes": 169093,
+  "device": "cpu",
+  "epochs": 4,
+  "best_validation_nll": 3.0152040176120094,
+  "torch": null,
+  "platform": null,
+  "note": "torch and platform were not recorded at training time (S47); train log is jev-base-v0.train.log"
+}
