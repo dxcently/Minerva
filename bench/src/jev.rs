@@ -106,6 +106,15 @@ impl JevService {
         c.args(args)
             .env("EIDOLON_SERVICE_PORT", port.to_string())
             .env("EIDOLON_SERVICE_TOKEN", &token)
+            // The air gap, set where the process is actually started: `entail`
+            // loads openjev's weights through transformers, and some versions
+            // still make a hub metadata check on load even though the weights
+            // are already on disk (jev/get-openjev.sh put them there). Without
+            // these two a run with no route to the internet is not guaranteed
+            // clean. `extensions/jev/extension.rn` sets the same two on its
+            // own service command, the other way this process gets started.
+            .env("HF_HUB_OFFLINE", "1")
+            .env("TRANSFORMERS_OFFLINE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());

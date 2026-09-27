@@ -16,6 +16,7 @@
 
 pub mod action;
 pub mod agent;
+pub mod board;
 pub mod brain;
 pub mod clock;
 pub mod config;

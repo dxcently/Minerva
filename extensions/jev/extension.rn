@@ -40,7 +40,21 @@ pub fn manifest() {
             // itself lives at jev/server.py, not copied in here -- it is
             // one file whether started by hand (`hoot jev`, historically)
             // or adopted by this loader, and a copy under tools/ would rot.
-            command: ".venv/bin/python -u server.py",
+            //
+            // The two offline names are the air gap, set where the process is
+            // actually started. `entail` loads openjev's weights through
+            // transformers, and some versions still make a hub metadata check
+            // on load even though the weights are already on disk
+            // (jev/get-openjev.sh put them there), so without them a run with
+            // no route to the internet is not guaranteed clean. They are in
+            // the command rather than an `env:` key because the loader hands a
+            // service exactly four names -- EIDOLON_SERVICE_PORT/_TOKEN and
+            // EIDOLON_EXTENSION_DIR/_NAME (crates/rune/src/ext.rs's
+            // `service_env_names`) -- and this command already runs under
+            // `bash -c`, so a bare assignment prefix is the whole mechanism.
+            // bench/src/jev.rs sets the same two on its own spawn of this
+            // same script.
+            command: "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv/bin/python -u server.py",
             cwd: "../../jev",
             health: "/health",
 
