@@ -1,10 +1,27 @@
 #!/bin/sh
-eidolon_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
-for profile in release debug; do
-    eidolon_binary="$eidolon_root/eidolon/target/$profile/eidolon.exe"
-    if [ -f "$eidolon_binary" ]; then
-        exec "$eidolon_binary" "$@"
+# Forwards to the real eidolon, which is Linux-only and lives in WSL.
+#   Linux/WSL:   $EIDOLON_BIN, else ~/.local/bin/eidolon (never this script).
+#   Git Bash:    wsl.exe -d Ubuntu, login shell, `eidolon` from its PATH.
+#                The working directory is not translated; the WSL side starts
+#                in its own default directory.
+case "$(uname -s)" in
+Linux)
+    self=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
+    candidate=${EIDOLON_BIN:-$HOME/.local/bin/eidolon}
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+        real=$(readlink -f -- "$candidate" 2>/dev/null || printf '%s' "$candidate")
+        if [ "$real" != "$self" ]; then
+            exec "$candidate" "$@"
+        fi
     fi
-done
-printf '%s\n' 'Eidolon is not built. Build eidolon-cli first.' >&2
-exit 1
+    printf '%s\n' "eidolon: no usable binary at ${EIDOLON_BIN:-\$HOME/.local/bin/eidolon}. Set EIDOLON_BIN to the full path of the Linux eidolon." >&2
+    exit 127
+    ;;
+*)
+    if command -v wsl.exe >/dev/null 2>&1; then
+        exec wsl.exe -d Ubuntu -e bash -lc 'exec eidolon "$@"' eidolon "$@"
+    fi
+    printf '%s\n' "eidolon: wsl.exe not found. eidolon runs in WSL (Ubuntu); set EIDOLON_BIN inside WSL." >&2
+    exit 127
+    ;;
+esac
