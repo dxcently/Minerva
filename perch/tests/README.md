@@ -23,5 +23,17 @@ with `required-features = ["test-bins"]`, so those tests are `#[cfg(feature = "t
 and are run with `cargo test --features test-bins`; `cargo test` alone still passes everything
 that needs no door.
 
+The **H1c** tests (same file, same feature) drive the proxy against that stand-in. They cover:
+the rebuilt request (the door's Bearer and rewritten `Host` arrive, `Cookie` and the page's own
+`Authorization` do not); the door's current contract passing with no route-specific code; the
+8 MiB body cap, which holds on a chunked stream, and a body that reaches the door while it is
+still arriving; a door's 401 becoming a 502; pane frames arriving as they happen, several panes
+counted and a closed tab not; a stop closing its panes **before** the SIGTERM lands (read off
+the fake's `sigterm-received streams=0`, including a pane still being set up, via
+`FAKE_LATE_PANE_MS`); a pane that has stopped reading holding up neither a stop nor a perch
+shutdown; exactly one `hub-stream-end` frame per pane, `stopping` or `dead` as the cause says;
+a session that is not live refused without a connection; and a rejected new session leaving no
+door token file behind.
+
 Directories are `tempfile`'s, under `/tmp` rather than the 9p mount this repository lives
 on: the `0600` and `0700` checks need a filesystem that keeps its promises.

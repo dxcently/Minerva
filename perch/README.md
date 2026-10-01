@@ -43,26 +43,33 @@ pre-create the directory its secret goes in.
 
 ## What this slice is
 
-This is **H1b** on top of H1a's front door. H1a was the process, its one secret, the gates
-every request passes and the static UI; **H1b is the session lifecycle behind those gates** —
-spawn a door, resume a kept log, stop a live one, list them — plus the perch's *own* watcher
-stream to every door it owns and the ordered stop that closes that stream **before** it
-signals the door.
+This is **H1c** on top of H1a's front door and H1b's session lifecycle. H1a was the process,
+its one secret, the gates every request passes and the static UI; H1b was the session
+lifecycle behind those gates — spawn a door, resume a kept log, stop a live one, list them —
+plus the perch's *own* watcher stream to every door it owns. **H1c is the proxy**: the page
+reaches a session's door only through `/s/<id>/api/<route>`, with the door's Bearer injected
+by the perch, and a stop cancels every pane and closes the watcher **before** it signals the
+door.
 
-What is **not** here, on purpose: the `/s/<id>/api/*` proxy and door SSE handed to a browser
-(H1c), and the idle reaper, `/hub/events`, `/hub/tree`, `/hub/mesh` (H2/H3).
+What is **not** here, on purpose: the idle reaper, `/hub/events`, `/hub/tree` (H2) and
+`/hub/mesh` (H3).
 
 ```text
   /            the UI bundle from --ui-dir: no token, `Host` checked
   /hub/sessions                 GET the list, POST to spawn a new session   (H1b)
   /hub/sessions/<id>/resume     POST: a door on that kept log                (H1b)
-  /hub/sessions/<id>/stop       POST: close the watcher, then SIGTERM        (H1b)
+  /hub/sessions/<id>/stop       POST: cancel panes, close watcher, SIGTERM   (H1b, H1c)
+  /s/<id>/api/<route>           GET|POST, proxied to that session's door     (H1c)
   /hub/events, /hub/tree, /hub/mesh        ->  404                           (H2/H3)
-  /s/...                        token-gated, no handler yet  ->  404         (H1c: the proxy)
+  any other /s/...              token-gated  ->  404
 ```
 
-An **unauthenticated** request to `/hub` or `/s` is a 401; an authenticated one is a
-404. Being able to tell those two apart is the whole point of this slice.
+An **unauthenticated** request to `/hub` or `/s` is a 401; an authenticated one to a route
+that is not there is a 404. The proxied path is a shape, not a list of routes
+(`^[a-z][a-z0-9-]{0,31}(/[a-z0-9-]{1,32})*$`), so a route the door grows needs no perch change.
+Only `Content-Type` and `Accept` cross to the door, a POST body streams under the 8 MiB cap,
+and a pane (`GET .../api/events`) ends with a `hub-stream-end` frame saying whether the door
+is `live`, `stopping` or `dead`. A door's 401 reaches the page as a 502.
 
 ### The gates, in order (hub.md §10.2)
 
@@ -88,9 +95,10 @@ src/lib.rs      bind, the runtime dir, the token mint and its removal on exit
 src/gate.rs     loopback_only, token_ok (subtle), host_ok, sec_fetch_ok
 src/serve.rs    accept loop, the gate order, the route match, the session routes, shutdown
 src/files.rs    the static rules, ported from eidolon/crates/web/src/files.rs
-src/sessions.rs the door table, the list, the id regex, the roster scan, the ordered stop
+src/sessions.rs the door table, the list, the id regex, the roster scan, the pane count, the ordered stop
 src/spawn.rs    argv, the fork (one long-lived thread, PDEATHSIG), the boot lines, the token file
 src/watch.rs    the perch's own /api/events stream to a door, and the handle that closes it
+src/proxy.rs    /s/<id>/api/<route>: the path shape, the rebuilt request, panes, hub-stream-end
 src/bin/fake_eidolon.rs   the stand-in door the tests drive, `--features test-bins` only
 tests/http.rs   a real perch on 127.0.0.1:0, over a real socket, against a real child door
 ```
@@ -105,10 +113,9 @@ too.
 out of the file the child printed, and the child runs at `RUST_LOG=trace` so a token that
 reached a log line would fail the suite.
 
-## Still to come (not in H1b)
+## Still to come (not in H1c)
 
 - **H2** — the idle reaper, the running/parked inference off the frames the H1b watcher
-  already reads, `/hub/events`, `/hub/tree`.
+  already reads, `/hub/events`, `/hub/tree`, and classifying a door that says `goodbye` and
+  exits as `stopping` rather than `dead` (the frame is not parsed today).
 - **H3** — `/hub/mesh`, `/hub/mesh/events`.
-- **H1c** — the `/s/<id>/api/*` proxy with the door's Bearer injected, SSE passed through
-  unbuffered, and the `hub-stream-end` frame that tells the page a door is gone.

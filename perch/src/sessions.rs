@@ -26,17 +26,25 @@
 //! stream to the door **first**, then signals. Both `/hub/sessions/<id>/stop` and the
 //! perch's own shutdown go through that one function; neither reimplements the order.
 //!
-//! Not here, on purpose: panes and the proxy (H1c), the idle reaper, `running`/`parked`
-//! inference, `/hub/events`, `/hub/tree`, `/hub/mesh` (H2/H3).
+//! **Panes** (H1c). A pane is a browser's proxied `/api/events` stream, and to the Stop finding
+//! it is the same thing as the watcher: an open SSE connection that makes a real door ignore
+//! SIGTERM. So each door carries a [`Panes`] handle (a count, a cancellation token, and the fact
+//! that a stop was asked), and [`Registry::stop`] cancels the panes and waits for them to close
+//! *before* it signals.
+//!
+//! Not here, on purpose: the idle reaper, `running`/`parked` inference, `/hub/events`,
+//! `/hub/tree`, `/hub/mesh` (H2/H3). The pane count is only reported in the list.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::spawn;
 use crate::watch::Watcher;
@@ -96,9 +104,9 @@ pub enum State {
     LiveElsewhere,
 }
 
-/// One row of `GET /hub/sessions`. `panes` is always 0 in H1b: there is no proxy, so no
-/// pane can be open (H1c counts them). `busy` is deliberately absent — it needs the
-/// roster/running inference, which is H2.
+/// One row of `GET /hub/sessions`. `panes` is the number of proxied `/api/events` streams open
+/// on a door this perch owns; kept and live-elsewhere rows have none to count. `busy` is
+/// deliberately absent — it needs the roster/running inference, which is H2.
 #[derive(Serialize)]
 pub struct Entry {
     pub id: String,
@@ -116,8 +124,8 @@ pub struct Entry {
 /// alias, because this type travels through the stop path, the spawn path and the row.
 pub type ExitWatch = watch::Receiver<Option<Exit>>;
 
-/// How a door ended. Kept for the `dead` row and, in H1c, for `hub-stream-end`'s `exit`
-/// field; the perch learns it from the child it reaped and from nothing else.
+/// How a door ended. Kept for the `dead` row and for `hub-stream-end`'s `exit` field; the
+/// perch learns it from the child it reaped and from nothing else.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Exit {
     pub code: Option<i32>,
@@ -132,6 +140,81 @@ impl Exit {
             // The reap itself failed: the door is still not there, which is all `dead` says.
             Err(_) => Self::default(),
         }
+    }
+}
+
+impl std::fmt::Display for Exit {
+    /// `hub-stream-end`'s `exit` spelling (hub.md §5): `code:N` or `signal:N`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.code, self.signal) {
+            (Some(code), _) => write!(f, "code:{code}"),
+            (None, Some(signal)) => write!(f, "signal:{signal}"),
+            (None, None) => write!(f, "unknown"),
+        }
+    }
+}
+
+/// The panes open on one door, as the Stop finding needs to see them (hub.md §6): how many,
+/// a way to close them all, and whether a stop was ever asked of this door.
+///
+/// One per [`Door`] row, so a resumed door starts with a fresh, uncancelled handle. The
+/// `stop_asked` flag is here and not in `Door::state` because `stop` ends in `dead`: once the
+/// row is `dead`, the state alone cannot tell a stopped door from a crashed one, and
+/// `hub-stream-end` has to (`stopping` vs `dead`).
+pub struct Panes {
+    count: watch::Sender<u32>,
+    cancel: CancellationToken,
+    stop_asked: AtomicBool,
+}
+
+impl Panes {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { count: watch::channel(0).0, cancel: CancellationToken::new(), stop_asked: AtomicBool::new(false) })
+    }
+
+    pub fn count(&self) -> u32 {
+        *self.count.borrow()
+    }
+
+    /// One more pane, until the guard drops. Taken *before* the proxy connects, so a stop that
+    /// races a pane being set up waits for it too.
+    pub fn open(self: &Arc<Self>) -> PaneGuard {
+        self.count.send_modify(|n| *n += 1);
+        PaneGuard { panes: self.clone() }
+    }
+
+    /// A stop was asked of this door: remember it, and close every pane.
+    fn ask_stop(&self) {
+        self.stop_asked.store(true, Ordering::SeqCst);
+        self.cancel.cancel();
+    }
+
+    pub fn stop_asked(&self) -> bool {
+        self.stop_asked.load(Ordering::SeqCst)
+    }
+
+    /// Resolves when a stop closes the panes.
+    pub fn closing(&self) -> tokio_util::sync::WaitForCancellationFutureOwned {
+        self.cancel.clone().cancelled_owned()
+    }
+
+    /// Wait until no pane is open, for at most `within`; whether it got there. Panes close
+    /// themselves once cancelled, so this is only ever a bounded wait for them to finish.
+    async fn drained(&self, within: Duration) -> bool {
+        let mut seen = self.count.subscribe();
+        tokio::time::timeout(within, seen.wait_for(|n| *n == 0)).await.is_ok_and(|reached| reached.is_ok())
+    }
+}
+
+/// One open pane. Dropping it is how a closed tab, a finished stream and a cancelled stream
+/// all become `count - 1`.
+pub struct PaneGuard {
+    panes: Arc<Panes>,
+}
+
+impl Drop for PaneGuard {
+    fn drop(&mut self) {
+        self.panes.count.send_modify(|n| *n = n.saturating_sub(1));
     }
 }
 
@@ -151,6 +234,39 @@ pub struct Door {
     token: Arc<str>,
     watcher: Option<Watcher>,
     exit: ExitWatch,
+    panes: Arc<Panes>,
+}
+
+/// What the proxy needs to talk to one live door, read in one lock so a dead door's port is
+/// never connected to (hub.md §5, attacker E).
+pub struct Target {
+    pub port: u16,
+    pub token: Arc<str>,
+    pub exit: ExitWatch,
+    pub panes: Arc<Panes>,
+}
+
+/// What the registry knows about an id, for `/s/<id>/api/...`.
+pub enum Lookup {
+    /// Ours, live, and not known to have exited.
+    Live(Target),
+    /// Ours, and gone: the 503. Includes a door whose child has exited but whose row the reap
+    /// task has not marked yet, because the exit channel is the first thing to change.
+    Dead,
+    /// Ours, and between states: `Starting` or `Stopping`.
+    Between(State),
+    /// Not a door of ours (kept, live-elsewhere, or nothing at all).
+    NotOurs,
+}
+
+/// One row of the door table, as the list and the roster check read it.
+struct Ours {
+    id: String,
+    state: State,
+    log: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    pid: u32,
+    panes: u32,
 }
 
 /// The registry: what the perch owns, plus the paths and roots every spawn is judged
@@ -173,6 +289,9 @@ pub struct Registry {
 const DRAIN: Duration = Duration::from_secs(10);
 /// A SIGKILLed child is reaped at once; this is only how long the perch looks.
 const SETTLE: Duration = Duration::from_secs(2);
+/// How long a stop waits for the panes it cancelled to finish closing (H1c). A pane ends in
+/// the time it takes to drop a socket; this only bounds a pane that has wedged.
+const PANE_DRAIN: Duration = Duration::from_secs(2);
 
 /// What a stop did, for the route's 202/409.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,13 +335,35 @@ impl Registry {
     }
 
     /// The doors this perch owns, for the list.
-    fn ours(&self) -> Vec<(String, State, Option<PathBuf>, Option<PathBuf>, u32)> {
+    fn ours(&self) -> Vec<Ours> {
         self.doors
             .lock()
             .unwrap()
             .iter()
-            .map(|door| (door.id.clone(), door.state, door.log.clone(), door.cwd.clone(), door.pid))
+            .map(|door| Ours {
+                id: door.id.clone(),
+                state: door.state,
+                log: door.log.clone(),
+                cwd: door.cwd.clone(),
+                pid: door.pid,
+                panes: door.panes.count(),
+            })
             .collect()
+    }
+
+    /// `/s/<id>/api/...`'s one question, answered in one lock: is this a door of ours, is it
+    /// live, and if so where is it and what does it want. The port is only ever handed out for
+    /// a door whose exit has not been published, so the proxy cannot be given a dead door's.
+    pub fn lookup(&self, id: &str) -> Lookup {
+        let doors = self.doors.lock().unwrap();
+        let Some(door) = doors.iter().find(|door| door.id == id) else { return Lookup::NotOurs };
+        match door.state {
+            State::Dead => Lookup::Dead,
+            State::Starting | State::Stopping => Lookup::Between(door.state),
+            State::Live if door.exit.borrow().is_some() => Lookup::Dead,
+            State::Live => Lookup::Live(Target { port: door.port, token: door.token.clone(), exit: door.exit.clone(), panes: door.panes.clone() }),
+            State::Kept | State::LiveElsewhere => Lookup::NotOurs,
+        }
     }
 
     /// `GET /hub/sessions`: kept + ours + `live-elsewhere`, one row per id — a door of ours
@@ -245,23 +386,23 @@ impl Registry {
 
         // Our own doors (source 2), which override the kept row while we hold them.
         let ours = self.ours();
-        for (id, state, log, cwd, _pid) in &ours {
+        for door in &ours {
             let row = Entry {
-                id: id.clone(),
-                state: *state,
-                cwd: cwd.as_ref().map(|p| p.display().to_string()),
-                panes: 0,
-                mtime: log.as_deref().and_then(mtime_secs),
+                id: door.id.clone(),
+                state: door.state,
+                cwd: door.cwd.as_ref().map(|p| p.display().to_string()),
+                panes: door.panes,
+                mtime: door.log.as_deref().and_then(mtime_secs),
                 title: None,
             };
-            by_id.insert(id.clone(), row);
+            by_id.insert(door.id.clone(), row);
         }
 
         // The roster (source 3): a kept log another consumer holds, whose pid is not one of
         // our children. Read-only, never adopted (Q5). H2 is what infers running/parked.
-        let our_pids: Vec<u32> = ours.iter().map(|(_, _, _, _, pid)| *pid).collect();
+        let our_pids: Vec<u32> = ours.iter().map(|door| door.pid).collect();
         for (id, peer) in self.roster() {
-            if ours.iter().any(|(ours, ..)| *ours == id) || !by_id.contains_key(&id) || our_pids.contains(&peer.pid) {
+            if ours.iter().any(|door| door.id == id) || !by_id.contains_key(&id) || our_pids.contains(&peer.pid) {
                 continue;
             }
             let row = Entry {
@@ -305,7 +446,7 @@ impl Registry {
     /// row, which is the gap hub.md W4 wants upstream to close.
     pub fn roster_holds(&self, log: &Path) -> bool {
         let log = canonical(log);
-        let ours: Vec<u32> = self.ours().iter().map(|(_, _, _, _, pid)| *pid).collect();
+        let ours: Vec<u32> = self.ours().iter().map(|door| door.pid).collect();
         self.roster().iter().any(|(_, row)| canonical(&row.log) == log && !ours.contains(&row.pid))
     }
 
@@ -336,6 +477,7 @@ impl Registry {
             token: Arc::from(""),
             watcher: None,
             exit: watch::channel(None).1,
+            panes: Panes::new(),
         });
         true
     }
@@ -381,7 +523,18 @@ impl Registry {
     pub fn insert(&self, id: String, log: PathBuf, cwd: PathBuf, pid: u32, port: u16, token: Arc<str>, watcher: Watcher, exit: ExitWatch) {
         let mut doors = self.doors.lock().unwrap();
         doors.retain(|door| door.id != id && (door.pid != pid || door.state == State::Dead));
-        doors.push(Door { id, log: Some(log), cwd: Some(cwd), state: State::Live, pid, port, token, watcher: Some(watcher), exit });
+        doors.push(Door {
+            id,
+            log: Some(log),
+            cwd: Some(cwd),
+            state: State::Live,
+            pid,
+            port,
+            token,
+            watcher: Some(watcher),
+            exit,
+            panes: Panes::new(),
+        });
     }
 
     /// A spawn that never reached `live`: the row stays, as `dead`, because "this door did
@@ -409,6 +562,13 @@ impl Registry {
     /// A child exited: the row becomes `dead`, its stream (to a process that is gone) is
     /// dropped, and a token file the door did not get to remove is removed here — a
     /// SIGKILLed door never runs its own `remove_file`.
+    ///
+    /// **Who owns a door's token file** (H1b review finding 2, decided): the path that
+    /// signals a door owns its file — [`Registry::stop`], `serve::give_up`, `spawn::give_up`.
+    /// This function owns the doors that die on their own (a crash, an `exit`, a kill from
+    /// outside), which no stop ever signalled. The two overlap on a stopped door, on purpose:
+    /// [`drop_token_file`] is idempotent and only removes a file that still holds this door's
+    /// token, so whichever runs second finds nothing to do, and a reused port is never touched.
     pub fn mark_exited(&self, pid: u32) {
         let cleanup = {
             let mut doors = self.doors.lock().unwrap();
@@ -424,6 +584,15 @@ impl Registry {
 
     /// §4 "Stop", and the one place the order lives. See the module doc: close, then
     /// signal, then wait, then SIGKILL.
+    ///
+    /// Close means *every* SSE stream the door holds: the perch's own watcher, and each pane
+    /// the proxy is passing through (H1c). A pane is an open `/api/events` stream exactly like
+    /// the watcher, so one left open would hold a real door's `GracefulShutdown` and turn this
+    /// stop into the 10 s wait and a SIGKILL.
+    ///
+    /// The path that signals a door owns its token file, so the removal at the bottom of this
+    /// function is this function's own. `mark_exited` will usually have got there first from
+    /// the reap task; both are idempotent (see there).
     pub async fn stop(&self, id: &str) -> Stop {
         let taken = {
             let mut doors = self.doors.lock().unwrap();
@@ -434,15 +603,27 @@ impl Registry {
                 return Stop::NotLive;
             }
             door.state = State::Stopping;
-            (door.pid, door.port, door.token.clone(), door.watcher.take(), door.exit.clone())
+            (door.pid, door.port, door.token.clone(), door.watcher.take(), door.exit.clone(), door.panes.clone())
         };
-        let (pid, port, token, watcher, exit) = taken;
+        let (pid, port, token, watcher, exit, panes) = taken;
+
+        // 0. Say that a stop was asked, and tell every pane to end. A pane ends by writing its
+        //    `hub-stream-end` frame (`door: "stopping"`) and closing its connection to the
+        //    door, so this only *starts* that; the wait is below.
+        panes.ask_stop();
 
         // 1. The perch's own stream to this door ends first. A door with an open
         //    `/api/events` stream is running hyper's `GracefulShutdown`, and SIGTERM alone
         //    would wait that stream out — minutes, and then a SIGKILL.
         if let Some(watcher) = watcher {
             watcher.close().await;
+        }
+
+        // 1b. …and the panes' streams, which are the same thing from the page's side. Bounded:
+        //     a pane that will not close is logged and the stop goes on, because the SIGKILL
+        //     path below still cleans up and a stuck page must not stop a door from stopping.
+        if !panes.drained(PANE_DRAIN).await {
+            tracing::warn!(pid, port, panes = panes.count(), "perch: a pane did not close in time; signalling the door anyway");
         }
 
         // 2. SIGTERM, so the door drains and removes its own token file. 3. Wait up to
@@ -510,7 +691,7 @@ fn signal(pid: u32, sig: libc::c_int) {
 
 /// The child's exit, as the reap task publishes it. `changed()` also fails when the sender
 /// is gone, which means the reaping itself ended — the door is not there either way.
-async fn wait_exit(exit: &mut ExitWatch) -> Exit {
+pub(crate) async fn wait_exit(exit: &mut ExitWatch) -> Exit {
     loop {
         if let Some(seen) = *exit.borrow_and_update() {
             return seen;
@@ -527,7 +708,7 @@ async fn wait_exit(exit: &mut ExitWatch) -> Exit {
 /// Only the file that still holds *this* door's token is removed, so a port that has been
 /// reused by another door's file — a different token — is left alone. The token is only
 /// ever compared; nothing here is logged but the path and the reason.
-fn drop_token_file(path: &Path, token: &str) {
+pub(crate) fn drop_token_file(path: &Path, token: &str) {
     match spawn::read_token_file(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Ok(found) if found == token => {
@@ -604,7 +785,10 @@ mod tests {
         // A roster row for a kept log, from a process that is not ours.
         let peer = runtime.path().join("eidolon").join("eidolon-9f2c");
         std::fs::create_dir_all(&peer).unwrap();
-        let meta = format!(r#"{{"id":"eidolon-9f2c","pid":999999,"log":"{}","cwd":"/tmp","title":"a peer","busy":true}}"#, dir.path().join("ctf-pwn-3.eid").display());
+        let meta = format!(
+            r#"{{"id":"eidolon-9f2c","pid":999999,"log":"{}","cwd":"/tmp","title":"a peer","busy":true}}"#,
+            dir.path().join("ctf-pwn-3.eid").display()
+        );
         std::fs::write(peer.join("meta.json"), meta).unwrap();
         // …and one for a log that is not here, which is not listed at all.
         let stray = runtime.path().join("eidolon").join("eidolon-stray");
@@ -618,7 +802,7 @@ mod tests {
         assert_eq!(row.id, "ctf-pwn-3");
         assert_eq!(row.state, State::LiveElsewhere, "the roster holds a kept log, and we do not");
         assert_eq!(row.title.as_deref(), Some("a peer"));
-        assert_eq!(row.panes, 0, "no proxy yet, so no pane can be open");
+        assert_eq!(row.panes, 0, "a roster row is not a door of ours, so it has no panes to count");
         assert!(row.mtime.is_some(), "a kept log has an mtime");
         assert!(registry.roster_holds(&dir.path().join("ctf-pwn-3.eid")), "the roster holds this log");
 
@@ -682,6 +866,53 @@ mod tests {
         let list = registry.list();
         assert_eq!(list.iter().find(|e| e.id == "second").unwrap().state, State::Dead, "the live row was the one reaped");
         assert_eq!(list.iter().find(|e| e.id == "first").unwrap().state, State::Dead);
+    }
+
+    /// The proxy's one question: a port is handed out for a live door and for nothing else, and
+    /// not for a door whose exit is already published even if the reap task has not yet marked
+    /// its row (hub.md §10.1, attacker E).
+    #[test]
+    fn the_proxy_is_given_a_port_only_for_a_live_door() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        sessions_dir(dir.path());
+        let registry = registry(dir.path(), runtime.path());
+        let log = dir.path().join("ctf-pwn-3.eid");
+        assert!(matches!(registry.lookup("ctf-pwn-3"), Lookup::NotOurs), "a kept log is not a door of ours");
+        assert!(matches!(registry.lookup("nothing"), Lookup::NotOurs));
+
+        assert!(registry.reserve("ctf-pwn-3", &log));
+        assert!(matches!(registry.lookup("ctf-pwn-3"), Lookup::Between(State::Starting)));
+        let (publish, exit) = watch::channel(None);
+        registry.attach("ctf-pwn-3", 4242, exit);
+        registry.ready("ctf-pwn-3", 4477, Arc::from("a-door-token"));
+        registry.mark_live("ctf-pwn-3", &log, Path::new("/tmp"));
+        match registry.lookup("ctf-pwn-3") {
+            Lookup::Live(target) => assert_eq!((target.port, &*target.token), (4477, "a-door-token")),
+            _ => panic!("a live door is Live"),
+        }
+        // The exit is published first and the row marked after: in between, the door is gone.
+        publish.send(Some(Exit { code: Some(1), signal: None })).unwrap();
+        assert!(matches!(registry.lookup("ctf-pwn-3"), Lookup::Dead), "an exited door's port is not handed out");
+        registry.mark_exited(4242);
+        assert!(matches!(registry.lookup("ctf-pwn-3"), Lookup::Dead));
+    }
+
+    #[tokio::test]
+    async fn a_pane_is_counted_while_it_lives_and_a_stop_is_remembered_after_the_door_is_dead() {
+        let panes = Panes::new();
+        assert_eq!((panes.count(), panes.stop_asked()), (0, false));
+        let (one, two) = (panes.open(), panes.open());
+        assert_eq!(panes.count(), 2);
+        assert!(!panes.drained(Duration::from_millis(50)).await, "two panes are open, so it does not drain");
+        drop(one);
+        assert_eq!(panes.count(), 1);
+        panes.ask_stop();
+        assert!(panes.stop_asked(), "the fact outlives the door's state: `dead` alone cannot say it was stopped");
+        tokio::time::timeout(Duration::from_secs(1), panes.closing()).await.expect("a stop cancels the panes");
+        drop(two);
+        assert!(panes.drained(Duration::from_millis(50)).await);
+        assert_eq!(panes.count(), 0);
     }
 
     #[test]

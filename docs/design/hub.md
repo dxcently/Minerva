@@ -60,7 +60,7 @@ Relations: a pane belongs to one session; a session has 0 or 1 door; a door has 
 | Token | `harnox::crypto::random_token()` after bind; `harnox::fs::write_atomic_0600` to `$XDG_RUNTIME_DIR/minerva/perch-<port>.token`; mode re-checked after write, start refused if not owner-only | copies lib.rs:158, :202 |
 | Runtime dir | **refuse to start without `XDG_RUNTIME_DIR`**; check the dir is owned by our uid and mode `& 077 == 0` | reasoned: eidolon falls back to the shared temp dir (presence.rs:109-114) and ignores a failed `chmod 0700` (presence.rs:130, `let _ =`), so a dir another user pre-created stays theirs |
 | stdout | `listening on http://<addr>/` and `token file: <path>`; never the token | copies lib.rs:209-210 |
-| Shutdown | SIGINT/SIGTERM: stop accepting, SIGTERM every child, wait up to 10 s each, SIGKILL leftovers and delete their token files, drain SSE (`server-graceful`), remove own token file | door does the same for itself (main.rs:660, lib.rs:253) |
+| Shutdown | SIGINT/SIGTERM: stop accepting, SIGTERM every child, wait up to 10 s each, SIGKILL leftovers and delete their token files, drain SSE (`server-graceful`, bounded to 3 s so a page that has stopped reading cannot hold the quit), remove own token file | door does the same for itself (main.rs:660, lib.rs:253) |
 | Perch crash | children get `PR_SET_PDEATHSIG(SIGTERM)` so they do not outlive the perch | **hypothesis**: PDEATHSIG fires when the *forking thread* exits, and tokio's blocking-pool threads exit when idle; spawn from one dedicated long-lived thread. Measure: kill -9 the perch in a test and assert children gone |
 | Platform | Unix only, like the door (lib.rs:159 `std::os::unix`) | observed |
 

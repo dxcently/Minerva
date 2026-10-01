@@ -489,20 +489,28 @@ struct Answer {
 
 impl Answer {
     fn parse(raw: &[u8]) -> Self {
-        let text = String::from_utf8_lossy(raw).to_string();
-        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+        let split = raw.windows(4).position(|w| w == b"\r\n\r\n");
+        let (head_bytes, body_bytes) = match split {
+            Some(at) => (&raw[..at], &raw[at + 4..]),
+            None => (raw, &raw[raw.len()..]),
+        };
+        let head = String::from_utf8_lossy(head_bytes).to_string();
         let status = head
             .split_whitespace()
             .nth(1)
             .and_then(|code| code.parse().ok())
-            .unwrap_or_else(|| panic!("no status line in {text:?}"));
+            .unwrap_or_else(|| panic!("no status line in {head:?}"));
         let mut headers = Vec::new();
         for line in head.lines().skip(1) {
             if let Some((name, value)) = line.split_once(':') {
                 headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
             }
         }
-        Self { status, head: head.to_string(), headers, body: body.to_string() }
+        // A proxied answer is chunked when the door's length was not known; a page reads the
+        // decoded bytes, and so does this.
+        let chunked = headers.iter().any(|(name, value)| name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked"));
+        let body = if chunked { dechunk(body_bytes).0 } else { body_bytes.to_vec() };
+        Self { status, head, headers, body: String::from_utf8_lossy(&body).to_string() }
     }
 
     /// Case-insensitive, as a browser reads them.
@@ -815,7 +823,9 @@ fn a_gated_route_with_a_wrong_token_is_401() {
 #[test]
 fn a_gated_route_that_is_not_built_yet_is_404_with_the_right_token() {
     // The point of H1a, and it still holds for every route a later slice owns: the gate
-    // passed, and what is behind it is not built.
+    // passed, and what is behind it is not built (`/hub/events`, `/hub/tree`, `/hub/mesh`: H2/H3).
+    // `/s` is built since H1c, but `x` is no session of this perch, so the proxy answers the
+    // same empty 404 for it: a session route for a session that is not there.
     let perch = Perch::start();
     let auth = format!("Bearer {}", perch.token.trim());
     for (method, path) in [
@@ -833,7 +843,7 @@ fn a_gated_route_that_is_not_built_yet_is_404_with_the_right_token() {
         assert_eq!(answer.status, 404, "{method} {path} with the token: {}", answer.head);
         assert_eq!(answer.body, "", "no unbuilt route has a body: {path}");
     }
-    // …and the routes H1b does build are not among them: they answer, which is what makes
+    // …and the routes that are built are not among them: they answer, which is what makes
     // the 404s above "not built yet" rather than "not for you".
     let sessions = Request::new(&perch.addr, "GET", "/hub/sessions").bearer(auth).send(&perch.addr);
     assert_eq!(sessions.status, 200, "{}", sessions.head);
@@ -1192,7 +1202,7 @@ fn the_list_shows_kept_logs_and_nothing_else_in_the_directory() {
     assert_eq!(list.len(), 1, "{list:?}");
     assert_eq!(list[0]["id"], "ctf-pwn-3");
     assert_eq!(list[0]["state"], "kept");
-    assert_eq!(list[0]["panes"], 0, "no proxy yet, so no pane can be open");
+    assert_eq!(list[0]["panes"], 0, "nothing proxied is open, so no pane is");
     assert!(list[0]["mtime"].as_u64().is_some(), "a kept log has an mtime: {}", list[0]);
     assert!(list[0].get("cwd").is_none(), "a kept log's cwd is not read: {}", list[0]);
 }
@@ -1263,7 +1273,7 @@ fn a_new_session_spawns_reaches_live_and_stops_clean() {
     let row = perch.row(&id).expect("the new session is listed");
     assert_eq!(row["state"], "live", "{row}");
     assert_eq!(row["cwd"], perch.work.canonicalize().unwrap().display().to_string(), "hello's cwd is the row's: {row}");
-    assert_eq!(row["panes"], 0, "no proxy yet, so no pane can be open");
+    assert_eq!(row["panes"], 0, "nothing proxied is open, so no pane is");
     assert!(perch.sessions.path().join(format!("{id}.eid")).is_file(), "the door wrote the log it named");
 
     // (c) The Stop finding: the watcher is closed *before* the door is signalled, so the
@@ -1497,13 +1507,37 @@ fn kill_minus_nine_on_the_perch_leaves_no_door_behind() {
 #[cfg(feature = "test-bins")]
 #[test]
 fn neither_token_reaches_the_output_or_an_answer() {
-    let mut perch = Perch::start_hub(&[]);
+    // `FAKE_REFUSE` makes `cancel` a door 401, so a 502 is among the proxied answers below.
+    let mut perch = Perch::start_hub(&[("FAKE_REFUSE", "/api/cancel")]);
     let perch_token = perch.token.trim().to_string();
     let answer = perch.post_json("/hub/sessions", serde_json::json!({ "cwd": perch.work.display().to_string() }));
     assert_eq!(answer.status, 201, "{}{}", answer.head, answer.body);
     let id = body_id(&answer);
     let (pid, port) = perch.fake_last_start();
     let door_token = perch.door_token(port);
+
+    // H1c: proxied traffic of every kind — a say, an answer, an open stream, and a 502 — and
+    // neither token in any head or body the page was handed. (The door's token is in exactly
+    // one header, the perch -> door one; the page's is in the one it sent.)
+    let mut pane = Pane::open(&perch, &id);
+    assert!(pane.read_until("\"hello\"", Duration::from_secs(5)));
+    let said = perch.post_json(&format!("/s/{id}/api/say"), serde_json::json!({ "text": "hi" }));
+    let answered = perch.post_json(&format!("/s/{id}/api/answer"), serde_json::json!({ "ask_id": 1, "answer": "ok", "note": "n" }));
+    let refused = perch.post_json(&format!("/s/{id}/api/cancel"), serde_json::json!({}));
+    assert_eq!((said.status, answered.status, refused.status), (202, 204, 502), "{}{}{}", said.head, answered.head, refused.head);
+    assert!(pane.read_until("ask-settled", Duration::from_secs(5)));
+    for (what, head, body) in [
+        ("a say", said.head.as_str(), said.body.as_str()),
+        ("an answer", answered.head.as_str(), answered.body.as_str()),
+        ("a 502", refused.head.as_str(), refused.body.as_str()),
+        ("a pane", pane.head.as_str(), pane.data().0.as_str()),
+    ] {
+        for token in [&door_token, &perch_token] {
+            assert!(!head.contains(token.as_str()) && !body.contains(token.as_str()), "a token is in {what}: {head} {body}");
+        }
+        assert!(!head.to_ascii_lowercase().contains("authorization"), "{what} names the header: {head}");
+    }
+    drop(pane);
 
     // Every answer a page can read, including the refusals.
     let list = perch.get("/hub/sessions");
@@ -1538,4 +1572,777 @@ fn neither_token_reaches_the_output_or_an_answer() {
         assert!(!perch.boot.contains(token.as_str()), "{what} is in the boot lines");
     }
     assert!(!stdout.contains("Authorization") && !stderr.contains("Authorization"), "{stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// H1c: the proxy, `/s/<id>/api/<route>` (hub.md §5, §6)
+// ---------------------------------------------------------------------------
+
+/// Decode as many whole chunks as `raw` holds: the bytes, and whether the terminal chunk has
+/// been seen. A page reads a proxied stream through this, a chunk at a time.
+fn dechunk(raw: &[u8]) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut at = 0;
+    loop {
+        let Some(eol) = raw[at..].windows(2).position(|w| w == b"\r\n") else { return (out, false) };
+        let size_text = String::from_utf8_lossy(&raw[at..at + eol]).to_string();
+        let Ok(size) = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16) else { return (out, true) };
+        let start = at + eol + 2;
+        if size == 0 {
+            return (out, true);
+        }
+        if raw.len() < start + size + 2 {
+            return (out, false);
+        }
+        out.extend_from_slice(&raw[start..start + size]);
+        at = start + size + 2;
+    }
+}
+
+/// One open `GET /s/<id>/api/events`, read incrementally the way a page's fetch would: the
+/// chunked body is decoded as it arrives, and every read is bounded by a deadline so a
+/// stream that never delivers fails a test instead of hanging it.
+#[cfg(feature = "test-bins")]
+struct Pane {
+    sock: TcpStream,
+    /// The chunked body as received, undecoded.
+    raw: Vec<u8>,
+    head: String,
+    /// The socket reached end-of-file (the perch closed it).
+    eof: bool,
+}
+
+#[cfg(feature = "test-bins")]
+impl Pane {
+    fn open(perch: &Perch, id: &str) -> Self {
+        Self::adopt(Self::begin(perch, id))
+    }
+
+    /// The request, sent, and nothing read: a pane the perch may still be setting up.
+    fn begin(perch: &Perch, id: &str) -> TcpStream {
+        let mut sock = TcpStream::connect(&perch.addr).unwrap();
+        let head = format!("GET /s/{id}/api/events HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nAccept: text/event-stream\r\n\r\n", perch.addr, perch.auth());
+        sock.write_all(head.as_bytes()).unwrap();
+        sock
+    }
+
+    /// The response head of a pane that [`Pane::begin`] sent for, read.
+    fn adopt(mut sock: TcpStream) -> Self {
+        sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut raw = Vec::new();
+        let end = loop {
+            if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at;
+            }
+            assert!(Instant::now() < deadline, "no response head for the pane: {:?}", String::from_utf8_lossy(&raw));
+            let mut buf = [0u8; 4096];
+            match sock.read(&mut buf) {
+                Ok(0) => panic!("the perch closed the pane before its head: {:?}", String::from_utf8_lossy(&raw)),
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                Err(_) => {}
+            }
+        };
+        let head = String::from_utf8_lossy(&raw[..end]).to_string();
+        assert!(head.starts_with("HTTP/1.1 200"), "the pane was refused: {head}");
+        let rest = raw[end + 4..].to_vec();
+        Self { sock, raw: rest, head, eof: false }
+    }
+
+    fn pump(&mut self) {
+        let mut buf = [0u8; 16 * 1024];
+        match self.sock.read(&mut buf) {
+            Ok(0) => self.eof = true,
+            Ok(n) => self.raw.extend_from_slice(&buf[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(_) => self.eof = true,
+        }
+    }
+
+    /// What the page has been handed so far, and whether the stream has ended cleanly.
+    fn data(&self) -> (String, bool) {
+        let (bytes, finished) = dechunk(&self.raw);
+        (String::from_utf8_lossy(&bytes).to_string(), finished)
+    }
+
+    /// Read until `needle` is in the stream, the stream ends, or `within` passes. `true` only
+    /// for the first: a stream that is still open and silent is a `false`, not a hang.
+    fn read_until(&mut self, needle: &str, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let (text, finished) = self.data();
+            if text.contains(needle) {
+                return true;
+            }
+            if finished || self.eof || Instant::now() >= deadline {
+                return false;
+            }
+            self.pump();
+        }
+    }
+
+    /// Read until the stream ends: `true` if it did within `within`.
+    fn read_to_end(&mut self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let (_, finished) = self.data();
+            if finished || self.eof {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.pump();
+        }
+    }
+
+    /// Every `data: {json}` frame so far that parses; the rest (a half frame) is ignored, as
+    /// a page ignores it.
+    fn frames(&self) -> Vec<serde_json::Value> {
+        self.data().0.lines().filter_map(|line| line.strip_prefix("data: ")).filter_map(|json| serde_json::from_str(json).ok()).collect()
+    }
+
+    /// The perch's own last frame, and the assertion that there is exactly one of it: a stream
+    /// that ends gets one `hub-stream-end`, not one per path that noticed the end.
+    fn end_frame(&self) -> serde_json::Value {
+        let mut ends: Vec<serde_json::Value> = self.frames().into_iter().filter(|f| f["type"] == "hub-stream-end").collect();
+        assert_eq!(ends.len(), 1, "exactly one hub-stream-end in {:?}", self.data().0);
+        ends.remove(0)
+    }
+}
+
+/// A live session under the stand-in door: its id, pid and port.
+#[cfg(feature = "test-bins")]
+fn live(perch: &Perch) -> (String, u32, u16) {
+    let answer = perch.post_json("/hub/sessions", serde_json::json!({ "cwd": perch.work.display().to_string() }));
+    assert_eq!(answer.status, 201, "{}{}", answer.head, answer.body);
+    let (pid, port) = perch.fake_last_start();
+    (body_id(&answer), pid, port)
+}
+
+/// The requests the stand-in door has recorded since `before` lines ago.
+#[cfg(feature = "test-bins")]
+fn since(perch: &Perch, before: usize) -> Vec<String> {
+    perch.fake_records().into_iter().skip(before).collect()
+}
+
+/// A bounded poll of the door's log, because a request the perch has made is a fact that
+/// reaches the file a moment later.
+#[cfg(feature = "test-bins")]
+fn wait_record(perch: &Perch, within: Duration, wanted: impl Fn(&[String]) -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if wanted(&perch.fake_records()) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A body of base64-looking characters, as a `say` with two images carries: deterministic, and
+/// not a repeating byte, so a body that was truncated, reordered or re-chunked wrongly differs.
+fn images_body(total: usize) -> Vec<u8> {
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut seed: u32 = 0x1234_5678;
+    let mut image = |len: usize| -> String {
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                alphabet[(seed >> 24) as usize % alphabet.len()] as char
+            })
+            .collect()
+    };
+    let (a, b) = (image(total / 2), image(total / 2));
+    format!("{{\"text\":\"look\",\"images\":[{{\"mime\":\"image/png\",\"data\":\"{a}\"}},{{\"mime\":\"image/png\",\"data\":\"{b}\"}}]}}").into_bytes()
+}
+
+/// A chunked POST of `len` bytes with the body going out on another thread, like
+/// [`send_oversize`] but with no `Content-Length` for anything to refuse up front: only the
+/// cap on the stream can stop it. A write error is the refusal, not a failure.
+fn send_chunked(addr: &str, path: &str, auth: &str, len: usize) -> Answer {
+    let head = format!("POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAuthorization: {auth}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n");
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    sock.write_all(head.as_bytes()).unwrap();
+    let mut writer = sock.try_clone().unwrap();
+    writer.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    let body = std::thread::spawn(move || {
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut written = 0;
+        while written < len {
+            let take = chunk.len().min(len - written);
+            let framed = [format!("{take:x}\r\n").as_bytes(), &chunk[..take], b"\r\n"].concat();
+            if writer.write_all(&framed).is_err() {
+                return;
+            }
+            written += take;
+        }
+        let _ = writer.write_all(b"0\r\n\r\n");
+    });
+    let mut raw = Vec::new();
+    let _ = sock.read_to_end(&mut raw);
+    let _ = body.join();
+    Answer::parse(&raw)
+}
+
+/// 1. The rewrite table (hub.md §5). A page request with every header a browser would add is
+///    turned into a door request with five facts and nothing else.
+///
+/// Mutations: drop the `Authorization` rewrite (the stand-in 401s, the perch answers 502);
+/// forward `Cookie` (the `cookie=` field is not `-`); drop the `Host` rewrite (the stand-in
+/// 403s a POST whose `Host` is not its own).
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_proxied_request_is_rebuilt_and_carries_the_doors_bearer_and_nothing_of_the_pages() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, port) = live(&perch);
+    let door_token = perch.door_token(port);
+    let before = perch.fake_records().len();
+
+    let answer = perch
+        .apireq("POST", &format!("/s/{id}/api/say"))
+        .header("Cookie", "sid=abc")
+        .header("Origin", "https://evil.example")
+        .header("Referer", "https://evil.example/x")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header("Last-Event-ID", "42")
+        .header("Accept", "application/json")
+        .body(b"{\"text\":\"hi\"}".to_vec())
+        .send(&perch.addr);
+    assert_eq!(answer.status, 202, "{}{}", answer.head, answer.body);
+    assert_eq!(answer.body, "{\"queued\":false}", "the door's body, unchanged");
+
+    let records = since(&perch, before);
+    let at = records.iter().position(|line| line == &format!("POST /api/say auth=Bearer {door_token}")).unwrap_or_else(|| panic!("the door's own Bearer: {records:?}"));
+    assert_eq!(
+        records[at + 1],
+        format!("hdr host=127.0.0.1:{port} content-type=application/json accept=application/json cookie=- origin=- referer=- sec-fetch-site=- last-event-id=-"),
+        "five facts, and nothing of the page's: {records:?}"
+    );
+    let perch_token = perch.token.trim();
+    assert!(records.iter().all(|line| !line.contains(perch_token)), "the perch's token reached the door: {records:?}");
+    assert!(perch.fake_records().iter().all(|line| !line.contains(perch_token)), "…or its log");
+
+    // The response: the door's status and content type, `no-store`, and nothing that sets state.
+    assert_eq!(answer.header("content-type").as_deref(), Some("application/json"), "{}", answer.head);
+    assert_eq!(answer.header("cache-control").as_deref(), Some("no-store"), "{}", answer.head);
+    assert_eq!(answer.header("x-content-type-options").as_deref(), Some("nosniff"));
+    assert_eq!(answer.header("referrer-policy").as_deref(), Some("no-referrer"));
+    assert!(answer.header("set-cookie").is_none(), "nothing that sets state: {}", answer.head);
+    assert!(!answer.head.contains(&door_token) && !answer.body.contains(&door_token), "a door token reached the page");
+}
+
+/// 2. The door's contract at 0194f2b passes through with no route-specific code: notes on an
+///    answer, `launch`, a multi-MiB `say` byte for byte, a refused `documents`, a route the
+///    perch has never heard of, and every malformed path shape.
+///
+/// Mutations: an allowlist of route names turns (e) red; touching the body turns (c) red;
+/// parsing or rewriting a frame turns (a) red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn the_doors_current_contract_passes_through_with_no_route_specific_code() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, _port) = live(&perch);
+
+    // (a) An ask note round-trips: opaque to the perch, and byte for byte on the pane.
+    let mut pane = Pane::open(&perch, &id);
+    assert!(pane.read_until("\"hello\"", Duration::from_secs(5)), "{:?}", pane.data());
+    let note = "because \"quotes\", a \\ backslash, a newline\n and é ☃";
+    let answered = perch.post_json(&format!("/s/{id}/api/answer"), serde_json::json!({ "ask_id": 7, "answer": "yes", "note": note }));
+    assert_eq!(answered.status, 204, "{}{}", answered.head, answered.body);
+    assert_eq!(answered.body, "");
+    assert!(pane.read_until("ask-settled", Duration::from_secs(5)), "{:?}", pane.data());
+    let settled = pane.frames().into_iter().find(|f| f["type"] == "ask-settled").expect("the ask-settled frame");
+    assert_eq!((settled["ask_id"].as_u64(), settled["answer"].as_str(), settled["how"].as_str()), (Some(7), Some("yes"), Some("answered")));
+    assert_eq!(settled["note"].as_str(), Some(note), "the note, byte for byte");
+    // …and without a note the frame has none.
+    let bare = perch.post_json(&format!("/s/{id}/api/answer"), serde_json::json!({ "ask_id": 8, "answer": "no" }));
+    assert_eq!(bare.status, 204);
+    assert!(pane.read_until("\"ask_id\":8", Duration::from_secs(5)));
+    assert!(pane.frames().iter().find(|f| f["ask_id"] == 8).is_some_and(|f| f.get("note").is_none()));
+    // A body the door refuses is the door's 400, passed through.
+    assert_eq!(perch.apireq("POST", &format!("/s/{id}/api/answer")).body(b"not json".to_vec()).send(&perch.addr).status, 400);
+
+    // (b) launch: 200, JSON, and the door's own body.
+    let launched = perch.post_json(&format!("/s/{id}/api/launch"), serde_json::json!({ "window": "editor" }));
+    assert_eq!(launched.status, 200, "{}{}", launched.head, launched.body);
+    assert_eq!(launched.header("content-type").as_deref(), Some("application/json"), "{}", launched.head);
+    let opened: serde_json::Value = serde_json::from_str(&launched.body).unwrap();
+    assert_eq!(opened["opened"], "fake editor");
+
+    // (c) A `say` with images totalling ~6 MiB of base64: the door got every byte.
+    let body = images_body(6 * 1024 * 1024);
+    assert!(body.len() > 6 * 1024 * 1024, "a multi-MiB say: {}", body.len());
+    let said = perch.apireq("POST", &format!("/s/{id}/api/say")).body(body.clone()).send(&perch.addr);
+    assert_eq!(said.status, 202, "{}{}", said.head, said.body);
+    let received = std::fs::read(format!("{}.body", perch.fake_log.as_ref().unwrap().display())).expect("the door's copy of the body");
+    assert_eq!(received.len(), body.len(), "the door got the whole body");
+    assert!(received == body, "…and it is byte-identical");
+
+    // (d) `documents` is refused by name, and the door's reason is the page's.
+    let refused = perch.post_json(&format!("/s/{id}/api/say"), serde_json::json!({ "text": "x", "documents": [{ "name": "a.pdf" }] }));
+    assert_eq!(refused.status, 422, "{}{}", refused.head, refused.body);
+    assert!(refused.body.contains("this door takes images only"), "{}", refused.body);
+    assert_eq!(perch.post_json(&format!("/s/{id}/api/cancel"), serde_json::json!({})).status, 409);
+
+    // (e) A route the perch has never heard of reaches the door, and the door's 404 comes back.
+    let before = perch.fake_records().len();
+    for method in ["GET", "POST"] {
+        let unknown = perch.apireq(method, &format!("/s/{id}/api/commands")).send(&perch.addr);
+        assert_eq!(unknown.status, 404, "{method}: {}", unknown.head);
+        assert_eq!(unknown.body, "no such route", "{method}: the door's 404, not the perch's empty one");
+    }
+    assert!(since(&perch, before).iter().any(|line| line.starts_with("GET /api/commands ")), "{:?}", since(&perch, before));
+    assert!(since(&perch, before).iter().any(|line| line.starts_with("POST /api/commands ")));
+    let nested = perch.apireq("GET", &format!("/s/{id}/api/commands/list-all")).send(&perch.addr);
+    assert_eq!((nested.status, nested.body.as_str()), (404, "no such route"), "a nested route is a shape too");
+
+    // (f) Malformed shapes never leave the perch: an empty 404, and the door sees nothing.
+    let before = perch.fake_records().len();
+    for path in [
+        format!("/s/{id}/x/events"),
+        format!("/s/{id}/api/"),
+        format!("/s/{id}/api"),
+        format!("/s/{id}/api/Say"),
+        format!("/s/{id}/api/a//b"),
+        format!("/s/{id}/api/a/../b"),
+        format!("/s/{id}/api/%65vents"),
+        format!("/s/{id}"),
+        format!("/s/{id}/"),
+        "/s".to_string(),
+        "/s/".to_string(),
+    ] {
+        for method in ["GET", "POST"] {
+            let answer = perch.apireq(method, &path).send(&perch.addr);
+            assert_eq!(answer.status, 404, "{method} {path}: {}", answer.head);
+            assert_eq!(answer.body, "", "{method} {path} is the perch's own empty 404");
+        }
+    }
+    assert_eq!(since(&perch, before), Vec::<String>::new(), "no malformed path reached the door");
+}
+
+/// 3. The body cap, where it is and is not. Never stricter than the door (exactly 8 MiB gets
+///    through), never looser (one byte over, declared or streamed, is refused), and a
+///    declared length over the cap makes no connection at all.
+///
+/// Mutations: remove `Limited` from the stream path (the chunked case reaches the stand-in's
+/// own cap, which records `body-refused`); a cap of `MAX_BODY - 1` (the exact case goes red);
+/// check the declared length after connecting (the first case sees a request).
+#[cfg(feature = "test-bins")]
+#[test]
+fn the_body_cap_is_the_doors_cap_and_holds_on_a_stream() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, _port) = live(&perch);
+    let path = format!("/s/{id}/api/say");
+    const CAP: usize = 8 * 1024 * 1024;
+
+    // A declared length one byte over: 413, empty, and the door was never asked.
+    let before = perch.fake_records().len();
+    let over = send_oversize(&perch.addr, "POST", &path, Some(&perch.auth()), CAP + 1);
+    assert_eq!(over.status, 413, "{}", over.head);
+    assert_eq!(over.body, "");
+    assert_eq!(since(&perch, before), Vec::<String>::new(), "no upstream request for a declared body over the cap");
+
+    // Exactly the cap: the door gets all of it.
+    let exact = perch.apireq("POST", &path).body(vec![b'x'; CAP]).send(&perch.addr);
+    assert_eq!(exact.status, 202, "{}{}", exact.head, exact.body);
+    assert!(since(&perch, before).iter().any(|line| line == "body-len=8388608"), "{:?}", since(&perch, before));
+
+    // A chunked body over the cap has no length to refuse up front: only the cap on the
+    // stream stops it, and it stops it before the door's own cap would (`body-refused`).
+    let before = perch.fake_records().len();
+    let chunked = send_chunked(&perch.addr, &path, &perch.auth(), CAP + 64 * 1024);
+    assert_eq!(chunked.status, 413, "{}", chunked.head);
+    let records = since(&perch, before);
+    assert!(records.iter().any(|line| line.starts_with("POST /api/say ")), "the body was streamed to the door until the cap: {records:?}");
+    assert!(!records.iter().any(|line| line.starts_with("body-len=")), "a body over the cap was not completed at the door: {records:?}");
+    assert!(!records.iter().any(|line| line == "body-refused"), "the door never saw a body over its own cap: {records:?}");
+    // The perch is fine afterwards.
+    assert_eq!(perch.post_json(&path, serde_json::json!({ "text": "again" })).status, 202);
+}
+
+/// 4. Streaming, not collecting. The door sees the request head while the page is still
+///    sending the body.
+///
+/// Mutation: collect the body before connecting (the head never reaches the stand-in until the
+/// whole body has arrived, so the bounded poll below fails).
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_body_is_streamed_to_the_door_while_it_is_still_arriving() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, _port) = live(&perch);
+    let before = perch.fake_records().len();
+    const WHOLE: usize = 1024 * 1024;
+
+    let head = format!(
+        "POST /s/{id}/api/say HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: {WHOLE}\r\n\r\n",
+        perch.addr,
+        perch.auth()
+    );
+    let mut sock = TcpStream::connect(&perch.addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    sock.write_all(head.as_bytes()).unwrap();
+    sock.write_all(&vec![b'x'; WHOLE / 2]).unwrap();
+
+    // Half the body is out and the other half is held back: the door must already have the head.
+    let arrived = wait_record(&perch, Duration::from_secs(5), |records| records.iter().skip(before).any(|line| line.starts_with("POST /api/say ")));
+    assert!(arrived, "the door never saw the request while the body was still arriving: {:?}", since(&perch, before));
+    assert!(!since(&perch, before).iter().any(|line| line.starts_with("body-len=")), "the body was not complete yet");
+
+    sock.write_all(&vec![b'y'; WHOLE / 2]).unwrap();
+    let mut raw = Vec::new();
+    let _ = sock.read_to_end(&mut raw);
+    let answer = Answer::parse(&raw);
+    assert_eq!(answer.status, 202, "{}{}", answer.head, answer.body);
+    assert!(since(&perch, before).iter().any(|line| line == &format!("body-len={WHOLE}")), "{:?}", since(&perch, before));
+}
+
+/// 5. A door's 401 is the perch's 502: the page never concludes its own token is bad.
+///
+/// Mutation: pass the status through (the page sees 401).
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_door_that_refuses_the_perch_is_502_and_never_401() {
+    let perch = Perch::start_hub(&[("FAKE_REFUSE", "/api/say")]);
+    let (id, _pid, _port) = live(&perch);
+    let refused = perch.post_json(&format!("/s/{id}/api/say"), serde_json::json!({ "text": "x" }));
+    assert_eq!(refused.status, 502, "{}{}", refused.head, refused.body);
+    assert_eq!(refused.body, "{\"error\":\"door refused the perch\"}");
+    assert_eq!(refused.header("content-type").as_deref(), Some("application/json"));
+    // Only that path: the rest of the door answers the same Bearer.
+    assert_eq!(perch.post_json(&format!("/s/{id}/api/cancel"), serde_json::json!({})).status, 409);
+}
+
+/// 6. SSE passes through unbuffered: `hello` arrives while the stream is still open, and a
+///    frame the door broadcasts afterwards arrives on the same pane.
+///
+/// Mutation: buffer the body (collect it, or hold frames until the stream ends): `hello` never
+/// arrives while the stream is open.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_pane_gets_frames_as_they_happen_and_the_stream_stays_open() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, _port) = live(&perch);
+    let mut pane = Pane::open(&perch, &id);
+    assert_eq!(pane.head.lines().find(|l| l.to_ascii_lowercase().starts_with("content-type:")).map(str::to_ascii_lowercase).as_deref(), Some("content-type: text/event-stream"));
+    assert!(pane.head.to_ascii_lowercase().contains("cache-control: no-store"), "{}", pane.head);
+    assert!(pane.read_until("\"hello\"", Duration::from_secs(5)), "hello did not arrive while the stream was open: {:?}", pane.data());
+    assert!(!pane.eof && !pane.data().1, "…and the stream is still open");
+    // A frame the door produces now reaches the same pane, live.
+    assert_eq!(perch.post_json(&format!("/s/{id}/api/answer"), serde_json::json!({ "ask_id": 1, "answer": "go" })).status, 204);
+    assert!(pane.read_until("ask-settled", Duration::from_secs(5)), "{:?}", pane.data());
+    assert!(!pane.eof, "still open after a live frame");
+}
+
+/// 7. Mirrors: several panes on one door, each its own stream, each counted; closing a tab
+///    brings the count down.
+///
+/// Mutation: never decrement the count (the drop-one case stays at 2).
+#[cfg(feature = "test-bins")]
+#[test]
+fn several_panes_on_one_session_are_counted_and_a_closed_tab_is_not() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, _port) = live(&perch);
+    assert_eq!(perch.row(&id).unwrap()["panes"], 0);
+    let mut one = Pane::open(&perch, &id);
+    let mut two = Pane::open(&perch, &id);
+    assert!(one.read_until("\"hello\"", Duration::from_secs(5)) && two.read_until("\"hello\"", Duration::from_secs(5)), "both panes get a hello of their own");
+    assert_eq!(perch.row(&id).unwrap()["panes"], 2, "{:?}", perch.row(&id));
+
+    // One answer reaches both mirrors.
+    assert_eq!(perch.post_json(&format!("/s/{id}/api/answer"), serde_json::json!({ "ask_id": 3, "answer": "ok" })).status, 204);
+    assert!(one.read_until("ask-settled", Duration::from_secs(5)) && two.read_until("ask-settled", Duration::from_secs(5)));
+
+    let panes_within = |want: u64, within: Duration| {
+        let deadline = Instant::now() + within;
+        loop {
+            if perch.row(&id).unwrap()["panes"] == want {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    drop(one);
+    assert!(panes_within(1, Duration::from_secs(2)), "a closed tab is one pane fewer: {:?}", perch.row(&id));
+    drop(two);
+    assert!(panes_within(0, Duration::from_secs(2)), "{:?}", perch.row(&id));
+}
+
+/// 8. The Stop finding for panes: a proxied `/api/events` is an open stream exactly like the
+///    watcher, so a stop closes it BEFORE it signals the door.
+///
+/// Two panes: one read normally, and one the perch is still setting up when the stop lands (the
+/// stand-in holds its head back 400 ms with the stream already counted open). The second is what
+/// makes "before" provable: the stop must WAIT for it, so the stand-in sees no open stream the
+/// moment the signal lands (`sigterm-received streams=0`).
+///
+/// Mutation: do not cancel the panes in `Registry::stop`: the stand-in (which, like a real door,
+/// holds SIGTERM while a stream is open) logs `sigterm streams=1`, the stop waits out the 10 s
+/// grace, and the time and the log assertions below both go red.
+/// Mutation: remove `panes.drained(PANE_DRAIN)` from `Registry::stop`: the signal lands while the
+/// late pane's stream is open, `sigterm-received streams=1`, and the last assertion goes red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn stopping_a_session_closes_its_panes_before_it_signals_the_door() {
+    let perch = Perch::start_hub(&[("FAKE_LATE_PANE_MS", "400")]);
+    let (id, pid, port) = live(&perch);
+    let mut pane = Pane::open(&perch, &id);
+    assert!(pane.read_until("\"hello\"", Duration::from_secs(5)));
+    let late = Pane::begin(&perch, &id);
+    assert!(wait_record(&perch, Duration::from_secs(5), |lines| lines.iter().any(|l| l == "late-stream-held")), "{:?}", perch.fake_records());
+    assert_eq!(perch.row(&id).unwrap()["panes"], 2);
+
+    let started = Instant::now();
+    let stopped = perch.post(&format!("/hub/sessions/{id}/stop"));
+    let took = started.elapsed();
+    assert_eq!(stopped.status, 202, "{}", stopped.head);
+    assert!(took < Duration::from_secs(5), "a stop with a pane open does not wait the grace out: {took:?}");
+
+    assert!(pane.read_to_end(Duration::from_secs(5)), "the pane was ended: {:?}", pane.data());
+    let end = pane.end_frame();
+    assert_eq!((end["session"].as_str(), end["door"].as_str()), (Some(id.as_str()), Some("stopping")), "{end}");
+    let (text, finished) = pane.data();
+    assert!(finished && text.ends_with("}\n\n"), "the page's stream ended cleanly after the frame: {text:?}");
+    // The pane that was still being set up is ended the same way, once.
+    let mut late = Pane::adopt(late);
+    assert!(late.read_to_end(Duration::from_secs(5)), "{:?}", late.data());
+    assert_eq!(late.end_frame()["door"], "stopping");
+
+    assert!(wait_gone(pid, Duration::from_secs(5)));
+    let records = perch.fake_records();
+    assert!(records.iter().any(|line| line == "sigterm-received streams=0"), "every stream was closed BEFORE the signal landed: {records:?}");
+    assert!(records.iter().any(|line| line == "sigterm streams=0"), "{records:?}");
+    assert!(perch.door_token_files().is_empty(), "no token file left: {:?}", perch.door_token_files());
+    assert!(!perch.door_token_file(port).exists());
+    assert_eq!(perch.state_of(&id).as_deref(), Some("dead"));
+}
+
+/// 9. A door that dies mid-frame: the page gets the half frame, then the perch's own frame (its
+///    leading blank line terminates the half one), then EOF; and the dead door's port is never
+///    connected to again.
+///
+/// Mutation: look the port up without the state check (a connect to the dead port arrives at
+/// the listener this test binds there).
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_door_that_dies_mid_frame_ends_the_pane_as_dead_and_is_never_connected_to_again() {
+    let perch = Perch::start_hub(&[("FAKE_EXIT_AFTER_MS", "3000")]);
+    let id = perch.keep_a_log("crashy");
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/resume")).status, 200);
+    let (pid, port) = perch.fake_last_start();
+    let mut pane = Pane::open(&perch, &id);
+    assert!(pane.read_until("\"hello\"", Duration::from_secs(5)));
+
+    assert!(pane.read_to_end(Duration::from_secs(15)), "the door's death ended the pane: {:?}", pane.data());
+    let (text, finished) = pane.data();
+    assert!(finished, "EOF after the frame");
+    // The key order of the perch's JSON is not part of the contract; the blank lines around it are.
+    assert!(text.contains("data: {\"type\":\"turn-st\n\ndata: {"), "the half frame, then a blank line, then the perch's frame: {text:?}");
+    assert!(text.contains("\"type\":\"hub-stream-end\""), "{text:?}");
+    assert!(text.ends_with("}\n\n"), "{text:?}");
+    let end = pane.end_frame();
+    assert_eq!((end["door"].as_str(), end["exit"].as_str(), end["session"].as_str()), (Some("dead"), Some("code:1"), Some(id.as_str())), "{end}");
+    assert!(pane.frames().iter().all(|f| f["type"] != "turn-st"), "the half frame did not parse, and a page drops it");
+
+    assert!(perch.wait_state(&id, "dead", Duration::from_secs(10)), "{:?}", perch.state_of(&id));
+    assert!(wait_gone(pid, Duration::from_secs(5)));
+    // The door's port is free now. Hold it, and prove the perch never connects to it.
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            listener.set_nonblocking(true).unwrap();
+            let again = perch.apireq("POST", &format!("/s/{id}/api/say")).body(b"{}".to_vec()).send(&perch.addr);
+            assert_eq!(again.status, 503, "{}{}", again.head, again.body);
+            assert_eq!(again.body, "{\"state\":\"dead\"}");
+            let get = perch.apireq("GET", &format!("/s/{id}/api/events")).send(&perch.addr);
+            assert_eq!((get.status, get.body.as_str()), (503, "{\"state\":\"dead\"}"));
+            match listener.accept() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => panic!("the perch connected to a dead door's port: {:?}", other.map(|(_, peer)| peer)),
+            }
+        }
+        Err(e) => {
+            // Some other process took the port in the meantime; the 503 is still checked.
+            eprintln!("could not bind the dead door's port {port}: {e}; checking the 503 only");
+            let again = perch.apireq("POST", &format!("/s/{id}/api/say")).body(b"{}".to_vec()).send(&perch.addr);
+            assert_eq!(again.status, 503, "{}", again.head);
+        }
+    }
+}
+
+/// 10. The perch's own shutdown with a pane open: every pane is closed, and ended with
+///     `stopping`, before any door is signalled, so the quit is fast and leaves no token file.
+///
+/// Mutation: as test 8, through `stop_all` (both of its mutations).
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_perch_shutdown_with_a_pane_open_ends_the_pane_and_leaves_no_token_file() {
+    let mut perch = Perch::start_hub(&[("FAKE_LATE_PANE_MS", "400")]);
+    let (id, pid, port) = live(&perch);
+    let mut pane = Pane::open(&perch, &id);
+    assert!(pane.read_until("\"hello\"", Duration::from_secs(5)));
+    let late = Pane::begin(&perch, &id);
+    assert!(wait_record(&perch, Duration::from_secs(5), |lines| lines.iter().any(|l| l == "late-stream-held")), "{:?}", perch.fake_records());
+
+    let started = Instant::now();
+    let status = perch.stop();
+    assert!(status.success(), "{status}");
+    assert!(started.elapsed() < Duration::from_secs(5), "a quit with a pane open does not wait the grace out: {:?}", started.elapsed());
+    assert!(pane.read_to_end(Duration::from_secs(5)), "{:?}", pane.data());
+    let end = pane.end_frame();
+    assert_eq!((end["door"].as_str(), end["session"].as_str()), (Some("stopping"), Some(id.as_str())), "{end}");
+    let mut late = Pane::adopt(late);
+    assert!(late.read_to_end(Duration::from_secs(5)), "{:?}", late.data());
+    assert_eq!(late.end_frame()["door"], "stopping");
+    assert!(wait_gone(pid, Duration::from_secs(5)));
+    assert!(!perch.door_token_file(port).exists(), "the door's token file");
+    assert!(!perch.token_file.exists(), "the perch's own token file");
+    let records = perch.fake_records();
+    assert!(records.iter().any(|line| line == "sigterm-received streams=0"), "every stream was closed BEFORE the signal landed: {records:?}");
+    assert!(records.iter().any(|line| line == "sigterm streams=0"), "{records:?}");
+}
+
+/// A page that has stopped reading: it said `GET events`, read `hello`, and then nothing, while
+/// the door broadcasts many MiB of frames, so the perch's write to it backs up and hyper stops
+/// polling the response body. Returns the pane (kept open by the caller: the socket is the page).
+#[cfg(feature = "test-bins")]
+fn a_pane_that_stopped_reading(perch: &Perch, id: &str) -> Pane {
+    let mut pane = Pane::open(perch, id);
+    assert!(pane.read_until("\"hello\"", Duration::from_secs(5)));
+    // 1000 `ask-settled` frames of 32 KiB each, ~32 MB: far past what the sockets between
+    // the door and the page can hold. Many small frames, not a few huge ones: hyper only stops
+    // polling the body once it has a queue of buffers it cannot write, and a handful of 4 MiB
+    // frames did not get it there.
+    let note = "n".repeat(32 * 1024);
+    for n in 0..1000 {
+        let sent = perch.post_json(&format!("/s/{id}/api/answer"), serde_json::json!({ "ask_id": n, "answer": "go", "note": note }));
+        assert_eq!(sent.status, 204, "{}", sent.head);
+    }
+    // Time for the backlog to build and the page's socket to fill. The page does not read.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(perch.row(id).unwrap()["panes"], 1);
+    pane
+}
+
+/// H1c review finding 1: a pane that has stopped reading must still be cancellable. hyper does not
+/// poll a response body while its write buffer is full, so the stop's cancellation cannot rely on
+/// the body being polled: the pane's own task closes the door's stream, and the stop takes no
+/// longer than its pane drain (2 s), where it took the door's 10 s grace and a SIGKILL before.
+///
+/// Mutation: give the pane no task of its own (cancel only from `Proxied::poll_frame`): the stop
+/// takes ~12 s, the stand-in logs `sigterm streams=1` and the time assertion goes red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_stop_does_not_wait_for_a_pane_that_has_stopped_reading() {
+    let perch = Perch::start_hub(&[]);
+    let (id, pid, port) = live(&perch);
+    let pane = a_pane_that_stopped_reading(&perch, &id);
+
+    let started = Instant::now();
+    let stopped = perch.post(&format!("/hub/sessions/{id}/stop"));
+    let took = started.elapsed();
+    assert_eq!(stopped.status, 202, "{}", stopped.head);
+    assert!(took < Duration::from_secs(2), "a stop is not held up by a page that is not reading: {took:?}");
+    assert!(wait_gone(pid, Duration::from_secs(5)));
+    let records = perch.fake_records();
+    assert!(records.iter().any(|line| line == "sigterm-received streams=0"), "the pane's stream was closed before SIGTERM: {records:?}");
+    assert!(!records.iter().any(|line| line == "sigterm-ignored"), "{records:?}");
+    assert!(perch.door_token_files().is_empty(), "{:?}", perch.door_token_files());
+    assert!(!perch.door_token_file(port).exists());
+    assert_eq!(perch.state_of(&id).as_deref(), Some("dead"));
+    assert!(!perch.err().contains("a pane did not close in time"), "{}", perch.err());
+    drop(pane);
+}
+
+/// H1c review finding 1, the other half: the perch's own shutdown with a page that is not reading
+/// must not hang on hyper's graceful drain. It exits within `serve::RESPONSE_DRAIN` (3 s) of the
+/// door being stopped, with the page's socket still open, and leaves no token file.
+///
+/// Mutation: an unbounded `graceful.shutdown().await` in `serve::run`: the perch is still running
+/// when `Perch::stop`'s own 10 s deadline passes, and it panics. (Without the pane's own task the
+/// door stop takes ~12 s first, which the time assertion also catches.)
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_perch_shutdown_is_not_held_up_by_a_pane_that_has_stopped_reading() {
+    let mut perch = Perch::start_hub(&[]);
+    let (id, pid, port) = live(&perch);
+    let pane = a_pane_that_stopped_reading(&perch, &id);
+
+    let started = Instant::now();
+    let status = perch.stop();
+    let took = started.elapsed();
+    assert!(status.success(), "{status}");
+    assert!(took < Duration::from_secs(6), "the quit is bounded though a page is not reading: {took:?}");
+    assert!(wait_gone(pid, Duration::from_secs(5)));
+    assert!(!perch.door_token_file(port).exists(), "the door's token file");
+    assert!(!perch.token_file.exists(), "the perch's own token file");
+    drop(pane);
+}
+
+/// 11. Session states that are not live: each refusal is its own answer, and none of them
+///     opens a connection to a door.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_session_that_is_not_live_is_refused_without_a_connection() {
+    let perch = Perch::start_hub(&[]);
+    let (alive, _pid, _port) = live(&perch);
+    let kept = perch.keep_a_log("kept-one");
+    let held = perch.keep_a_log("held-elsewhere");
+    perch.roster_row("eidolon-9f2c", &perch.sessions.path().join("held-elsewhere.eid"), 999_999);
+    let before = perch.fake_records().len();
+
+    for (method, path) in [("GET", "events"), ("POST", "say")] {
+        let unknown = perch.apireq(method, &format!("/s/nobody/api/{path}")).send(&perch.addr);
+        assert_eq!((unknown.status, unknown.body.as_str()), (404, ""), "{method} unknown: {}", unknown.head);
+        // A kept log, and one a peer holds (never adopted: Q5): the page can offer a resume.
+        for id in [&kept, &held] {
+            let refused = perch.apireq(method, &format!("/s/{id}/api/{path}")).send(&perch.addr);
+            assert_eq!(refused.status, 409, "{method} {id}: {}", refused.head);
+            assert_eq!(refused.body, "{\"state\":\"kept\"}");
+            assert_eq!(refused.header("content-type").as_deref(), Some("application/json"));
+        }
+        // Not ids at all: never a path, never a connection.
+        for id in ["..", "-x", ".hidden", "a%2Fb"] {
+            let bad = perch.apireq(method, &format!("/s/{id}/api/{path}")).send(&perch.addr);
+            assert_eq!((bad.status, bad.body.as_str()), (404, ""), "{method} {id}: {}", bad.head);
+        }
+    }
+    assert_eq!(since(&perch, before), Vec::<String>::new(), "no refusal opened a connection to a door");
+    // The live one was untouched by any of it.
+    assert_eq!(perch.apireq("POST", &format!("/s/{alive}/api/cancel")).body(b"{}".to_vec()).send(&perch.addr).status, 409);
+
+    // A stopped session is `dead` (the row is still ours) and answers 503, not `kept`.
+    assert_eq!(perch.post(&format!("/hub/sessions/{alive}/stop")).status, 202);
+    let gone = perch.apireq("GET", &format!("/s/{alive}/api/events")).send(&perch.addr);
+    assert_eq!((gone.status, gone.body.as_str()), (503, "{\"state\":\"dead\"}"), "{}", gone.head);
+}
+
+/// 13. H1b review finding 1: a new session whose door names a log outside the sessions dir is
+///     rejected, the door that ignores SIGTERM is killed, and its token file does not outlive
+///     it. No row was ever written for it, so the reap task has nothing to find it by: the
+///     signal path owns the file.
+///
+/// Mutation: drop `drop_token_file` from `serve::give_up` (the file stays, for good).
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_rejected_new_session_leaves_no_door_token_file_behind() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let perch = Perch::start_hub(&[("FAKE_IGNORE_SIGTERM", "1"), ("FAKE_SESSIONS_DIR", elsewhere.path().to_str().unwrap())]);
+    let answer = perch.post_json("/hub/sessions", serde_json::json!({ "cwd": perch.work.display().to_string() }));
+    assert_eq!(answer.status, 503, "{}{}", answer.head, answer.body);
+    assert!(answer.body.contains("not in the sessions dir"), "{}", answer.body);
+    let (pid, port) = perch.fake_last_start();
+    assert!(wait_gone(pid, Duration::from_secs(5)), "the door that ignored SIGTERM was killed");
+    // The token file is the perch's to remove, and it is removed by the time the 503 is out.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !perch.door_token_files().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(perch.door_token_files().is_empty(), "an orphaned door token file: {:?}", perch.door_token_files());
+    assert!(!perch.door_token_file(port).exists());
 }

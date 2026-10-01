@@ -1,17 +1,19 @@
 //! The perch: one loopback HTTP server that will front several `eidolon web` doors
 //! so the browser UI (`webui/term`) can tile them without touching upstream.
 //!
-//! This is slice **H1b** on top of H1a's front door. H1a was the process, the token and the
-//! gates; H1b is the **session lifecycle** behind them:
+//! This is slice **H1c** on top of H1a's front door and H1b's session lifecycle. H1a was the
+//! process, the token and the gates; H1b is the **session lifecycle** behind them; H1c is the
+//! **proxy**, which is what makes a door reachable from a page:
 //!
 //! ```text
 //!   perch [--bind 127.0.0.1:0] [--ui-dir DIR] [--root DIR]... [--eidolon PATH] [--sessions-dir DIR]
 //!
 //!   /                    the UI bundle from --ui-dir, no token, `Host` checked
-//!   /hub/sessions        GET the list, POST to spawn one          (this slice)
-//!   /hub/sessions/<id>/resume, /stop                              (this slice)
+//!   /hub/sessions        GET the list, POST to spawn one          (H1b)
+//!   /hub/sessions/<id>/resume, /stop                              (H1b)
+//!   /s/<id>/api/<route>  GET|POST to that session's door, its Bearer injected,
+//!                        SSE passed through, `hub-stream-end` appended   (H1c, this slice)
 //!   /hub/events, /hub/tree, /hub/mesh                             (H2/H3: still 404)
-//!   /s/<id>/api/...      the proxy and its SSE                    (H1c: still 404)
 //! ```
 //!
 //! So an **unauthenticated** request to `/hub` or `/s` is a 401 and an authenticated one to
@@ -32,7 +34,9 @@
 //! it mints its own, prints the path, and the perch reads it from a `0600` file it refuses
 //! to trust without checking owner and mode (§4 steps 3-6, §10.4 row 1). The perch holds its
 //! own `/api/events` stream to each door it owns ([`watch`]), which is how a door becomes
-//! `live` and the stream a stop closes *before* it signals.
+//! `live` and the stream a stop closes *before* it signals. A browser's proxied
+//! `/api/events` (a pane, [`proxy`]) is the same kind of stream and is closed in the same
+//! place, first.
 //!
 //! **The token** is 256 random bits per start, written `0600` to
 //! `$XDG_RUNTIME_DIR/minerva/perch-<port>.token`. It is never in argv, never in the
@@ -53,6 +57,7 @@ compile_error!("the perch is Unix only: it needs a 0600 token file, $XDG_RUNTIME
 
 pub mod files;
 pub mod gate;
+pub mod proxy;
 pub mod serve;
 pub mod sessions;
 pub mod spawn;
