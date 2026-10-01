@@ -1,0 +1,661 @@
+// `subagent_spawn`: a child `eidolon run` in the background, handed ../brief.md. It reports
+// once with `send` and stops; nothing here waits for it. The state directory written here
+// is what the other tools read.
+//
+// The model comes from the `model` argument (never saved), then the project pick for the
+// `kind`, then the global pick. With none, nothing starts and the answer is `needs_choice`:
+// a successful output, not a refusal. This tool never opens a dialog.
+
+pub fn manifest() {
+    #{
+        name: "subagent_spawn",
+        description: "Start a child eidolon session in the background with a brief, and return at once with its id, pid and log path. The child is one bounded task: when it is done, or out of time, it messages *this* session with `send` -- a direct message wakes an idle parent, which is the report arriving -- and then stops. Follow it from here with `subagent_list`, `subagent_trace` and `subagent_steer`, and stop it with `subagent_cancel`. Its journal is the record to pick it up again with `eidolon resume <journal>`, and the path is in the child's log. The child's model comes from `model` (one-off) or else the pick saved for its `kind` (project, then global). If no model is picked for the kind, this starts nothing and returns {\"status\":\"needs_choice\", options, retry}: choose one or ask the operator, then call `subagent_pick` {kind, model} or retry with `model`. A child that needs a choice ends with it in its final text; read it with `subagent_trace` and answer with `subagent_steer`.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "task": #{
+                    "type": "string",
+                    "description": "What the child should do, in your words. It runs in this session's working directory.",
+                },
+                "kind": #{
+                    "type": "string",
+                    "description": "What sort of subagent this is, a name you choose (research, review, grind, ...; letters, digits, '-', '_', '.'). Picks are remembered per kind: the child runs the model picked for it, and if none is, you get needs_choice with options. Default \"default\".",
+                },
+                "model": #{
+                    "type": "string",
+                    "description": "Model key as `eidolon models` prints it (provider:model), for this child only: wins over any pick and is not saved. Leave out to use the kind's pick.",
+                },
+                "budget": #{
+                    "type": "object",
+                    "description": "Limits for this child. `calls`: the most model calls it may make, enforced live (its config gets max_iterations = calls; at the limit the turn ends). `usd_max`: a ceiling in dollars, recorded and checked after the fact by subagent_list/subagent_trace -- not enforced while it runs. `usd_min`: dollars this child is entitled to before a fan-out workflow steps it down (a reserve); recorded only.",
+                    "properties": #{
+                        "calls": #{ "type": "integer", "description": "Most model calls, 1..10000." },
+                        "usd_max": #{ "type": "number", "description": "Dollar ceiling, checked post-hoc." },
+                        "usd_min": #{ "type": "number", "description": "Dollar reserve, recorded." },
+                    },
+                },
+                "tools": #{
+                    "type": "array",
+                    "items": #{ "type": "string" },
+                    "description": "Tools the child should confine itself to, written into its brief. Advisory: nothing enforces it until upstream eidolon has `run --tools`.",
+                },
+                "deadline_min": #{
+                    "type": "integer",
+                    "description": "Minutes the child has before it is stopped by a signal to its own process group, and reports what it has. Default 15, clamped to 1..120.",
+                },
+                "yolo": #{
+                    "type": "boolean",
+                    "description": "Pass `--yolo` to the child: answer every question the gate raises with yes. Default false -- and without it the child stalls on its first flagged tool call (bash, write), because nobody is at its end to answer and nothing can be. Set it for any child meant to act.",
+                },
+            },
+            "required": ["task"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let kind = text_of(input.get("kind")).trim();
+    if kind == "" {
+        kind = "default";
+    }
+    kind = checked_kind(kind)?;
+
+    // A child reports to whoever is registered among its peers, so this session has to be:
+    // the roster's first line is "You are `<id>`." and the id is between the backticks.
+    let roster = eidolon::peers().await?;
+    let parent = parent_id(roster);
+    if parent == "" {
+        return Err("`peers` named no session id: this session is not registered among its peers (swarm disabled in config.toml?), so a child would have nobody to report to");
+    }
+
+    // The guard is the line the child's own command runs; asking it here refuses a nested
+    // call with a reason, not with a pid whose log is one refusal line.
+    let guard = eidolon::shell(GUARD, Some(10)).await?;
+    if guard.contains("[exit code 3]") {
+        return Err(REFUSED);
+    }
+
+    // Found now, so a missing binary is an error here and not a child that dies at its first line.
+    let found = eidolon::shell(sh_eid("printf '%s' \"$eid\"", []), Some(10)).await?;
+    if found.contains("[exit code") {
+        return Err(`${found}`);
+    }
+    let eid = found.trim();
+
+    let minutes = deadline_min(input.get("deadline_min"));
+    let yolo = match input.get("yolo") {
+        Some(v) => v == true,
+        None => false,
+    };
+    let budget = budget_of(input.get("budget"))?;
+    let tools = tools_of(input.get("tools"))?;
+
+    let model = text_of(input.get("model")).trim();
+    let model_from = "argument";
+    if model == "" {
+        let picks = read_picks().await?;
+        model_from = "project pick";
+        match picks.get("project").unwrap().get(kind) {
+            Some(m) => model = `${m}`,
+            None => {}
+        }
+        if model == "" {
+            model_from = "global pick";
+            match picks.get("global").unwrap().get(kind) {
+                Some(m) => model = `${m}`,
+                None => {}
+            }
+        }
+    }
+    if model == "" {
+        let rows = catalog().await?;
+        return needs_choice(kind, rows, "subagent_spawn", input);
+    }
+
+    // Second-resolution stamp plus two bytes of /dev/urandom: two spawns in one second
+    // differ, and a directory listing sorts by creation.
+    let stamp = eidolon::shell(ID_CMD, Some(10)).await?;
+    let id = "";
+    let started = "";
+    match stamp.split_once(' ') {
+        Some(pair) => {
+            id = pair.0;
+            started = pair.1;
+        }
+        None => {}
+    }
+    if !id.starts_with("sa-") {
+        let msg = `the shell did not hand back a subagent id (${stamp})`;
+        return Err(msg);
+    }
+
+    let prepared = eidolon::shell(sh_cmd(PREP_SH, [id, budget.calls]), Some(30)).await?;
+    if prepared.contains("[exit code") || prepared.contains("--- stderr ---") {
+        let msg = `the state directory could not be made: ${prepared}`;
+        return Err(msg);
+    }
+    let dir = prepared.trim();
+    let config = "";
+    if budget.calls != "" {
+        config = `${dir}/config.toml`;
+    }
+
+    let text = brief(id, parent, input.task, minutes, tools);
+    let flags = "";
+    if config != "" {
+        flags += `--config ${quote(config)} `;
+    }
+    flags += `--model ${quote(model)} `;
+    if yolo {
+        flags += "--yolo ";
+    }
+    let child = CHILD_SH
+        .replace("{seconds}", `${minutes * 60}`)
+        .replace("{eid}", quote(eid))
+        .replace("{flags}", flags)
+        .replace("{brief}", quote(text));
+
+    let started_at = eidolon::shell_background(child).await?;
+    let pid = field(started_at, "pid");
+    let log = field(started_at, "log");
+    let status = path_of(field(started_at, "status"));
+    if pid == "" || log == "" {
+        let msg = `the child started without reporting a pid and a log, so there is nothing to record: ${started_at}`;
+        return Err(msg);
+    }
+
+    let state = WRITE_SH
+        .replace("{id}", quote(id))
+        .replace("{lines}", meta_lines(id, parent, kind, model, model_from, budget, config, pid, log, status, started, minutes))
+        .replace("{brief}", quote(text));
+    let written = eidolon::shell(state, Some(30)).await?;
+    if written.contains("[exit code") || written.contains("--- stderr ---") {
+        let msg = `the child is running, but its state directory could not be written: ${written}`;
+        return Err(msg);
+    }
+
+    let report = `subagent ${id}
+pid: ${pid}
+log: ${log}
+status: ${status} (written when the child finishes)
+kind: ${kind}
+model: ${model} (${model_from}), deadline ${minutes} min
+budget: ${budget_words(budget)}
+`;
+    Ok(report)
+}
+
+// The project file is relative to the session's working directory, which is where
+// `eidolon::shell` runs.
+const PICKS_SH = "g=${XDG_STATE_HOME:-$HOME/.local/state}/eidolon/subagents/picks.json
+printf '@@global\\n'
+cat \"$g\" 2>/dev/null
+printf '\\n@@project\\n'
+cat .eidolon/subagent-picks.json 2>/dev/null
+true
+";
+
+// The catalog, cheapest first: tab-separated key, input $/M, output $/M, context, with "-"
+// where the listing says nothing. `eidolon models` also prints a header per provider,
+// `[system]` lines and a cache note; model rows have a `provider:model` first word and
+// the " · " separator. Unpriced rows sort last, never as free.
+const CATALOG_SH = "m=$(\"$eid\" models 2>/dev/null) || { printf 'subagent: `eidolon models` (%s) exited non-zero, so there is no model list.\\n' \"$eid\" >&2; exit 4; }
+printf '%s\n' \"$m\" | awk '
+/^\\[/ { next }
+$1 ~ /:/ && index($0, \" · \") > 0 {
+  pin = \"-\"; pout = \"-\"; ctx = \"-\"; key = \"999999999.0000\"
+  if (match($0, /\\$[0-9.]+\\/[0-9.]+ per M/)) {
+    s = substr($0, RSTART + 1, RLENGTH - 1)
+    split(s, a, \"/\")
+    pin = a[1]; pout = a[2] + 0
+    key = sprintf(\"%014.4f\", pin + pout)
+  }
+  if (match($0, /[0-9]+k ctx/)) { ctx = substr($0, RSTART, RLENGTH - 4) }
+  printf \"%s\\t%s\\t%s\\t%s\\t%s\\n\", key, $1, pin, pout, ctx
+}' | sort | cut -f2-
+";
+
+// The child's state directory, and -- when $2 (a call budget) is not empty --
+// its config: `max_iterations = $2` first, then the operator's config.toml
+// without its own top-level max_iterations. The original is only read. Prints
+// the directory.
+const PREP_SH = "root=${XDG_STATE_HOME:-$HOME/.local/state}/eidolon/subagents
+dir=$root/$1
+mkdir -p \"$dir\" || exit 1
+if [ -n \"$2\" ]; then
+  src=${XDG_CONFIG_HOME:-$HOME/.config}/eidolon/config.toml
+  {
+    printf 'max_iterations = %s\\n' \"$2\"
+    if [ -r \"$src\" ]; then
+      awk 'BEGIN { top = 1 } /^[ \\t]*\\[/ { top = 0 } top && /^[ \\t]*max_iterations[ \\t]*=/ { next } { print }' \"$src\"
+    fi
+  } > \"$dir/config.toml\" || exit 1
+fi
+printf '%s' \"$dir\"
+";
+
+// `usd` is input plus output $/M, or () when the listing names no price.
+async fn catalog() {
+    let out = eidolon::shell(sh_eid(CATALOG_SH, []), Some(60)).await?;
+    if out.contains("[exit code") {
+        return Err(`no model list: ${out}`);
+    }
+    let rows = [];
+    for line in out.split("\n") {
+        let f = line.split("\t").collect::<Vec>();
+        if f.len() < 4 {
+            continue;
+        }
+        let price = "unpriced";
+        let usd = None;
+        if f[1] != "-" {
+            price = "$" + f[1] + "/" + f[2] + " per M";
+            usd = Some(((number(f[1]) + number(f[2])) * 10000.0).round() / 10000.0);
+        }
+        let ctx = "context unknown";
+        if f[3] != "-" {
+            ctx = `${f[3]} ctx`;
+        }
+        rows.push(#{ model: f[0], price: price, ctx: ctx, usd: usd });
+    }
+    if rows.len() == 0 {
+        return Err("`eidolon models` listed no models, so there is nothing to choose from: check that this eidolon has a provider configured (EIDOLON_BIN, if set, names the binary used)");
+    }
+    Ok(rows)
+}
+
+// A successful result, not a refusal: the model is the caller's (or its operator's) to decide.
+fn needs_choice(kind, rows, tool, input) {
+    let options = [];
+    for r in rows.iter().take(12) {
+        options.push(#{ model: r.model, price: r.price, ctx: r.ctx });
+    }
+    let question = `No model picked for kind '${kind}'. Choose one (or ask the operator), then call subagent_pick {kind, model} or retry with model.`;
+    let out = #{
+        status: "needs_choice",
+        kind: kind,
+        question: question,
+        options: options,
+        total_models: rows.len(),
+        retry: #{ tool: tool, input: input },
+    };
+    json::to_string(out).unwrap_or("{\"status\":\"needs_choice\"}")
+}
+
+// A file that is not a JSON object is refused rather than skipped.
+async fn read_picks() {
+    let out = eidolon::shell(sh_cmd(PICKS_SH, []), Some(30)).await?;
+    let global = "";
+    let project = "";
+    match out.split_once("\n@@project\n") {
+        Some(pair) => {
+            global = pair.0;
+            project = pair.1;
+        }
+        None => {}
+    }
+    match global.split_once("@@global\n") {
+        Some(pair) => global = pair.1,
+        None => {}
+    }
+    Ok(#{ global: parse_picks(global, "the global picks file")?, project: parse_picks(project, "<cwd>/.eidolon/subagent-picks.json")? })
+}
+
+fn parse_picks(text, what) {
+    let t = text.trim();
+    if t == "" {
+        return Ok(#{});
+    }
+    match json::from_string(t) {
+        Ok(v) => {
+            let out = #{};
+            for (k, m) in v {
+                out.insert(k, `${m}`);
+            }
+            Ok(out)
+        }
+        Err(e) => Err(`${what} is not a JSON object of kind -> model (${e}); fix or delete it`),
+    }
+}
+
+// "*" is only for listing picks and is refused here.
+fn checked_kind(raw) {
+    let kind = raw.trim();
+    if kind == "" || kind == "*" {
+        return Err("kind is a short name you choose for this sort of subagent, e.g. research");
+    }
+    if kind.len() > 64 {
+        return Err("kind is at most 64 characters");
+    }
+    for c in kind.chars() {
+        if !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err(`kind '${kind}' may hold only letters, digits, '-', '_' and '.'`);
+        }
+    }
+    Ok(kind)
+}
+
+fn budget_of(raw) {
+    let out = #{ calls: "", usd_max: "", usd_min: "" };
+    let b = match raw {
+        Some(v) => v,
+        None => return Ok(out),
+    };
+    match b.get("calls") {
+        Some(v) => {
+            let s = `${v}`;
+            let n = match s.parse::<i64>() {
+                Ok(n) => n,
+                Err(_) => 0,
+            };
+            if n < 1 || n > 10000 {
+                return Err(`budget.calls is a whole number from 1 to 10000, not ${s}`);
+            }
+            out.calls = `${n}`;
+        }
+        None => {}
+    }
+    match b.get("usd_max") {
+        Some(v) => out.usd_max = dollars(v, "usd_max")?,
+        None => {}
+    }
+    match b.get("usd_min") {
+        Some(v) => out.usd_min = dollars(v, "usd_min")?,
+        None => {}
+    }
+    if out.usd_max != "" && out.usd_min != "" && number(out.usd_min) > number(out.usd_max) {
+        return Err("budget.usd_min is more than budget.usd_max");
+    }
+    Ok(out)
+}
+
+fn dollars(v, name) {
+    let s = `${v}`;
+    match s.parse::<f64>() {
+        Ok(n) => {
+            if n < 0.0 {
+                return Err(`budget.${name} is a number of dollars >= 0, not ${s}`);
+            }
+            Ok(s)
+        }
+        Err(_) => Err(`budget.${name} is a number of dollars, not ${s}`),
+    }
+}
+
+fn budget_words(budget) {
+    let parts = [];
+    if budget.calls != "" {
+        parts.push(`calls ${budget.calls} (enforced: max_iterations in the child's own config)`);
+    }
+    if budget.usd_max != "" {
+        parts.push("usd_max $" + budget.usd_max + " (checked after the fact)");
+    }
+    if budget.usd_min != "" {
+        parts.push("usd_min $" + budget.usd_min + " (a reserve; recorded)");
+    }
+    if parts.len() == 0 {
+        return "none";
+    }
+    let out = "";
+    for p in parts {
+        if out != "" {
+            out += ", ";
+        }
+        out += p;
+    }
+    out
+}
+
+fn tools_of(raw) {
+    let out = [];
+    match raw {
+        Some(list) => {
+            for t in list {
+                let name = `${t}`.trim();
+                if name != "" {
+                    out.push(name);
+                }
+            }
+        }
+        None => {}
+    }
+    Ok(out)
+}
+
+fn number(text) {
+    match text.parse::<f64>() {
+        Ok(n) => n,
+        Err(_) => 0.0,
+    }
+}
+
+
+// The guard as the child's command line runs it, and as `subagent_spawn` asks it first.
+const GUARD = "[ -n \"$EIDOLON_SUBAGENT\" ] && { echo \"refused: a subagent may not spawn subagents\" >&2; exit 3; }";
+const REFUSED = "refused: a subagent may not spawn subagents";
+
+// The child, as the one command line `shell_background` takes (run under `bash -c`, in this
+// session's working directory), in POSIX sh:
+//
+//   * the guard first, so a child of a child is refused at its first line;
+//   * the deadline as a `sleep` in a backgrounded subshell that signals its process group:
+//     `shell_background` starts the command under `setsid`, so `kill -TERM 0` reaches
+//     `eidolon run` and its whole tree and nothing else. No `timeout`: it is GNU;
+//   * `kill $!` when the child finishes first. The subshell's trap takes the `sleep` too,
+//     or a stray `sleep` keeps the group answering `kill -0 -<pid>` "alive" until the deadline.
+//
+// The pid that comes back is the shell's, the group leader, which `subagent_cancel` signals.
+const CHILD_SH = "[ -n \"$EIDOLON_SUBAGENT\" ] && { echo \"refused: a subagent may not spawn subagents\" >&2; exit 3; }
+export EIDOLON_SUBAGENT=1
+export EIDOLON_BIN={eid}
+( trap 'kill \"$sleeper\" 2>/dev/null; exit 0' TERM
+  sleep {seconds} &
+  sleeper=$!
+  wait \"$sleeper\"
+  echo \"deadline reached\" >&2
+  kill -TERM 0 ) &
+{eid} run {flags}{brief}
+code=$?
+kill $! 2>/dev/null
+exit $code
+";
+
+// `printf` gets one quoted word per line, so nothing in a task, kind or model can become syntax.
+const WRITE_SH = "root=${XDG_STATE_HOME:-$HOME/.local/state}/eidolon/subagents
+dir=$root/{id}
+mkdir -p \"$dir\" || exit 1
+printf '%s\n' {lines} > \"$dir/meta\" || exit 1
+printf '%s' {brief} > \"$dir/brief\" || exit 1
+printf '%s\n' \"$dir/meta\" \"$dir/brief\"
+";
+
+// No trailing newline, so the line back is exactly the two words.
+const ID_CMD = "s=$(date +%s); printf 'sa-%s-%s %s' \"$s\" \"$(od -An -N2 -tx1 /dev/urandom | tr -d ' \\n')\" \"$s\"";
+
+// The block from ../brief.md, which is its readable copy: keep them in step. The tool fills
+// {id}, {parent}, {task} and {deadline}; {cwd} becomes words, because the child inherits the
+// parent's directory.
+const BRIEF = "You are subagent {id}.
+
+Your parent is {parent}; your tools run in {cwd}; you have {deadline} minutes,
+after which you are stopped and report what you have.
+
+{task}
+
+When the task is done — or the deadline arrives — do exactly three things and
+nothing else:
+
+1. Send your parent one message, to {parent}, with `send` — a direct message
+   wakes an idle parent by default, and that is the point: the report is the
+   thing the parent is waiting on:
+   * state: done, or stopped-early and why
+   * what you changed, by path, and whether it is committed
+   * the checks you ran, with their counts, and what you could NOT check
+   * your journal path, so the parent can resume you (`eidolon resume <path>`,
+     optionally `--at <record id>`), and whether the context should be
+     compacted first (`compact` in a session; the journal records it)
+2. Say nothing else to anyone. No channel messages, no courtesy replies.
+3. Stop. If you are a one-shot run you simply end; if you are a chat, end your
+   turn and leave the journal as it is — it is the record the parent resumes.
+
+Your journal is the only thing that has to be right. Do not summarise it away,
+do not compact for a finished task, and do not delete the log.
+
+The parent follows you with `subagent_list`, `subagent_trace` and
+`subagent_steer`, and can stop you with `subagent_cancel`. A steer arrives at
+your next step: read it as a change of plan, and say so in your report.
+Do not call subagent_spawn yourself.
+";
+
+fn brief(id, parent, task, minutes, tools) {
+    let body = `${task}`;
+    if tools.len() > 0 {
+        let names = "";
+        for t in tools {
+            if names != "" {
+                names += ", ";
+            }
+            names += t;
+        }
+        body += `\n\nConfine yourself to these tools: ${names}. Nothing enforces this; it is the parent's instruction, and a reason to say so in your report if you could not do the task within it.`;
+    }
+    let text = BRIEF
+        .replace("{id}", id)
+        .replace("{parent}", parent)
+        .replace("{deadline}", `${minutes}`)
+        .replace("{cwd}", "the parent's working directory")
+        .replace("{task}", body);
+    text
+}
+
+// One `key=value` line per fact. An empty value means "not given"; this file records what
+// was passed, not what it means.
+fn meta_lines(id, parent, kind, model, model_from, budget, config, pid, log, status, started, minutes) {
+    let lines = "";
+    let facts = [
+        `id=${id}`,
+        `parent=${parent}`,
+        `kind=${kind}`,
+        `model=${model}`,
+        `model_from=${model_from}`,
+        `budget_calls=${budget.calls}`,
+        `budget_usd_max=${budget.usd_max}`,
+        `budget_usd_min=${budget.usd_min}`,
+        `config=${config}`,
+        `pid=${pid}`,
+        `log=${log}`,
+        `status=${status}`,
+        `started=${started}`,
+        `deadline_min=${minutes}`,
+    ];
+    for f in facts {
+        lines += `${quote(f)} `;
+    }
+    lines
+}
+
+// The id between the first pair of backticks, "" when there is none.
+fn parent_id(roster) {
+    let id = "";
+    match roster.split_once("`") {
+        Some(head) => match head.1.split_once("`") {
+            Some(quoted) => id = quoted.0,
+            None => {}
+        },
+        None => {}
+    }
+    id
+}
+
+// Default 15; clamped, since the deadline is a `sleep` and 0 minutes is no child at all.
+fn deadline_min(requested) {
+    let n = match requested {
+        Some(v) => v,
+        None => 15,
+    };
+    if n < 1 {
+        1
+    } else if n > 120 {
+        120
+    } else {
+        n
+    }
+}
+
+fn text_of(value) {
+    match value {
+        Some(v) => `${v}`,
+        None => "",
+    }
+}
+
+fn field(text, key) {
+    let out = "";
+    let body = `${text}`;
+    for line in body.split('\n') {
+        if line.starts_with(`${key}: `) {
+            match line.split_once(": ") {
+                Some(pair) => out = pair.1,
+                None => {}
+            }
+        }
+    }
+    out
+}
+
+// `shell_background` prints `status: <path> (written when the command finishes)`; the parenthetical is not the path.
+fn path_of(text) {
+    let body = `${text}`;
+    let out = body;
+    match body.split_once(" (") {
+        Some(pair) => out = pair.0,
+        None => {}
+    }
+    out
+}
+
+fn quote(text) {
+    let s = `${text}`;
+    `'${s.replace("'", "'\\''")}'`
+}
+
+// The eidolon binary: $EIDOLON_BIN if set (and then only that), else `eidolon` on PATH, else
+// $HOME/.local/bin/eidolon, each only if it answers `--version`: without a login shell (a
+// Windows `wsl.exe -e`, a service, cron) PATH can hold a stub that is executable and runs
+// nothing (Minerva's does). None works: exit 127 and say how to fix it.
+const EID_SH = "eid=
+eid_ok() { [ -f \"$1\" ] && [ -x \"$1\" ] && \"$1\" --version >/dev/null 2>&1; }
+if [ -n \"${EIDOLON_BIN:-}\" ]; then
+  if eid_ok \"$EIDOLON_BIN\"; then eid=$EIDOLON_BIN; fi
+else
+  onpath=$(command -v eidolon 2>/dev/null)
+  if [ -n \"$onpath\" ] && eid_ok \"$onpath\"; then
+    eid=$onpath
+  elif eid_ok \"$HOME/.local/bin/eidolon\"; then
+    eid=$HOME/.local/bin/eidolon
+  fi
+fi
+if [ -z \"$eid\" ]; then
+  if [ -n \"${EIDOLON_BIN:-}\" ]; then
+    printf 'subagent: EIDOLON_BIN is set to %s, which is not an executable that runs (`%s --version` failed). Fix it or unset it.\\n' \"$EIDOLON_BIN\" \"$EIDOLON_BIN\" >&2
+  else
+    printf 'subagent: cannot find a working eidolon binary: `eidolon` on PATH is %s and %s/.local/bin/eidolon does not run. Set EIDOLON_BIN to the full path of one that does.\\n' \"${onpath:-absent}\" \"$HOME\" >&2
+  fi
+  exit 127
+fi
+";
+
+// The script, handed to `sh -c` with its arguments after `$0`: POSIX sh rather
+// than whatever `eidolon::shell` runs.
+fn sh_cmd(script, args) {
+    let cmd = `sh -c ${quote(script)} sa`;
+    for a in args {
+        cmd += ` ${quote(a)}`;
+    }
+    cmd
+}
+
+fn sh_eid(script, args) {
+    sh_cmd(EID_SH + script, args)
+}

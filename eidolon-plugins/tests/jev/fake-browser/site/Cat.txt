@@ -1,0 +1,6 @@
+- main [ref=e1]:
+  - heading "Cat" [level=1] [ref=e2]
+  - link "Felidae" [ref=e3]:
+    - /url: /wiki/Felidae
+  - link "Ancient Egypt" [ref=e4]:
+    - /url: /wiki/Ancient_Egypt

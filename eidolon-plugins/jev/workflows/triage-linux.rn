@@ -1,0 +1,25 @@
+// `triage-linux`: a chooser walks a fixed menu of read-only recon commands.
+
+// PIN is the sha256 of graphs/triage-linux.json; tests/jev/pin.sh rewrites it.
+const GRAPH = "triage-linux";
+const PIN = "sha256:388fbebbc8abebfd1a70527d77ecb011bc30ca01de95788b9092801b22d9324e";
+
+pub fn workflow() {
+    #{
+        name: "triage-linux",
+        description: "Triage an unfamiliar Linux box with a fixed menu of read-only commands, a chooser picking each next one: what it is, what it exposes, what is running, what looks out of place. Here by default; distro or ssh to run elsewhere. Needs the jev service.",
+        approval: "read_only",
+        params: #{
+            "type": "object",
+            "properties": #{
+                "distro": #{ "type": "string", "description": "Run the commands inside this WSL distribution." },
+                "ssh": #{ "type": "string", "description": "Run the commands on this host over ssh (user@host or host; key-based)." },
+                "ssh_port": #{ "type": "integer", "description": "The ssh port, with ssh. Default 22." },
+            },
+        },
+    }
+}
+
+pub async fn run(args) {
+    run_pinned(GRAPH, PIN, with_defaults(args, #{})).await
+}

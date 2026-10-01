@@ -1,0 +1,34 @@
+// `browser_back`, faked: see ../fb.sh. FAKE_BROWSER names the directory fb.sh is in.
+pub fn manifest() {
+    #{
+        name: "browser_back",
+        description: "Go back (a test fake)",
+        approval: "read_only",
+        input_schema: #{ "type": "object", "properties": #{} },
+    }
+}
+
+fn word(input, key) {
+    match input.get(key) {
+        Some(v) => {
+            let s = `${v}`;
+            for c in s.chars() {
+                let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == ':' || c == '/' || c == '.';
+                if !ok {
+                    return Err("not a plain word: " + s);
+                }
+            }
+            Ok(s)
+        }
+        None => Ok(""),
+    }
+}
+
+pub async fn call(input) {
+    let arg = "";
+    let out = eidolon::shell("bash \"$FAKE_BROWSER/fb.sh\" back " + arg, Some(20)).await?;
+    if out.starts_with("[exit code") || out.contains("--- stderr ---") {
+        return Err(out);
+    }
+    Ok(out)
+}

@@ -1,0 +1,429 @@
+// Run a plan from `subagent_plan` (README, "Fan-out workflow"): spawn each role's children,
+// follow them, step the model down or stop when finished children's spend crosses the
+// thresholds, and report what came back.
+//
+// Args: the plan (`roles`, `thresholds`, `ladder`, `total_usd`, `task`) and three knobs:
+//   parallel   most children running at once, 1-10, default 3
+//   poll_s     seconds each `subagent_list` waits before looking, 1-60, default 30
+//   max_polls  waits before giving up on running children, 1-120, default 60
+//
+// Every effect is a dispatched tool call, so the gate sees each one and a resumed run
+// replays them; the program reads no clock and sleeps only through `subagent_list`'s `wait_s`.
+//
+// Ratio = known spend / total_usd, spend being the HIGH end of the range (over-counts rather
+// than under-counts). A running child counts as zero, a finished child on an unpriced model
+// as unknown: named in the report, not moving the ratio. With no total the thresholds are
+// inactive. `step_down` skips a role that has not yet spent its `usd_min` reserve.
+
+pub fn workflow() {
+    #{
+        name: "fanout",
+        description: "Run a subagent_plan: spawn each role's children on their picked models, watch finished children's spend against the formation's thresholds (step down, ask, stop), and report each child's result.",
+        approval: "mutating",
+        params: #{
+            "type": "object",
+            "properties": #{
+                "task": #{ "type": "string", "description": "The task every child is given (from the plan)." },
+                "roles": #{ "type": "array", "description": "The plan's resolved roles." },
+                "thresholds": #{ "type": "array", "description": "The plan's thresholds." },
+                "ladder": #{ "type": "array", "description": "The plan's priced catalog, cheapest first." },
+                "total_usd": #{ "type": "number", "description": "The plan's total budget in dollars; omit for none." },
+                "parallel": #{ "type": "integer", "description": "Most children running at once, 1-10. Default 3." },
+                "poll_s": #{ "type": "integer", "description": "Seconds to wait before each look at the children, 1-60. Default 30." },
+                "max_polls": #{ "type": "integer", "description": "Looks to make while children run, 1-120. Default 60." },
+            },
+            "required": ["task", "roles"],
+        },
+    }
+}
+
+pub async fn run(args) {
+    match args.get("status") {
+        Some(s) => {
+            if `${s}` != "plan" {
+                return fatal("fanout: these args are not a plan (status is " + `${s}` + "): pass what subagent_plan returned once it said \"plan\"");
+            }
+        }
+        None => {}
+    }
+    let task = match args.get("task") {
+        Some(t) => `${t}`,
+        None => return fatal("fanout: args need the plan's `task`"),
+    };
+    let roles = match args.get("roles") {
+        Some(r) => r,
+        None => return fatal("fanout: args need the plan's `roles`"),
+    };
+    let ladder = match args.get("ladder") {
+        Some(l) => l,
+        None => [],
+    };
+    let thresholds = sorted_thresholds(match args.get("thresholds") {
+        Some(t) => t,
+        None => [],
+    });
+    let total = match args.get("total_usd") {
+        Some(v) => as_number(v),
+        None => None,
+    };
+    let parallel = clamp(opt_int(args.get("parallel"), 3), 1, 10);
+    let poll_s = clamp(opt_int(args.get("poll_s"), 30), 1, 60);
+    let max_polls = clamp(opt_int(args.get("max_polls"), 120 / 2), 1, 120);
+
+    let spawned = [];
+    let asked = [];
+    let notes = [];
+    let stopped = false;
+    let state = #{ spent: 0.0, unknown: 0, running: 0, by_role: #{}, rows: #{} };
+
+    for role in roles {
+        let rname = text(role.get("role"));
+        let count = opt_int(role.get("count"), 1);
+        let floor = text(role.get("floor"));
+        let model_picked = text(role.get("model"));
+        let budget = match role.get("budget") {
+            Some(b) => b,
+            None => #{},
+        };
+        let usd_min = match budget.get("usd_min") {
+            Some(v) => number(`${v}`),
+            None => 0.0,
+        };
+        let i = 0;
+        while i < count && !stopped {
+            i += 1;
+
+            if spawned.len() > 0 {
+                state = look(spawned, 0).await?;
+            }
+            let polls = 0;
+            while state.running >= parallel && polls < max_polls {
+                polls += 1;
+                state = look(spawned, poll_s).await?;
+            }
+
+            let ratio = 0.0;
+            match total {
+                Some(t) => {
+                    if t > 0.0 {
+                        ratio = state.spent / t;
+                    }
+                }
+                None => {}
+            }
+            let rungs = 0;
+            for th in thresholds {
+                let at = number(`${th.get("at").unwrap()}`);
+                if ratio < at {
+                    continue;
+                }
+                let action = text(th.get("action"));
+                if action == "stop" {
+                    stopped = true;
+                    notes.push("stop threshold " + `${at}` + " crossed: spent " + money(state.spent) + " of " + money(total.unwrap()) + "; no further children started");
+                } else if action == "ask" {
+                    let key = `${at}`;
+                    let seen = false;
+                    for a in asked {
+                        if a == key {
+                            seen = true;
+                        }
+                    }
+                    if !seen {
+                        asked.push(key);
+                        let question = "fanout: finished children have spent " + money(state.spent) + " of " + money(total.unwrap()) + " (ratio " + `${ratio}` + ", threshold " + `${at}` + "), with " + `${spawned.len()}` + " started and the rest of the plan still to spawn. Answer \"stop\" to stop spawning; anything else carries on.";
+                        let answer = eidolon::park(question).await?;
+                        notes.push("asked at " + `${at}` + ", answered: " + answer);
+                        if answer.trim().to_lowercase().starts_with("stop") {
+                            stopped = true;
+                        }
+                    }
+                } else if action == "step_down" {
+                    rungs += 1;
+                }
+            }
+            if stopped {
+                break;
+            }
+
+            // The pick, stepped down if a threshold says so and the role's reserve has been spent.
+            let model = model_picked;
+            if rungs > 0 {
+                let role_spent = match state.by_role.get(rname) {
+                    Some(v) => v,
+                    None => 0.0,
+                };
+                if role_spent >= usd_min {
+                    let lower = step_down(model_picked, rungs, floor, ladder);
+                    if lower != model_picked {
+                        notes.push("role " + rname + ": stepped down " + model_picked + " -> " + lower + " (" + `${rungs}` + " step_down threshold(s) crossed)");
+                    } else {
+                        notes.push("role " + rname + ": step-down due but not taken: no cheaper priced rung, or the floor (" + floor + ") forbids it, so it keeps " + model_picked);
+                    }
+                    model = lower;
+                } else {
+                    notes.push("role " + rname + ": step-down due but its reserve (usd_min " + money(usd_min) + ") is unspent (" + money(role_spent) + "), so it keeps " + model_picked);
+                }
+            }
+
+            let input = #{ task: task.clone(), kind: text(role.get("kind")), model: model.clone() };
+            input.insert("budget", budget.clone());
+            match role.get("tools") {
+                Some(t) => {
+                    input.insert("tools", t);
+                }
+                None => {}
+            }
+            match role.get("yolo") {
+                Some(y) => {
+                    input.insert("yolo", y);
+                }
+                None => {}
+            }
+            match role.get("deadline_min") {
+                Some(d) => {
+                    input.insert("deadline_min", d);
+                }
+                None => {}
+            }
+            let made = match eidolon::tool_call("subagent_spawn", input).await {
+                Ok(t) => t,
+                Err(e) => {
+                    if spawned.len() == 0 {
+                        return fatal("fanout: nothing could be spawned: " + e);
+                    }
+                    notes.push("spawn of " + rname + " failed, no further children started: " + e);
+                    stopped = true;
+                    break;
+                }
+            };
+            let id = id_of(made);
+            if id == "" {
+                if spawned.len() == 0 {
+                    return fatal("fanout: spawn did not start a child: " + made);
+                }
+                notes.push("spawn of " + rname + " started nothing (" + made + "), no further children started");
+                stopped = true;
+                break;
+            }
+            spawned.push(#{ id: id, role: rname, kind: text(role.get("kind")), model: model });
+        }
+        if stopped {
+            break;
+        }
+    }
+
+    // Let the rest finish, unless stopped: a stop returns what is done.
+    if !stopped && spawned.len() > 0 {
+        let polls = 0;
+        state = look(spawned, 0).await?;
+        while state.running > 0 && polls < max_polls {
+            polls += 1;
+            state = look(spawned, poll_s).await?;
+        }
+        if state.running > 0 {
+            notes.push("gave up waiting after " + `${max_polls}` + " looks: " + `${state.running}` + " child(ren) still running");
+        }
+    } else if spawned.len() > 0 {
+        state = look(spawned, 0).await?;
+    }
+
+    report(spawned, state, total, notes).await
+}
+
+// The finished children's spend and the running count, from one `subagent_list` call. `spent` is
+// the high end of each finished, priced child's range; `unknown` counts finished ones with no
+// figure; `by_role` splits `spent` by role.
+async fn look(spawned, wait_s) {
+    let ids = [];
+    for c in spawned {
+        ids.push(c.id);
+    }
+    let input = #{ ids: ids, format: "json" };
+    if wait_s > 0 {
+        input.insert("wait_s", wait_s);
+    }
+    let text_out = match eidolon::tool_call("subagent_list", input).await {
+        Ok(t) => t,
+        Err(e) => return Err("subagent_list failed: " + e),
+    };
+    let rows = match json::from_string(text_out) {
+        Ok(r) => r,
+        Err(e) => return Err("subagent_list did not answer JSON: " + `${e}`),
+    };
+    let state = #{ spent: 0.0, unknown: 0, running: 0, by_role: #{}, rows: #{} };
+    for row in rows {
+        let id = text(row.get("id"));
+        let alive = match row.get("alive") {
+            Some(a) => a == true,
+            None => false,
+        };
+        state.rows.insert(id.clone(), row);
+        if alive {
+            state.running += 1;
+            continue;
+        }
+        let high = match row.get("usd_high") {
+            Some(v) => as_number(v),
+            None => None,
+        };
+        match high {
+            Some(h) => {
+                state.spent += h;
+                let role = "";
+                for c in spawned {
+                    if c.id == id {
+                        role = c.role;
+                    }
+                }
+                let before = match state.by_role.get(role) {
+                    Some(v) => v,
+                    None => 0.0,
+                };
+                state.by_role.insert(role.clone(), before + h);
+            }
+            None => {
+                state.unknown += 1;
+            }
+        }
+    }
+    Ok(state)
+}
+
+// The next strictly cheaper rung, `rungs` times, never below the floor's price.
+// A model the ladder does not price stays as it is; so does one whose floor the
+// ladder does not price (the step cannot be checked, so it is not taken).
+fn step_down(model, rungs, floor, ladder) {
+    let cur = find(ladder, model);
+    if cur < 0 {
+        return model;
+    }
+    let floor_usd = 0.0;
+    if floor != "" {
+        let f = find(ladder, floor);
+        if f < 0 {
+            return model;
+        }
+        floor_usd = ladder[f].usd;
+    }
+    let r = 0;
+    while r < rungs {
+        r += 1;
+        let j = cur - 1;
+        let found = -1;
+        while j >= 0 && found < 0 {
+            if ladder[j].usd < ladder[cur].usd {
+                found = j;
+            }
+            j -= 1;
+        }
+        if found < 0 || ladder[found].usd < floor_usd {
+            break;
+        }
+        cur = found;
+    }
+    ladder[cur].model
+}
+
+fn find(ladder, model) {
+    let i = 0;
+    let at = -1;
+    for l in ladder {
+        if l.model == model {
+            at = i;
+        }
+        i += 1;
+    }
+    at
+}
+
+fn sorted_thresholds(list) {
+    let out = [];
+    for t in list {
+        let at = as_number(t.get("at").unwrap()).unwrap_or(0.0);
+        let i = 0;
+        while i < out.len() && as_number(out[i].get("at").unwrap()).unwrap_or(0.0) <= at {
+            i += 1;
+        }
+        out.insert(i, t);
+    }
+    out
+}
+
+// One block per child (state, spend, tail of its log, which holds its report or question), then the threshold notes.
+async fn report(spawned, state, total, notes) {
+    let out = "fanout: " + `${spawned.len()}` + " child(ren) started\n";
+    for c in spawned {
+        let row = match state.rows.get(c.id) {
+            Some(r) => r,
+            None => #{},
+        };
+        let alive = match row.get("alive") {
+            Some(a) => a == true,
+            None => false,
+        };
+        let spend = "spend unknown";
+        match row.get("calls") {
+            Some(n) => {
+                let high = match row.get("usd_high") {
+                    Some(v) => as_number(v),
+                    None => None,
+                };
+                match high {
+                    Some(h) => {
+                        let low = match row.get("usd_low") {
+                            Some(v) => as_number(v).unwrap_or(0.0),
+                            None => 0.0,
+                        };
+                        spend = `${n}` + " calls, " + money(low) + " to " + money(h);
+                    }
+                    None => {
+                        spend = `${n}` + " calls, dollars unpriced or unknown";
+                    }
+                }
+            }
+            None => {}
+        }
+        let status = "finished";
+        if alive {
+            status = "still running";
+        }
+        out += "\n== " + c.id + "  role " + c.role + ", kind " + c.kind + ", model " + c.model + "  " + status + "  " + spend + "\n";
+        let tail = match eidolon::tool_call("subagent_trace", #{ id: c.id, lines: 30 }).await {
+            Ok(t) => t,
+            Err(e) => "(trace failed: " + e + ")",
+        };
+        out += tail;
+    }
+    out += "\n";
+    match total {
+        Some(t) => {
+            out += "known spend of finished children: " + money(state.spent) + " of " + money(t) + " (high end of each range";
+            out += "; running children count as zero until a turn ends";
+            if state.unknown > 0 {
+                out += "; " + `${state.unknown}` + " finished child(ren) have no dollar figure and are not counted";
+            }
+            out += ")\n";
+        }
+        None => {
+            out += "no total budget: thresholds were inactive. known spend of finished children: " + money(state.spent) + "\n";
+        }
+    }
+    for n in notes {
+        out += "note: " + n + "\n";
+    }
+    Ok(out)
+}
+
+fn id_of(made) {
+    let id = "";
+    for line in made.split("\n") {
+        if line.starts_with("subagent sa-") {
+            match line.split_once(" ") {
+                Some(p) => id = p.1,
+                None => {}
+            }
+        }
+    }
+    id
+}

@@ -1,0 +1,49 @@
+// `browser_click`: the service's `click` (../service/src/browser.rs).
+pub fn manifest() {
+    #{
+        name: "browser_click",
+        description: "Click the element with this ref, taken from the most recent browser_snapshot. A ref not from that snapshot -- reused, or from an earlier one -- is refused by name rather than guessed at. Reach for this to follow a link, press a button, or otherwise act on something browser_snapshot showed you. After it returns, call browser_snapshot again before clicking or typing anything else: this call invalidates every ref the last snapshot handed out, on the assumption that a click can change the page even when it does not navigate.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "ref": #{
+                    "type": "string",
+                    "description": "A ref from the current browser_snapshot, e.g. \"e7\".",
+                },
+            },
+            "required": ["ref"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    call_service("click", input).await
+}
+
+// Everything below is the same in every browser_*.rn: upstream eidolon
+// compiles each tool file on its own, and a tool file is meant to be handed
+// over whole.
+
+// The browser service (../service). Change the port here and in the
+// service's EIDOLON_SERVICE_PORT together.
+fn service() {
+    #{
+        name: "browser",
+        base_url: "http://127.0.0.1:8090",
+        token_file: "~/.config/eidolon/browser.token",
+        auth: #{ header: "Authorization", prefix: "Bearer " },
+        timeout_s: 180,
+    }
+}
+
+// POST {method, args} to /call; the answer is {ok, result} or {ok: false, error}.
+async fn call_service(method, args) {
+    let body = json::to_string(#{ "method": method, "args": args })?;
+    let reply = json::from_string(eidolon::api_request(service(), "POST", "/call", Some(body)).await?)?;
+    if reply.status != 200 {
+        return Err(`browser service answered ${reply.status}: ${reply.body}`);
+    }
+    let out = json::from_string(reply.body)?;
+    if out.ok { Ok(out.result) } else { Err(out.error) }
+}

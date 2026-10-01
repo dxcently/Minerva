@@ -1,0 +1,246 @@
+// What a tool's text becomes as an observation, and the accessibility-tree lines a
+// `refs` menu is built from. A `browser_snapshot` starts with a head block of
+// `key: value` lines (url, title, heading, chars, ...) and a blank line, then the tree
+// (`- link "name" [ref=e7]:`, nested by indent). Any other tool text is just `text`.
+
+fn parse_head(raw) {
+    let lines = raw.split("\n").collect::<Vec>();
+    if lines.len() < 3 {
+        return None;
+    }
+    if !lines[0].starts_with("url: ") || !lines[1].starts_with("title: ") {
+        return None;
+    }
+    let head = #{ url: lines[0].get(5..).unwrap_or(""), title: lines[1].get(7..).unwrap_or("") };
+    let i = 2;
+    while i < lines.len() {
+        let l = lines[i];
+        if l == "" {
+            let body = "";
+            let j = i + 1;
+            let first = true;
+            while j < lines.len() {
+                if first {
+                    first = false;
+                } else {
+                    body += "\n";
+                }
+                body += lines[j];
+                j += 1;
+            }
+            return Some(#{ head: head, body: body });
+        }
+        match l.split_once(": ") {
+            Some((key, value)) => {
+                if !is_head_key(key) {
+                    return None;
+                }
+                head[key] = value;
+            }
+            None => return None,
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_head_key(k) {
+    let first = true;
+    for c in k.chars() {
+        if first {
+            if !(c >= 'a' && c <= 'z') {
+                return false;
+            }
+            first = false;
+        } else if !((c >= 'a' && c <= 'z') || c == '_') {
+            return false;
+        }
+    }
+    !first
+}
+
+fn refs_grammar() {
+    #{
+        prop: regex_compile("^/(?P<key>[A-Za-z][A-Za-z0-9_-]*):\\s*(?P<value>.*)$").unwrap(),
+        quoted: regex_compile("^'(?P<head>(?:''|[^'])*)'\\s*:\\s*(?P<rest>.*)$").unwrap(),
+        element: regex_compile("^(?P<role>[A-Za-z][A-Za-z0-9_-]*)(?:\\s+\"(?P<name>(?:[^\"\\\\]|\\\\.)*)\")?(?P<attrs>(?:\\s*\\[[A-Za-z]+=[^\\]]*\\])*)\\s*:?\\s*(?P<text>.*)$").unwrap(),
+        attr: regex_compile("\\[(?P<k>[A-Za-z]+)=(?P<v>[^\\]]*)\\]").unwrap(),
+    }
+}
+
+fn is_landmark(role) {
+    role == "banner" || role == "navigation" || role == "main" || role == "complementary"
+        || role == "contentinfo" || role == "search" || role == "region"
+}
+
+fn parse_attrs(gr, s) {
+    let out = #{};
+    let rest = s;
+    loop {
+        let m = regex_search_in(gr.attr, rest);
+        match m {
+            Some(hit) => {
+                match hit.groups.get("k") {
+                    Some(k) => { out[k] = oget_or(hit.groups, "v", ""); }
+                    None => {}
+                }
+                let cs = rest.chars().collect::<Vec>();
+                let tail = "";
+                let i = hit.end;
+                while i < cs.len() {
+                    tail += `${cs[i]}`;
+                    i += 1;
+                }
+                rest = tail;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+// Tree lines into records #{ref, role, name, level, url, landmark, text}, and a count
+// of lines that looked like tree syntax and did not parse.
+fn parse_refs(gr, tree) {
+    let records = [];
+    let stack = [];
+    let skipped = 0;
+    for raw in tree.split("\n") {
+        let stripped = raw.trim();
+        if stripped == "" {
+            continue;
+        }
+        let indent = 0;
+        for c in raw.chars() {
+            if c == ' ' {
+                indent += 1;
+            } else {
+                break;
+            }
+        }
+        if !stripped.starts_with("- ") {
+            continue;
+        }
+        let content = raw.get(indent + 2..).unwrap_or("");
+        while stack.len() > 0 && stack[stack.len() - 1].indent >= indent {
+            stack.pop();
+        }
+        let parent = if stack.len() > 0 { stack[stack.len() - 1].rec } else { () };
+
+        match regex_search_in(gr.prop, content) {
+            Some(pm) => {
+                let key = oget_or(pm.groups, "key", "");
+                if key == "url" && !is_null(parent) {
+                    parent["url"] = oget_or(pm.groups, "value", "").trim();
+                }
+                stack.push(#{ indent: indent, rec: () });
+                continue;
+            }
+            None => {}
+        }
+
+        let element_src = content;
+        let text_override = ();
+        if content.starts_with("'") {
+            match regex_search_in(gr.quoted, content) {
+                Some(qm) => {
+                    element_src = oget_or(qm.groups, "head", "").replace("''", "'");
+                    let rest = oget_or(qm.groups, "rest", "").trim();
+                    text_override = if rest.len() >= 2 && rest.starts_with("\"") && rest.ends_with("\"") {
+                        rest.get(1..rest.len() - 1).unwrap_or(rest)
+                    } else {
+                        rest
+                    };
+                }
+                None => {}
+            }
+        }
+
+        match regex_search_in(gr.element, element_src) {
+            Some(em) => {
+                let attrs = parse_attrs(gr, oget_or(em.groups, "attrs", ""));
+                let level = ();
+                match attrs.get("level") {
+                    Some(lv) => {
+                        match lv.parse::<i64>() {
+                            Ok(n) => { level = n; }
+                            Err(_) => {}
+                        }
+                    }
+                    None => {}
+                }
+                let landmark = ();
+                let si = stack.len();
+                while si > 0 {
+                    si -= 1;
+                    let anc = stack[si].rec;
+                    if !is_null(anc) && is_landmark(anc.role) {
+                        landmark = anc.role;
+                        break;
+                    }
+                }
+                let text = if is_null(text_override) { oget_or(em.groups, "text", "").trim() } else { text_override };
+                let rec = #{
+                    "ref": oget_or(attrs, "ref", ()),
+                    role: oget_or(em.groups, "role", ""),
+                    name: oget_or(em.groups, "name", ()),
+                    level: level,
+                    url: (),
+                    landmark: landmark,
+                    text: if text == "" { () } else { text },
+                };
+                records.push(rec);
+                stack.push(#{ indent: indent, rec: rec });
+            }
+            None => {
+                skipped += 1;
+                stack.push(#{ indent: indent, rec: () });
+            }
+        }
+    }
+    #{ records: records, skipped: skipped }
+}
+
+// `chars:` in the head is the body length as the producer counted it; any other length
+// means it was shortened on the way, and `truncated` says so.
+fn build_obs(gr, raw) {
+    let parsed = parse_head(raw);
+    let obs = #{ text: raw, url: (), title: (), h1: (), scope: (), section: (), chars: (), truncated: false };
+    match parsed {
+        Some(p) => {
+            obs.text = p.body;
+            obs.url = p.head.url;
+            obs.title = p.head.title;
+            obs.scope = oget_or(p.head, "scope", ());
+            obs.section = oget_or(p.head, "section", ());
+            match oget(p.head, "chars") {
+                Some(cv) => {
+                    match cv.parse::<i64>() {
+                        Ok(n) => {
+                            obs.chars = n;
+                            if p.body.chars().count() != n {
+                                obs.truncated = true;
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                None => {}
+            }
+            let h = oget_or(p.head, "heading", "");
+            if h != "" {
+                obs.h1 = h;
+            } else {
+                let pr = parse_refs(gr, p.body);
+                for r in pr.records {
+                    if r.role == "heading" && !is_null(r.level) && r.level == 1 && !is_null(r.name) && r.name != "" {
+                        obs.h1 = r.name;
+                        break;
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+    obs
+}

@@ -1,0 +1,341 @@
+// `jev_graph`: a graph of this plugin as a drawing, as its exact text (`raw`), or in
+// pages (`from`). A workflow cannot read a file, so it asks here. The harness spills a
+// tool answer over about 8 KB to a file, hence pages of about 5000 characters;
+// `run_pinned` joins them, hashes the text and refuses a graph its workflow does not pin.
+//
+// The plugin dir is ${EIDOLON_JEV_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/eidolon/plugins/jev};
+// a copy under test sets EIDOLON_JEV_DIR. The id and `from` are checked before they
+// reach the command line.
+
+pub fn manifest() {
+    #{
+        name: "jev_graph",
+        description: "A jev graph of this plugin, drawn: JSON with its states (path, kind leaf/compound/final/history, description, what the menu is made from, the tools its actions call), its edges (from, to, kind, event, guard type) and the input it takes. With raw: true, the graph file's text exactly as stored; with from: N, one page of that text from line N (a first line `jev-page next=M`, then the lines) -- a graph workflow reads and hash-checks it that way.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "graph": #{ "type": "string", "description": "The graph's id: wiki-hop, find-related, ctf-juice-recon, triage-linux, triage-wsl or triage-botforge." },
+                "raw": #{ "type": "boolean", "description": "Return the file's text unchanged instead of the drawing." },
+                "from": #{ "type": "integer", "description": "Return one page of the file's text, starting at this line (1-based). The first line of the answer is `jev-page next=M`." },
+            },
+            "required": ["graph"],
+        },
+    }
+}
+
+fn graph_id(input) {
+    let id = match input.get("graph") {
+        Some(g) => `${g}`,
+        None => return Err("graph is required: the id of a graph in this plugin's graphs/"),
+    };
+    if id.len() == 0 || id.len() > 64 {
+        return Err("a graph id is 1 to 64 characters");
+    }
+    for c in id.chars() {
+        if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+            return Err(`not a graph id: ${id} (lowercase letters, digits and '-')`);
+        }
+    }
+    Ok(id)
+}
+
+fn failed(text) {
+    text.starts_with("[exit code") || text.starts_with("[timed out") || text.contains("--- stderr ---")
+}
+
+pub async fn call(input) {
+    let id = graph_id(input)?;
+    let path = "\"${EIDOLON_JEV_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/eidolon/plugins/jev}/graphs/" + id + ".json\"";
+    match input.get("from") {
+        Some(f) => {
+            if f is i64 || f is String {
+                let n = match `${f}`.parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) => return Err(`from is a line number, not ${f}`),
+                };
+                if n < 1 || n > 100000 {
+                    return Err(`from is a line number from 1, not ${n}`);
+                }
+                let script = "awk -v s=" + `${n}` + " 'NR<s{next} NR>s && n+length($0)+1>5000{nxt=NR; exit} {n+=length($0)+1; a[++k]=$0} END{print \"jev-page next=\" nxt+0; for(i=1;i<=k;i++) print a[i]}' " + path;
+                let text = eidolon::shell(script, Some(10)).await?;
+                if failed(text) || !text.starts_with("jev-page next=") {
+                    return Err(`no graph named ${id} in this plugin's graphs/: ${text}`);
+                }
+                return Ok(text);
+            }
+        }
+        None => {}
+    }
+    let raw = match input.get("raw") {
+        Some(r) => r == true,
+        None => false,
+    };
+    let text = eidolon::shell("cat " + path, Some(10)).await?;
+    if failed(text) {
+        return Err(`no graph named ${id} in this plugin's graphs/: ${text}`);
+    }
+    if raw {
+        return Ok(text);
+    }
+    let doc = match json::from_string(text) {
+        Ok(d) => d,
+        Err(e) => return Err(`the graph ${id} is not JSON: ${e}`),
+    };
+    Ok(json::to_string(draw(doc))?)
+}
+
+// The drawing's shape is in the README, "Drawing a run".
+
+fn is_null(v) {
+    match v {
+        () => true,
+        _ => false,
+    }
+}
+
+fn get_or(o, key, dflt) {
+    if o is Object {
+        match o.get(key) {
+            Some(v) => v,
+            None => dflt,
+        }
+    } else {
+        dflt
+    }
+}
+
+fn sorted_keys(o) {
+    let ks = [];
+    if o is Object {
+        for (k, _) in o {
+            ks.push(k);
+        }
+    }
+    ks.sort();
+    ks
+}
+
+fn dotted(path) {
+    let out = "";
+    let first = true;
+    for p in path {
+        if !first {
+            out += ".";
+        }
+        out += p;
+        first = false;
+    }
+    out
+}
+
+fn transitions_of(v) {
+    let out = [];
+    if is_null(v) {
+        return out;
+    }
+    if v is String {
+        out.push(#{ target: v });
+    } else if v is Object {
+        out.push(v);
+    } else if v is Vec {
+        for t in v {
+            if t is String {
+                out.push(#{ target: t });
+            } else {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+// `#id.a.b` is an absolute path, a bare name a sibling of the declaring state (a root transition's is top-level).
+fn target_path(id, owner, target) {
+    if target.starts_with("#") {
+        let parts = [];
+        for p in target.get(1..).unwrap_or("").split(".") {
+            if p != "" {
+                parts.push(p);
+            }
+        }
+        let out = [];
+        let i = 1;
+        while i < parts.len() {
+            out.push(parts[i]);
+            i += 1;
+        }
+        return dotted(out);
+    }
+    let out = [];
+    let i = 0;
+    while i + 1 < owner.len() {
+        out.push(owner[i]);
+        i += 1;
+    }
+    out.push(target);
+    dotted(out)
+}
+
+fn action_tools(actions, found) {
+    if !(actions is Vec) {
+        return;
+    }
+    for a in actions {
+        if a is Object && get_or(a, "type", "") == "tool" {
+            let name = get_or(get_or(a, "params", #{}), "name", ());
+            if name is String {
+                found.push(name);
+            }
+        }
+    }
+}
+
+fn edge_of(id, from, owner, tr, kind, event) {
+    let e = #{ from: from, kind: kind };
+    if event != "" {
+        e["event"] = event;
+    }
+    match tr.get("target") {
+        Some(t) => { e["to"] = target_path(id, owner, t); }
+        None => { e["to"] = (); }
+    }
+    let guard = get_or(tr, "guard", ());
+    if guard is Object {
+        e["guard"] = get_or(guard, "type", "");
+    }
+    if get_or(tr, "reenter", false) == true {
+        e["reenter"] = true;
+    }
+    e
+}
+
+fn choose_of(st) {
+    let meta = get_or(st, "meta", #{});
+    let choose = get_or(meta, "choose", ());
+    if !(choose is Object) {
+        return ();
+    }
+    let c = #{};
+    let from = get_or(choose, "from", ());
+    if from is String {
+        c["source"] = from;
+    } else if from is Object {
+        let ks = sorted_keys(from);
+        if ks.len() > 0 {
+            c["source"] = ks[0];
+            if ks[0] == "menu" {
+                let labels = [];
+                for item in get_or(from, "menu", []) {
+                    labels.push(get_or(item, "label", ""));
+                }
+                c["options"] = labels;
+            }
+        }
+    }
+    let floor = get_or(meta, "floor", ());
+    if !is_null(floor) {
+        c["floor"] = floor;
+    }
+    let ask = get_or(meta, "ask", ());
+    if !is_null(ask) {
+        c["ask"] = ask;
+    }
+    c
+}
+
+fn walk(id, states, parent, out_states, out_edges) {
+    for key in sorted_keys(states) {
+        let st = states[key];
+        let path = parent.clone();
+        path.push(key);
+        let name = dotted(path);
+        let kind = "leaf";
+        let ty = get_or(st, "type", "");
+        let children = get_or(st, "states", ());
+        if ty == "final" {
+            kind = "final";
+        } else if ty == "history" {
+            kind = "history";
+        } else if children is Object {
+            kind = "compound";
+        }
+        let rec = #{ path: name, kind: kind };
+        let d = get_or(st, "description", ());
+        if d is String {
+            rec["description"] = d;
+        }
+        let ch = choose_of(st);
+        if ch is Object {
+            rec["choose"] = ch;
+        }
+        let tools = [];
+        action_tools(get_or(st, "entry", ()), tools);
+        action_tools(get_or(st, "exit", ()), tools);
+        let on = get_or(st, "on", #{});
+        for ev in sorted_keys(on) {
+            for tr in transitions_of(on[ev]) {
+                action_tools(get_or(tr, "actions", ()), tools);
+            }
+        }
+        if tools.len() > 0 {
+            tools.sort();
+            rec["tools"] = tools;
+        }
+        if kind == "compound" {
+            let init = get_or(st, "initial", "");
+            if init != "" {
+                rec["initial"] = init;
+                out_edges.push(#{ from: name, to: name + "." + init, kind: "initial" });
+            }
+        }
+        if kind == "history" {
+            match st.get("target") {
+                Some(t) => { out_edges.push(#{ from: name, to: target_path(id, path, t), kind: "history" }); }
+                None => {}
+            }
+        }
+        out_states.push(rec);
+        for tr in transitions_of(get_or(st, "always", ())) {
+            out_edges.push(edge_of(id, name, path, tr, "always", ""));
+        }
+        for ev in sorted_keys(on) {
+            for tr in transitions_of(on[ev]) {
+                out_edges.push(edge_of(id, name, path, tr, "on", ev));
+            }
+        }
+        for tr in transitions_of(get_or(st, "onDone", ())) {
+            out_edges.push(edge_of(id, name, path, tr, "onDone", ""));
+        }
+        if kind == "compound" {
+            walk(id, children, path, out_states, out_edges);
+        }
+    }
+}
+
+fn draw(doc) {
+    let id = get_or(doc, "id", "");
+    let jev = get_or(get_or(doc, "meta", #{}), "jev", #{});
+    let states = [];
+    let edges = [];
+    walk(id, get_or(doc, "states", #{}), [], states, edges);
+    let root_on = [];
+    let on = get_or(doc, "on", #{});
+    for ev in sorted_keys(on) {
+        for tr in transitions_of(on[ev]) {
+            root_on.push(edge_of(id, "*", [], tr, "on", ev));
+        }
+    }
+    #{
+        graph: id,
+        description: get_or(doc, "description", ""),
+        initial: get_or(doc, "initial", ""),
+        input: get_or(jev, "input", #{}),
+        budget: get_or(jev, "budget", #{}),
+        tools: get_or(jev, "tools", []),
+        root_on: root_on,
+        states: states,
+        edges: edges,
+        marks: #{ tool: "jev_mark", kinds: ["enter", "park", "final", "end"] },
+    }
+}

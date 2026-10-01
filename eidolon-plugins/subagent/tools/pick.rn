@@ -1,0 +1,367 @@
+// `subagent_pick`: which model a kind of subagent runs on, remembered until changed (README,
+// Picks). It is the only writer of the pick files, and the only tool here that may put a
+// question to a person (`choices_user`), only when called with a kind and no model. When
+// nobody can answer it returns the same `needs_choice` result as spawn and plan.
+
+pub fn manifest() {
+    #{
+        name: "subagent_pick",
+        description: "Choose, change or clear the model a kind of subagent runs on. Picks are sticky: `subagent_spawn` and `subagent_plan` use the pick for the kind they are given. With `model`, saves it. With `clear`, removes the entry. With neither, asks the operator through a dialog, listing the models `eidolon models` knows cheapest first; if nobody can answer, returns `needs_choice` with the options so you can decide or ask the operator and call this again with `model`. `kind: \"*\"` with nothing else lists the current picks (read-only). Project picks (`scope: project`, saved in <cwd>/.eidolon/subagent-picks.json) win over global ones.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "kind": #{
+                    "type": "string",
+                    "description": "The kind of subagent, a name you choose: letters, digits, '-', '_', '.', at most 64. Use \"*\" with no model to list the picks.",
+                },
+                "model": #{
+                    "type": "string",
+                    "description": "Model key as `eidolon models` prints it (provider:model). Saves it as this kind's pick. Leave out to be asked.",
+                },
+                "scope": #{
+                    "type": "string",
+                    "enum": ["global", "project"],
+                    "description": "Where to save: `global` (default, every project) or `project` (this working directory only, wins over global).",
+                },
+                "clear": #{
+                    "type": "boolean",
+                    "description": "Remove this kind's pick from the chosen scope instead of saving one.",
+                },
+            },
+            "required": ["kind"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let kind = checked_kind(text_of(input.get("kind")), true)?;
+    let scope = text_of(input.get("scope"));
+    if scope == "" {
+        scope = "global";
+    }
+    if scope != "global" && scope != "project" {
+        return Err(`scope is global or project, not '${scope}'`);
+    }
+    let clear = match input.get("clear") {
+        Some(v) => v == true,
+        None => false,
+    };
+    let model = text_of(input.get("model")).trim();
+
+    let picks = read_picks().await?;
+
+    if kind == "*" {
+        if model != "" || clear {
+            return Err("kind \"*\" only lists; name a kind to save or clear a pick");
+        }
+        return Ok(listing(picks));
+    }
+
+    if clear {
+        let mine = picks.get(scope).unwrap();
+        match mine.get(kind) {
+            Some(_) => {
+                mine.remove(kind);
+            }
+            None => {
+                return Ok(`nothing to clear: no ${scope} pick for kind '${kind}'`);
+            }
+        }
+        let path = save_picks(scope, mine).await?;
+        return Ok(`cleared the ${scope} pick for kind '${kind}' (${path})`);
+    }
+
+    if model == "" {
+        // Nothing named: ask. A dialog that cannot be answered is the question handed back, not an error.
+        let rows = catalog().await?;
+        let options = [];
+        for r in rows.iter().take(12) {
+            options.push(#{ label: r.model, description: `${r.price}, ${r.ctx}` });
+        }
+        if options.len() > 0 {
+            let prompt = `Which model should subagents of kind '${kind}' run on? The pick is saved (${scope}) and used until changed.`;
+            let answer = match eidolon::choices_user(prompt, options).await {
+                Ok(a) => a,
+                Err(_) => "",
+            };
+            let chosen = "";
+            for r in rows {
+                if r.model == answer.trim() {
+                    chosen = r.model;
+                }
+            }
+            if chosen != "" {
+                model = chosen;
+            }
+        }
+        if model == "" {
+            return needs_choice(kind, rows, "subagent_pick", input);
+        }
+    }
+
+    let mine = picks.get(scope).unwrap();
+    mine.insert(kind.clone(), model.clone());
+    let path = save_picks(scope, mine).await?;
+    let note = "";
+    if scope == "global" {
+        match picks.get("project").unwrap().get(kind) {
+            Some(m) => note = `\nnote: this project pins '${kind}' to ${m}, which still wins here`,
+            None => {}
+        }
+    }
+    // The catalog only feeds a note here: a pick that names its model is saved
+    // whether or not the listing loads.
+    match catalog().await {
+        Ok(rows) => {
+            let known = false;
+            for r in rows {
+                if r.model == model {
+                    known = true;
+                }
+            }
+            if !known {
+                note += `\nnote: ${model} is not in the \`eidolon models\` catalog; saved anyway, and it will run unpriced`;
+            }
+        }
+        Err(e) => {
+            note += `\nnote: catalog unavailable: ${e}; saved without checking`;
+        }
+    }
+    Ok(`saved: kind '${kind}' -> ${model} (${scope}: ${path})${note}`)
+}
+
+// The project file is relative to the session's working directory, which is where
+// `eidolon::shell` runs.
+const PICKS_SH = "g=${XDG_STATE_HOME:-$HOME/.local/state}/eidolon/subagents/picks.json
+printf '@@global\\n'
+cat \"$g\" 2>/dev/null
+printf '\\n@@project\\n'
+cat .eidolon/subagent-picks.json 2>/dev/null
+true
+";
+
+// One pick file, rewritten whole through a temp file and a rename. $1 is the scope, $2 the JSON; prints the path written.
+const SAVE_SH = "scope=$1
+content=$2
+if [ \"$scope\" = project ]; then
+  f=$(pwd)/.eidolon/subagent-picks.json
+else
+  f=${XDG_STATE_HOME:-$HOME/.local/state}/eidolon/subagents/picks.json
+fi
+mkdir -p \"$(dirname \"$f\")\" || exit 1
+printf '%s\\n' \"$content\" > \"$f.tmp.$$\" || exit 1
+mv \"$f.tmp.$$\" \"$f\" || exit 1
+printf '%s' \"$f\"
+";
+
+// The catalog, cheapest first: tab-separated key, input $/M, output $/M, context, with "-"
+// where the listing says nothing. `eidolon models` also prints a header per provider,
+// `[system]` lines and a cache note; model rows have a `provider:model` first word and
+// the " · " separator. Unpriced rows sort last, never as free.
+const CATALOG_SH = "m=$(\"$eid\" models 2>/dev/null) || { printf 'subagent: `eidolon models` (%s) exited non-zero, so there is no model list.\\n' \"$eid\" >&2; exit 4; }
+printf '%s\n' \"$m\" | awk '
+/^\\[/ { next }
+$1 ~ /:/ && index($0, \" · \") > 0 {
+  pin = \"-\"; pout = \"-\"; ctx = \"-\"; key = \"999999999.0000\"
+  if (match($0, /\\$[0-9.]+\\/[0-9.]+ per M/)) {
+    s = substr($0, RSTART + 1, RLENGTH - 1)
+    split(s, a, \"/\")
+    pin = a[1]; pout = a[2] + 0
+    key = sprintf(\"%014.4f\", pin + pout)
+  }
+  if (match($0, /[0-9]+k ctx/)) { ctx = substr($0, RSTART, RLENGTH - 4) }
+  printf \"%s\\t%s\\t%s\\t%s\\t%s\\n\", key, $1, pin, pout, ctx
+}' | sort | cut -f2-
+";
+
+// `usd` is input plus output $/M, or () when the listing names no price.
+async fn catalog() {
+    let out = eidolon::shell(sh_eid(CATALOG_SH, []), Some(60)).await?;
+    if out.contains("[exit code") {
+        return Err(`no model list: ${out}`);
+    }
+    let rows = [];
+    for line in out.split("\n") {
+        let f = line.split("\t").collect::<Vec>();
+        if f.len() < 4 {
+            continue;
+        }
+        let price = "unpriced";
+        let usd = None;
+        if f[1] != "-" {
+            price = "$" + f[1] + "/" + f[2] + " per M";
+            usd = Some(((number(f[1]) + number(f[2])) * 10000.0).round() / 10000.0);
+        }
+        let ctx = "context unknown";
+        if f[3] != "-" {
+            ctx = `${f[3]} ctx`;
+        }
+        rows.push(#{ model: f[0], price: price, ctx: ctx, usd: usd });
+    }
+    if rows.len() == 0 {
+        return Err("`eidolon models` listed no models, so there is nothing to choose from: check that this eidolon has a provider configured (EIDOLON_BIN, if set, names the binary used)");
+    }
+    Ok(rows)
+}
+
+// A successful result, not a refusal: the model is the caller's (or its operator's) to decide.
+fn needs_choice(kind, rows, tool, input) {
+    let options = [];
+    for r in rows.iter().take(12) {
+        options.push(#{ model: r.model, price: r.price, ctx: r.ctx });
+    }
+    let question = `No model picked for kind '${kind}'. Choose one (or ask the operator), then call subagent_pick {kind, model} or retry with model.`;
+    let out = #{
+        status: "needs_choice",
+        kind: kind,
+        question: question,
+        options: options,
+        total_models: rows.len(),
+        retry: #{ tool: tool, input: input },
+    };
+    json::to_string(out).unwrap_or("{\"status\":\"needs_choice\"}")
+}
+
+// A file that is not a JSON object is refused rather than overwritten.
+async fn read_picks() {
+    let out = eidolon::shell(sh_cmd(PICKS_SH, []), Some(30)).await?;
+    let body = out;
+    let global = "";
+    let project = "";
+    match body.split_once("\n@@project\n") {
+        Some(pair) => {
+            global = pair.0;
+            project = pair.1;
+        }
+        None => {}
+    }
+    match global.split_once("@@global\n") {
+        Some(pair) => global = pair.1,
+        None => {}
+    }
+    Ok(#{ global: parse_picks(global, "the global picks file")?, project: parse_picks(project, "<cwd>/.eidolon/subagent-picks.json")? })
+}
+
+fn parse_picks(text, what) {
+    let t = text.trim();
+    if t == "" {
+        return Ok(#{});
+    }
+    match json::from_string(t) {
+        Ok(v) => {
+            let out = #{};
+            for (k, m) in v {
+                out.insert(k, `${m}`);
+            }
+            Ok(out)
+        }
+        Err(e) => Err(`${what} is not a JSON object of kind -> model (${e}); fix or delete it`),
+    }
+}
+
+async fn save_picks(scope, picks) {
+    let text = json::to_string(picks)?;
+    let written = eidolon::shell(sh_cmd(SAVE_SH, [scope, text]), Some(30)).await?;
+    if written.contains("[exit code") || written.contains("--- stderr ---") {
+        return Err(`could not write the ${scope} picks file: ${written}`);
+    }
+    Ok(written.trim())
+}
+
+fn listing(picks) {
+    let out = "";
+    for scope in ["project", "global"] {
+        let n = 0;
+        for (k, m) in picks.get(scope).unwrap() {
+            out += `${scope}: ${k} -> ${m}\n`;
+            n += 1;
+        }
+        if n == 0 {
+            out += `${scope}: (none)\n`;
+        }
+    }
+    out += "project wins over global for the same kind\n";
+    out
+}
+
+// "*" is the listing and is let through only when the caller says so.
+fn checked_kind(raw, star) {
+    let kind = raw.trim();
+    if kind == "" {
+        return Err("kind is required: a short name you choose for this sort of subagent, e.g. research");
+    }
+    if kind == "*" {
+        if star {
+            return Ok(kind);
+        }
+        return Err("kind \"*\" is only for listing picks");
+    }
+    if kind.len() > 64 {
+        return Err("kind is at most 64 characters");
+    }
+    for c in kind.chars() {
+        if !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err(`kind '${kind}' may hold only letters, digits, '-', '_' and '.'`);
+        }
+    }
+    Ok(kind)
+}
+
+fn text_of(value) {
+    match value {
+        Some(v) => `${v}`,
+        None => "",
+    }
+}
+
+fn number(text) {
+    match text.parse::<f64>() {
+        Ok(n) => n,
+        Err(_) => 0.0,
+    }
+}
+
+fn quote(text) {
+    let s = `${text}`;
+    `'${s.replace("'", "'\\''")}'`
+}
+
+// The eidolon binary: $EIDOLON_BIN if set (and then only that), else `eidolon` on PATH, else
+// $HOME/.local/bin/eidolon, each only if it answers `--version`: without a login shell (a
+// Windows `wsl.exe -e`, a service, cron) PATH can hold a stub that is executable and runs
+// nothing (Minerva's does). None works: exit 127 and say how to fix it.
+const EID_SH = "eid=
+eid_ok() { [ -f \"$1\" ] && [ -x \"$1\" ] && \"$1\" --version >/dev/null 2>&1; }
+if [ -n \"${EIDOLON_BIN:-}\" ]; then
+  if eid_ok \"$EIDOLON_BIN\"; then eid=$EIDOLON_BIN; fi
+else
+  onpath=$(command -v eidolon 2>/dev/null)
+  if [ -n \"$onpath\" ] && eid_ok \"$onpath\"; then
+    eid=$onpath
+  elif eid_ok \"$HOME/.local/bin/eidolon\"; then
+    eid=$HOME/.local/bin/eidolon
+  fi
+fi
+if [ -z \"$eid\" ]; then
+  if [ -n \"${EIDOLON_BIN:-}\" ]; then
+    printf 'subagent: EIDOLON_BIN is set to %s, which is not an executable that runs (`%s --version` failed). Fix it or unset it.\\n' \"$EIDOLON_BIN\" \"$EIDOLON_BIN\" >&2
+  else
+    printf 'subagent: cannot find a working eidolon binary: `eidolon` on PATH is %s and %s/.local/bin/eidolon does not run. Set EIDOLON_BIN to the full path of one that does.\\n' \"${onpath:-absent}\" \"$HOME\" >&2
+  fi
+  exit 127
+fi
+";
+
+// POSIX sh rather than whatever `eidolon::shell` runs.
+fn sh_cmd(script, args) {
+    let cmd = `sh -c ${quote(script)} sa`;
+    for a in args {
+        cmd += ` ${quote(a)}`;
+    }
+    cmd
+}
+
+fn sh_eid(script, args) {
+    sh_cmd(EID_SH + script, args)
+}

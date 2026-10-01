@@ -1,0 +1,48 @@
+// `browser_read`: the service's `read` (../service/src/browser.rs).
+pub fn manifest() {
+    #{
+        name: "browser_read",
+        description: "The current page's visible text, plain, up to max characters (default 8000). Cheaper than browser_snapshot when you want to read what a page says rather than act on it -- no refs, no structural markup, just the words a reader would see. Reach for this after browser_open or browser_click when the next step is understanding content, not clicking or typing into something else.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "max": #{
+                    "type": "integer",
+                    "description": "Maximum characters to return. Default 8000.",
+                },
+            },
+        },
+    }
+}
+
+pub async fn call(input) {
+    call_service("read", input).await
+}
+
+// Everything below is the same in every browser_*.rn: upstream eidolon
+// compiles each tool file on its own, and a tool file is meant to be handed
+// over whole.
+
+// The browser service (../service). Change the port here and in the
+// service's EIDOLON_SERVICE_PORT together.
+fn service() {
+    #{
+        name: "browser",
+        base_url: "http://127.0.0.1:8090",
+        token_file: "~/.config/eidolon/browser.token",
+        auth: #{ header: "Authorization", prefix: "Bearer " },
+        timeout_s: 180,
+    }
+}
+
+// POST {method, args} to /call; the answer is {ok, result} or {ok: false, error}.
+async fn call_service(method, args) {
+    let body = json::to_string(#{ "method": method, "args": args })?;
+    let reply = json::from_string(eidolon::api_request(service(), "POST", "/call", Some(body)).await?)?;
+    if reply.status != 200 {
+        return Err(`browser service answered ${reply.status}: ${reply.body}`);
+    }
+    let out = json::from_string(reply.body)?;
+    if out.ok { Ok(out.result) } else { Err(out.error) }
+}

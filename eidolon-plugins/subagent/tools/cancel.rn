@@ -1,0 +1,82 @@
+// `subagent_cancel`: one signal to the child's whole process group (`shell_background`
+// starts it under `setsid`, so the group is the child's tree and nothing else).
+pub fn manifest() {
+    #{
+        name: "subagent_cancel",
+        description: "Stop one subagent: SIGTERM to its whole process group, SIGKILL if it has not gone within 5 seconds, and an answer saying which happened. The child's state directory and journal are left in place, so `subagent_trace` still reads it and `eidolon resume` can pick the work up. A child that was already gone is reported, not signalled.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "id": #{
+                    "type": "string",
+                    "description": "The subagent id `subagent_spawn` returned: `sa-<seconds>-<4 hex>`.",
+                },
+            },
+            "required": ["id"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let id = checked_id(input.id);
+    if id == "" {
+        let msg = `not a subagent id: ${input.id} (they look like sa-1790508668-ab12) -- subagent_list has the ones there are`;
+        return Err(msg);
+    }
+    eidolon::shell(sh_cmd(CANCEL_SH, [id]), Some(60)).await
+}
+
+// No `timeout` and no fractional sleep: both are GNU-flavoured, and this runs on any Unix.
+const CANCEL_SH = "root=${XDG_STATE_HOME:-$HOME/.local/state}/eidolon/subagents
+id=$1
+dir=$root/$id
+if [ ! -d \"$dir\" ]; then
+  printf 'unknown subagent %s: no state directory under %s\\n' \"$id\" \"$root\"
+  exit 0
+fi
+pid=$(sed -n 's/^pid=//p' \"$dir/meta\" | head -n 1)
+if [ -z \"$pid\" ]; then
+  printf 'subagent %s has no pid recorded in %s/meta, so there is nothing to signal\\n' \"$id\" \"$dir\"
+  exit 0
+fi
+if ! kill -0 -\"$pid\" 2>/dev/null; then
+  printf 'subagent %s (pid %s) is not running, so nothing was signalled; its state directory is left in place as the record\\n' \"$id\" \"$pid\"
+  exit 0
+fi
+kill -TERM -\"$pid\" 2>/dev/null
+waited=0
+while [ \"$waited\" -lt 5 ] && kill -0 -\"$pid\" 2>/dev/null; do
+  sleep 1
+  waited=$((waited + 1))
+done
+if kill -0 -\"$pid\" 2>/dev/null; then
+  kill -KILL -\"$pid\" 2>/dev/null
+  printf 'subagent %s (pid %s) did not stop on SIGTERM within 5 s, so SIGKILL was sent to its process group after %s s; its state directory is left in place as the record\\n' \"$id\" \"$pid\" \"$waited\"
+else
+  printf 'subagent %s (pid %s) was stopped by SIGTERM to its process group after %s s, with everything it had started; its state directory is left in place as the record\\n' \"$id\" \"$pid\" \"$waited\"
+fi
+";
+
+// The id becomes a path, and quoting does not protect a path.
+fn checked_id(raw) {
+    let id = `${raw}`;
+    if !id.starts_with("sa-") || id.contains("/") || id.contains(".") {
+        return "";
+    }
+    id
+}
+
+fn quote(text) {
+    let s = `${text}`;
+    `'${s.replace("'", "'\\''")}'`
+}
+
+// POSIX sh rather than whatever `eidolon::shell` runs.
+fn sh_cmd(script, args) {
+    let cmd = `sh -c ${quote(script)} sa`;
+    for a in args {
+        cmd += ` ${quote(a)}`;
+    }
+    cmd
+}

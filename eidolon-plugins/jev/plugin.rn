@@ -1,0 +1,22 @@
+// No `service:` block on purpose: the service behind `jev_choose` and `jev_entail` is
+// Python and torch, which a plugin cannot ship. The README says how to start it.
+pub fn manifest() {
+    #{
+        name: "jev",
+        version: "0.2.0",
+        description: "jev automation graphs as eidolon workflows: a state-machine interpreter, graphs pinned by hash, and tools for the recon commands, the chooser and the NLI scorer",
+        claims: #{
+            tools: [
+                "graph", "mark", "choose", "entail",
+                "os_release", "uname", "hostname_uptime", "who",
+                "listening", "established", "addresses", "firewall", "processes",
+                "juice_headers", "juice_robots",
+            ],
+            grants: ["file:~/.config/eidolon/jev.token"],
+            workflows: [
+                "selftest", "find-related", "wiki-hop", "ctf-juice-recon",
+                "triage-linux", "triage-wsl", "triage-botforge",
+            ],
+        },
+    }
+}

@@ -1,0 +1,270 @@
+// A state's `meta.choose`: where the menu comes from, what is dropped or added, and
+// which options are taken without asking the scorer. An option is
+// #{ label, event, data }; `data` is what the source knew about it.
+
+fn make_option(label, event, data) {
+    #{ label: label, event: event, data: data }
+}
+
+fn options_from_menu(items) {
+    let out = [];
+    for item in items {
+        let data = #{};
+        for (k, v) in item {
+            if k != "label" && k != "event" {
+                data[k] = v;
+            }
+        }
+        out.push(make_option(item.label, oget_or(item, "event", "PICK"), data));
+    }
+    out
+}
+
+fn options_from_lines(cfg, scope) {
+    let of = oget_or(cfg, "of", "context.obs.text");
+    let skip = oget_or(cfg, "skip", 0);
+    let text = match resolve(of, scope) {
+        Some(v) => { if v is String { v } else { "" } }
+        None => "",
+    };
+    let out = [];
+    let n = 0;
+    for line in text.split("\n") {
+        if n >= skip {
+            let stripped = line.trim();
+            if stripped != "" {
+                out.push(make_option(stripped, "PICK", #{ line: stripped, index: n - skip }));
+            }
+        }
+        n += 1;
+    }
+    out
+}
+
+fn refs_of(rt, resolved) {
+    if resolved is Object {
+        let text = oget_or(resolved, "text", ());
+        if text is String {
+            if rt.refs_text == text {
+                return rt.refs_records;
+            }
+            let pr = parse_refs(rt.gr, text);
+            if pr.skipped > 0 {
+                rt.warnings.push(`${pr.skipped} accessibility-tree line(s) did not match the expected shape and were skipped: the menu may be missing options`);
+            }
+            rt.refs_text = text;
+            rt.refs_records = pr.records;
+            return pr.records;
+        }
+        return [];
+    }
+    if resolved is Vec {
+        return resolved;
+    }
+    let none = [];
+    none
+}
+
+fn options_from_refs(rt, cfg, scope) {
+    let of = oget_or(cfg, "of", "context.obs");
+    let roles = oget_or(cfg, "roles", ["link", "button"]);
+    let within = oget_or(cfg, "within", ());
+    let named = oget_or(cfg, "named", true);
+    let url_re = match oget(cfg, "url") {
+        Some(p) => {
+            match regex_compile(p) {
+                Ok(re) => re,
+                Err(e) => return Err(#{ k: "fatal", msg: "choose.from.refs.url: " + e }),
+            }
+        }
+        None => (),
+    };
+    let resolved = match resolve(of, scope) {
+        Some(v) => v,
+        None => (),
+    };
+    let out = [];
+    for r in refs_of(rt, resolved) {
+        let in_roles = false;
+        for ro in roles {
+            if ro == r.role {
+                in_roles = true;
+            }
+        }
+        if !in_roles {
+            continue;
+        }
+        if !is_null(within) && (is_null(r.landmark) || r.landmark != within) {
+            continue;
+        }
+        if named && (is_null(r.name) || r.name == "") {
+            continue;
+        }
+        if is_null(r["ref"]) || r["ref"] == "" {
+            continue;
+        }
+        if !is_null(url_re) {
+            // a link with no url, or one outside the bound, is never offered
+            if is_null(r.url) || r.url == "" || regex_search_in(url_re, r.url).is_none() {
+                continue;
+            }
+        }
+        let label = if is_null(r.name) { "" } else { r.name };
+        out.push(make_option(label, "PICK", #{ "ref": r["ref"], role: r.role, name: r.name, url: r.url }));
+    }
+    Ok(out)
+}
+
+// The state's outgoing events except the reserved ones, in the graph's own order (`on_order`).
+fn options_from_transitions(st) {
+    let out = [];
+    let on = oget_or(st, "on", #{});
+    for ev in events_in_order(on, oget_or(st, "on_order", ())) {
+        if ev == "PICK" || ev == "EMPTY" || ev == "ERROR" {
+            continue;
+        }
+        let ts = as_transitions(on[ev]);
+        let label = ev;
+        if ts.len() > 0 {
+            let d = oget_or(ts[0], "description", "");
+            if d != "" {
+                label = d;
+            }
+        }
+        out.push(make_option(label, ev, #{}));
+    }
+    out
+}
+
+fn collapse_duplicates(opts) {
+    let seen = #{};
+    let out = [];
+    let dropped = 0;
+    for o in opts {
+        if seen.contains_key(o.label) {
+            dropped += 1;
+        } else {
+            seen[o.label] = true;
+            out.push(o);
+        }
+    }
+    #{ options: out, dropped: dropped }
+}
+
+fn option_scope(scope, o) {
+    let data = #{};
+    for (k, v) in o.data {
+        data[k] = v;
+    }
+    data["label"] = o.label;
+    data["event"] = o.event;
+    #{ context: scope.context, input: scope.input, event: scope.event, run: scope.run, option: data }
+}
+
+// The menu for a state: Ok(options), or Err for a bad source.
+fn build_options(rt, st, choose, scope) {
+    let from = choose.from;
+    let raw = [];
+    if from is String {
+        raw = options_from_transitions(st);
+    } else if from.contains_key("refs") {
+        raw = options_from_refs(rt, from.refs, scope)?;
+    } else if from.contains_key("menu") {
+        raw = options_from_menu(from.menu);
+    } else {
+        raw = options_from_lines(from.lines, scope);
+    }
+    let c = collapse_duplicates(raw);
+    raw = c.options;
+    rt.counts.duplicates_collapsed += c.dropped;
+
+    match oget(choose, "exclude") {
+        Some(tpl) => {
+            let ex = render_value(tpl, scope, rt.warnings);
+            let set = #{};
+            if ex is Vec {
+                for x in ex {
+                    set[stringify(x)] = true;
+                }
+            } else if ex is String {
+                set[ex] = true;
+            }
+            let kept = [];
+            for o in raw {
+                if !set.contains_key(o.label) {
+                    kept.push(o);
+                }
+            }
+            raw = kept;
+        }
+        None => {}
+    }
+
+    let max_n = oget_or(choose, "max", graph_default(rt.g, "max", 64));
+    if raw.len() > max_n {
+        let capped = [];
+        let i = 0;
+        while i < max_n {
+            capped.push(raw[i]);
+            i += 1;
+        }
+        raw = capped;
+    }
+
+    match oget(choose, "also") {
+        Some(extra) => {
+            for e in options_from_menu(extra) {
+                raw.push(e);
+            }
+            let c2 = collapse_duplicates(raw);
+            raw = c2.options;
+            rt.counts.duplicates_collapsed += c2.dropped;
+        }
+        None => {}
+    }
+
+    match oget(choose, "label") {
+        Some(tpl) => {
+            for o in raw {
+                o.label = render(tpl, option_scope(scope, o), rt.warnings);
+            }
+        }
+        None => {}
+    }
+    Ok(raw)
+}
+
+fn chooser_context(choose, scope, st, warns) {
+    match oget(choose, "context") {
+        Some(tpl) => { return render(tpl, scope, warns); }
+        None => {}
+    }
+    let desc = oget_or(st, "description", "");
+    let goal = match resolve("context.goal", scope) {
+        Some(g) => g,
+        None => (),
+    };
+    let obs = match resolve("context.obs.text", scope) {
+        Some(t) => stringify(t),
+        None => "",
+    };
+    if !is_null(goal) && goal != "" {
+        stringify(goal) + "\n" + desc + "\n" + obs
+    } else {
+        desc + "\n" + obs
+    }
+}
+
+// Ok(index) of the first option a `prefer` rule passes (rules in order, options in menu order), or Ok(-1).
+async fn first_preferred(rt, prefer, opts, scope) {
+    for rule in prefer {
+        let i = 0;
+        while i < opts.len() {
+            if eval_guard(rt, rule, option_scope(scope, opts[i])).await? {
+                return Ok(i);
+            }
+            i += 1;
+        }
+    }
+    Ok(-1)
+}

@@ -1,0 +1,96 @@
+{
+  "id": "ctf-juice-recon",
+  "version": "1",
+  "description": "Read-only reconnaissance of the local OWASP Juice Shop lab (127.0.0.1:3001). No external hosts, credentials or exploitation.",
+  "initial": "headers",
+  "context": {
+    "notes": []
+  },
+  "meta": {
+    "jev": {
+      "tools": [
+        "jev_juice_headers",
+        "jev_juice_robots"
+      ],
+      "input": {
+        "type": "object",
+        "properties": {
+          "distro": {
+            "type": "string",
+            "description": "Reach the lab from inside this WSL distribution (the lab listens on that distribution's 127.0.0.1). Omit when it listens on this machine."
+          }
+        }
+      },
+      "budget": {
+        "steps": 10,
+        "actions": 4,
+        "escalations": 2
+      }
+    }
+  },
+  "on": {
+    "ERROR": "failed"
+  },
+  "states": {
+    "headers": {
+      "description": "Inspect HTTP headers",
+      "entry": [
+        {
+          "type": "tool",
+          "params": {
+            "name": "jev_juice_headers",
+            "input": {
+              "distro": "{{input.distro}}"
+            },
+            "into": "obs"
+          }
+        },
+        {
+          "type": "push",
+          "params": {
+            "path": "notes",
+            "value": "{{context.obs.text}}"
+          }
+        }
+      ],
+      "always": "robots"
+    },
+    "robots": {
+      "description": "Read robots.txt for published paths",
+      "entry": [
+        {
+          "type": "tool",
+          "params": {
+            "name": "jev_juice_robots",
+            "input": {
+              "distro": "{{input.distro}}"
+            },
+            "into": "obs"
+          }
+        },
+        {
+          "type": "push",
+          "params": {
+            "path": "notes",
+            "value": "{{context.obs.text}}"
+          }
+        }
+      ],
+      "always": "report"
+    },
+    "report": {
+      "type": "final",
+      "description": "Read-only lab evidence collected",
+      "output": {
+        "notes": "{{context.notes}}"
+      }
+    },
+    "failed": {
+      "type": "final",
+      "description": "Lab unavailable or a command failed",
+      "output": {
+        "error": "{{event.error}}"
+      }
+    }
+  }
+}

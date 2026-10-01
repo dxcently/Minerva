@@ -1,0 +1,36 @@
+// jev/workflows/find-related.rn -- run the `find-related` graph (graphs/find-related.json).
+//
+//   eidolon workflow run <plugin dir> find-related --args '{"term":"subagent"}'
+//
+// Traces one term across eidolon's layers -- docs, Rust source, Rune scripts,
+// extensions, the box's design record -- with the built-in `grep`, then reads
+// the head of the first file a hit names with `read`. Read-only, no model.
+//
+// The graph's paths (`eidolon`, `eidolon/crates`, `extensions`, `docs`,
+// `Aoide/docs`) are relative to the working directory: run it from the root of
+// the tree it was written for (the Minerva checkout), or give --cwd.
+//
+// The graph is read through `jev_graph` and hash-checked against PIN before it
+// runs; change the graph and the pin together (tests/jev/pin.sh).
+
+const GRAPH = "find-related";
+const PIN = "sha256:d7ea7d0b9a0ecbf1fd00c3aa37e21b3e4360c9fdaa560840bda4da02fb94ba3e";
+
+pub fn workflow() {
+    #{
+        name: "find-related",
+        description: "Trace one term across eidolon's docs, Rust crates, Rune scripts, extensions and the design record with grep, then read the head of the first file that implements it. Read-only. Paths are relative to the working directory.",
+        approval: "read_only",
+        params: #{
+            "type": "object",
+            "properties": #{
+                "term": #{ "type": "string", "description": "The word to trace: an identifier (peers), a command (send), or a concept (subagent)." },
+            },
+            "required": ["term"],
+        },
+    }
+}
+
+pub async fn run(args) {
+    run_pinned(GRAPH, PIN, args).await
+}

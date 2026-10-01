@@ -1,0 +1,23 @@
+// `ctf-juice-recon`: the headers and robots.txt of a local Juice Shop lab; no chooser, no model.
+
+// PIN is the sha256 of graphs/ctf-juice-recon.json; tests/jev/pin.sh rewrites it.
+const GRAPH = "ctf-juice-recon";
+const PIN = "sha256:8b4d598619ea52087b662bd5314688388a85184334b37fa16aac3a6a2ce20e9e";
+
+pub fn workflow() {
+    #{
+        name: "ctf-juice-recon",
+        description: "Read-only recon of a local OWASP Juice Shop lab at 127.0.0.1:3001: its HTTP headers and robots.txt. Two fixed curl commands; optionally run inside a WSL distro.",
+        approval: "read_only",
+        params: #{
+            "type": "object",
+            "properties": #{
+                "distro": #{ "type": "string", "description": "Run the curls inside this WSL distribution. Omit when the lab listens on this machine." },
+            },
+        },
+    }
+}
+
+pub async fn run(args) {
+    run_pinned(GRAPH, PIN, with_defaults(args, #{})).await
+}

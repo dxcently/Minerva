@@ -1,0 +1,71 @@
+// `browser_snapshot`: the service's `snapshot` (../service/src/browser.rs).
+pub fn manifest() {
+    #{
+        name: "browser_snapshot",
+        description: "An accessibility snapshot of the current page: every interactive and structurally meaningful element, nested by landmark, each carrying a ref like [ref=e7] that browser_click and browser_type accept. Call this after browser_open, and again after every browser_click or browser_type before using another ref -- a ref is only valid against the snapshot that produced it, and a stale one is refused by name rather than guessed at. Reach for this whenever you need to see the page well enough to act on it, especially to find the ref of something to click or type into. Not for reading prose -- browser_read returns the page's visible text without the structural markup, and is cheaper when you only want to read. On a large page, narrow with within and roles before reaching for depth -- they change what crosses back to you; depth only changes how deep the walk goes.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "timeout_s": #{
+                    "type": "integer",
+                    "description": "How long to wait for the snapshot before giving up. Default 60.",
+                },
+                "depth": #{
+                    "type": "integer",
+                    "description": "Limit the tree to this many levels below the top. Unset by default (the whole tree). A size knob, not a selectivity one -- within and roles narrow the answer itself.",
+                },
+                "within": #{
+                    "type": "string",
+                    "description": "Restrict the snapshot to the one element with this landmark role -- main, navigation, banner, contentinfo, complementary, search, region. The tree is rooted at that element; a page with no such element, or more than one, is refused by name. The first thing to reach for on a large page, before depth.",
+                },
+                "roles": #{
+                    "type": "array",
+                    "items": #{
+                        "type": "string",
+                    },
+                    "description": "Keep only elements whose role is in this list, e.g. [\"link\"]. With within, a line is kept only when within is its nearest landmark, so a link inside a navigation inside main is left out. Unset by default (every role).",
+                },
+                "max": #{
+                    "type": "integer",
+                    "description": "Keep at most this many role-matching elements, in document order. Requires roles. A cap, not a target.",
+                },
+                "section": #{
+                    "type": "string",
+                    "description": "Restrict a roles-filtered snapshot to the one landmark whose first heading has this exact text, e.g. \"See also\". Requires within and roles. No such landmark, or more than one, is refused by name.",
+                },
+            },
+        },
+    }
+}
+
+pub async fn call(input) {
+    call_service("snapshot", input).await
+}
+
+// Everything below is the same in every browser_*.rn: upstream eidolon
+// compiles each tool file on its own, and a tool file is meant to be handed
+// over whole.
+
+// The browser service (../service). Change the port here and in the
+// service's EIDOLON_SERVICE_PORT together.
+fn service() {
+    #{
+        name: "browser",
+        base_url: "http://127.0.0.1:8090",
+        token_file: "~/.config/eidolon/browser.token",
+        auth: #{ header: "Authorization", prefix: "Bearer " },
+        timeout_s: 180,
+    }
+}
+
+// POST {method, args} to /call; the answer is {ok, result} or {ok: false, error}.
+async fn call_service(method, args) {
+    let body = json::to_string(#{ "method": method, "args": args })?;
+    let reply = json::from_string(eidolon::api_request(service(), "POST", "/call", Some(body)).await?)?;
+    if reply.status != 200 {
+        return Err(`browser service answered ${reply.status}: ${reply.body}`);
+    }
+    let out = json::from_string(reply.body)?;
+    if out.ok { Ok(out.result) } else { Err(out.error) }
+}

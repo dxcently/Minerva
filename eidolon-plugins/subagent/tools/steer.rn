@@ -1,0 +1,155 @@
+// `subagent_steer`: one message into a running child, delivered with `send` and waking it.
+// It lands at the child's next step, not mid-token: it changes the plan rather than
+// answering a question, and whatever the child is doing finishes first.
+pub fn manifest() {
+    #{
+        name: "subagent_steer",
+        description: "Send a message to one running subagent and wake it, so it reads the message at its next step and changes what it is doing. Use it to narrow a task, answer a question the child asked, or stop a line of work without stopping the child. It cannot reach a child that has not registered yet or has already finished; the answer says which of the three it was.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "id": #{
+                    "type": "string",
+                    "description": "The subagent id `subagent_spawn` returned: `sa-<seconds>-<4 hex>`.",
+                },
+                "text": #{
+                    "type": "string",
+                    "description": "What to say to the child. It reads this as its operator's change of plan, so say what to do differently, not who you are.",
+                },
+            },
+            "required": ["id", "text"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let id = checked_id(input.id);
+    if id == "" {
+        let msg = `not a subagent id: ${input.id} (they look like sa-1790508668-ab12) -- subagent_list has the ones there are`;
+        return Err(msg);
+    }
+    let text = `${input.text}`;
+    if text == "" {
+        return Err("say what to steer with: `text` was empty");
+    }
+
+    // The child's state directory names its journal, the journal names its registration, and only then is there a peer id.
+    let said = eidolon::shell(sh_cmd(STEER_SH, [id]), Some(60)).await?;
+    let kind = "";
+    let peer = "";
+    match said.split_once(' ') {
+        Some(pair) => {
+            kind = pair.0;
+            peer = pair.1.trim();
+        }
+        None => {}
+    }
+    if kind != "found" || peer == "" {
+        // Not registered yet, finished, gone or unknown: the script's own sentence says which.
+        return Ok(`${said}`);
+    }
+
+    // `peer_send` takes its id with it, so the two values the report names are read before
+    // the call: a value handed to a primitive is gone ("cannot read, value is moved").
+    let child = `${peer}`;
+    let me = `${id}`;
+    let delivered = eidolon::peer_send(peer, text, true).await?;
+    let report = `steered ${me} (peer ${child}): ${delivered}
+The child reads it at its next step, not mid-token. \`subagent_trace ${me}\` a moment later shows what it did with it.`;
+    Ok(report)
+}
+
+// Finding the peer id, as one POSIX sh script. A child's live identity is its journal, not
+// the roster's title (empty for a headless child). One line of stdout is the answer:
+// `found <peer id>`, or `none <why>`.
+const STEER_SH = "root=${XDG_STATE_HOME:-$HOME/.local/state}/eidolon/subagents
+runtime=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/eidolon
+id=$1
+dir=$root/$id
+
+# The peer id of the session born with this journal, or nothing.
+peer_of() {
+  journal=$1
+  [ -n \"$journal\" ] || return 0
+  for m in \"$runtime\"/*/meta.json; do
+    [ -f \"$m\" ] || continue
+    body=$(cat \"$m\")
+    case \"$body\" in
+      *\"$journal\"*)
+        d=${m%/meta.json}
+        printf '%s' \"${d##*/}\"
+        return 0
+        ;;
+    esac
+  done
+  return 0
+}
+
+# How a child ended, from the status file `shell_background` writes beside its
+# log: compact JSON, `code` null when a signal ended it.
+ended_of() {
+  status=$1
+  if [ -z \"$status\" ] || [ ! -f \"$status\" ]; then
+    printf 'nothing recorded yet (still running, or nobody reaped it)'
+    return 0
+  fi
+  fields=$(sed -n 's/.*\"code\":\\([^,]*\\),\"signal\":\\([^,]*\\),.*/\\1 \\2/p' \"$status\")
+  code=${fields%% *}
+  signal=${fields#* }
+  if [ \"$code\" = null ]; then
+    printf 'killed by signal %s' \"$signal\"
+  elif [ -n \"$code\" ] && [ \"$fields\" != \"$code\" ]; then
+    printf 'exit code %s' \"$code\"
+  else
+    printf 'unreadable status file'
+  fi
+  return 0
+}
+
+if [ ! -d \"$dir\" ]; then
+  printf 'none unknown subagent %s: no state directory under %s\\n' \"$id\" \"$root\"
+  exit 0
+fi
+pid=$(sed -n 's/^pid=//p' \"$dir/meta\" | head -n 1)
+log=$(sed -n 's/^log=//p' \"$dir/meta\" | head -n 1)
+status=$(sed -n 's/^status=//p' \"$dir/meta\" | head -n 1)
+journal=$(sed -n 's/^session: //p' \"$log\" 2>/dev/null | head -n 1)
+peer=$(peer_of \"$journal\")
+if [ -n \"$peer\" ] && [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then
+  printf 'found %s\\n' \"$peer\"
+  exit 0
+fi
+if [ -n \"$status\" ] && [ -f \"$status\" ]; then
+  printf 'none subagent %s has finished (%s), so there is no turn left to steer\\n' \"$id\" \"$(ended_of \"$status\")\"
+  exit 0
+fi
+if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then
+  printf 'none subagent %s is not registered yet: its process is alive but no journal line has appeared in its log, so it has not reached the point of registering -- try again in a moment\\n' \"$id\"
+  exit 0
+fi
+printf 'none subagent %s is gone: its process is not alive and no status file records an end (the session that spawned it may have exited first), so there is nothing to steer\\n' \"$id\"
+";
+
+// The id becomes a path, and quoting does not protect a path.
+fn checked_id(raw) {
+    let id = `${raw}`;
+    if !id.starts_with("sa-") || id.contains("/") || id.contains(".") {
+        return "";
+    }
+    id
+}
+
+fn quote(text) {
+    let s = `${text}`;
+    `'${s.replace("'", "'\\''")}'`
+}
+
+// POSIX sh rather than whatever `eidolon::shell` runs.
+fn sh_cmd(script, args) {
+    let cmd = `sh -c ${quote(script)} sa`;
+    for a in args {
+        cmd += ` ${quote(a)}`;
+    }
+    cmd
+}

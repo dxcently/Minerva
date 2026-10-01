@@ -1,0 +1,135 @@
+// browser/workflows/page_watch.rn — the watch: is this page still what it
+// was? One run answers in one line and leaves one file behind: the digest
+// of the page's readable text, stored at the caller-named state path.
+//
+// Division of labour, and why: the workflow scope cannot READ (no fs in
+// scope), and until it gained one pure computation it could not HASH
+// either — the byte-sum in page_walk exists for that lack, and a byte-sum
+// cannot see a same-length edit, which is the edit a watch exists to see.
+// The hash is `eidolon::sha256` in the vouch rows' own spelling; the READ
+// is a tool, browser_state, whose bytes are vouched like any verb and
+// whose only job is returning the stored digest, empty on a first run.
+// The baseline WRITE is this workflow's own `write` step — the shipped
+// table's named row, the act an operator table can deny by name.
+//
+// The trap this shape exists to avoid: a fetch that fails is NEITHER
+// changed NOR unchanged, and must not touch the stored digest. If a
+// transient failure wrote "nothing" as the baseline, the next successful
+// run would read as a change — and a monitor that cries wolf once is
+// worse than no monitor. So a page that does not answer — open or read
+// fails, or the page answers with no readable text at all — is its own
+// outcome, `unreadable (…), baseline kept`, the run completed, and the
+// state file's bytes are exactly what they were. A REFUSED step is not
+// unreadable: the gate stopping the run is fatal, the same rule page_walk
+// runs under ("the user declined this tool call", "denied by policy:").
+//
+// The digest is over exactly what browser_read returned — the page's
+// answer, the only thing this run saw. The title rides in it when the
+// reader surfaces it and is invisible when it does not; there is no other
+// honest choice, since nothing downstream of the read can see more than
+// the read saw. The report carries the full digests, not an abbreviation:
+// a monitor's line should be checkable against `sha256sum` without the
+// run that produced it.
+//
+// Args: `url` (the page to watch, required), `state` (absolute path of
+// the digest file, required — caller-named, like the walk's `out`),
+// `read_max` (chars per read, default 8000).
+
+pub fn workflow() {
+    #{
+        name: "page_watch",
+        description: "Watch one page: open, read, compare the digest against the stored baseline; one line out, and the baseline is written only when the page actually answered.",
+        approval: "mutating",
+        params: #{
+            "type": "object",
+            "properties": #{
+                "url": #{ "type": "string", "description": "The page to watch, including scheme." },
+                "state": #{ "type": "string", "description": "Absolute path of the digest file — the baseline lives here between runs." },
+                "read_max": #{ "type": "integer", "description": "Max characters read from the page. Default 8000." },
+            },
+            "required": ["url", "state"],
+        },
+    }
+}
+
+fn fatal(msg) {
+    #{ content: msg, is_error: true }
+}
+
+pub async fn run(args) {
+    let url = match args.get("url") {
+        Some(u) => u,
+        None => return fatal("page_watch: args need a `url` to watch"),
+    };
+    let state = match args.get("state") {
+        Some(s) => s,
+        None => return fatal("page_watch: args need a `state` — the absolute path the digest lives at"),
+    };
+    let read_max = match args.get("read_max") {
+        Some(m) => m,
+        None => 8000,
+    };
+
+    // The baseline first: a state path that cannot be read must stop the
+    // run before the browser is touched — an unreadable OLD baseline must
+    // never be answered by writing a new one over it.
+    let stored = match eidolon::tool_call("browser_state", #{ path: state }).await {
+        Ok(s) => s,
+        Err(e) => {
+            if e.contains("the user declined this tool call") || e.contains("denied by policy:") {
+                return fatal("page_watch: refused reading the baseline: " + e);
+            }
+            return fatal("page_watch: the baseline could not be read, nothing touched: " + e);
+        }
+    };
+
+    // The page. open then read; a failure here is the transient case the
+    // watch exists to survive: one line, baseline kept, run completed.
+    match eidolon::tool_call("browser_open", #{ url: url }).await {
+        Ok(_) => (),
+        Err(e) => {
+            if e.contains("the user declined this tool call") || e.contains("denied by policy:") {
+                return fatal("page_watch: refused at open: " + e);
+            }
+            return "page_watch: unreadable (" + e + "), baseline kept";
+        }
+    }
+    let text = match eidolon::tool_call("browser_read", #{ max: read_max }).await {
+        Ok(t) => t,
+        Err(e) => {
+            if e.contains("the user declined this tool call") || e.contains("denied by policy:") {
+                return fatal("page_watch: refused at read: " + e);
+            }
+            return "page_watch: unreadable (" + e + "), baseline kept";
+        }
+    };
+    // A page that answers with no readable text did not answer. Blocking
+    // interstitials and empty error pages read empty; storing that as the
+    // baseline would hide the page until it came back.
+    if text == "" {
+        return "page_watch: unreadable (the page answered with no readable text), baseline kept";
+    }
+
+    let digest = eidolon::sha256(text);
+    if digest == stored {
+        return "page_watch: unchanged (" + digest + ")";
+    }
+
+    // The page answered and differs — first run or change. Only here is
+    // the baseline written.
+    let bytes = text.len();
+    match eidolon::tool_call("write", #{ path: state, content: digest + "\n" }).await {
+        Ok(_) => (),
+        Err(e) => {
+            if e.contains("the user declined this tool call") || e.contains("denied by policy:") {
+                return fatal("page_watch: refused writing the baseline: " + e);
+            }
+            return fatal("page_watch: the baseline write failed, the stored digest is untouched: " + e);
+        }
+    }
+    if stored == "" {
+        "page_watch: baseline stored (" + digest + "), " + format!("{}", bytes) + " bytes -> " + state
+    } else {
+        "page_watch: changed (" + stored + " -> " + digest + "), " + format!("{}", bytes) + " bytes -> " + state
+    }
+}

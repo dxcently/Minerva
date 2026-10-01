@@ -1,0 +1,365 @@
+// Values and `{{path}}` templates: the part of the interpreter with no effects. All of
+// lib/ is one compile unit. Two constraints from the Rune this runs on:
+//
+//   * An object's key order is not stable, and a workflow is replayed from its journal
+//     on resume, so anything that decides by key order sorts first: `canon` and
+//     `sorted_keys` are the two doors.
+//   * A closure that calls a lib function must be reachable from every workflow, or
+//     linking fails. So no closures in lib/ except regex.rn, which every workflow
+//     reaches through the interpreter.
+
+fn is_null(v) {
+    match v {
+        () => true,
+        _ => false,
+    }
+}
+
+fn join(parts, sep) {
+    let out = "";
+    let first = true;
+    for p in parts {
+        if first {
+            first = false;
+        } else {
+            out += sep;
+        }
+        out += p;
+    }
+    out
+}
+
+fn sorted_keys(o) {
+    let ks = [];
+    for (k, _) in o {
+        ks.push(k);
+    }
+    ks.sort();
+    ks
+}
+
+// JSON with sorted keys and Python's default separators (", " and ": ").
+fn canon(v) {
+    match v {
+        () => "null",
+        _ => {
+            if v is String {
+                json::to_string(v).unwrap_or("\"\"")
+            } else if v is bool {
+                if v { "true" } else { "false" }
+            } else if v is i64 || v is u64 {
+                `${v}`
+            } else if v is f64 {
+                `${v}`
+            } else if v is Vec {
+                let parts = [];
+                for x in v {
+                    parts.push(canon(x));
+                }
+                "[" + join(parts, ", ") + "]"
+            } else if v is Object {
+                let parts = [];
+                for k in sorted_keys(v) {
+                    parts.push(json::to_string(k).unwrap_or("\"\"") + ": " + canon(v[k]));
+                }
+                "{" + join(parts, ", ") + "}"
+            } else {
+                "null"
+            }
+        }
+    }
+}
+
+// A list is newline-joined, an object is JSON, null is nothing.
+fn stringify(v) {
+    match v {
+        () => "",
+        _ => {
+            if v is String {
+                v
+            } else if v is Vec {
+                let parts = [];
+                for x in v {
+                    parts.push(stringify(x));
+                }
+                join(parts, "\n")
+            } else {
+                canon(v)
+            }
+        }
+    }
+}
+
+// Some(value) for a key of `o`, None when absent or `o` is not an object.
+fn oget(o, key) {
+    if o is Object {
+        o.get(key)
+    } else {
+        None
+    }
+}
+
+fn oget_or(o, key, dflt) {
+    match oget(o, key) {
+        Some(v) => v,
+        None => dflt,
+    }
+}
+
+// A dotted path into a scope: Some(value) (null is a value) or None for
+// missing. Lists are indexed by integer, negative from the end.
+fn resolve(path, scope) {
+    let cur = scope;
+    for seg in path.split(".") {
+        if cur is Object {
+            match cur.get(seg) {
+                Some(v) => { cur = v; }
+                None => return None,
+            }
+        } else if cur is Vec {
+            match seg.parse::<i64>() {
+                Ok(i) => {
+                    let n = cur.len();
+                    let j = if i < 0 { n + i } else { i };
+                    if j < 0 || j >= n {
+                        return None;
+                    }
+                    cur = cur[j];
+                }
+                Err(_) => return None,
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(cur)
+}
+
+fn is_path_char(c, first) {
+    if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' {
+        true
+    } else if first {
+        false
+    } else {
+        (c >= '0' && c <= '9') || c == '.'
+    }
+}
+
+fn is_path(s) {
+    let first = true;
+    let any = false;
+    for c in s.chars() {
+        if !is_path_char(c, first) {
+            return false;
+        }
+        first = false;
+        any = true;
+    }
+    any
+}
+
+// Missing paths render as nothing, with a warning.
+fn render(t, scope, warns) {
+    let out = "";
+    let first = true;
+    for part in t.split("{{") {
+        if first {
+            out += part;
+            first = false;
+            continue;
+        }
+        match part.split_once("}}") {
+            Some((inner, rest)) => {
+                let name = inner.trim();
+                if is_path(name) {
+                    match resolve(name, scope) {
+                        Some(v) => { out += stringify(v); }
+                        None => { warns.push("unresolved template path: " + name); }
+                    }
+                    out += rest;
+                } else {
+                    out += "{{" + part;
+                }
+            }
+            None => { out += "{{" + part; }
+        }
+    }
+    out
+}
+
+// Like render, but a template that is exactly one placeholder gives the value itself,
+// as a copy (a tool call would otherwise move it out of the graph's or context's own
+// value). A missing path is null, not "".
+fn render_value(t, scope, warns) {
+    let tr = t.trim();
+    if tr.starts_with("{{") && tr.ends_with("}}") && tr.len() >= 4 {
+        let inner = tr.get(2..tr.len() - 2).unwrap_or("");
+        if !inner.contains("{{") && !inner.contains("}}") {
+            let name = inner.trim();
+            if is_path(name) {
+                let found = match resolve(name, scope) {
+                    Some(v) => v,
+                    None => {
+                        warns.push("unresolved template path: " + name);
+                        ()
+                    }
+                };
+                return copy_json(found);
+            }
+        }
+    }
+    render(t, scope, warns)
+}
+
+fn render_deep(v, scope, warns) {
+    if v is String {
+        render_value(v, scope, warns)
+    } else if v is Object {
+        let out = #{};
+        for (k, x) in v {
+            out[k] = render_deep(x, scope, warns);
+        }
+        out
+    } else if v is Vec {
+        let out = [];
+        for x in v {
+            out.push(render_deep(x, scope, warns));
+        }
+        out
+    } else {
+        v
+    }
+}
+
+fn copy_json(v) {
+    match json::from_string(json::to_string(v).unwrap_or("null")) {
+        Ok(c) => c,
+        Err(_) => v,
+    }
+}
+
+fn path_dot(path) {
+    join(path, ".")
+}
+
+fn path_push(path, seg) {
+    let out = [];
+    for p in path {
+        out.push(p);
+    }
+    out.push(seg);
+    out
+}
+
+fn path_take(path, n) {
+    let out = [];
+    let i = 0;
+    while i < n && i < path.len() {
+        out.push(path[i]);
+        i += 1;
+    }
+    out
+}
+
+fn path_eq(a, b) {
+    if a.len() != b.len() {
+        return false;
+    }
+    let i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn common_prefix_len(a, b) {
+    let i = 0;
+    while i < a.len() && i < b.len() && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+fn chars_head(s, n) {
+    if s.len() <= n {
+        return s;
+    }
+    let cs = s.chars().collect::<Vec>();
+    if cs.len() <= n {
+        return s;
+    }
+    let out = "";
+    let i = 0;
+    while i < n {
+        out += `${cs[i]}`;
+        i += 1;
+    }
+    out
+}
+
+fn chars_tail(s, n) {
+    if s.len() <= n {
+        return s;
+    }
+    let cs = s.chars().collect::<Vec>();
+    if cs.len() <= n {
+        return s;
+    }
+    let out = "";
+    let i = cs.len() - n;
+    while i < cs.len() {
+        out += `${cs[i]}`;
+        i += 1;
+    }
+    out
+}
+
+// `defaults` fill any key that is absent, null or "". Non-object arguments count as none.
+fn with_defaults(args, defaults) {
+    let out = #{};
+    if args is Object {
+        for (k, v) in args {
+            out[k] = v;
+        }
+    }
+    for (k, v) in defaults {
+        let have = match out.get(k) {
+            Some(x) => !(is_null(x) || (x is String && x.trim() == "")),
+            None => false,
+        };
+        if !have {
+            out[k] = v;
+        }
+    }
+    out
+}
+
+// render_deep, except that a top-level key whose value is exactly one `{{input.<name>}}`
+// is left out when the run was not given that argument, so the tool never sees a null
+// its schema would refuse.
+fn render_input(v, scope, warns) {
+    if !(v is Object) {
+        return render_deep(v, scope, warns);
+    }
+    let out = #{};
+    for (k, x) in v {
+        if x is String {
+            let tr = x.trim();
+            if tr.starts_with("{{input.") && tr.ends_with("}}") && tr.len() > 10 {
+                let name = tr.get(2..tr.len() - 2).unwrap_or("").trim();
+                let unset = match resolve(name, scope) {
+                    Some(have) => is_null(have) || (have is String && have.trim() == ""),
+                    None => true,
+                };
+                if unset {
+                    continue;
+                }
+            }
+        }
+        out[k] = render_deep(x, scope, warns);
+    }
+    out
+}

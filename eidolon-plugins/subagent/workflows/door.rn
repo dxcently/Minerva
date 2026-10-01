@@ -1,0 +1,77 @@
+// The door for an orchestrator outside eidolon (README, "From Claude Code, Codex or aoide"):
+// `{tool, input}` in, the tool's answer back unchanged as the run's report, `needs_choice`
+// and `plan` payloads included. No dialog is opened on this path, and anything outside the
+// fixed set of seven tools and `schema` is refused, so the door cannot reach another tool.
+// The plugin must be trusted first, or the gate asks about every verb.
+//
+// `schema` is embedded because a workflow cannot read a tool's manifest: the one built-in
+// that returns them spills past 8000 characters, and the seven are longer. It is a summary
+// and can drift; `eidolon tools` is always current. Keep SCHEMA in step with the tool files.
+
+pub fn workflow() {
+    #{
+        name: "door",
+        description: "Call one subagent tool from outside eidolon: {tool: spawn|pick|plan|list|trace|steer|cancel|schema, input: {...}}. The tool's answer comes back unchanged (needs_choice and plan payloads included); `schema` says what each tool takes. `eidolon workflow run` takes the plugin directory, not its name: ${XDG_CONFIG_HOME:-$HOME/.config}/eidolon/plugins/subagent, or run its bin/subagent-door '<args JSON>'.",
+        approval: "mutating",
+        params: #{
+            "type": "object",
+            "properties": #{
+                "tool": #{
+                    "type": "string",
+                    "enum": ["spawn", "pick", "plan", "list", "trace", "steer", "cancel", "schema"],
+                    "description": "Which subagent tool to call, or `schema` for what each takes.",
+                },
+                "input": #{ "type": "object", "description": "That tool's input." },
+            },
+            "required": ["tool"],
+        },
+    }
+}
+
+pub async fn run(args) {
+    let tool = match args.get("tool") {
+        Some(t) => `${t}`,
+        None => return fatal("door: args need `tool`: spawn, pick, plan, list, trace, steer, cancel or schema"),
+    };
+    if tool == "schema" {
+        return Ok(SCHEMA);
+    }
+    let allowed = false;
+    for t in ["spawn", "pick", "plan", "list", "trace", "steer", "cancel"] {
+        if t == tool {
+            allowed = true;
+        }
+    }
+    if !allowed {
+        return fatal("door: '" + tool + "' is not one of spawn, pick, plan, list, trace, steer, cancel, schema");
+    }
+    let input = match args.get("input") {
+        Some(i) => i,
+        None => #{},
+    };
+    match eidolon::tool_call("subagent_" + tool, input).await {
+        Ok(out) => Ok(out),
+        Err(e) => fatal(e),
+    }
+}
+
+// The seven tools' inputs, summarised. `needs_choice` and `plan` are successful results; the caller reads `status`.
+const SCHEMA = "{\"tools\":{
+\"spawn\":{\"does\":\"start a child eidolon session in the background; returns id, pid, log. Or, when no model is picked for the kind, {status:needs_choice, kind, question, options:[{model,price,ctx}], retry:{tool,input}} and nothing is started.\",
+ \"input\":{\"task\":\"string, required\",\"kind\":\"string, default 'default': picks are remembered per kind\",\"model\":\"string, provider:model, one-off, wins over picks\",\"budget\":\"{calls:int (enforced live), usd_max:number (checked after), usd_min:number (reserve)}\",\"tools\":\"[string], advisory\",\"deadline_min\":\"int 1..120, default 15\",\"yolo\":\"bool, default false (the child stalls on flagged tools without it)\"}},
+\"pick\":{\"does\":\"save, clear or list the model picked for a kind. With no model and no UI, returns needs_choice with options.\",
+ \"input\":{\"kind\":\"string, required; '*' lists all picks\",\"model\":\"string, provider:model: saves it\",\"scope\":\"'global' (default) or 'project'\",\"clear\":\"bool: remove the pick\"}},
+\"plan\":{\"does\":\"resolve a formation into {status:plan, roles, thresholds, ladder, total_usd, warnings, confirm}, or needs_choice if a role's kind has no pick. Spawns nothing; show the plan to the operator, then run workflow subagent/fanout with it.\",
+ \"input\":{\"formation\":\"string, required: solo or fanout or a file in the formations state dir\",\"task\":\"string, required\",\"kinds\":\"{role: kind} overrides\",\"budget\":\"{usd:number} total for the run\"}},
+\"list\":{\"does\":\"every child with state, kind, model, budget and spend (calls, dollars as a low-high range, or unpriced/unknown, never $0)\",
+ \"input\":{\"ids\":\"[string] only these\",\"format\":\"'text' (default) or 'json'\",\"wait_s\":\"int 0..60, sleep before listing\"}},
+\"trace\":{\"does\":\"the tail of a child's log with state, budget and spend. A child that needs a choice ends with it here.\",
+ \"input\":{\"id\":\"string, required: sa-<seconds>-<4 hex>\",\"lines\":\"int 1..400, default 40\"}},
+\"steer\":{\"does\":\"send a message to a running child, read at its next step; how you answer a child's question\",
+ \"input\":{\"id\":\"string, required\",\"text\":\"string, required\"}},
+\"cancel\":{\"does\":\"SIGTERM then SIGKILL to the child's process group; state and journal stay\",
+ \"input\":{\"id\":\"string, required\"}}},
+\"run\":\"eidolon workflow run <plugin dir> door --args '<json>'; <plugin dir> is the directory ${XDG_CONFIG_HOME:-$HOME/.config}/eidolon/plugins/subagent, not the name subagent. Or: <plugin dir>/bin/subagent-door '<json>', which finds the directory and the eidolon binary (EIDOLON_BIN, PATH, ~/.local/bin).\",
+\"note\":\"This is a summary. The full manifests, always current: eidolon tools (grep subagent_). No tool on this door opens a dialog; needs_choice and plan come back to you.\",
+\"nesting\":\"A subagent cannot spawn subagents (EIDOLON_SUBAGENT guard): only the orchestrator calls spawn.\"}
+";

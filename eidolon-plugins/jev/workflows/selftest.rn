@@ -1,0 +1,242 @@
+// The interpreter checked against itself: no model, no network, no tool but jev_mark and
+// jev_graph. One small graph exercises nesting, a forced pick, guards, `assign`/`push`,
+// `entry`/`exit`, `onDone` and `history`; the regex engine, the template engine and the
+// snapshot parser run against fixed inputs. Fails naming the checks that did not hold.
+
+pub fn workflow() {
+    #{
+        name: "selftest",
+        description: "Check the jev interpreter against fixed inputs: regex, templates, snapshot parsing and a small state chart. No model, no network. Completes if every check holds, fails naming the ones that do not.",
+        approval: "read_only",
+        params: #{ "type": "object", "properties": #{} },
+    }
+}
+
+const GRAPH = "{
+  \"id\": \"selftest-g\",
+  \"initial\": \"work\",
+  \"context\": { \"log\": [], \"tried\": [] },
+  \"meta\": { \"jev\": { \"tools\": [], \"budget\": { \"steps\": 20, \"escalations\": 2 }, \"input\": { \"required\": [\"who\"] } } },
+  \"on\": { \"ERROR\": \"failed\" },
+  \"states\": {
+    \"work\": {
+      \"initial\": \"a\",
+      \"onDone\": \"report\",
+      \"states\": {
+        \"a\": {
+          \"exit\": [ { \"type\": \"assign\", \"params\": { \"tried\": [] } } ],
+          \"always\": [ { \"guard\": { \"type\": \"count\", \"params\": { \"path\": \"context.tried\", \"gte\": 2 } }, \"target\": \"b\" } ],
+          \"meta\": { \"choose\": { \"from\": { \"menu\": [ { \"label\": \"x\" } ] } } },
+          \"on\": { \"PICK\": { \"actions\": [ { \"type\": \"push\", \"params\": { \"path\": \"tried\", \"value\": \"{{event.option.label}}\" } } ] } }
+        },
+        \"b\": {
+          \"entry\": [ { \"type\": \"push\", \"params\": { \"path\": \"log\", \"value\": \"b by {{input.who}}\" } } ],
+          \"always\": [ { \"guard\": { \"type\": \"count\", \"params\": { \"path\": \"context.log\", \"gte\": 2 } }, \"target\": \"done\" } ],
+          \"meta\": { \"choose\": { \"from\": { \"menu\": [ { \"label\": \"detour\", \"event\": \"DETOUR\" } ] } } },
+          \"on\": { \"DETOUR\": \"#selftest-g.side\" }
+        },
+        \"done\": { \"type\": \"final\" },
+        \"hist\": { \"type\": \"history\", \"history\": \"shallow\", \"target\": \"a\" }
+      }
+    },
+    \"side\": {
+      \"always\": [ { \"guard\": { \"type\": \"equals\", \"params\": { \"path\": \"input.who\", \"value\": \"selftest\" } }, \"target\": \"back\" } ],
+      \"meta\": { \"choose\": { \"from\": { \"menu\": [ { \"label\": \"stay\" } ] } } },
+      \"on\": { \"PICK\": \"side\" }
+    },
+    \"back\": {
+      \"meta\": { \"choose\": { \"from\": { \"menu\": [ { \"label\": \"return\", \"event\": \"RETURN\" } ] } } },
+      \"on\": { \"RETURN\": \"#selftest-g.work.hist\" }
+    },
+    \"report\": { \"type\": \"final\", \"output\": { \"log\": \"{{context.log}}\", \"who\": \"{{input.who}}\" } },
+    \"failed\": { \"type\": \"final\", \"output\": { \"error\": \"{{event.error}}\" } }
+  }
+}";
+
+const SNAPSHOT = "url: https://en.wikipedia.org/wiki/Cat
+title: Cat - Wikipedia
+heading: Cat
+scope: main
+chars: 301
+
+- main [ref=e1]:
+  - heading \"Cat\" [level=1] [ref=e2]
+  - link \"Felidae\" [ref=e3]:
+    - /url: /wiki/Felidae
+  - link \"Felis\" [ref=e4]:
+    - /url: https://en.wikipedia.org/wiki/Felis
+  - link \"Edit\" [ref=e5]:
+    - /url: /w/index.php?title=Cat&action=edit
+  - link \"File:Cat.jpg\" [ref=e6]:
+    - /url: /wiki/File:Cat.jpg
+  - 'link \"Ship''s Cat\" [ref=e7]': x
+  - paragraph [ref=e8]: some text";
+
+fn check(out, bad, name, got, want) {
+    if canon(got) == canon(want) {
+        out.push("ok   " + name);
+    } else {
+        out.push("FAIL " + name + ": got " + canon(got) + ", want " + canon(want));
+        bad.push(name);
+    }
+}
+
+fn rx(pattern, text) {
+    match regex_search(pattern, text) {
+        Ok(m) => m.is_some(),
+        Err(_) => "error",
+    }
+}
+
+fn rx_group(pattern, text, name) {
+    match regex_search(pattern, text) {
+        Ok(m) => match m {
+            Some(hit) => oget_or(hit.groups, name, ()),
+            None => (),
+        },
+        Err(_) => "error",
+    }
+}
+
+fn menu_labels(text, path) {
+    let labels = [];
+    match load_graph(text) {
+        Ok(g) => {
+            let rt = new_rt(g, #{});
+            let st = state_at(g, path);
+            let choose = st.meta.choose;
+            match build_options(rt, st, choose, scope_of(rt)) {
+                Ok(os) => { for o in os { labels.push(o.label); } }
+                Err(_) => { labels.push("error"); }
+            }
+        }
+        Err(e) => { labels.push("refused: " + e); }
+    }
+    labels
+}
+
+pub async fn run(args) {
+    let out = [];
+    let bad = [];
+
+    // regex: the three patterns the graphs use, and the edges of the subset
+    let url = "^(?:https://en\\.wikipedia\\.org)?/wiki/[^:#?]+$";
+    check(out, bad, "regex url full", rx(url, "https://en.wikipedia.org/wiki/Cat"), true);
+    check(out, bad, "regex url path", rx(url, "/wiki/Cat"), true);
+    check(out, bad, "regex url namespace refused", rx(url, "/wiki/File:Cat.jpg"), false);
+    check(out, bad, "regex url other origin refused", rx(url, "https://evil.example/wiki/Cat"), false);
+    let hdr = "^COMMAND\\s+PID\\s+USER";
+    check(out, bad, "regex header", rx(hdr, "COMMAND   PID USER  %CPU\nbash 1 root"), true);
+    check(out, bad, "regex header only at line start", rx(hdr, "Usage: ps\nCOMMAND PID"), false);
+    let cap = "^(?P<path>[^:\\n]+):(?P<line>\\d+):";
+    check(out, bad, "regex capture path", rx_group(cap, "noise\neidolon/docs/a.md:12: text\nz", "path"), "eidolon/docs/a.md");
+    check(out, bad, "regex capture line", rx_group(cap, "eidolon/docs/a.md:12: text", "line"), "12");
+    check(out, bad, "regex no hit", rx(cap, "no hits here"), false);
+    check(out, bad, "regex alternation", rx("^(ab|cd)+x", "ababcdx"), true);
+    check(out, bad, "regex unsupported is refused", rx("a{2}", "aa"), "error");
+
+    // templates
+    let scope = #{ context: #{ n: 3, list: ["a", "b"], o: #{ k: "v" }, nothing: () }, input: #{ s: "x" } };
+    let warns = [];
+    check(out, bad, "render text", render("{{input.s}}-{{context.n}}", scope, warns), "x-3");
+    check(out, bad, "render list joins with newlines", render("{{context.list}}", scope, warns), "a\nb");
+    check(out, bad, "render object is sorted JSON", render("{{context.o}}", scope, warns), "{\"k\": \"v\"}");
+    check(out, bad, "render null is empty", render("[{{context.nothing}}]", scope, warns), "[]");
+    check(out, bad, "render missing is empty, with a warning", [render("[{{context.zzz}}]", scope, warns), warns.len()], ["[]", 1]);
+    check(out, bad, "render_value keeps a list", render_value("{{context.list}}", scope, warns), ["a", "b"]);
+    check(out, bad, "render_value of text is text", render_value("a {{context.n}}", scope, warns), "a 3");
+
+    // snapshot parsing
+    let gr = refs_grammar();
+    let obs = build_obs(gr, SNAPSHOT);
+    check(out, bad, "obs heading from the head block", obs.h1, "Cat");
+    check(out, bad, "obs url", obs.url, "https://en.wikipedia.org/wiki/Cat");
+    check(out, bad, "obs chars mismatch is truncated", obs.truncated, true);
+    check(out, bad, "obs text is the body", obs.text.starts_with("- main [ref=e1]:"), true);
+    let pr = parse_refs(gr, obs.text);
+    check(out, bad, "refs parsed, none skipped", [pr.records.len(), pr.skipped], [8, 0]);
+    check(out, bad, "refs link url", pr.records[3].url, "https://en.wikipedia.org/wiki/Felis");
+    check(out, bad, "refs landmark", pr.records[2].landmark, "main");
+    check(out, bad, "refs level", pr.records[1].level, 1);
+    check(out, bad, "refs quoted head", pr.records[6].name, "Ship's Cat");
+
+    // the menu a `refs` source builds, bounded by url
+    let g = match load_graph("{\"id\":\"t\",\"initial\":\"s\",\"states\":{\"s\":{}}}") {
+        Ok(g) => g,
+        Err(e) => return fatal("selftest: " + e),
+    };
+    let rt = new_rt(g, #{});
+    rt.context["obs"] = obs;
+    let choose = #{ from: #{ refs: #{ roles: ["link"], within: "main", url: url } } };
+    let opts = build_options(rt, #{}, choose, scope_of(rt));
+    let labels = [];
+    match opts {
+        Ok(os) => { for o in os { labels.push(o.label); } }
+        Err(_) => { labels.push("error"); }
+    }
+    check(out, bad, "refs menu is bounded by url and by name", labels, ["Felidae", "Felis"]);
+
+    // the state chart
+    let report = run_graph(GRAPH, #{ who: "selftest" }).await;
+    let rtext = if report is String { report } else { stringify(oget_or(report, "content", "")) };
+    check(out, bad, "graph reached its report", rtext.contains("\"outcome\": \"reached\""), true);
+    check(out, bad, "graph output carries the log and the input", rtext.contains("\"output\": {\"log\": [\"b by selftest\", \"b by selftest\"], \"who\": \"selftest\"}"), true);
+    check(out, bad, "graph path through the history detour", rtext.contains("\"path\": [\"work\", \"a\", \"b\", \"side\", \"back\", \"work\", \"b\", \"done\", \"report\"]"), true);
+    check(out, bad, "graph decisions counted", rtext.contains("\"steps\": 4"), true);
+    let missing = run_graph(GRAPH, #{}).await;
+    check(out, bad, "graph refuses a run without its input", stringify(oget_or(missing, "content", "")).contains("needs `who`"), true);
+    let unknown = run_graph("{\"id\":\"u\",\"initial\":\"s\",\"states\":{\"s\":{\"always\":[{\"guard\":{\"type\":\"contains\",\"params\":{}},\"target\":\"s\"}]}}}", #{}).await;
+    check(out, bad, "graph refuses a guard it does not have", stringify(oget_or(unknown, "content", "")).contains("not supported"), true);
+
+    // the plugin's own graphs, read through jev_graph in pages, must load
+    for id in ["ctf-juice-recon", "find-related", "triage-botforge", "triage-linux", "triage-wsl", "wiki-hop"] {
+        let loaded = match read_graph(id).await {
+            Ok(t) => match load_graph(t) {
+                Ok(_) => "loads",
+                Err(e) => "refused: " + e,
+            },
+            Err(e) => "unreadable: " + e,
+        };
+        check(out, bad, "graph " + id + " loads", loaded, "loads");
+    }
+    let whole = match read_graph("triage-linux").await {
+        Ok(t) => t,
+        Err(e) => e,
+    };
+    check(out, bad, "a graph over the tool-answer limit arrives whole, in pages", [whole.len() > 8000, whole.ends_with("}\n")], [true, true]);
+    let drawn = match eidolon::tool_call("jev_graph", #{ graph: "triage-linux" }).await {
+        Ok(t) => json::from_string(t),
+        Err(e) => Err(e),
+    };
+    match drawn {
+        Ok(d) => {
+            let has_hist_edge = false;
+            for e in d.edges {
+                if e.from == "recover" && e.get("to") == Some("investigate.hist") {
+                    has_hist_edge = true;
+                }
+            }
+            check(out, bad, "jev_graph draws the states", d.states.len(), 10);
+            check(out, bad, "jev_graph draws a transition into a history state", has_hist_edge, true);
+        }
+        Err(e) => check(out, bad, "jev_graph draws", "error: " + `${e}`, "drawn"),
+    }
+
+    // a `transitions` menu keeps the graph's event order: `recover` lists CONTINUE before ABORT
+    let rec_labels = match read_graph("triage-linux").await {
+        Ok(t) => menu_labels(t, ["recover"]),
+        Err(e) => ["unreadable: " + e],
+    };
+    check(out, bad, "transitions menu keeps document order (recover)", rec_labels, ["continue where it left off", "stop and report what is known"]);
+    let ordered = "{\"id\":\"o\",\"initial\":\"p\",\"states\":{\"p\":{\"initial\":\"q\",\"states\":{\"q\":{\"meta\":{\"choose\":{\"from\":\"transitions\"}},\"on\":{\"ZED\":{\"target\":\"q\"},\"ALPHA\":{\"target\":\"q\",\"description\":\"a \\\"quoted\\\" {brace}\"},\"MID\":\"q\"}}}}}}";
+    check(out, bad, "transitions menu keeps document order (nested, odd text)", menu_labels(ordered, ["p", "q"]), ["ZED", "a \"quoted\" {brace}", "MID"]);
+
+    let text = "";
+    for l in out {
+        text += l + "\n";
+    }
+    if bad.len() > 0 {
+        return fatal(text + "selftest: " + `${bad.len()}` + " check(s) failed");
+    }
+    text + "selftest: " + `${out.len()}` + " checks hold"
+}

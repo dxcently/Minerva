@@ -1,0 +1,23 @@
+// `triage-wsl`: triage-linux inside a WSL distribution through wsl.exe.
+
+// PIN is the sha256 of graphs/triage-wsl.json; tests/jev/pin.sh rewrites it.
+const GRAPH = "triage-wsl";
+const PIN = "sha256:644c25ddaf28cfd75d26955de3a31b80c5451825b2b94f12030ef62e5aa4924f";
+
+pub fn workflow() {
+    #{
+        name: "triage-wsl",
+        description: "Triage a WSL distribution (Ubuntu by default) with a fixed menu of read-only commands run through wsl.exe, a chooser picking each next one. Needs a Windows host and the jev service.",
+        approval: "read_only",
+        params: #{
+            "type": "object",
+            "properties": #{
+                "distro": #{ "type": "string", "description": "The WSL distribution. Default Ubuntu." },
+            },
+        },
+    }
+}
+
+pub async fn run(args) {
+    run_pinned(GRAPH, PIN, with_defaults(args, #{ distro: "Ubuntu" })).await
+}

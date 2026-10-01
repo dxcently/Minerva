@@ -1,0 +1,60 @@
+// `browser_open`: the service's `open` (../service/src/browser.rs).
+pub fn manifest() {
+    #{
+        name: "browser_open",
+        description: "Navigate the one shared browser to a URL -- there is one browser and one page for the whole machine, so this changes what every browser_* call sees next, not just yours. Always follow it with browser_snapshot before clicking or typing anything: this call invalidates whatever refs an earlier snapshot handed out, the same as browser_click and browser_type do. Reach for this to start on a page or to jump straight to a known URL. Not for reading a URL you do not intend to click through or type into -- fetch is cheaper and does not tie up the one shared browser. An open with confine discards the shared browser's cookies -- it replaces the context, not just the page, so treat it as the start of a new session for the origins it lists.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "url": #{
+                    "type": "string",
+                    "description": "The URL to open, including scheme, e.g. \"https://example.com\".",
+                },
+                "timeout_s": #{
+                    "type": "integer",
+                    "description": "How long to wait for the page to finish loading. Default 30.",
+                },
+                "confine": #{
+                    "type": "array",
+                    "items": #{
+                        "type": "string",
+                    },
+                    "description": "Confine the browser to these origins -- https://en.wikipedia.org, http://127.0.0.1:3000 -- until the next browser_open: a fresh context with no cookies, no downloads, and every request to any other origin refused before it leaves the machine. Leave it out to browse freely.",
+                },
+            },
+            "required": ["url"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    call_service("open", input).await
+}
+
+// Everything below is the same in every browser_*.rn: upstream eidolon
+// compiles each tool file on its own, and a tool file is meant to be handed
+// over whole.
+
+// The browser service (../service). Change the port here and in the
+// service's EIDOLON_SERVICE_PORT together.
+fn service() {
+    #{
+        name: "browser",
+        base_url: "http://127.0.0.1:8090",
+        token_file: "~/.config/eidolon/browser.token",
+        auth: #{ header: "Authorization", prefix: "Bearer " },
+        timeout_s: 180,
+    }
+}
+
+// POST {method, args} to /call; the answer is {ok, result} or {ok: false, error}.
+async fn call_service(method, args) {
+    let body = json::to_string(#{ "method": method, "args": args })?;
+    let reply = json::from_string(eidolon::api_request(service(), "POST", "/call", Some(body)).await?)?;
+    if reply.status != 200 {
+        return Err(`browser service answered ${reply.status}: ${reply.body}`);
+    }
+    let out = json::from_string(reply.body)?;
+    if out.ok { Ok(out.result) } else { Err(out.error) }
+}

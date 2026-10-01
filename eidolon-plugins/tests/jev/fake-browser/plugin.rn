@@ -1,0 +1,11 @@
+// A stand-in for the `browser` plugin: four tools named like the real ones, answering from
+// fb.sh. The name is `browser` because wiki-hop calls `browser_open`, so it must never be
+// installed into a real config: guard.sh refuses unless XDG_CONFIG_HOME is a temp dir.
+pub fn manifest() {
+    #{
+        name: "browser",
+        version: "0.0.0",
+        description: "TEST DOUBLE for jev's tests, never install into a real config. A four-page fake of en.wikipedia.org behind browser_open/snapshot/click/back, for testing jev's wiki-hop.",
+        claims: #{ tools: ["open", "snapshot", "click", "back"] },
+    }
+}

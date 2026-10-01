@@ -1,0 +1,801 @@
+// The graph interpreter: the part of jev's automation interpreter the six graphs use.
+// It enters the initial state, then loops: take an `always` transition if one fires,
+// otherwise build the menu from `meta.choose`, take the `prefer`red option or ask the
+// scorer, park on a person when it is not sure enough, and fire the picked event.
+//
+// Every effect is a dispatched step (`eidolon::tool_call`, `eidolon::park`), and
+// nothing depends on a clock or on key order, so a resumed run replays its journal to
+// the same point. Hence no `wall_s` budget; the host's 200-step cap bounds a long walk.
+//
+// Control flow is Err(#{ k, ... }) carried by `?`:
+//   reached  a top-level final state was entered      stopped  a person said stop
+//   budget   steps/actions/escalations/visits ran out  tool     a tool failed (an ERROR event)
+//   fatal    the graph or the gate is wrong: the run fails, no report
+
+fn fatal(msg) {
+    #{ content: msg, is_error: true }
+}
+
+fn e_fatal(msg) {
+    Err(#{ k: "fatal", msg: msg })
+}
+
+fn num(v) {
+    if v is i64 || v is u64 { v as f64 } else { v }
+}
+
+// The harness refusing, not the tool failing: the run stops instead of firing ERROR.
+fn tool_fatal(e) {
+    tool_refused(e) || e.contains("the run passed its step") || e.contains("the run passed its spend budget")
+}
+
+fn fmt3(x) {
+    let n = (num(x) * 1000.0) as i64;
+    if n < 0 { n = 0; }
+    let ip = n / 1000;
+    let fp = n % 1000;
+    let f = `${fp}`;
+    while f.len() < 3 {
+        f = "0" + f;
+    }
+    `${ip}.${f}`
+}
+
+fn new_rt(g, input) {
+    #{
+        g: g,
+        gr: refs_grammar(),
+        input: input,
+        context: copy_json(oget_or(g.doc, "context", #{})),
+        event: #{},
+        active: [],
+        history: #{},
+        visits: #{},
+        counts: #{ steps: 0, actions: 0, escalations: 0, chooser_calls: 0, rule_picks: 0, duplicates_collapsed: 0, marks: 0 },
+        warnings: [],
+        path_log: [],
+        refs_text: "",
+        refs_records: [],
+        output: (),
+        outcome: (),
+        final_state: (),
+        error: (),
+        error_reason: (),
+        exhausted: (),
+        stop_reason: (),
+    }
+}
+
+fn scope_of(rt) {
+    #{ context: rt.context, input: rt.input, event: rt.event, run: #{ id: "", step: rt.counts.steps } }
+}
+
+fn tool_allowed(rt, name) {
+    for t in oget_or(rt.g.jev, "tools", []) {
+        if t == name {
+            return true;
+        }
+    }
+    false
+}
+
+// The one place the interpreter says where it is (README, "Drawing a run").
+async fn mark(rt, kind, state, extra) {
+    let input = #{ graph: rt.g.id, kind: kind, state: state, step: rt.counts.steps, actions: rt.counts.actions };
+    for (k, v) in extra {
+        input[k] = v;
+    }
+    match eidolon::tool_call("jev_mark", input).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if tool_fatal(e) {
+                return e_fatal("jev_mark: " + e);
+            }
+            rt.warnings.push("jev_mark failed: " + e);
+            Ok(())
+        }
+    }
+}
+
+fn get_at(context, dotted) {
+    let node = context;
+    for seg in dotted.split(".") {
+        if !(node is Object) || !node.contains_key(seg) {
+            return ();
+        }
+        node = node[seg];
+    }
+    node
+}
+
+fn ensure_list_at(context, dotted) {
+    let segs = dotted.split(".").collect::<Vec>();
+    let node = context;
+    let i = 0;
+    while i < segs.len() - 1 {
+        if !node.contains_key(segs[i]) || !(node[segs[i]] is Object) {
+            node[segs[i]] = #{};
+        }
+        node = node[segs[i]];
+        i += 1;
+    }
+    let last = segs[segs.len() - 1];
+    if !node.contains_key(last) || !(node[last] is Vec) {
+        node[last] = [];
+    }
+    node[last]
+}
+
+async fn run_actions(rt, actions) {
+    for action in actions {
+        let kind = action.type;
+        let params = oget_or(action, "params", #{});
+        if kind == "tool" {
+            run_tool_action(rt, params).await?;
+        } else if kind == "capture" {
+            run_capture(rt, params)?;
+        } else if kind == "assign" {
+            for (k, v) in params {
+                rt.context[k] = render_deep(v, scope_of(rt), rt.warnings);
+            }
+        } else if kind == "push" {
+            let value = render_deep(params.value, scope_of(rt), rt.warnings);
+            ensure_list_at(rt.context, params.path).push(value);
+        }
+    }
+    Ok(())
+}
+
+// The pattern's named groups become fields of context.<into>; no match is a failed observation, not an empty one.
+fn run_capture(rt, params) {
+    let value = match resolve(params.path, scope_of(rt)) {
+        Some(v) => v,
+        None => (),
+    };
+    let text = if value is String { value } else { stringify(value) };
+    let m = match regex_search(params.pattern, text) {
+        Ok(m) => m,
+        Err(e) => return e_fatal("capture: " + e),
+    };
+    match m {
+        None => {
+            return Err(#{
+                k: "tool", tool: "capture", reason: "unexpected",
+                text: "capture at '" + params.path + "' matched nothing with pattern '" + params.pattern + "': not the kind of result this action asked for",
+            });
+        }
+        Some(hit) => {
+            let into = params.into;
+            if !(oget_or(rt.context, into, ()) is Object) {
+                rt.context[into] = #{};
+            }
+            for (k, v) in hit.groups {
+                rt.context[into][k] = v;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_tool_action(rt, params) {
+    if rt.counts.actions + 1 > graph_budget(rt.g, "actions", 100) {
+        return Err(#{ k: "budget", name: "actions" });
+    }
+    let name = render_value(params.name, scope_of(rt), rt.warnings);
+    if !(name is String) || !tool_allowed(rt, name) {
+        return e_fatal("the graph calls '" + stringify(name) + "', which its meta.jev.tools does not declare");
+    }
+    let input = render_input(oget_or(params, "input", #{}), scope_of(rt), rt.warnings);
+    let into = oget_or(params, "into", "obs");
+    let result = eidolon::tool_call(name, input).await;
+    rt.counts.actions += 1;
+    let text = match result {
+        Ok(t) => t,
+        Err(e) => {
+            if tool_fatal(e) {
+                return e_fatal(name + " was refused: " + e);
+            }
+            return Err(#{ k: "tool", text: e, reason: "failed", tool: name });
+        }
+    };
+    let candidate = build_obs(rt.gr, text);
+    if candidate.truncated {
+        return Err(#{
+            k: "tool", tool: name, reason: "truncated",
+            text: "observation from '" + name + "' was truncated in transport: " + `${candidate.text.chars().count()}` + " of " + `${candidate.chars}` + " declared characters arrived",
+        });
+    }
+    match oget(params, "expect") {
+        Some(g) => {
+            let ctx = #{};
+            for (k, v) in rt.context {
+                ctx[k] = v;
+            }
+            ctx[into] = candidate;
+            let probe = #{ context: ctx, input: rt.input, event: rt.event, run: #{ id: "", step: rt.counts.steps } };
+            if !eval_guard(rt, g, probe).await? {
+                return Err(#{
+                    k: "tool", tool: name, reason: "unexpected",
+                    text: "observation from '" + name + "' did not satisfy expect (" + g.type + "): not the kind of result this action asked for",
+                });
+            }
+        }
+        None => {}
+    }
+    rt.context[into] = candidate;
+    Ok(())
+}
+
+// A history state is its parent's last active child, or its own `target` if the parent was never entered.
+fn resolve_history_chain(rt, path) {
+    let st = state_at(rt.g, path);
+    if oget_or(st, "type", "") != "history" {
+        return Ok(path);
+    }
+    let parent = path_take(path, path.len() - 1);
+    let resolved = [];
+    match oget(rt.history, path_dot(parent)) {
+        Some(child) => { resolved = path_push(parent, child.clone()); }
+        None => {
+            match resolve_target(rt.g, path, st.target) {
+                Some(p) => { resolved = p; }
+                None => return e_fatal("history state '" + path_dot(path) + "' has an unresolvable target"),
+            }
+        }
+    }
+    resolve_history_chain(rt, resolved)
+}
+
+async fn exit_to(rt, keep_len) {
+    while rt.active.len() > keep_len {
+        let leaving = rt.active;
+        let st = state_at(rt.g, leaving);
+        run_actions(rt, oget_or(st, "exit", [])).await?;
+        let parent = path_take(leaving, leaving.len() - 1);
+        if parent.len() >= keep_len {
+            rt.history[path_dot(parent)] = leaving[leaving.len() - 1].clone();
+        }
+        rt.active = parent;
+    }
+    Ok(())
+}
+
+// A final state was entered: a top-level one ends the run, a nested one fires
+// its parent's `onDone`. Ok(true) when that moved the run elsewhere.
+async fn handle_final(rt, seg) {
+    let st = state_at(rt.g, seg);
+    match oget(st, "output") {
+        Some(o) => { rt.output = render_deep(o, scope_of(rt), rt.warnings); }
+        None => {}
+    }
+    if seg.len() == 1 {
+        return Err(#{ k: "reached", state: seg[0] });
+    }
+    let parent = path_take(seg, seg.len() - 1);
+    let on_done = oget_or(state_at(rt.g, parent), "onDone", ());
+    let ts = as_transitions(on_done);
+    if ts.len() == 0 {
+        return Ok(false);
+    }
+    let idx = first_passing(rt, ts, scope_of(rt)).await?;
+    if idx < 0 {
+        return Ok(false);
+    }
+    execute_transition(rt, parent, ts[idx]).await?;
+    Ok(true)
+}
+
+async fn enter(rt, from_path, target_path) {
+    let path = resolve_history_chain(rt, target_path)?;
+    let depth = from_path.len() + 1;
+    while depth <= path.len() {
+        let seg = path_take(path, depth);
+        rt.active = seg;
+        rt.path_log.push(seg[seg.len() - 1]);
+        let key = path_dot(seg);
+        rt.visits[key] = oget_or(rt.visits, key, 0) + 1;
+        let st = state_at(rt.g, seg);
+        let max_visits = oget_or(oget_or(st, "meta", #{}), "visits", graph_default(rt.g, "visits", 20));
+        if rt.visits[key] > max_visits {
+            return Err(#{ k: "budget", name: "visits" });
+        }
+        let ty = oget_or(st, "type", "");
+        if !is_compound(st) {
+            mark(rt, if ty == "final" { "final" } else { "enter" }, key, #{}).await?;
+        }
+        run_actions(rt, oget_or(st, "entry", [])).await?;
+        if ty == "final" {
+            if handle_final(rt, seg).await? {
+                return Ok(());
+            }
+        }
+        depth += 1;
+    }
+    let leaf = state_at(rt.g, rt.active);
+    if path_eq(rt.active, path) && is_compound(leaf) && oget_or(leaf, "initial", "") != "" {
+        enter(rt, rt.active, path_push(rt.active, leaf.initial)).await?;
+    }
+    Ok(())
+}
+
+// One transition: leave, run its actions, enter. No target is internal (only the actions run).
+// `owning` is the state it was declared on, which a relative target resolves against;
+// leaving and entering are relative to where the run is, which can be deeper.
+async fn execute_transition(rt, owning, tr) {
+    let actions = oget_or(tr, "actions", []);
+    let target = match oget(tr, "target") {
+        Some(t) => t,
+        None => {
+            run_actions(rt, actions).await?;
+            return Ok(());
+        }
+    };
+    let new_path = match resolve_target(rt.g, owning, target) {
+        Some(p) => p,
+        None => return e_fatal("unresolved target '" + target + "' from '" + path_dot(owning) + "'"),
+    };
+    let reenter = oget_or(tr, "reenter", false);
+    let natural = common_prefix_len(rt.active, new_path);
+    let lca = natural;
+    if reenter && new_path.len() - 1 < natural {
+        lca = new_path.len() - 1;
+    }
+    exit_to(rt, lca).await?;
+    run_actions(rt, actions).await?;
+    enter(rt, rt.active, new_path).await?;
+    Ok(())
+}
+
+// Looked up in the active state, then each ancestor, then the root's `on`. Ok(#{ owner, tr }) or Ok(()).
+async fn find_transition(rt, from_path, event) {
+    let path = from_path;
+    loop {
+        let on = if path.len() == 0 { rt.g.root_on } else { oget_or(state_at(rt.g, path), "on", #{}) };
+        match oget(on, event) {
+            Some(entry) => {
+                let ts = as_transitions(entry);
+                let idx = first_passing(rt, ts, scope_of(rt)).await?;
+                if idx >= 0 {
+                    return Ok(#{ owner: path, tr: ts[idx] });
+                }
+            }
+            None => {}
+        }
+        if path.len() == 0 {
+            return Ok(());
+        }
+        path = path_take(path, path.len() - 1);
+    }
+}
+
+// Ok("continue") when the transition ran, Ok("ended_error") when nothing
+// handled an ERROR (or any event but EMPTY, which parks instead).
+async fn fire_event(rt, from_path, event, event_data) {
+    rt.event = event_data;
+    let found = find_transition(rt, from_path, event).await?;
+    if is_null(found) {
+        if event == "EMPTY" {
+            let st = if from_path.len() > 0 { state_at(rt.g, from_path) } else { #{} };
+            let ask = oget_or(oget_or(st, "meta", #{}), "ask", "");
+            let q = if ask != "" { render(ask, scope_of(rt), rt.warnings) } else { "" };
+            park_pick(rt, "the menu was empty and nothing handled EMPTY", q, [], []).await?;
+            return e_fatal("an EMPTY park has no options to pick from");
+        }
+        if event == "ERROR" {
+            rt.error = oget_or(event_data, "error", "unhandled tool error");
+            rt.error_reason = oget_or(event_data, "reason", ());
+        } else {
+            rt.error = "event '" + event + "' raised at '" + path_dot(from_path) + "' but nothing handles it";
+        }
+        return Ok("ended_error");
+    }
+    execute_transition(rt, found.owner, found.tr).await?;
+    Ok("continue")
+}
+
+// Park until someone answers with an option (its number or exact label) or `stop`. Ok(index);
+// Err(stopped) on stop. Any other answer parks again against the escalation budget, so a
+// person who keeps answering wrong ends the run rather than holding it.
+async fn park_pick(rt, why, ask, labels, probs) {
+    let base = "jev " + rt.g.id + ": " + why + "\n";
+    if ask != "" {
+        base += ask + "\n";
+    }
+    base += "state: " + path_dot(rt.active) + " (step " + `${rt.counts.steps}` + ")\n";
+    let i = 0;
+    while i < labels.len() {
+        let p = if probs.len() > i { fmt3(probs[i]) + "  " } else { "" };
+        base += "  " + `${i}` + "  " + p + labels[i] + "\n";
+        i += 1;
+    }
+    if labels.len() > 0 {
+        base += "Answer with the number or the exact label, or `stop` (or `stop: <reason>`) to end the run.";
+    } else {
+        base += "Nothing here can be picked: answer `stop` (or `stop: <reason>`) to end the run.";
+    }
+    let question = base.clone();
+    loop {
+        if rt.counts.escalations + 1 > graph_budget(rt.g, "escalations", 10) {
+            return Err(#{ k: "budget", name: "escalations" });
+        }
+        rt.counts.escalations += 1;
+        mark(rt, "park", path_dot(rt.active), #{}).await?;
+        let answer = match eidolon::park(question.clone()).await {
+            Ok(a) => a.trim(),
+            Err(e) => return e_fatal("park: " + e),
+        };
+        if answer == "stop" || answer.starts_with("stop:") {
+            let reason = "stopped at a park";
+            if answer.len() > 5 {
+                let r = answer.get(5..).unwrap_or("").trim();
+                if r != "" {
+                    reason = r;
+                }
+            }
+            return Err(#{ k: "stopped", reason: reason });
+        }
+        let found = -1;
+        let j = 0;
+        while j < labels.len() {
+            if labels[j] == answer {
+                found = j;
+                break;
+            }
+            j += 1;
+        }
+        if found < 0 {
+            match answer.parse::<i64>() {
+                Ok(n) => { if n >= 0 && n < labels.len() { found = n; } }
+                Err(_) => {}
+            }
+        }
+        if found >= 0 {
+            return Ok(found);
+        }
+        question = "'" + answer + "' is not one of the options.\n" + base;
+    }
+}
+
+// A ref is good only against the snapshot that made it.
+fn ref_is_current(rt, want) {
+    let obs = oget_or(rt.context, "obs", ());
+    if !(obs is Object) {
+        return false;
+    }
+    let text = oget_or(obs, "text", ());
+    if !(text is String) {
+        return false;
+    }
+    for r in refs_of(rt, obs) {
+        if r["ref"] == want {
+            return true;
+        }
+    }
+    false
+}
+
+async fn choose_phase(rt, path, st, choose) {
+    let scope = scope_of(rt);
+    let opts = build_options(rt, st, choose, scope)?;
+    if opts.len() == 0 {
+        return fire_event(rt, path, "EMPTY", #{}).await;
+    }
+    let meta = oget_or(st, "meta", #{});
+    let floor = num(oget_or(meta, "floor", graph_default(rt.g, "floor", 0.5)));
+    let margin = num(oget_or(meta, "margin", graph_default(rt.g, "margin", 0.1)));
+    let ask_tpl = oget_or(meta, "ask", "");
+    let ask = if ask_tpl != "" { render(ask_tpl, scope, rt.warnings) } else { "" };
+    let context_str = chooser_context(choose, scope, st, rt.warnings);
+
+    let labels = [];
+    for o in opts {
+        labels.push(o.label);
+    }
+
+    let index = first_preferred(rt, oget_or(choose, "prefer", []), opts, scope).await?;
+    if index >= 0 {
+        rt.counts.rule_picks += 1;
+    } else if opts.len() == 1 {
+        index = 0;
+    } else {
+        rt.counts.chooser_calls += 1;
+        let probs = [];
+        let unavailable = "";
+        match eidolon::tool_call("jev_choose", #{ context: context_str, options: labels }).await {
+            Ok(text) => {
+                match json::from_string(text) {
+                    Ok(parsed) => {
+                        let table = oget_or(parsed, "probs", #{});
+                        for l in labels {
+                            probs.push(num(oget_or(table, l, 0.0)));
+                        }
+                    }
+                    Err(_) => { unavailable = "the chooser's answer was not JSON"; }
+                }
+            }
+            Err(e) => {
+                if tool_fatal(e) {
+                    return e_fatal("jev_choose was refused: " + e);
+                }
+                unavailable = e;
+            }
+        }
+        if unavailable != "" {
+            let zeros = [];
+            for _ in labels {
+                zeros.push(0.0);
+            }
+            index = park_pick(rt, "chooser unavailable: " + unavailable, ask, labels, zeros).await?;
+        } else {
+            // the highest, the first of equals; and the runner-up
+            let best = 0;
+            let k = 1;
+            while k < probs.len() {
+                if probs[k] > probs[best] {
+                    best = k;
+                }
+                k += 1;
+            }
+            let top1 = probs[best];
+            let top2 = 0.0;
+            k = 0;
+            while k < probs.len() {
+                if k != best && probs[k] > top2 {
+                    top2 = probs[k];
+                }
+                k += 1;
+            }
+            index = best;
+            if !(top1 >= floor && top1 - top2 >= margin) {
+                let why = if top1 < floor {
+                    "top " + fmt3(top1) + " under floor " + fmt3(floor)
+                } else {
+                    "top " + fmt3(top1) + ", margin " + fmt3(top1 - top2) + " under " + fmt3(margin)
+                };
+                index = park_pick(rt, why, ask, labels, probs).await?;
+            }
+        }
+    }
+
+    let chosen = opts[index];
+    match oget(chosen.data, "ref") {
+        Some(r) => {
+            if !ref_is_current(rt, r) {
+                return Err(#{
+                    k: "tool", tool: "pick", reason: "stale",
+                    text: "stale ref '" + stringify(r) + "': the snapshot that produced it is no longer current",
+                });
+            }
+        }
+        None => {}
+    }
+    let data = #{};
+    for (k, v) in chosen.data {
+        data[k] = v;
+    }
+    data["label"] = chosen.label;
+    data["event"] = chosen.event;
+    fire_event(rt, path, chosen.event, #{ option: data }).await
+}
+
+fn tool_event(e) {
+    #{ error: e.text, reason: e.reason, tool: e.tool }
+}
+
+// One pass of the loop. Ok("again") or Ok("ended_error"), or Err.
+async fn step_once(rt) {
+    let path = rt.active;
+    let st = state_at(rt.g, path);
+    let ts = as_transitions(oget_or(st, "always", ()));
+    let idx = first_passing(rt, ts, scope_of(rt)).await?;
+    if idx >= 0 {
+        execute_transition(rt, path, ts[idx]).await?;
+        return Ok("again");
+    }
+    let choose = oget(oget_or(st, "meta", #{}), "choose");
+    let cfg = match choose {
+        Some(c) => c,
+        None => {
+            rt.outcome = "error";
+            rt.error = "state '" + path_dot(path) + "' has no way to progress: no always guard passed and there is no choose block";
+            return Ok("ended_error");
+        }
+    };
+    if rt.counts.steps + 1 > graph_budget(rt.g, "steps", 50) {
+        return Err(#{ k: "budget", name: "steps" });
+    }
+    rt.counts.steps += 1;
+    let status = choose_phase(rt, path, st, cfg).await?;
+    if status == "ended_error" {
+        return Ok("ended_error");
+    }
+    Ok("again")
+}
+
+async fn run_loop(rt) {
+    loop {
+        let r = step_once(rt).await;
+        let status = "again";
+        match r {
+            Ok(s) => { status = s; }
+            Err(e) => {
+                if e.k != "tool" {
+                    return Err(e);
+                }
+                status = fire_event(rt, rt.active, "ERROR", tool_event(e)).await?;
+            }
+        }
+        if status == "ended_error" {
+            rt.outcome = "error";
+            return Ok(());
+        }
+    }
+}
+
+async fn bootstrap(rt) {
+    let r = enter(rt, [], [rt.g.doc.initial]).await;
+    match r {
+        Ok(_) => {}
+        Err(e) => {
+            if e.k != "tool" {
+                return Err(e);
+            }
+            let status = fire_event(rt, rt.active, "ERROR", tool_event(e)).await?;
+            if status == "ended_error" {
+                rt.outcome = "error";
+                return Ok(());
+            }
+        }
+    }
+    run_loop(rt).await
+}
+
+fn dedupe(xs) {
+    let seen = #{};
+    let out = [];
+    for x in xs {
+        if !seen.contains_key(x) {
+            seen[x] = true;
+            out.push(x);
+        }
+    }
+    out
+}
+
+fn report_of(rt) {
+    let r = #{
+        graph: rt.g.id,
+        outcome: rt.outcome,
+        final_state: rt.final_state,
+        output: rt.output,
+        steps: rt.counts.steps,
+        actions: rt.counts.actions,
+        escalations: rt.counts.escalations,
+        chooser_calls: rt.counts.chooser_calls,
+        rule_picks: rt.counts.rule_picks,
+        duplicates_collapsed: rt.counts.duplicates_collapsed,
+        exhausted: rt.exhausted,
+        path: rt.path_log,
+    };
+    if rt.outcome == "stopped" {
+        r["reason"] = rt.stop_reason;
+    }
+    if rt.outcome == "error" {
+        r["error"] = rt.error;
+        r["reason"] = rt.error_reason;
+    }
+    if rt.warnings.len() > 0 {
+        r["warnings"] = dedupe(rt.warnings);
+    }
+    r
+}
+
+fn check_input(g, input) {
+    let schema = oget_or(g.jev, "input", #{});
+    for key in oget_or(schema, "required", []) {
+        match oget(input, key) {
+            Some(v) => {
+                if is_null(v) || (v is String && v.trim() == "") {
+                    return Err("this graph needs `" + key + "`");
+                }
+            }
+            None => { return Err("this graph needs `" + key + "`"); }
+        }
+    }
+    Ok(())
+}
+
+// Run a graph document (already hash-checked by the caller) on `input`. Returns the report
+// as JSON text when a final state was reached; otherwise a failed run (the report as the
+// reason, or a message when the graph or the gate is wrong).
+async fn run_graph(text, input) {
+    let g = match load_graph(text) {
+        Ok(g) => g,
+        Err(e) => return fatal("jev: " + e),
+    };
+    match check_input(g, input) {
+        Ok(_) => {}
+        Err(e) => return fatal("jev " + g.id + ": " + e),
+    }
+    let rt = new_rt(g, input);
+    let result = bootstrap(rt).await;
+    match result {
+        Ok(_) => {}
+        Err(e) => {
+            if e.k == "reached" {
+                rt.outcome = "reached";
+                rt.final_state = e.state;
+            } else if e.k == "budget" {
+                rt.outcome = "exhausted";
+                rt.exhausted = e.name;
+            } else if e.k == "stopped" {
+                rt.outcome = "stopped";
+                rt.stop_reason = e.reason;
+            } else if e.k == "tool" {
+                rt.outcome = "error";
+                rt.error = "unhandled tool error while already recovering from another: " + e.text;
+                rt.error_reason = e.reason;
+            } else {
+                return fatal("jev " + g.id + ": " + stringify(oget_or(e, "msg", "the interpreter failed")));
+            }
+        }
+    }
+    let report = canon(report_of(rt));
+    if rt.outcome != "reached" {
+        let _ = mark(rt, "end", path_dot(rt.active), #{ outcome: rt.outcome }).await;
+        return fatal(report);
+    }
+    report
+}
+
+// The graph's file, joined from the pages `jev_graph` hands out (a tool answer
+// over the harness's size limit is spilled to a file, so a graph of any size comes
+// in pages of about 5000 characters; see tools/graph.rn). Ok(text) or Err(reason).
+async fn read_graph(name) {
+    let text = "";
+    let from = 1;
+    let pages = 0;
+    while from > 0 {
+        pages += 1;
+        if pages > 40 {
+            return Err("the graph is more than 40 pages");
+        }
+        let page = eidolon::tool_call("jev_graph", #{ graph: name, from: from }).await?;
+        let head = page.clone();
+        let body = "";
+        match page.split_once("
+") {
+            Some(pair) => {
+                head = pair.0;
+                body = pair.1;
+            }
+            None => {}
+        }
+        if !head.starts_with("jev-page next=") {
+            return Err("a page of the graph had no jev-page header");
+        }
+        let next = match head.get(14..head.len()).unwrap_or("").trim().parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => return Err("a page of the graph had a bad jev-page header: " + head),
+        };
+        text += body;
+        if next != 0 && next <= from {
+            return Err("the graph's pages do not advance");
+        }
+        from = next;
+    }
+    Ok(text)
+}
+
+// What every graph's workflow runs: fetch the text through `jev_graph`, refuse it unless it matches the pin, run it.
+async fn run_pinned(name, pin, input) {
+    let text = match read_graph(name).await {
+        Ok(t) => t,
+        Err(e) => return fatal("jev " + name + ": could not read the graph: " + e),
+    };
+    let got = eidolon::sha256(text);
+    if got != pin {
+        return fatal("jev " + name + ": the graph's content is " + got + ", not the " + pin + " this workflow pins; refusing to run a graph that was not reviewed with it. If the change is intended, re-pin: tests/jev/pin.sh");
+    }
+    run_graph(text, input).await
+}

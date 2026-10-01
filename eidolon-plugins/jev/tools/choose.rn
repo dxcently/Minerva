@@ -1,0 +1,58 @@
+// `jev_choose`: the jev service's `choose`. The service is not part of this plugin; see the README.
+pub fn manifest() {
+    #{
+        name: "jev_choose",
+        description: "Score a fixed list of options against a context in one forward pass -- no reasoning tokens, effectively instant. Reach for this when the decision is really a pick among a small set you have already enumerated: which menu item to click, which queue a ticket belongs in, which candidate to follow, which branch to take next. You get a probability per option back as JSON {probs: {option: p}, best: option}, so it also works as a confidence check on a choice you already lean toward. Not for open-ended judgment, ranking free text you have not reduced to a short option list, or picking the options themselves. Options must be distinct. Needs the jev service.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "context": #{
+                    "type": "string",
+                    "description": "The situation or question the options answer, in plain text.",
+                },
+                "options": #{
+                    "type": "array",
+                    "items": #{ "type": "string" },
+                    "minItems": 2,
+                    "description": "At least two distinct options to score, e.g. [\"refund\", \"sales\", \"technical support\"].",
+                },
+            },
+            "required": ["context", "options"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let context = match input.get("context") {
+        Some(c) => c,
+        None => return Err("context is required"),
+    };
+    let options = match input.get("options") {
+        Some(o) => o,
+        None => return Err("options is required"),
+    };
+    let out = call_service("choose", #{ "context": context, "options": options }).await?;
+    Ok(json::to_string(out)?)
+}
+
+// Port 8091 (8090 is the browser plugin's); the service reads it from EIDOLON_SERVICE_PORT.
+fn service() {
+    #{
+        name: "jev",
+        base_url: "http://127.0.0.1:8091",
+        token_file: "~/.config/eidolon/jev.token",
+        auth: #{ header: "Authorization", prefix: "Bearer " },
+        timeout_s: 120,
+    }
+}
+
+async fn call_service(method, args) {
+    let body = json::to_string(#{ "method": method, "args": args })?;
+    let reply = json::from_string(eidolon::api_request(service(), "POST", "/call", Some(body)).await?)?;
+    if reply.status != 200 {
+        return Err(`jev service answered ${reply.status}: ${reply.body}`);
+    }
+    let out = json::from_string(reply.body)?;
+    if out.ok { Ok(out.result) } else { Err(out.error) }
+}

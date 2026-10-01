@@ -1,0 +1,15 @@
+// `tools` and `workflows` name the stems of tools/*.rn and workflows/*.rn, sorted; a tool file
+// keeps declaring the namespaced `name:` it is registered under (`tools/spawn.rn` is
+// `subagent_spawn`). `name` must equal this directory's name.
+
+pub fn manifest() {
+    #{
+        name: "subagent",
+        version: "0.2.1",
+        description: "child eidolon sessions for a bounded task: spawn on a model picked per kind, plan formations, budgets, list, trace, steer, cancel, and a fan-out workflow",
+        claims: #{
+            tools: ["spawn", "list", "trace", "steer", "cancel", "pick", "plan"],
+            workflows: ["fanout", "door"],
+        },
+    }
+}

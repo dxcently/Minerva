@@ -1,0 +1,222 @@
+// browser/workflows/page_walk.rn — the workflow payload's first customer
+// (vault, *The Plugin System (design)*, §Workflows: "a pagination walk").
+//
+// A pagination walk over this plugin's own tools: open a page, snapshot it,
+// follow one named control up to a page budget, and collect each page's
+// readable text into ONE file. The size rule is the point: the bulk rides
+// `write` steps to the output path and never enters a model context — the
+// run's report is one line (pages, bytes, path, checksum). Every step is an
+// ordinary dispatched call — journaled under the run's deterministic id,
+// classified by the one gate, replayed verbatim on resume; the workflow
+// scope has no other effect it could cause (`fs_write`/`shell` do not
+// compile here), so there is no second execution path to audit.
+//
+// The operator's yes: the door refuses to start unless every verb this
+// plugin ships is vouched byte-for-byte (`vouch_check`); the walk's one
+// non-browser verb, `write`, rides the shipped table's named ALLOW row
+// ("write a file"), so no further act is owed. An operator table that flags
+// writes makes that refusal surface at step 0 — the header write, before
+// any browser call — and the walk answers one failed line, starting
+// nothing.
+//
+// Failure shapes, as the run reports them:
+// - a page that will not load (the service's error) is a RECORDED step: the
+//   note lands in the output file, the loop ends, the run completes and the
+//   report line says so;
+// - a gate refusal ("the user declined this tool call", "denied by
+//   policy:") is FATAL: the run fails naming it. A refused step is never a
+//   page like any other.
+//
+// Args: `url` (start page, required), `follow` (exact accessible name of
+// the next-page control, required), `out` (absolute output path,
+// required), `pages` (budget, 1-40, default 5), `read_max` (chars per page
+// collected, default 8000).
+
+pub fn workflow() {
+    #{
+        name: "page_walk",
+        description: "Follow one named control across pages, collecting each page's text into one file; reports one line.",
+        approval: "mutating",
+        params: #{
+            "type": "object",
+            "properties": #{
+                "url": #{ "type": "string", "description": "The page to start on, including scheme." },
+                "follow": #{ "type": "string", "description": "Exact accessible name of the control that leads to the next page, e.g. \"Older posts\"." },
+                "out": #{ "type": "string", "description": "Absolute path of the file the bulk is written to." },
+                "pages": #{ "type": "integer", "description": "Page budget, 1-40. Default 5." },
+                "read_max": #{ "type": "integer", "description": "Max characters collected per page. Default 8000." },
+            },
+            "required": ["url", "follow", "out"],
+        },
+    }
+}
+
+fn fatal(msg) {
+    #{ content: msg, is_error: true }
+}
+
+/// One line out: pages (with the failed count when any), bytes, the output
+/// path, and a cheap byte-sum checksum a reader can compare against the
+/// file without opening it. The path is the real identity — `sha256sum` it
+/// for a strong one; the checksum's job is noticing that a re-run changed
+/// the bulk.
+fn report(visited, failed, bulk, out) {
+    let bs = bulk.as_bytes();
+    let n = bulk.len();
+    let cs = 0;
+    let i = 0;
+    while i < n {
+        cs = cs + bs[i];
+        i = i + 1;
+    }
+    let noun = if visited == 1 { " page" } else { " pages" };
+    let line = "page_walk: " + format!("{}", visited) + noun;
+    if failed > 0 {
+        line = line + " (" + format!("{}", failed) + " failed)";
+    }
+    line = line + ", " + format!("{}", n) + " bytes, cs=" + format!("{}", cs) + " -> " + out;
+    line
+}
+
+pub async fn run(args) {
+    let url = match args.get("url") {
+        Some(u) => u,
+        None => return fatal("page_walk: args need a `url` to start from"),
+    };
+    let follow = match args.get("follow") {
+        Some(f) => f,
+        None => return fatal("page_walk: args need a `follow` — the exact name of the next-page control"),
+    };
+    let out = match args.get("out") {
+        Some(o) => o,
+        None => return fatal("page_walk: args need an `out` — the absolute path the bulk is written to"),
+    };
+    let pages = match args.get("pages") {
+        Some(p) => p,
+        None => 5,
+    };
+    let read_max = match args.get("read_max") {
+        Some(m) => m,
+        None => 8000,
+    };
+    if pages < 1 {
+        pages = 1;
+    }
+    if pages > 40 {
+        pages = 40;
+    }
+
+    // Step 0 — the bulk door. Writing the header first means an unwriteable
+    // output costs one step, not a whole walk. A refusal here is fatal by
+    // the rule above; nothing has been loaded yet.
+    let bulk = "# page_walk " + url + "\nfollow: \"" + follow + "\"\n";
+    match eidolon::tool_call("write", #{ path: out, content: bulk }).await {
+        Ok(_) => (),
+        Err(e) => return fatal("page_walk: the output write was refused, walk not started: " + e),
+    }
+
+    let visited = 0;
+    let failed = 0;
+    let next = url;
+    let first = true;
+    let more = true;
+
+    while more && visited < pages {
+        // Load the page: open on the first, click the follow control after.
+        let loaded = if first {
+            first = false;
+            eidolon::tool_call("browser_open", #{ url: next }).await
+        } else {
+            eidolon::tool_call("browser_click", #{ "ref": next }).await
+        };
+        match loaded {
+            Ok(_) => (),
+            Err(e) => {
+                if e.contains("the user declined this tool call") || e.contains("denied by policy:") {
+                    return fatal("page_walk: refused at page " + format!("{}", visited + 1) + ": " + e);
+                }
+                // A page that will not load is a recorded step, not a fatal
+                // error. With no page loaded there is nothing to follow, so
+                // the walk ends here — recorded, and said in the report.
+                failed = failed + 1;
+                bulk = bulk + "\n== LOAD FAILED: " + e + "\n";
+                let _ = eidolon::tool_call("write", #{ path: out, content: bulk }).await;
+                more = false;
+            }
+        }
+        if !more {
+            break;
+        }
+
+        // Snapshot only what can be followed: links and buttons, refs and
+        // names, no prose. The follow name matches the quoted accessible
+        // name exactly.
+        let snap = match eidolon::tool_call("browser_snapshot", #{ roles: ["link", "button"] }).await {
+            Ok(s) => s,
+            Err(e) => {
+                if e.contains("the user declined this tool call") || e.contains("denied by policy:") {
+                    return fatal("page_walk: refused before snapshot at page " + format!("{}", visited + 1) + ": " + e);
+                }
+                failed = failed + 1;
+                bulk = bulk + "\n== SNAPSHOT FAILED: " + e + "\n";
+                let _ = eidolon::tool_call("write", #{ path: out, content: bulk }).await;
+                more = false;
+                break;
+            }
+        };
+        let next_ref = "";
+        for line in snap.split("\n") {
+            if line.contains("[ref=") && line.contains("\"" + follow + "\"") {
+                match line.split_once("[ref=") {
+                    Some((_, tail)) => match tail.split_once("]") {
+                        Some((r, _)) => next_ref = r,
+                        None => (),
+                    },
+                    None => (),
+                }
+            }
+        }
+
+        // The page's readable text is the bulk. A read failure is recorded
+        // like a load failure: the page's structure was seen, its words
+        // were not.
+        let text = match eidolon::tool_call("browser_read", #{ max: read_max }).await {
+            Ok(t) => t,
+            Err(e) => {
+                if e.contains("the user declined this tool call") || e.contains("denied by policy:") {
+                    return fatal("page_walk: refused collecting page " + format!("{}", visited + 1) + ": " + e);
+                }
+                failed = failed + 1;
+                bulk = bulk + "\n== READ FAILED: " + e + "\n";
+                let _ = eidolon::tool_call("write", #{ path: out, content: bulk }).await;
+                more = false;
+                break;
+            }
+        };
+        visited = visited + 1;
+        bulk = bulk + "\n\n== page " + format!("{}", visited) + " ==\n" + text;
+
+        // Persist progress every page: a walk cut mid-flight leaves the
+        // pages it got on disk, and each write is a journaled step the log
+        // can replay.
+        match eidolon::tool_call("write", #{ path: out, content: bulk }).await {
+            Ok(_) => (),
+            Err(e) => {
+                if e.contains("the user declined this tool call") || e.contains("denied by policy:") {
+                    return fatal("page_walk: refused writing page " + format!("{}", visited) + ": " + e);
+                }
+                return fatal("page_walk: the output write failed after page " + format!("{}", visited) + ": " + e);
+            }
+        }
+
+        // No follow control on the page: the walk is done, and the last
+        // page counted.
+        if next_ref == "" {
+            more = false;
+        } else {
+            next = next_ref;
+        }
+    }
+
+    report(visited, failed, bulk, out)
+}

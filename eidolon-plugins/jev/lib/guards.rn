@@ -1,0 +1,158 @@
+// `equals`, `count` and `matches` are decided here; `entails` asks `jev_entail`, a
+// journaled step, so a resumed run does not ask twice. A guard not handled here is
+// refused at load (graph.rn `check_guard`), never skipped.
+
+fn tool_refused(e) {
+    e.contains("the user declined this tool call") || e.contains("denied by policy:") || e.contains("has no grant covering")
+}
+
+fn values_equal(a, b, fold) {
+    if a is String && b is String {
+        if fold {
+            return a.trim().to_lowercase() == b.trim().to_lowercase();
+        }
+        return a == b;
+    }
+    canon(a) == canon(b)
+}
+
+// Ok(bool), or Err(fatal) when the gate refused the scorer. An unreachable scorer
+// is "does not pass" with a warning, like a neutral verdict.
+async fn nli_passes(rt, guard, scope) {
+    let params = oget_or(guard, "params", #{});
+    let premise = render(oget_or(params, "premise", "{{context.obs.text}}"), scope, rt.warnings);
+    let hypothesis = render(params.hypothesis, scope, rt.warnings);
+    let max_chars = oget_or(params, "max_chars", 1500);
+    if premise.len() > max_chars {
+        if oget_or(params, "window", "head") == "tail" {
+            premise = chars_tail(premise, max_chars);
+        } else {
+            premise = chars_head(premise, max_chars);
+        }
+    }
+    if premise.trim() == "" || hypothesis.trim() == "" {
+        rt.warnings.push("entails guard: empty premise or hypothesis, treated as not passing");
+        return Ok(false);
+    }
+    let threshold = oget_or(params, "threshold", graph_default(rt.g, "threshold", 0.6));
+    let reply = match eidolon::tool_call("jev_entail", #{ premise: premise, hypotheses: [hypothesis] }).await {
+        Ok(text) => text,
+        Err(e) => {
+            if tool_refused(e) {
+                return Err(#{ k: "fatal", msg: "jev_entail was refused: " + e });
+            }
+            rt.warnings.push("entails guard: the scorer failed (" + e + "), treated as not passing");
+            return Ok(false);
+        }
+    };
+    let parsed = match json::from_string(reply) {
+        Ok(p) => p,
+        Err(_) => {
+            rt.warnings.push("entails guard: the scorer's answer was not JSON, treated as not passing");
+            return Ok(false);
+        }
+    };
+    let results = oget_or(parsed, "results", []);
+    if !(results is Vec) || results.len() == 0 {
+        rt.warnings.push("entails guard: the scorer answered no result, treated as not passing");
+        return Ok(false);
+    }
+    let scores = oget_or(results[0], "scores", #{});
+    let p = oget_or(scores, "entailment", 0.0);
+    Ok(p >= threshold)
+}
+
+async fn eval_guard(rt, guard, scope) {
+    let kind = guard.type;
+    let params = oget_or(guard, "params", #{});
+    if kind == "equals" {
+        let left = match resolve(params.path, scope) {
+            Some(v) => v,
+            None => (),
+        };
+        let right = params.value;
+        if right is String {
+            right = render_value(right, scope, rt.warnings);
+        }
+        return Ok(values_equal(left, right, oget_or(params, "fold", false)));
+    }
+    if kind == "count" {
+        let n = 0;
+        match resolve(params.path, scope) {
+            Some(v) => {
+                if v is Vec || v is String {
+                    n = if v is Vec { v.len() } else { v.chars().count() };
+                } else if v is Object {
+                    n = sorted_keys(v).len();
+                }
+            }
+            None => {}
+        }
+        match oget(params, "gte") {
+            Some(g) => { if n < g { return Ok(false); } }
+            None => {}
+        }
+        match oget(params, "lte") {
+            Some(l) => { if n > l { return Ok(false); } }
+            None => {}
+        }
+        return Ok(true);
+    }
+    if kind == "matches" {
+        let text = match resolve(params.path, scope) {
+            Some(v) => stringify(v),
+            None => "",
+        };
+        let found = match regex_search(params.pattern, text) {
+            Ok(m) => Ok(m.is_some()),
+            Err(e) => Err(#{ k: "fatal", msg: e }),
+        };
+        return found;
+    }
+    if kind == "entails" {
+        return nli_passes(rt, guard, scope).await;
+    }
+    Err(#{ k: "fatal", msg: "guard type " + kind + " is not supported" })
+}
+
+fn as_transitions(v) {
+    if is_null(v) {
+        return [];
+    }
+    if v is String {
+        return [#{ target: v }];
+    }
+    if v is Object {
+        return [v];
+    }
+    if v is Vec {
+        let out = [];
+        for t in v {
+            if t is String {
+                out.push(#{ target: t });
+            } else {
+                out.push(t);
+            }
+        }
+        return out;
+    }
+    let none = [];
+    none
+}
+
+// Index of the first transition whose guard passes (no guard passes), or -1.
+async fn first_passing(rt, transitions, scope) {
+    let i = 0;
+    while i < transitions.len() {
+        match oget(transitions[i], "guard") {
+            Some(g) => {
+                if eval_guard(rt, g, scope).await? {
+                    return Ok(i);
+                }
+            }
+            None => return Ok(i),
+        }
+        i += 1;
+    }
+    Ok(-1)
+}

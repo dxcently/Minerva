@@ -1,0 +1,25 @@
+// `triage-botforge`: triage-linux for unattended runs. No NLI guards and floor and
+// margin 0, so the chooser's pick is always taken and a run never parks.
+
+// PIN is the sha256 of graphs/triage-botforge.json; tests/jev/pin.sh rewrites it.
+const GRAPH = "triage-botforge";
+const PIN = "sha256:03d2e05600b06d35b90d9d658e3a5b73c2c006108baf15cfa977770885264c2f";
+
+pub fn workflow() {
+    #{
+        name: "triage-botforge",
+        description: "Read-only recon of the BotForge range guest over ssh with a fixed menu of commands, the chooser's pick always taken (no confidence floor, no NLI). ssh defaults to mford@127.0.0.1 port 2222. Needs the jev service for jev_choose.",
+        approval: "read_only",
+        params: #{
+            "type": "object",
+            "properties": #{
+                "ssh": #{ "type": "string", "description": "The host to triage over ssh. Default mford@127.0.0.1." },
+                "ssh_port": #{ "type": "integer", "description": "The ssh port. Default 2222." },
+            },
+        },
+    }
+}
+
+pub async fn run(args) {
+    run_pinned(GRAPH, PIN, with_defaults(args, #{ ssh: "mford@127.0.0.1", ssh_port: 2222 })).await
+}

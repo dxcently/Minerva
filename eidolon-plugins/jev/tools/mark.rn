@@ -1,0 +1,26 @@
+// `jev_mark`: a no-op whose input is the record of where a run is. The interpreter
+// calls it as a step, so a viewer reads the active node as the last `jev_mark`
+// step in the run's journal.
+pub fn manifest() {
+    #{
+        name: "jev_mark",
+        description: "Record where a jev graph run is: the graph, what happened (enter, park, final, end), the dotted state path, and the step and action counts. A graph workflow calls this itself; it has no effect beyond appearing in the run's journal, where a viewer reads the active node. Calling it by hand does not move any run.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "graph": #{ "type": "string", "description": "The graph's id, e.g. triage-linux." },
+                "kind": #{ "type": "string", "enum": ["enter", "park", "final", "end"], "description": "enter: a leaf state was entered; park: the run is waiting on a person in this state; final: a final state was entered; end: the run ended without one (outcome says how)." },
+                "state": #{ "type": "string", "description": "The state's dotted path, e.g. investigate.identify." },
+                "step": #{ "type": "integer", "description": "Decisions taken so far." },
+                "actions": #{ "type": "integer", "description": "Tool actions taken so far." },
+                "outcome": #{ "type": "string", "description": "With kind end: exhausted, stopped or error." },
+            },
+            "required": ["graph", "kind", "state"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    Ok("marked " + `${input.graph}` + " " + `${input.kind}` + " " + `${input.state}`)
+}

@@ -1,0 +1,62 @@
+// browser/tools/state.rn — the read the workflow scope cannot do.
+//
+// The workflow scope has no fs: a watch that compares against a stored
+// baseline needs a tool to read it, and this is that tool, with one job —
+// return the digest stored at `path`, trimmed, empty when nothing is
+// stored yet. It never writes: the baseline is updated by the watch's own
+// `write` step, the named policy row an operator table can deny by name,
+// so the operator's yes on this file's bytes is a yes to READ state only.
+// A missing file is the first run and answers empty; any other read
+// failure is real and passes through — an unreadable OLD baseline must
+// never pass for "no baseline", or the next watch would write a new one
+// over it.
+pub fn manifest() {
+    #{
+        name: "browser_state",
+        description: "Return the page digest stored at `path` -- the baseline a page_watch compares against -- trimmed, empty when nothing is stored yet. Read-only: the baseline is updated by the watch's own write step, never through here.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "path": #{
+                    "type": "string",
+                    "description": "Absolute path of the digest file.",
+                },
+            },
+            "required": ["path"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let path = match input.get("path") {
+        Some(p) => p,
+        None => return Err("browser_state needs a `path` -- the digest file to read"),
+    };
+    match eidolon::fs_read(path, None, None).await {
+        Ok(text) => {
+            // fs_read renders the read tool's line-numbered form, and an
+            // empty file as the sentinel `[empty file]`. The digest file is
+            // one line, so the gutter strips cleanly; both display
+            // artifacts answer as "no baseline yet", which is what they
+            // mean here.
+            let line = match text.split_once("\t") {
+                Some((_, rest)) => rest,
+                None => text,
+            };
+            let line = line.trim();
+            if line == "" || line == "[empty file]" {
+                Ok("")
+            } else {
+                Ok(line)
+            }
+        }
+        Err(e) => {
+            if e.contains("os error 2") || e.contains("No such file") {
+                Ok("")
+            } else {
+                Err(e)
+            }
+        }
+    }
+}

@@ -1,0 +1,208 @@
+{
+  "id": "wiki-hop",
+  "version": "1",
+  "description": "Reach a target Wikipedia article from a start article by following article links.",
+  "initial": "open",
+  "context": {
+    "goal": "",
+    "start": "",
+    "visited": [],
+    "path": []
+  },
+  "meta": {
+    "jev": {
+      "tools": [
+        "browser_open",
+        "browser_snapshot",
+        "browser_click",
+        "browser_back"
+      ],
+      "input": {
+        "type": "object",
+        "required": [
+          "start",
+          "goal"
+        ],
+        "properties": {
+          "start": {
+            "type": "string"
+          },
+          "goal": {
+            "type": "string"
+          }
+        }
+      },
+      "defaults": {
+        "floor": 0.35,
+        "margin": 0.05,
+        "visits": 30
+      },
+      "budget": {
+        "steps": 30,
+        "actions": 70,
+        "escalations": 30
+      }
+    }
+  },
+  "on": {
+    "ERROR": "failed"
+  },
+  "states": {
+    "open": {
+      "description": "Open the start article.",
+      "entry": [
+        {
+          "type": "assign",
+          "params": {
+            "goal": "{{input.goal}}",
+            "start": "{{input.start}}"
+          }
+        },
+        {
+          "type": "tool",
+          "params": {
+            "name": "browser_open",
+            "input": {
+              "url": "https://en.wikipedia.org/wiki/{{context.start}}",
+              "confine": [
+                "https://en.wikipedia.org"
+              ]
+            }
+          }
+        }
+      ],
+      "always": "reading"
+    },
+    "reading": {
+      "description": "On an article; pick the link most likely to lead toward the goal.",
+      "entry": [
+        {
+          "type": "tool",
+          "params": {
+            "name": "browser_snapshot",
+            "input": {
+              "within": "main",
+              "roles": [
+                "link"
+              ]
+            },
+            "into": "obs"
+          }
+        },
+        {
+          "type": "push",
+          "params": {
+            "path": "path",
+            "value": "{{context.obs.h1}}"
+          }
+        }
+      ],
+      "always": [
+        {
+          "description": "the exact title",
+          "guard": {
+            "type": "equals",
+            "params": {
+              "path": "context.obs.h1",
+              "value": "{{context.goal}}"
+            }
+          },
+          "target": "arrived"
+        },
+        {
+          "description": "a redirect, or a variant of the title",
+          "guard": {
+            "type": "entails",
+            "params": {
+              "premise": "Title: {{context.obs.title}}. Heading: {{context.obs.h1}}.",
+              "hypothesis": "This is the encyclopedia article about {{context.goal}}.",
+              "threshold": 0.8
+            }
+          },
+          "target": "arrived"
+        }
+      ],
+      "meta": {
+        "choose": {
+          "from": {
+            "refs": {
+              "roles": [
+                "link"
+              ],
+              "within": "main",
+              "url": "^(?:https://en\\.wikipedia\\.org)?/wiki/[^:#?]+$"
+            }
+          },
+          "exclude": "{{context.visited}}",
+          "max": 64,
+          "context": "Target article: {{context.goal}}\nCurrent article: {{context.obs.h1}}\n{{context.obs.text}}",
+          "label": "{{option.name}}",
+          "prefer": [
+            {
+              "type": "equals",
+              "params": {
+                "path": "option.label",
+                "value": "{{context.goal}}",
+                "fold": true
+              }
+            }
+          ]
+        },
+        "floor": 0.35,
+        "ask": "Which link leads toward the article \"{{context.goal}}\"?"
+      },
+      "on": {
+        "PICK": {
+          "target": "reading",
+          "reenter": true,
+          "actions": [
+            {
+              "type": "push",
+              "params": {
+                "path": "visited",
+                "value": "{{context.obs.h1}}"
+              }
+            },
+            {
+              "type": "tool",
+              "params": {
+                "name": "browser_click",
+                "input": {
+                  "ref": "{{event.option.ref}}"
+                }
+              }
+            }
+          ]
+        },
+        "EMPTY": {
+          "target": "reading",
+          "reenter": true,
+          "actions": [
+            {
+              "type": "tool",
+              "params": {
+                "name": "browser_back"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "arrived": {
+      "type": "final",
+      "description": "The goal article is open.",
+      "output": {
+        "path": "{{context.path}}"
+      }
+    },
+    "failed": {
+      "type": "final",
+      "description": "A browser action failed.",
+      "output": {
+        "error": "{{event.error}}",
+        "reason": "{{event.reason}}",
+        "path": "{{context.path}}"
+      }
+    }
+  }
+}

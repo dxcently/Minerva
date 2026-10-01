@@ -1,0 +1,26 @@
+// The plugin manifest for `browser` — the directory's name is the namespace
+// every verb it ships is registered under (`browser_open`, ...), so this file
+// says only what the plugin says about itself.
+pub fn manifest() {
+    #{
+        name: "browser",
+        version: "0.1.0",
+        description: "one headless Chromium for the whole machine, behind seven tools",
+        // The daemon, declared: `eidolon plugins service approve browser`
+        // records the operator's yes against THIS text by hash, so an edit
+        // here asks again, and `service start` then runs it detached with
+        // readiness taken from the same `readiness` block the tools use.
+        // Chromium comes from PATH or EIDOLON_BROWSER_CHROME; the service
+        // makes the token file on first run.
+        service: #{
+            command: "eidolon-browser",
+            readiness: #{ port: 8090, health: "/health" },
+            ready_timeout_s: 30,
+        },
+        claims: #{
+            tools: ["open", "snapshot", "click", "type", "read", "back", "state"],
+            grants: ["file:~/.config/eidolon/browser.token"],
+            workflows: ["page_walk", "page_watch"],
+        },
+    }
+}

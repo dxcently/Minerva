@@ -1,0 +1,296 @@
+// A graph document, read once. One that uses a feature the interpreter lacks is
+// refused at load, by name, never run with the feature ignored.
+
+// Every state by dotted path ("investigate.identify"), parents first; checks each.
+fn collect_states(states, prefix, out, errors) {
+    for name in sorted_keys(states) {
+        let st = states[name];
+        let path = if prefix == "" { name } else { prefix + "." + name };
+        out[path] = st;
+        check_state(path, st, errors);
+        match oget(st, "states") {
+            Some(sub) => { collect_states(sub, path, out, errors); }
+            None => {}
+        }
+    }
+}
+
+fn check_guard(where_, g, errors) {
+    if !(g is Object) {
+        errors.push(where_ + ": a guard is an object {type, params}");
+        return;
+    }
+    let t = oget_or(g, "type", "");
+    if t != "equals" && t != "count" && t != "matches" && t != "entails" {
+        errors.push(where_ + ": guard type '" + `${t}` + "' is not supported (equals, count, matches, entails are)");
+    }
+}
+
+fn check_actions(where_, actions, errors) {
+    if is_null(actions) {
+        return;
+    }
+    if !(actions is Vec) {
+        errors.push(where_ + ": actions are a list");
+        return;
+    }
+    for a in actions {
+        let t = oget_or(a, "type", "");
+        if t != "tool" && t != "push" && t != "assign" && t != "capture" {
+            errors.push(where_ + ": action type '" + `${t}` + "' is not supported (tool, push, assign, capture are)");
+        }
+        let p = oget_or(a, "params", #{});
+        match oget(p, "expect") {
+            Some(g) => { check_guard(where_ + " expect", g, errors); }
+            None => {}
+        }
+    }
+}
+
+fn check_transitions(where_, v, errors) {
+    for t in as_transitions(v) {
+        match oget(t, "guard") {
+            Some(g) => { check_guard(where_, g, errors); }
+            None => {}
+        }
+        check_actions(where_ + " actions", oget_or(t, "actions", ()), errors);
+    }
+}
+
+fn check_state(path, st, errors) {
+    let ty = oget_or(st, "type", "");
+    if ty != "" && ty != "final" && ty != "history" {
+        errors.push(path + ": state type '" + `${ty}` + "' is not supported");
+    }
+    check_actions(path + " entry", oget_or(st, "entry", ()), errors);
+    check_actions(path + " exit", oget_or(st, "exit", ()), errors);
+    check_transitions(path + " always", oget_or(st, "always", ()), errors);
+    check_transitions(path + " onDone", oget_or(st, "onDone", ()), errors);
+    match oget(st, "on") {
+        Some(on) => {
+            for ev in sorted_keys(on) {
+                check_transitions(path + " on " + ev, on[ev], errors);
+            }
+        }
+        None => {}
+    }
+    let choose = oget(oget_or(st, "meta", #{}), "choose");
+    match choose {
+        Some(c) => {
+            let from = oget_or(c, "from", ());
+            let ok = false;
+            if from is String && from == "transitions" {
+                ok = true;
+            } else if from is Object {
+                if from.contains_key("menu") || from.contains_key("lines") || from.contains_key("refs") {
+                    ok = true;
+                }
+            }
+            if !ok {
+                errors.push(path + ": choose.from must be 'transitions' or one of menu, lines, refs");
+            }
+            for key in sorted_keys(c) {
+                if key != "from" && key != "exclude" && key != "max" && key != "context" && key != "label"
+                    && key != "prefer" && key != "also" {
+                    errors.push(path + ": choose." + key + " is not supported");
+                }
+            }
+            match oget(c, "prefer") {
+                Some(rules) => {
+                    for g in rules {
+                        check_guard(path + " prefer", g, errors);
+                    }
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    if ty == "history" && oget_or(st, "history", "shallow") != "shallow" {
+        errors.push(path + ": only shallow history is supported");
+    }
+}
+
+// The keys of every object in a JSON text, in text order, by path ("/states/recover/on"
+// -> ["CONTINUE", "ABORT"]). A parsed object does not keep that order (Rune sorts it)
+// and a `transitions` menu follows the graph's own event order.
+fn key_orders(text) {
+    let cs = text.chars().collect::<Vec>();
+    let orders = #{};
+    let stack = [];
+    let i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '"' {
+            let s = "";
+            i += 1;
+            while i < cs.len() && cs[i] != '"' {
+                if cs[i] == '\\' && i + 1 < cs.len() {
+                    i += 1;
+                }
+                s += `${cs[i]}`;
+                i += 1;
+            }
+            if stack.len() > 0 {
+                let top = stack[stack.len() - 1];
+                if top.obj && top.want_key {
+                    top.keys.push(s.clone());
+                    top.cur = s;
+                    top.want_key = false;
+                }
+            }
+        } else if c == '{' || c == '[' {
+            let path = "";
+            if stack.len() > 0 {
+                let top = stack[stack.len() - 1];
+                let seg = if top.obj { top.cur.clone() } else { `${top.idx}` };
+                path = top.path.clone() + "/" + seg;
+            }
+            stack.push(#{ obj: c == '{', path: path, keys: [], cur: "", want_key: c == '{', idx: 0 });
+        } else if c == '}' || c == ']' {
+            match stack.pop() {
+                Some(top) => {
+                    if top.obj {
+                        orders[top.path] = top.keys;
+                    }
+                }
+                None => {}
+            }
+        } else if c == ',' {
+            if stack.len() > 0 {
+                let top = stack[stack.len() - 1];
+                if top.obj {
+                    top.want_key = true;
+                } else {
+                    top.idx += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    orders
+}
+
+// The `on` events in document order (`order`), then any the text did not give, sorted.
+fn events_in_order(on, order) {
+    let out = [];
+    let seen = #{};
+    if order is Vec {
+        for ev in order {
+            if on.contains_key(ev) && !seen.contains_key(ev) {
+                seen[ev] = true;
+                out.push(ev.clone());
+            }
+        }
+    }
+    for ev in sorted_keys(on) {
+        if !seen.contains_key(ev) {
+            out.push(ev.clone());
+        }
+    }
+    out
+}
+
+// The parsed document and its state table, or Err(reason) naming everything unsupported.
+fn load_graph(text) {
+    let doc = match json::from_string(text) {
+        Ok(d) => d,
+        Err(_) => return Err("the graph is not JSON"),
+    };
+    let errors = [];
+    if !(doc is Object) || oget_or(doc, "id", "") == "" {
+        return Err("the graph has no id");
+    }
+    let paths = #{};
+    match oget(doc, "states") {
+        Some(sts) => { collect_states(sts, "", paths, errors); }
+        None => { errors.push("the graph has no states"); }
+    }
+    if !paths.contains_key(`${oget_or(doc, "initial", "")}`) {
+        errors.push("initial '" + `${oget_or(doc, "initial", "")}` + "' is not a top-level state");
+    }
+    let orders = key_orders(text);
+    for p in sorted_keys(paths) {
+        let st = paths[p];
+        match oget(st, "on") {
+            Some(on) => {
+                let key = "";
+                for part in p.split(".") {
+                    key += "/states/" + part;
+                }
+                st["on_order"] = events_in_order(on, oget_or(orders, key + "/on", ()));
+            }
+            None => {}
+        }
+    }
+    let meta_jev = oget_or(oget_or(doc, "meta", #{}), "jev", #{});
+    for ev in sorted_keys(oget_or(doc, "on", #{})) {
+        check_transitions("root on " + ev, doc.on[ev], errors);
+    }
+    if errors.len() > 0 {
+        return Err("the graph uses what this interpreter does not have: " + join(errors, "; "));
+    }
+    Ok(#{
+        id: doc.id,
+        doc: doc,
+        paths: paths,
+        jev: meta_jev,
+        root_on: oget_or(doc, "on", #{}),
+    })
+}
+
+fn graph_default(g, key, dflt) {
+    oget_or(oget_or(g.jev, "defaults", #{}), key, dflt)
+}
+
+fn graph_budget(g, key, dflt) {
+    oget_or(oget_or(g.jev, "budget", #{}), key, dflt)
+}
+
+// The root is not a state.
+fn state_at(g, path) {
+    g.paths[path_dot(path)]
+}
+
+fn state_exists(g, path) {
+    g.paths.contains_key(path_dot(path))
+}
+
+fn is_compound(st) {
+    match oget(st, "states") {
+        Some(s) => sorted_keys(s).len() > 0,
+        None => false,
+    }
+}
+
+// `#id.a.b` is an absolute path, a bare name a sibling of the declaring state; None otherwise.
+fn resolve_target(g, from_path, target) {
+    let path = [];
+    if target.starts_with("#") {
+        let parts = [];
+        for p in target.get(1..).unwrap_or("").split(".") {
+            if p != "" {
+                parts.push(p);
+            }
+        }
+        if parts.len() == 0 || parts[0] != g.id {
+            return None;
+        }
+        let i = 1;
+        while i < parts.len() {
+            path.push(parts[i]);
+            i += 1;
+        }
+    } else {
+        if from_path.len() == 0 {
+            path = [target];
+        } else {
+            path = path_push(path_take(from_path, from_path.len() - 1), target);
+        }
+    }
+    if state_exists(g, path) {
+        Some(path)
+    } else {
+        None
+    }
+}

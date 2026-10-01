@@ -1,0 +1,352 @@
+// `subagent_trace`: the tail of one child's log, plus whether it is still running, how it
+// ended and what it has spent. The log is the only window on a child mid-run, so it is what
+// a steer is judged by, and where a child's question (its final text) is read.
+//
+// Spend is read from the journal as `subagent_list` reads it: calls and dollars as a range,
+// "unpriced" for a model the catalog does not price, "unknown" for a child with no journal
+// yet -- never $0.
+pub fn manifest() {
+    #{
+        name: "subagent_trace",
+        description: "The last lines of one subagent's log, with whether its process is alive, how it ended, its budget and what it has spent (model calls and dollars from its journal; unpriced is said, never $0). The log is the child's whole output: its stdout, its stderr, and the `session:` line naming its journal. A child that needs a decision ends with the question in its final text: read it here and answer with `subagent_steer`. Read-only.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "id": #{
+                    "type": "string",
+                    "description": "The subagent id `subagent_spawn` returned: `sa-<seconds>-<4 hex>`.",
+                },
+                "lines": #{
+                    "type": "integer",
+                    "description": "How many lines from the end of the log to show. Default 40, clamped to 1..400.",
+                },
+            },
+            "required": ["id"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let id = checked_id(input.id);
+    if id == "" {
+        let msg = `not a subagent id: ${input.id} (they look like sa-1790508668-ab12) -- subagent_list has the ones there are`;
+        return Err(msg);
+    }
+    let lines = clamp_lines(input.get("lines"));
+    let out = eidolon::shell(sh_eid(TRACE_SH, [id, `${lines}`]), Some(120)).await?;
+    if out.contains("[exit code") {
+        return Err(out);
+    }
+    Ok(render(out, id, lines))
+}
+
+// The tail, as one POSIX sh script (no GNU-only flags, no `timeout`; the state root is
+// computed there because Rune sees no environment). It prints `key=value` facts, a `@@tail`
+// line, then the tail; or one `@@missing` line saying why there is nothing to show.
+const TRACE_SH = "root=${XDG_STATE_HOME:-$HOME/.local/state}/eidolon/subagents
+id=$1
+lines=$2
+dir=$root/$id
+models=$(\"$eid\" models 2>/dev/null) || { printf 'subagent: `eidolon models` (%s) exited non-zero, so spend cannot be priced.\\n' \"$eid\" >&2; exit 4; }
+
+# How a child ended, from the status file `shell_background` writes beside its
+# log: compact JSON, `code` null when a signal ended it.
+ended_of() {
+  status=$1
+  if [ -z \"$status\" ] || [ ! -f \"$status\" ]; then
+    printf 'nothing recorded yet (still running, or nobody reaped it)'
+    return 0
+  fi
+  fields=$(sed -n 's/.*\"code\":\\([^,]*\\),\"signal\":\\([^,]*\\),.*/\\1 \\2/p' \"$status\")
+  code=${fields%% *}
+  signal=${fields#* }
+  if [ \"$code\" = null ]; then
+    printf 'killed by signal %s' \"$signal\"
+  elif [ -n \"$code\" ] && [ \"$fields\" != \"$code\" ]; then
+    printf 'exit code %s' \"$code\"
+  else
+    printf 'unreadable status file'
+  fi
+  return 0
+}
+
+# What a journal says a child spent: \"calls tin tout cache_read cache_write low
+# high\", the two dollar figures being \"unpriced\" when the catalog has no price
+# for the model; \"nojournal\" when there is nothing to read.
+spend_of() {
+  journal=$1
+  [ -n \"$journal\" ] && [ -f \"$journal\" ] || { printf 'nojournal'; return 0; }
+  rates=$(printf '%s\\n' \"$models\" | awk -v m=\"$2\" '$1 == m && index($0, \" · \") > 0 { if (match($0, /\\$[0-9.]+\\/[0-9.]+ per M/)) { s = substr($0, RSTART + 1, RLENGTH - 1); split(s, a, \"/\"); printf \"%s %s\", a[1], a[2] + 0 } exit }')
+  \"$eid\" log --json \"$journal\" 2>/dev/null | awk -v rates=\"$rates\" '
+    function num(s, k,    r) {
+      if (match(s, \"\\\"\" k \"\\\":[0-9]+\")) { r = substr(s, RSTART + length(k) + 3, RLENGTH - length(k) - 3); return r + 0 }
+      return 0
+    }
+    /\"kind\":\\{\"(TurnSettled|TurnSpend|ModelSpend)\":/ {
+      ti += num($0, \"input_tokens\"); to += num($0, \"output_tokens\")
+      cr += num($0, \"cache_read_input_tokens\"); cw += num($0, \"cache_creation_input_tokens\")
+    }
+    /\"kind\":\\{\"(TurnPace|TurnSpend)\":/ { calls += num($0, \"calls\") }
+    END {
+      if (rates == \"\") { printf \"%d %d %d %d %d unpriced unpriced\", calls, ti, to, cr, cw; exit }
+      split(rates, p, \" \")
+      low = (ti * p[1] + to * p[2] + cw * p[1]) / 1000000
+      high = low + cr * p[1] / 1000000
+      printf \"%d %d %d %d %d %.6f %.6f\", calls, ti, to, cr, cw, low, high
+    }'
+}
+
+if [ ! -d \"$dir\" ]; then
+  printf '@@missing\\nunknown subagent %s: no state directory %s\\n' \"$id\" \"$dir\"
+  exit 0
+fi
+if [ ! -f \"$dir/meta\" ]; then
+  printf '@@missing\\nsubagent %s has no meta file in %s, so nothing is recorded about it\\n' \"$id\" \"$dir\"
+  exit 0
+fi
+get() { sed -n \"s/^$1=//p\" \"$dir/meta\" | head -n 1; }
+kind=$(get kind)
+[ -n \"$kind\" ] || kind=$(get role)
+model=$(get model)
+pid=$(get pid)
+log=$(get log)
+status=$(get status)
+if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then
+  alive=alive
+else
+  alive=not-alive
+fi
+journal=$(sed -n 's/^session: //p' \"$log\" 2>/dev/null | head -n 1)
+printf 'id=%s\\nkind=%s\\nmodel=%s\\nmodel_from=%s\\ndeadline_min=%s\\npid=%s\\n' \"$id\" \"$kind\" \"$model\" \"$(get model_from)\" \"$(get deadline_min)\" \"$pid\"
+printf 'budget_calls=%s\\nbudget_usd_max=%s\\nbudget_usd_min=%s\\n' \"$(get budget_calls)\" \"$(get budget_usd_max)\" \"$(get budget_usd_min)\"
+printf 'alive=%s\\nended=%s\\njournal=%s\\nlog=%s\\n' \"$alive\" \"$(ended_of \"$status\")\" \"$journal\" \"$log\"
+printf 'spend=%s\\n' \"$(spend_of \"$journal\" \"$model\")\"
+printf '@@tail\\n'
+if [ -f \"$log\" ]; then
+  tail -n \"$lines\" \"$log\"
+  printf '\\n'
+else
+  printf '(the log is not written yet)\\n'
+fi
+";
+
+fn render(out, id, lines) {
+    let pair = out.split("\n@@tail\n").collect::<Vec>();
+    let head = pair[0];
+    let tail = "";
+    if pair.len() > 1 {
+        tail = pair[1];
+    }
+    if head.starts_with("@@missing") {
+        let parts = head.split("\n").collect::<Vec>();
+        let msg = out;
+        if parts.len() > 1 {
+            msg = parts[1];
+        }
+        let shown = msg + "\n";
+        return shown;
+    }
+    let k = #{};
+    for line in head.split("\n") {
+        match line.split_once("=") {
+            Some(p) => {
+                k.insert(p.0, p.1);
+            }
+            None => {}
+        }
+    }
+    let kind = field(k, "kind");
+    if kind == "" {
+        kind = "-";
+    }
+    let model = field(k, "model");
+    if model == "" {
+        model = "(the config default)";
+    }
+    let journal = field(k, "journal");
+    if journal == "" {
+        journal = "not printed yet";
+    }
+    let text = `subagent ${id}: ${field(k, "alive")}, ${field(k, "ended")}\n`;
+    text += `kind ${kind}, model ${model} (${field(k, "model_from")}), deadline ${field(k, "deadline_min")} min, pid ${field(k, "pid")}\n`;
+    text += `budget: ${budget_words(k)}\n`;
+    text += `spend: ${spend_words(k)}\n`;
+    text += `journal: ${journal}\n`;
+    text += `log: ${field(k, "log")} -- last ${lines} lines\n`;
+    text += tail;
+    text
+}
+
+fn field(k, name) {
+    match k.get(name) {
+        Some(v) => `${v}`,
+        None => "",
+    }
+}
+
+fn spend(k) {
+    let parts = field(k, "spend").split(" ").collect::<Vec>();
+    let out = #{ known: false, calls: 0, tin: 0, tout: 0, cr: 0, cw: 0, priced: false, low: None, high: None, low_s: "", high_s: "" };
+    if parts.len() < 7 {
+        return out;
+    }
+    out.known = true;
+    out.calls = int(parts[0]);
+    out.tin = int(parts[1]);
+    out.tout = int(parts[2]);
+    out.cr = int(parts[3]);
+    out.cw = int(parts[4]);
+    if parts[5] != "unpriced" {
+        out.priced = true;
+        out.low = Some(number(parts[5]));
+        out.high = Some(number(parts[6]));
+        out.low_s = parts[5];
+        out.high_s = parts[6];
+    }
+    out
+}
+
+// "over" when even the low figure is past usd_max, "maybe" when only the high one is, "" otherwise or when unknowable.
+fn over(k, s) {
+    let max = field(k, "budget_usd_max");
+    if max == "" || !s.priced {
+        return "";
+    }
+    let m = number(max);
+    if s.low.unwrap() > m {
+        return "over";
+    }
+    if s.high.unwrap() > m {
+        return "maybe";
+    }
+    ""
+}
+
+fn budget_words(k) {
+    let parts = [];
+    if field(k, "budget_calls") != "" {
+        parts.push(`calls ${field(k, "budget_calls")} (enforced)`);
+    }
+    if field(k, "budget_usd_max") != "" {
+        parts.push("usd_max $" + field(k, "budget_usd_max") + " (post-hoc)");
+    }
+    if field(k, "budget_usd_min") != "" {
+        parts.push("usd_min $" + field(k, "budget_usd_min") + " (reserve)");
+    }
+    if parts.len() == 0 {
+        return "none";
+    }
+    let out = "";
+    for p in parts {
+        if out != "" {
+            out += ", ";
+        }
+        out += p;
+    }
+    out
+}
+
+fn spend_words(k) {
+    let s = spend(k);
+    if !s.known {
+        return "unknown (no journal readable yet: the child has not printed its session line, or never started a session)";
+    }
+    let words = `${s.calls} calls, ${s.tin} in / ${s.tout} out / ${s.cr} cache-read tokens, `;
+    if !s.priced {
+        words += "dollars unpriced (the catalog has no price for this model)";
+    } else if s.low_s == s.high_s {
+        words += "$" + s.low_s;
+    } else {
+        words += "$" + s.low_s + " to $" + s.high_s + " (cache reads free .. at the input rate)";
+    }
+    let o = over(k, s);
+    if o == "over" {
+        words += "  OVER usd_max $" + field(k, "budget_usd_max");
+    } else if o == "maybe" {
+        words += "  may be over usd_max $" + field(k, "budget_usd_max");
+    }
+    words
+}
+
+fn int(text) {
+    match text.parse::<i64>() {
+        Ok(n) => n,
+        Err(_) => 0,
+    }
+}
+
+fn number(text) {
+    match text.parse::<f64>() {
+        Ok(n) => n,
+        Err(_) => 0.0,
+    }
+}
+
+// The id becomes a path, and quoting does not protect a path.
+fn checked_id(raw) {
+    let id = `${raw}`;
+    if !id.starts_with("sa-") || id.contains("/") || id.contains(".") {
+        return "";
+    }
+    id
+}
+
+// Default 40; clamped, since the number reaches `tail`.
+fn clamp_lines(requested) {
+    let n = match requested {
+        Some(v) => int(`${v}`),
+        None => 40,
+    };
+    if n < 1 {
+        1
+    } else if n > 400 {
+        400
+    } else {
+        n
+    }
+}
+
+fn quote(text) {
+    let s = `${text}`;
+    `'${s.replace("'", "'\\''")}'`
+}
+
+// The eidolon binary: $EIDOLON_BIN if set (and then only that), else `eidolon` on PATH, else
+// $HOME/.local/bin/eidolon, each only if it answers `--version`: without a login shell (a
+// Windows `wsl.exe -e`, a service, cron) PATH can hold a stub that is executable and runs
+// nothing (Minerva's does). None works: exit 127 and say how to fix it.
+const EID_SH = "eid=
+eid_ok() { [ -f \"$1\" ] && [ -x \"$1\" ] && \"$1\" --version >/dev/null 2>&1; }
+if [ -n \"${EIDOLON_BIN:-}\" ]; then
+  if eid_ok \"$EIDOLON_BIN\"; then eid=$EIDOLON_BIN; fi
+else
+  onpath=$(command -v eidolon 2>/dev/null)
+  if [ -n \"$onpath\" ] && eid_ok \"$onpath\"; then
+    eid=$onpath
+  elif eid_ok \"$HOME/.local/bin/eidolon\"; then
+    eid=$HOME/.local/bin/eidolon
+  fi
+fi
+if [ -z \"$eid\" ]; then
+  if [ -n \"${EIDOLON_BIN:-}\" ]; then
+    printf 'subagent: EIDOLON_BIN is set to %s, which is not an executable that runs (`%s --version` failed). Fix it or unset it.\\n' \"$EIDOLON_BIN\" \"$EIDOLON_BIN\" >&2
+  else
+    printf 'subagent: cannot find a working eidolon binary: `eidolon` on PATH is %s and %s/.local/bin/eidolon does not run. Set EIDOLON_BIN to the full path of one that does.\\n' \"${onpath:-absent}\" \"$HOME\" >&2
+  fi
+  exit 127
+fi
+";
+
+// POSIX sh rather than whatever `eidolon::shell` runs.
+fn sh_cmd(script, args) {
+    let cmd = `sh -c ${quote(script)} sa`;
+    for a in args {
+        cmd += ` ${quote(a)}`;
+    }
+    cmd
+}
+
+fn sh_eid(script, args) {
+    sh_cmd(EID_SH + script, args)
+}

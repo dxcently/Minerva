@@ -1,0 +1,18 @@
+{
+  "name": "fanout",
+  "roles": [
+    {
+      "role": "scout",
+      "count": 3,
+      "kind": "research",
+      "tools": ["read", "grep", "bash"],
+      "budget": { "calls": 40, "usd_max": 0.5, "usd_min": 0.1 },
+      "floor": null
+    }
+  ],
+  "thresholds": [
+    { "at": 0.7, "action": "step_down" },
+    { "at": 0.9, "action": "ask" },
+    { "at": 1.0, "action": "stop" }
+  ]
+}

@@ -1,0 +1,6 @@
+- main [ref=e1]:
+  - heading "Ancient Egypt" [level=1] [ref=e2]
+  - link "Egypt" [ref=e3]:
+    - /url: /wiki/Egypt
+  - link "Cat" [ref=e4]:
+    - /url: /wiki/Cat

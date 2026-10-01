@@ -1,0 +1,27 @@
+// `wiki-hop`: follow Wikipedia links from `start` to `goal` through the browser plugin.
+// A hop costs about five steps of the host's 200-step cap, so a run is bounded at
+// roughly thirty hops.
+
+// PIN is the sha256 of graphs/wiki-hop.json; tests/jev/pin.sh rewrites it.
+const GRAPH = "wiki-hop";
+const PIN = "sha256:2db16e39c7016e410bd4f8c96f75255944387762ff4be080af821d94e2124bab";
+
+pub fn workflow() {
+    #{
+        name: "wiki-hop",
+        description: "Reach a target Wikipedia article from a start article by following links in the browser plugin, a chooser scoring the links on each page. Parks on a person when the chooser is unsure. Needs the browser plugin and the jev service.",
+        approval: "mutating",
+        params: #{
+            "type": "object",
+            "properties": #{
+                "start": #{ "type": "string", "description": "The article to start from, as it appears in the URL after /wiki/ (Cat, Ancient_Egypt)." },
+                "goal": #{ "type": "string", "description": "The title of the article to reach." },
+            },
+            "required": ["start", "goal"],
+        },
+    }
+}
+
+pub async fn run(args) {
+    run_pinned(GRAPH, PIN, args).await
+}

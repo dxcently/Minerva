@@ -1,0 +1,375 @@
+{
+  "id": "triage-wsl",
+  "version": "1",
+  "description": "Read-only triage inside a WSL distribution (Ubuntu unless a distro is given), isolated from the host shell: triage-linux, run through wsl.exe.",
+  "initial": "investigate",
+  "context": {
+    "notes": [],
+    "tried": [],
+    "flagged": []
+  },
+  "meta": {
+    "jev": {
+      "tools": [
+        "jev_addresses",
+        "jev_established",
+        "jev_firewall",
+        "jev_hostname_uptime",
+        "jev_listening",
+        "jev_os_release",
+        "jev_processes",
+        "jev_uname",
+        "jev_who"
+      ],
+      "input": {
+        "type": "object",
+        "properties": {
+          "distro": {
+            "type": "string",
+            "description": "Run the commands inside this WSL distribution."
+          },
+          "ssh": {
+            "type": "string",
+            "description": "Run the commands on this host over ssh (key-based)."
+          },
+          "ssh_port": {
+            "type": "integer",
+            "description": "The ssh port, with ssh."
+          }
+        },
+        "description": "distro defaults to Ubuntu in this graph's workflow."
+      },
+      "defaults": {
+        "floor": 0.5,
+        "margin": 0.15,
+        "visits": 8
+      },
+      "budget": {
+        "steps": 40,
+        "actions": 40,
+        "escalations": 10
+      }
+    }
+  },
+  "on": {
+    "ERROR": "recover"
+  },
+  "states": {
+    "investigate": {
+      "description": "Three questions in order, each answered from its own menu.",
+      "initial": "identify",
+      "onDone": "report",
+      "states": {
+        "identify": {
+          "description": "What is this box?",
+          "exit": [
+            {
+              "type": "assign",
+              "params": {
+                "tried": []
+              }
+            }
+          ],
+          "always": [
+            {
+              "guard": {
+                "type": "entails",
+                "params": {
+                  "premise": "{{context.notes}}",
+                  "hypothesis": "The operating system, its version and the hostname are all stated.",
+                  "threshold": 0.7,
+                  "window": "tail",
+                  "max_chars": 1200
+                }
+              },
+              "target": "network"
+            },
+            {
+              "guard": {
+                "type": "count",
+                "params": {
+                  "path": "context.tried",
+                  "gte": 3
+                }
+              },
+              "target": "network"
+            }
+          ],
+          "meta": {
+            "choose": {
+              "from": {
+                "menu": [
+                  {
+                    "label": "os release",
+                    "tool": "jev_os_release"
+                  },
+                  {
+                    "label": "kernel and arch",
+                    "tool": "jev_uname"
+                  },
+                  {
+                    "label": "hostname and uptime",
+                    "tool": "jev_hostname_uptime"
+                  },
+                  {
+                    "label": "who is logged in",
+                    "tool": "jev_who"
+                  }
+                ]
+              },
+              "exclude": "{{context.tried}}",
+              "context": "Triage: identify the box.\nKnown:\n{{context.notes}}"
+            },
+            "ask": "Which command answers what this box is?"
+          },
+          "on": {
+            "PICK": {
+              "actions": [
+                {
+                  "type": "push",
+                  "params": {
+                    "path": "tried",
+                    "value": "{{event.option.label}}"
+                  }
+                },
+                {
+                  "type": "tool",
+                  "params": {
+                    "name": "{{event.option.tool}}",
+                    "input": {
+                      "distro": "{{input.distro}}",
+                      "ssh": "{{input.ssh}}",
+                      "ssh_port": "{{input.ssh_port}}"
+                    }
+                  }
+                },
+                {
+                  "type": "push",
+                  "params": {
+                    "path": "notes",
+                    "value": "{{event.option.label}}: {{context.obs.text}}"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "network": {
+          "description": "What does it expose?",
+          "exit": [
+            {
+              "type": "assign",
+              "params": {
+                "tried": []
+              }
+            }
+          ],
+          "always": [
+            {
+              "guard": {
+                "type": "entails",
+                "params": {
+                  "premise": "{{context.obs.text}}",
+                  "hypothesis": "The output lists the ports the machine is listening on.",
+                  "threshold": 0.7,
+                  "max_chars": 1200
+                }
+              },
+              "target": "processes"
+            },
+            {
+              "guard": {
+                "type": "count",
+                "params": {
+                  "path": "context.tried",
+                  "gte": 3
+                }
+              },
+              "target": "processes"
+            }
+          ],
+          "meta": {
+            "choose": {
+              "from": {
+                "menu": [
+                  {
+                    "label": "listening sockets",
+                    "tool": "jev_listening"
+                  },
+                  {
+                    "label": "established connections",
+                    "tool": "jev_established"
+                  },
+                  {
+                    "label": "interfaces",
+                    "tool": "jev_addresses"
+                  },
+                  {
+                    "label": "firewall rules",
+                    "tool": "jev_firewall"
+                  }
+                ]
+              },
+              "exclude": "{{context.tried}}",
+              "context": "Triage: what the box exposes.\nKnown:\n{{context.notes}}"
+            },
+            "ask": "Which command shows what this box exposes?"
+          },
+          "on": {
+            "PICK": {
+              "actions": [
+                {
+                  "type": "push",
+                  "params": {
+                    "path": "tried",
+                    "value": "{{event.option.label}}"
+                  }
+                },
+                {
+                  "type": "tool",
+                  "params": {
+                    "name": "{{event.option.tool}}",
+                    "input": {
+                      "distro": "{{input.distro}}",
+                      "ssh": "{{input.ssh}}",
+                      "ssh_port": "{{input.ssh_port}}"
+                    }
+                  }
+                },
+                {
+                  "type": "push",
+                  "params": {
+                    "path": "notes",
+                    "value": "{{event.option.label}}: {{context.obs.text}}"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "processes": {
+          "description": "What is running? One listing, then judge it.",
+          "entry": [
+            {
+              "type": "tool",
+              "params": {
+                "name": "jev_processes",
+                "input": {
+                  "distro": "{{input.distro}}",
+                  "ssh": "{{input.ssh}}",
+                  "ssh_port": "{{input.ssh_port}}"
+                },
+                "expect": {
+                  "type": "matches",
+                  "params": {
+                    "path": "context.obs.text",
+                    "pattern": "^COMMAND\\s+PID\\s+USER"
+                  }
+                }
+              }
+            },
+            {
+              "type": "push",
+              "params": {
+                "path": "notes",
+                "value": "processes: {{context.obs.text}}"
+              }
+            }
+          ],
+          "always": "judge"
+        },
+        "judge": {
+          "description": "Does any process look out of place?",
+          "meta": {
+            "choose": {
+              "from": {
+                "lines": {
+                  "of": "context.obs.text",
+                  "skip": 1
+                }
+              },
+              "also": [
+                {
+                  "label": "nothing looks wrong",
+                  "event": "CLEAN"
+                }
+              ],
+              "max": 32,
+              "context": "Triage: flag a process that does not belong on a server.\nKnown:\n{{context.notes}}"
+            },
+            "floor": 0.6,
+            "ask": "Which process looks out of place, if any?"
+          },
+          "on": {
+            "PICK": {
+              "target": "done",
+              "actions": [
+                {
+                  "type": "push",
+                  "params": {
+                    "path": "flagged",
+                    "value": "{{event.option.label}}"
+                  }
+                }
+              ]
+            },
+            "CLEAN": "done"
+          }
+        },
+        "done": {
+          "type": "final"
+        },
+        "hist": {
+          "type": "history",
+          "history": "shallow",
+          "target": "identify"
+        }
+      }
+    },
+    "recover": {
+      "description": "A command failed. Carry on where the investigation was, or stop.",
+      "entry": [
+        {
+          "type": "push",
+          "params": {
+            "path": "notes",
+            "value": "error: {{event.error}}"
+          }
+        }
+      ],
+      "meta": {
+        "choose": {
+          "from": "transitions",
+          "context": "Triage: a command failed.\n{{event.error}}"
+        },
+        "floor": 0.7,
+        "ask": "A command failed. Continue the investigation or stop?"
+      },
+      "on": {
+        "CONTINUE": {
+          "target": "#triage-wsl.investigate.hist",
+          "description": "continue where it left off"
+        },
+        "ABORT": {
+          "target": "aborted",
+          "description": "stop and report what is known"
+        }
+      }
+    },
+    "report": {
+      "type": "final",
+      "description": "Triage complete.",
+      "output": {
+        "notes": "{{context.notes}}",
+        "flagged": "{{context.flagged}}"
+      }
+    },
+    "aborted": {
+      "type": "final",
+      "description": "Stopped after a failure.",
+      "output": {
+        "notes": "{{context.notes}}"
+      }
+    }
+  }
+}

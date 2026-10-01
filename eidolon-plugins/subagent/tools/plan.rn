@@ -1,0 +1,517 @@
+// `subagent_plan`: turn a named formation (README, Formations) into a plan -- roles, counts,
+// models, budgets -- for the operator to approve. It spawns nothing and never opens a dialog.
+//
+// The file is looked for in the state directory's formations/, then the installed plugin's
+// formations/, then the embedded SOLO and FANOUT. A tool script cannot ask where its own
+// directory is, so the second is a guess at where `plugins install` put the plugin, and the
+// third keeps `solo` and `fanout` working when the guess is wrong.
+//
+// Each role's model resolves as in `subagent_spawn`; a kind with no pick makes the whole
+// answer `needs_choice` for that kind.
+
+pub fn manifest() {
+    #{
+        name: "subagent_plan",
+        description: "Resolve a formation into a plan and return it for the operator to approve; spawns nothing. Reads the formation (yours in the state dir, else the plugin's `solo` or `fanout`), gives every role the model picked for its kind (project pick, then global), and returns {status: \"plan\", roles, thresholds, ladder, ...}: show it to the operator and run the workflow `subagent/fanout` with it only after they agree. If any role's kind has no pick, returns {status: \"needs_choice\", kind, options, retry} instead: choose one or ask the operator, call `subagent_pick`, and plan again. The plan's `ladder` is the priced catalog, cheapest first, which the workflow steps down along.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "formation": #{
+                    "type": "string",
+                    "description": "Formation name: `solo` (one worker) or `fanout` (three scouts) are shipped; a file <name>.json in the formations state directory adds more. Letters, digits, '-', '_'.",
+                },
+                "task": #{
+                    "type": "string",
+                    "description": "The task every spawned child is given, in your words.",
+                },
+                "kinds": #{
+                    "type": "object",
+                    "description": "Override a role's kind: {\"scout\": \"cheap-research\"}. The pick for the overriding kind is used instead of the formation's.",
+                },
+                "budget": #{
+                    "type": "object",
+                    "description": "Total for the whole run: {\"usd\": 2.0}. The workflow compares the spend of finished children to it against the formation's thresholds. Without it, the sum of each role's count x usd_max is used when every role has one; with neither, thresholds are inactive.",
+                    "properties": #{ "usd": #{ "type": "number" } },
+                },
+            },
+            "required": ["formation", "task"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let name = text_of(input.get("formation")).trim();
+    for c in name.chars() {
+        if !(c.is_alphanumeric() || c == '-' || c == '_') {
+            return Err(`formation '${name}' may hold only letters, digits, '-' and '_'`);
+        }
+    }
+    if name == "" {
+        return Err("formation is required: solo or fanout, or the name of a file in the formations state directory");
+    }
+    let task = text_of(input.get("task"));
+    if task.trim() == "" {
+        return Err("task is required");
+    }
+
+    let found = eidolon::shell(sh_cmd(FORM_SH, [name]), Some(30)).await?;
+    let source = "";
+    let body = "";
+    if found.starts_with("@@none") {
+        if name == "solo" {
+            source = "embedded copy of solo";
+            body = SOLO;
+        } else if name == "fanout" {
+            source = "embedded copy of fanout";
+            body = FANOUT;
+        } else {
+            return Err(`no formation named '${name}': looked for it in the formations state directory and in the plugin's formations/. solo and fanout are shipped.`);
+        }
+    } else {
+        match found.split_once("\n") {
+            Some(pair) => {
+                source = pair.0.replace("@@user ", "yours: ").replace("@@plugin ", "shipped: ");
+                body = pair.1;
+            }
+            None => return Err(`the formation file for '${name}' is empty`),
+        }
+    }
+    let formation = match json::from_string(body) {
+        Ok(v) => v,
+        Err(e) => return Err(`the formation '${name}' (${source}) is not valid JSON: ${e}`),
+    };
+
+    let overrides = match input.get("kinds") {
+        Some(o) => o,
+        None => #{},
+    };
+    let roles = match formation.get("roles") {
+        Some(list) => list,
+        None => return Err(`the formation '${name}' has no "roles"`),
+    };
+    let picks = read_picks().await?;
+    let resolved = [];
+    let unresolved = [];
+    let total_max = 0.0;
+    let every_max = true;
+    let n = 0;
+    for r in roles {
+        n += 1;
+        let role = text_of(r.get("role")).trim();
+        if role == "" {
+            return Err(`role ${n} of the formation '${name}' has no "role" name`);
+        }
+        let count = int(text_of(r.get("count")));
+        if r.get("count").is_none() {
+            count = 1;
+        }
+        if count < 1 || count > 10 {
+            return Err(`role '${role}': count is 1..10, not ${count}`);
+        }
+        let kind = text_of(r.get("kind")).trim();
+        match overrides.get(role) {
+            Some(k) => kind = `${k}`.trim(),
+            None => {}
+        }
+        if kind == "" {
+            kind = "default";
+        }
+        kind = checked_kind(kind)?;
+
+        let model = "";
+        let model_from = "project pick";
+        match picks.get("project").unwrap().get(kind) {
+            Some(m) => model = `${m}`,
+            None => {}
+        }
+        if model == "" {
+            model_from = "global pick";
+            match picks.get("global").unwrap().get(kind) {
+                Some(m) => model = `${m}`,
+                None => {}
+            }
+        }
+        if model == "" {
+            let seen = false;
+            for u in unresolved {
+                if u == kind {
+                    seen = true;
+                }
+            }
+            if !seen {
+                unresolved.push(kind);
+            }
+        }
+
+        let tools = [];
+        match r.get("tools") {
+            Some(list) => {
+                for t in list {
+                    tools.push(`${t}`);
+                }
+            }
+            None => {}
+        }
+        let budget = #{};
+        match r.get("budget") {
+            Some(b) => {
+                for (k, v) in b {
+                    budget.insert(k, v);
+                }
+            }
+            None => {}
+        }
+        match budget.get("usd_max") {
+            Some(v) => total_max += number(`${v}`) * count as f64,
+            None => every_max = false,
+        }
+        let floor = "";
+        match r.get("floor") {
+            Some(f) => {
+                // JSON null arrives as the unit value, which has no text form.
+                if json::to_string(f).unwrap_or("null") != "null" {
+                    floor = `${f}`;
+                }
+            }
+            None => {}
+        }
+        let entry = #{
+            role: role,
+            count: count,
+            kind: kind,
+            model: model,
+            model_from: model_from,
+            tools: tools,
+            budget: budget,
+            floor: floor,
+        };
+        match r.get("yolo") {
+            Some(v) => {
+                entry.insert("yolo", v == true);
+            }
+            None => {}
+        }
+        match r.get("deadline_min") {
+            Some(v) => {
+                entry.insert("deadline_min", int(`${v}`));
+            }
+            None => {}
+        }
+        resolved.push(entry);
+    }
+    if resolved.len() == 0 {
+        return Err(`the formation '${name}' has no roles`);
+    }
+
+    let rows = catalog().await?;
+    if unresolved.len() > 0 {
+        return needs_choice(unresolved, rows, input);
+    }
+
+    let ladder = [];
+    for r in rows {
+        match r.usd {
+            Some(u) => {
+                ladder.push(#{ model: r.model, usd: u });
+            }
+            None => {}
+        }
+    }
+
+    let total = None;
+    let total_from = "none: thresholds are inactive";
+    match input.get("budget") {
+        Some(b) => match b.get("usd") {
+            Some(v) => {
+                total = Some(number(`${v}`));
+                total_from = "budget.usd";
+            }
+            None => {}
+        },
+        None => {}
+    }
+    if total.is_none() && every_max {
+        total = Some(total_max);
+        total_from = "sum of count x usd_max over the roles";
+    }
+
+    let warnings = [];
+    for e in resolved {
+        if e.floor != "" {
+            let at = None;
+            let me = None;
+            for l in ladder {
+                if l.model == e.floor {
+                    at = Some(l.usd);
+                }
+                if l.model == e.model {
+                    me = Some(l.usd);
+                }
+            }
+            if at.is_none() {
+                warnings.push(`role '${e.role}': floor ${e.floor} has no price in the catalog, so step-down is disabled for it`);
+            } else if me.is_some() && me.unwrap() < at.unwrap() {
+                warnings.push(`role '${e.role}': its model ${e.model} is already cheaper than its floor ${e.floor}`);
+            }
+        }
+        if e.model.starts_with("mock") || ladder.len() == 0 {
+            continue;
+        }
+        let priced = false;
+        for l in ladder {
+            if l.model == e.model {
+                priced = true;
+            }
+        }
+        if !priced {
+            warnings.push(`role '${e.role}': ${e.model} has no price in the catalog: its spend will read unpriced and cannot count against thresholds`);
+        }
+    }
+
+    let thresholds = match formation.get("thresholds") {
+        Some(t) => t,
+        None => [],
+    };
+    for t in thresholds {
+        let action = text_of(t.get("action"));
+        if action != "step_down" && action != "ask" && action != "stop" {
+            return Err(`formation '${name}': threshold action is step_down, ask or stop, not '${action}'`);
+        }
+    }
+
+    let out = #{
+        status: "plan",
+        formation: name,
+        source: source,
+        task: task,
+        total_usd: total,
+        total_from: total_from,
+        roles: resolved,
+        thresholds: thresholds,
+        ladder: ladder,
+        warnings: warnings,
+        confirm: "Show this plan to the operator, and run workflow subagent/fanout with it (eidolon workflow run <plugin dir> fanout --args <this JSON>, where <plugin dir> is the directory, not the name: ${XDG_CONFIG_HOME:-$HOME/.config}/eidolon/plugins/subagent) only after they agree. To change a model, call subagent_pick and plan again.",
+    };
+    Ok(json::to_string(out)?)
+}
+
+// The two formations that ship, embedded for when the installed copy cannot be
+// found. Keep them in step with ../formations/solo.json and fanout.json.
+const SOLO = "{\"name\":\"solo\",\"roles\":[{\"role\":\"worker\",\"count\":1,\"kind\":\"default\",\"tools\":[],\"budget\":{\"calls\":60,\"usd_max\":1.0,\"usd_min\":0.0},\"floor\":null}],\"thresholds\":[{\"at\":0.9,\"action\":\"ask\"},{\"at\":1.0,\"action\":\"stop\"}]}
+";
+
+const FANOUT = "{\"name\":\"fanout\",\"roles\":[{\"role\":\"scout\",\"count\":3,\"kind\":\"research\",\"tools\":[\"read\",\"grep\",\"bash\"],\"budget\":{\"calls\":40,\"usd_max\":0.5,\"usd_min\":0.1},\"floor\":null}],\"thresholds\":[{\"at\":0.7,\"action\":\"step_down\"},{\"at\":0.9,\"action\":\"ask\"},{\"at\":1.0,\"action\":\"stop\"}]}
+";
+
+// The formation file for $1, the state directory's first: a marker line naming which, then the file; or `@@none`.
+const FORM_SH = "name=$1
+mine=${XDG_STATE_HOME:-$HOME/.local/state}/eidolon/subagents/formations/$name.json
+shipped=${XDG_CONFIG_HOME:-$HOME/.config}/eidolon/plugins/subagent/formations/$name.json
+if [ -f \"$mine\" ]; then
+  printf '@@user %s\\n' \"$mine\"
+  cat \"$mine\"
+elif [ -f \"$shipped\" ]; then
+  printf '@@plugin %s\\n' \"$shipped\"
+  cat \"$shipped\"
+else
+  printf '@@none\\n'
+fi
+";
+
+// The project file is relative to the session's working directory, which is where
+// `eidolon::shell` runs.
+const PICKS_SH = "g=${XDG_STATE_HOME:-$HOME/.local/state}/eidolon/subagents/picks.json
+printf '@@global\\n'
+cat \"$g\" 2>/dev/null
+printf '\\n@@project\\n'
+cat .eidolon/subagent-picks.json 2>/dev/null
+true
+";
+
+// The catalog, cheapest first: tab-separated key, input $/M, output $/M, context, with "-"
+// where the listing says nothing. `eidolon models` also prints a header per provider,
+// `[system]` lines and a cache note; model rows have a `provider:model` first word and
+// the " · " separator. Unpriced rows sort last, never as free.
+const CATALOG_SH = "m=$(\"$eid\" models 2>/dev/null) || { printf 'subagent: `eidolon models` (%s) exited non-zero, so there is no model list.\\n' \"$eid\" >&2; exit 4; }
+printf '%s\n' \"$m\" | awk '
+/^\\[/ { next }
+$1 ~ /:/ && index($0, \" · \") > 0 {
+  pin = \"-\"; pout = \"-\"; ctx = \"-\"; key = \"999999999.0000\"
+  if (match($0, /\\$[0-9.]+\\/[0-9.]+ per M/)) {
+    s = substr($0, RSTART + 1, RLENGTH - 1)
+    split(s, a, \"/\")
+    pin = a[1]; pout = a[2] + 0
+    key = sprintf(\"%014.4f\", pin + pout)
+  }
+  if (match($0, /[0-9]+k ctx/)) { ctx = substr($0, RSTART, RLENGTH - 4) }
+  printf \"%s\\t%s\\t%s\\t%s\\t%s\\n\", key, $1, pin, pout, ctx
+}' | sort | cut -f2-
+";
+
+// `usd` is input plus output $/M, or () when the listing names no price.
+async fn catalog() {
+    let out = eidolon::shell(sh_eid(CATALOG_SH, []), Some(60)).await?;
+    if out.contains("[exit code") {
+        return Err(`no model list: ${out}`);
+    }
+    let rows = [];
+    for line in out.split("\n") {
+        let f = line.split("\t").collect::<Vec>();
+        if f.len() < 4 {
+            continue;
+        }
+        let price = "unpriced";
+        let usd = None;
+        if f[1] != "-" {
+            price = "$" + f[1] + "/" + f[2] + " per M";
+            usd = Some(((number(f[1]) + number(f[2])) * 10000.0).round() / 10000.0);
+        }
+        let ctx = "context unknown";
+        if f[3] != "-" {
+            ctx = `${f[3]} ctx`;
+        }
+        rows.push(#{ model: f[0], price: price, ctx: ctx, usd: usd });
+    }
+    if rows.len() == 0 {
+        return Err("`eidolon models` listed no models, so there is nothing to choose from: check that this eidolon has a provider configured (EIDOLON_BIN, if set, names the binary used)");
+    }
+    Ok(rows)
+}
+
+// A successful result, not a refusal. The first unresolved kind is the one asked about; all are listed.
+fn needs_choice(kinds, rows, input) {
+    let kind = kinds[0];
+    let options = [];
+    for r in rows.iter().take(12) {
+        options.push(#{ model: r.model, price: r.price, ctx: r.ctx });
+    }
+    let question = `No model picked for kind '${kind}'. Choose one (or ask the operator), then call subagent_pick {kind, model} or retry with model.`;
+    let out = #{
+        status: "needs_choice",
+        kind: kind,
+        unresolved_kinds: kinds,
+        question: question,
+        options: options,
+        total_models: rows.len(),
+        retry: #{ tool: "subagent_plan", input: input },
+    };
+    json::to_string(out).unwrap_or("{\"status\":\"needs_choice\"}")
+}
+
+// A file that is not a JSON object is refused rather than skipped.
+async fn read_picks() {
+    let out = eidolon::shell(sh_cmd(PICKS_SH, []), Some(30)).await?;
+    let global = "";
+    let project = "";
+    match out.split_once("\n@@project\n") {
+        Some(pair) => {
+            global = pair.0;
+            project = pair.1;
+        }
+        None => {}
+    }
+    match global.split_once("@@global\n") {
+        Some(pair) => global = pair.1,
+        None => {}
+    }
+    Ok(#{ global: parse_picks(global, "the global picks file")?, project: parse_picks(project, "<cwd>/.eidolon/subagent-picks.json")? })
+}
+
+fn parse_picks(text, what) {
+    let t = text.trim();
+    if t == "" {
+        return Ok(#{});
+    }
+    match json::from_string(t) {
+        Ok(v) => {
+            let out = #{};
+            for (k, m) in v {
+                out.insert(k, `${m}`);
+            }
+            Ok(out)
+        }
+        Err(e) => Err(`${what} is not a JSON object of kind -> model (${e}); fix or delete it`),
+    }
+}
+
+fn checked_kind(raw) {
+    let kind = raw.trim();
+    if kind == "" || kind == "*" {
+        return Err("kind is a short name you choose for this sort of subagent, e.g. research");
+    }
+    if kind.len() > 64 {
+        return Err("kind is at most 64 characters");
+    }
+    for c in kind.chars() {
+        if !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err(`kind '${kind}' may hold only letters, digits, '-', '_' and '.'`);
+        }
+    }
+    Ok(kind)
+}
+
+fn text_of(value) {
+    match value {
+        Some(v) => `${v}`,
+        None => "",
+    }
+}
+
+fn int(text) {
+    match text.parse::<i64>() {
+        Ok(n) => n,
+        Err(_) => 0,
+    }
+}
+
+fn number(text) {
+    match text.parse::<f64>() {
+        Ok(n) => n,
+        Err(_) => 0.0,
+    }
+}
+
+fn quote(text) {
+    let s = `${text}`;
+    `'${s.replace("'", "'\\''")}'`
+}
+
+// The eidolon binary: $EIDOLON_BIN if set (and then only that), else `eidolon` on PATH, else
+// $HOME/.local/bin/eidolon, each only if it answers `--version`: without a login shell (a
+// Windows `wsl.exe -e`, a service, cron) PATH can hold a stub that is executable and runs
+// nothing (Minerva's does). None works: exit 127 and say how to fix it.
+const EID_SH = "eid=
+eid_ok() { [ -f \"$1\" ] && [ -x \"$1\" ] && \"$1\" --version >/dev/null 2>&1; }
+if [ -n \"${EIDOLON_BIN:-}\" ]; then
+  if eid_ok \"$EIDOLON_BIN\"; then eid=$EIDOLON_BIN; fi
+else
+  onpath=$(command -v eidolon 2>/dev/null)
+  if [ -n \"$onpath\" ] && eid_ok \"$onpath\"; then
+    eid=$onpath
+  elif eid_ok \"$HOME/.local/bin/eidolon\"; then
+    eid=$HOME/.local/bin/eidolon
+  fi
+fi
+if [ -z \"$eid\" ]; then
+  if [ -n \"${EIDOLON_BIN:-}\" ]; then
+    printf 'subagent: EIDOLON_BIN is set to %s, which is not an executable that runs (`%s --version` failed). Fix it or unset it.\\n' \"$EIDOLON_BIN\" \"$EIDOLON_BIN\" >&2
+  else
+    printf 'subagent: cannot find a working eidolon binary: `eidolon` on PATH is %s and %s/.local/bin/eidolon does not run. Set EIDOLON_BIN to the full path of one that does.\\n' \"${onpath:-absent}\" \"$HOME\" >&2
+  fi
+  exit 127
+fi
+";
+
+// POSIX sh rather than whatever `eidolon::shell` runs.
+fn sh_cmd(script, args) {
+    let cmd = `sh -c ${quote(script)} sa`;
+    for a in args {
+        cmd += ` ${quote(a)}`;
+    }
+    cmd
+}
+
+fn sh_eid(script, args) {
+    sh_cmd(EID_SH + script, args)
+}

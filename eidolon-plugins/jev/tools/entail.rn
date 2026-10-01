@@ -1,0 +1,58 @@
+// `jev_entail`: the jev service's `entail`. The service is not part of this plugin; see the README.
+pub fn manifest() {
+    #{
+        name: "jev_entail",
+        description: "Score whether a premise entails, contradicts, or is neutral toward each of one or more hypotheses, in one forward pass over a fine-tuned 4B-parameter NLI cross-encoder, answering JSON {results: [{hypothesis, label, scores}]}. Reach for this to check a guard condition, to fact-check a candidate answer against a reference, or to decide whether a tool result supports or refutes a claim. Give it the plainest statement of each: it scores the two strings against each other, not the surrounding conversation. The first call after the service starts loads the ~9 GB model and can take twenty seconds or more; that is expected, not a stall. Needs the jev service.",
+        approval: "read_only",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "premise": #{
+                    "type": "string",
+                    "description": "The statement taken as true, that each hypothesis is checked against.",
+                },
+                "hypotheses": #{
+                    "type": "array",
+                    "items": #{ "type": "string" },
+                    "minItems": 1,
+                    "description": "One or more claims to score against the premise.",
+                },
+            },
+            "required": ["premise", "hypotheses"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    let premise = match input.get("premise") {
+        Some(p) => p,
+        None => return Err("premise is required"),
+    };
+    let hypotheses = match input.get("hypotheses") {
+        Some(h) => h,
+        None => return Err("hypotheses is required"),
+    };
+    let out = call_service("entail", #{ "premise": premise, "hypotheses": hypotheses }).await?;
+    Ok(json::to_string(out)?)
+}
+
+// Port 8091 (8090 is the browser plugin's); the service reads it from EIDOLON_SERVICE_PORT.
+fn service() {
+    #{
+        name: "jev",
+        base_url: "http://127.0.0.1:8091",
+        token_file: "~/.config/eidolon/jev.token",
+        auth: #{ header: "Authorization", prefix: "Bearer " },
+        timeout_s: 120,
+    }
+}
+
+async fn call_service(method, args) {
+    let body = json::to_string(#{ "method": method, "args": args })?;
+    let reply = json::from_string(eidolon::api_request(service(), "POST", "/call", Some(body)).await?)?;
+    if reply.status != 200 {
+        return Err(`jev service answered ${reply.status}: ${reply.body}`);
+    }
+    let out = json::from_string(reply.body)?;
+    if out.ok { Ok(out.result) } else { Err(out.error) }
+}
