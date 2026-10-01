@@ -224,7 +224,7 @@ Windows can reach WSL's loopback by default. The page moves the token out of the
 
 ## Part 5: jev, the chooser (optional)
 
-jev scores a menu of options in one pass (`choose`), checks whether one statement follows from another (`entail`), and runs jev automation graphs.
+jev scores a menu of options in one pass (`choose`), checks whether one statement follows from another (`entail`), and runs jev graphs as Rune workflows from the `jev` plugin (for example `eidolon workflow run ~/.config/eidolon/plugins/jev selftest`).
 
 > **Status:** jev loads into eidolon as the `jev` plugin (`eidolon-plugins/jev`): `jev_choose` and `jev_entail` call this service on `127.0.0.1:8091` with the bearer token in `~/.config/eidolon/jev.token`, and the automation graphs run as workflows. Install it, and the `browser` and `subagent` plugins, with `eidolon plugins install dxcently/eidolon-plugins browser subagent jev --ref 3be1e2b378ba0442de2ecf5a2b9625baebadbefc` and then `eidolon plugins trust <name>` for each; each plugin's README (in `eidolon-plugins/<name>/README.md`) has the rest (the browser service, the token grants).
 
@@ -254,10 +254,10 @@ For `entail`, download the openjev weights:
 
 ```bash
 jev/get-openjev.sh                                   # ~9 GB into models/openjev, pinned revision
-(cd jev && JEV_TEST_OPENJEV=1 .venv/bin/python -m unittest tests.test_guards_openjev)
+(cd jev && .venv/bin/python test_server.py)
 ```
 
-- **No local GPU and no download?** The `choose` side can call a hosted Jev-family model instead: set `JEV_CHOOSER` as described in `jev/automation/systemone.py`. `entail` has no hosted option, so it needs the weights.
+- **No local GPU and no download?** `jev/server.py` serves only `/health`, `choose` and `entail` on `127.0.0.1:8091`, and both `choose` and `entail` need the weights; there is no hosted option.
 
 ---
 
