@@ -67,9 +67,9 @@ and every one answering a `Result`:
   not an `Option`: `match input.get("replace_all") { Some(b) => b == true, None => false }`.
 - `shell(command, timeout_s)` — the command's rendered output, exit code
   and stderr inline; killed as a process group on timeout or cancel.
-- `grep(pattern, path, glob, case_insensitive, max)` — `path:line: text`,
+- `grep(pattern, path, glob, case_insensitive, limit)` — `path:line: text`,
   gitignore-aware, capped.
-- `web_fetch(url, max, timeout_s, raw)` — a page reduced to its text with
+- `web_fetch(url, limit, timeout_s, raw)` — a page reduced to its text with
   links kept, or the bytes with `raw`.
 - `choices_user(prompt, options)` — a multiple-choice question to the
   operator, routed through the dispatcher like any tool call; the only

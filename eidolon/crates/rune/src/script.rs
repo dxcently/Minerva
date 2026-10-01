@@ -18,7 +18,7 @@ use serde::de::IntoDeserializer;
 
 use eidolon_core::tool::{CallContext, Tool, ToolManifest, ToolOutput};
 
-use crate::host::{Host, with_cancel, with_tool};
+use crate::host::{Host, with_call_id, with_cancel, with_tool};
 
 pub struct ScriptTool {
     manifest: ToolManifest,
@@ -45,6 +45,10 @@ impl ScriptTool {
         if manifest.name.is_empty() {
             manifest.name = name.to_string();
         }
+        // The hash of what was actually compiled, for the vouch stage to
+        // hold a vouch row against — a manifest cannot carry it in (it is
+        // `#[serde(skip)]`), and this is the one path that knows the source.
+        manifest.source_hash = Some(crate::permits::content_hash(src));
         Ok(ScriptTool {
             manifest,
             unit,
@@ -52,20 +56,42 @@ impl ScriptTool {
             host,
         })
     }
+
+    /// Attribute a compiled tool to a plugin: the registered name becomes
+    /// the namespaced one the layout gives (`<plugin>_<stem>`), and the
+    /// manifest carries the plugin the gate's question and the audit lines
+    /// read. The adoption path's to call, before the tool is registered —
+    /// [`ToolManifest::plugin`] is `#[serde(skip)]` precisely so a script
+    /// cannot claim an origin this method is the only door to.
+    pub fn attribute(&mut self, name: &str, plugin: &str) {
+        self.name = name.to_string();
+        self.manifest.name = name.to_string();
+        self.manifest.plugin = Some(plugin.to_string());
+    }
 }
 
 /// Compile one source against the host's shared context. About 0.1 ms for
 /// a built-in; the context it compiles against is the expensive part, and
 /// that is built once per host.
 fn compile_unit(name: &str, src: &str, host: &Arc<Host>) -> anyhow::Result<Arc<Unit>> {
-    let compiler = host.compiler()?;
+    compile_source(&host.compiler()?.context, name, src)
+}
+
+/// Compile one source against a context. Shared by the tool loader and
+/// the plugin manifest reader ([`crate::plugins`]): the diagnostics
+/// rendering is the part worth sharing verbatim.
+pub(crate) fn compile_source(
+    context: &rune::Context,
+    name: &str,
+    src: &str,
+) -> anyhow::Result<Arc<Unit>> {
     let mut sources = Sources::new();
     sources
         .insert(Source::new(name, src).map_err(|e| anyhow!("source: {e}"))?)
         .map_err(|e| anyhow!("inserting source: {e}"))?;
     let mut diagnostics = Diagnostics::new();
     let result = rune::prepare(&mut sources)
-        .with_context(&compiler.context)
+        .with_context(context)
         .with_diagnostics(&mut diagnostics)
         .build();
     match result {
@@ -98,8 +124,10 @@ pub fn rune_to_json(v: &Value) -> anyhow::Result<serde_json::Value> {
     serde_json::to_value(v).context("serialising a rune value")
 }
 
-/// Interpret whatever `call()` returned.
-fn interpret(value: Value) -> ToolOutput {
+/// Interpret whatever `call()` returned. The workflow's `run()` return goes
+/// through the same reading — a report is a tool-output-shaped thing — which
+/// is why this is crate-visible rather than private.
+pub(crate) fn interpret(value: Value) -> ToolOutput {
     // A Rune `Result` (from `?` or an explicit Err) — unwrap it first.
     if let Ok(r) = rune::from_value::<Result<Value, Value>>(value.clone()) {
         return match r {
@@ -147,14 +175,28 @@ impl Tool for ScriptTool {
         let unit = self.unit.clone();
         let host = self.host.clone();
         let cancel = ctx.cancel.clone();
+        // The plugin this tool belongs to, when one contributed it — the
+        // audit lines' `consumer=plugin:<name>`, carried beside the name.
+        let plugin = self.manifest.plugin.clone();
+        // The chain this call extends, read here on the thread the
+        // dispatcher is polling. A script's nested dispatch reaches this
+        // same point on the script's own thread, whose chain is the
+        // parentage the fresh thread below inherits and the dispatch door's
+        // depth limit counts; a model's call reads an empty chain here.
+        let chain = crate::host::current_chain();
+        let call_id = ctx.call_id.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name(format!("rune-{name}"))
             .spawn(move || {
                 // The token is this thread's for the length of the call:
                 // the VM is pinned here, so every host function it invokes
-                // reads this one and no other.
-                let result = with_tool(&name, || with_cancel(cancel, || -> anyhow::Result<ToolOutput> {
+                // reads this one and no other. The dispatch id rides the
+                // same way: the model-call primitive journals the call's
+                // spend paired with it.
+                let result = with_tool(&name, plugin.as_deref(), chain, || {
+                    with_call_id(&call_id, || {
+                        with_cancel(cancel, || -> anyhow::Result<ToolOutput> {
                     let runtime = host.compiler()?.runtime.clone();
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -172,7 +214,9 @@ impl Tool for ScriptTool {
                             .map_err(|e| anyhow!("{e}"))?;
                         Ok(interpret(value))
                     })
-                }));
+                        })
+                    })
+                });
                 let _ = tx.send(result);
             })
             .context("spawning the rune thread")?;
@@ -320,6 +364,85 @@ mod tests {
             assert_eq!(&t.manifest().name, name);
             assert!(t.manifest().input_schema.is_object());
         }
+    }
+
+    /// A box that is simply not wired to a vault must not read as a broken
+    /// build: a user script wrapping the vault rungs compiles everywhere,
+    /// and the absent capability says so by name at the call. Both rungs
+    /// are exercised, because they answer the absence at two different
+    /// doors — `mneme_call` from the host field, `mneme_rpc` before its
+    /// dispatch.
+    #[tokio::test]
+    async fn a_script_wrapping_the_vault_rungs_compiles_without_a_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::new(dir.path().to_path_buf());
+        let src = r#"
+            pub fn manifest() {
+                #{
+                    name: "needs-vault",
+                    description: "wraps the vault rungs",
+                    input_schema: #{},
+                    approval: "read_only",
+                }
+            }
+
+            pub async fn call(input) {
+                if input.rung == "raw" {
+                    eidolon::mneme_call("rpc", #{ function: "list" }).await
+                } else {
+                    eidolon::mneme_rpc("list", #{}).await
+                }
+            }
+        "#;
+        let tool = match ScriptTool::compile("needs-vault", src, host) {
+            Ok(tool) => tool,
+            Err(e) => panic!(
+                "a vault-less host must compile a script naming the vault rungs: {e:#}"
+            ),
+        };
+        for rung in ["raw", "wrapped"] {
+            let out = tool
+                .call(serde_json::json!({ "rung": rung }), ctx(dir.path()))
+                .await
+                .unwrap();
+            assert!(out.is_error, "{rung}: {}", out.content);
+            assert!(
+                out.content
+                    .contains("no vault is configured for this harness"),
+                "{rung}: {}",
+                out.content
+            );
+        }
+    }
+
+    /// The other side of the same rule: a primitive that exists *nowhere*
+    /// is drift, and the compile error must stay loud — quieting the
+    /// absent-capability case must not swallow it. `bg_start` is the real
+    /// specimen: fork-era config on a fleet box, named by nothing in this
+    /// tree.
+    #[tokio::test]
+    async fn an_unknown_primitive_is_still_a_compile_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::new(dir.path().to_path_buf());
+        let src = r#"
+            pub fn manifest() {
+                #{
+                    name: "drift",
+                    description: "names a primitive that does not exist",
+                    input_schema: #{},
+                    approval: "read_only",
+                }
+            }
+
+            pub async fn call(input) {
+                eidolon::bg_start("x").await
+            }
+        "#;
+        let err = match ScriptTool::compile("drift", src, host) {
+            Ok(_) => panic!("a primitive that exists nowhere must stay a compile error"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("bg_start"), "{err:#}");
     }
 
     /// The cancellation token reaches a host function through the call's
@@ -493,5 +616,28 @@ mod mneme_tests {
             .await
             .unwrap();
         assert!(out.is_error, "{}", out.content);
+    }
+
+    /// The dispatcher's spill exemption looks for a named read length in
+    /// the call's arguments and in the objects under them
+    /// (`eidolon_core::dispatch::named_read_length`), and that is how the
+    /// vault pages without a chain: `read_note` called with `offset`/`limit`
+    /// carries its length at `args.limit`, one level in from the call. The
+    /// walk finds it only while `args` is an object — an envelope that
+    /// became a string or an array would put a paging model back on the
+    /// receipt's treadmill, one spill file per page.
+    #[test]
+    fn the_vault_tool_carries_its_arguments_as_an_object_a_named_length_can_live_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let tf = dir.path().join("tok");
+        std::fs::write(&tf, "tok").unwrap();
+        let host = Host::with_mneme(
+            dir.path().to_path_buf(),
+            Mneme::new("http://127.0.0.1:1/mcp", Credential::TokenFile(tf)),
+        );
+        let mut reg = eidolon_core::tool::ToolRegistry::new();
+        crate::register_builtins(&mut reg, &host, dir.path()).unwrap();
+        let args = &reg.get("mneme_rpc").unwrap().manifest().input_schema["properties"]["args"];
+        assert_eq!(args["type"], "object", "`args` is still an object: {args}");
     }
 }

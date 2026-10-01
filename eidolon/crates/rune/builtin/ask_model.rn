@@ -1,0 +1,41 @@
+//! Built-in `ask_model`: one tool-less model call — a prompt, optionally
+//! riding given prior turns, to one model with no tools and no agent loop.
+//! The answer is Melete's envelope, always: a plain string carrying
+//! `{"ok":true,"reply":…}` or `{"ok":false,"error":…}`, so a script parses
+//! one shape and branches on `ok`. This tool is script-only — a workflow
+//! drives it, and a model is never offered it. The model defaults to the
+//! session's own; the endpoint, key and output cap are the session's, and
+//! no input names them.
+
+pub fn manifest() {
+    #{
+        name: "ask_model",
+        description: "Make a single tool-less model call: one prompt, plus optional prior turns, to one model with no tools and no agent loop. Answers Melete's envelope — always a string carrying {\"ok\":true,\"reply\":…} or {\"ok\":false,\"error\":…}; parse it with json::from_string and branch on `ok`. Registered for scripts (workflows); never offered to a model.",
+        approval: "mutating",
+        script_only: true,
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "prompt": #{ "type": "string", "description": "The instruction to answer" },
+                "model": #{ "type": "string", "description": "A spec the catalog resolves (`provider:id`, a bare id, `mock`); defaults to this session's model" },
+                "history": #{
+                    "type": "array",
+                    "description": "Prior turns as { role: \"user\" | \"assistant\", content: string }, in order, honoured as given",
+                    "items": #{
+                        "type": "object",
+                        "properties": #{
+                            "role": #{ "type": "string", "enum": ["user", "assistant"] },
+                            "content": #{ "type": "string" },
+                        },
+                        "required": ["role", "content"],
+                    },
+                },
+            },
+            "required": ["prompt"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::model_call(input).await
+}

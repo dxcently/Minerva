@@ -1,0 +1,127 @@
+name: ci
+
+# The house shape is harnox's .github/workflows/ci.yml: one `check` job,
+# checkout → toolchain → cache → clippy → test. What differs here is
+# explained where it differs; the skeleton is the sibling repo's, not a
+# paste of it.
+#
+# Local truth this mirrors — the two commands this repo is actually run by
+# hand, and the numbers they produced when the web stack landed (c77ec68):
+#
+#   cargo test --workspace --no-fail-fast   46 targets, 1456 passing, 9 ignored
+#   cargo clippy --workspace --all-targets  clean
+#
+# `--no-fail-fast` is the hand-run habit and is kept deliberately: one red
+# target should not hide the state of the other 45. It is also why the job
+# must read the exit status from a step that does not stop on first failure.
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+
+# Read-only by default: a build needs the checkout and nothing else. This is
+# the one place we harden beyond the sibling file, which sets no `permissions`
+# at all and therefore runs on the runner's permissive defaults.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TERM_PROGRESS_WHEN: never
+  # A build of this workspace can pull a git dependency; make the fetch
+  # loud enough to diagnose, and keep a rerun cheap.
+  CARGO_NET_RETRY: "2"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Hardened, which the sibling file is not: a hung test target should cost
+    # 30 minutes, not the 6-hour job ceiling. The hand-run suite finishes in
+    # well under 10 minutes on this hardware, so 30 is generous for a cold
+    # runner building every crate from scratch.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The one genuinely eidolon-specific step, and the reason this workflow
+      # is not just harnox's file with two commands swapped.
+      #
+      # Cargo.toml declares harnox as a *git* dep pinned to a release tag —
+      # because this workspace is itself a git dependency of Melete, and Cargo
+      # cannot follow a path that leaves a git dependency's checkout. But the
+      # same manifest carries:
+      #
+      #     [patch."https://github.com/noah427/harnox"]
+      #     harnox = { path = "../harnox" }
+      #
+      # which makes a *local* build take the sibling checkout. On a fresh
+      # runner there is no sibling, and the build dies before compiling
+      # anything:
+      #
+      #     error: failed to load source for dependency `harnox`
+      #     Caused by: unable to update /home/runner/work/eidolon/harnox
+      #
+      # So the patch target has to exist before cargo is ever invoked. Clone
+      # harnox as a sibling and check out *the tag this manifest pins* — not
+      # its default branch — because the point of the pin is that a git
+      # consumer (Melete) resolves that exact tag, and CI should resolve the
+      # same thing. A green CI that compiled harnox's HEAD would be measuring
+      # a different graph from the one consumers get.
+      #
+      # The tag is read out of the manifest rather than hardcoded here, so
+      # bumping the pin does not silently leave CI on the old one.
+      #
+      # harnox is private, and the runner's GITHUB_TOKEN sees this repo only,
+      # so the clone reaches it over SSH with a read-only deploy key on harnox
+      # — the same arrangement mneme and melete use, and the same secret name
+      # (`HARNOX_DEPLOY_KEY`). GitHub's host key is pinned rather than trusted
+      # on first use. Because the patch resolves harnox from that path, cargo
+      # never fetches it, so this is the only place the key is needed.
+      - name: Fetch harnox at the pinned tag (the [patch] target)
+        env:
+          HARNOX_DEPLOY_KEY: ${{ secrets.HARNOX_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          tag=$(python3 -c '
+          import re, sys
+          t = open("Cargo.toml").read()
+          m = re.search(r"^harnox\s*=\s*\{[^}]*tag\s*=\s*\"([^\"]+)\"", t, re.M)
+          sys.stdout.write(m.group(1) if m else "")
+          ')
+          if [ -z "$tag" ]; then
+            echo "::error::no harnox tag found in Cargo.toml — the pin moved shape; update this step"
+            exit 1
+          fi
+          if [ -z "$HARNOX_DEPLOY_KEY" ]; then
+            echo "::error::HARNOX_DEPLOY_KEY is empty — harnox is private and no token reaches it"
+            exit 1
+          fi
+          echo "harnox pin: $tag"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$HARNOX_DEPLOY_KEY" > ~/.ssh/harnox_deploy_key
+          chmod 600 ~/.ssh/harnox_deploy_key
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" >> ~/.ssh/known_hosts
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/harnox_deploy_key -o IdentitiesOnly=yes" \
+            git clone --quiet --depth 1 --branch "$tag" \
+            ssh://git@github.com/noah427/harnox ../harnox
+          echo "checked out: $(git -C ../harnox describe --tags --always)"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The sibling clone above is not a workspace member, but naming it
+          # keeps the key stable if the layout ever changes.
+          workspaces: |
+            . -> target
+            ../harnox -> target
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --no-fail-fast --locked

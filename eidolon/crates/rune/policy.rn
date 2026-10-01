@@ -1,3 +1,4 @@
+// table-version: 1 (2026-09-28)
 //! policy.rn — the harness's leaf table for the command safety classifier.
 //!
 //! The split (see the vault's "The Command Safety Classifier (design)"): Rust
@@ -37,6 +38,14 @@
 //! upgrade carries the copy forward while it is untouched and leaves it
 //! alone once edited, with the shipped version then in
 //! `~/.config/eidolon/system/policy.rn` to diff against.
+//!
+//! The `table-version` line at the top is how a copy says when its base
+//! was current: a seeded copy inherits it, an edited copy keeps the one it
+//! was seeded with, and a copy with none predates the marking outright.
+//! Bump it in the same commit that adds or removes a row — the rows are
+//! the ground truth and `eidolon policy-rows` compares those; the marker
+//! is only the cheap "your base is older than the shipped table" answer
+//! beside them.
 
 const ALLOW = "allow";
 const FLAG = "flag";

@@ -3,7 +3,8 @@
 //!
 //! This module never runs a tool or asks policy anything: intent goes through
 //! `crate::driver::Handle` and `crate::user::WebUser`, never to the
-//! `Dispatcher` directly (`AGENTS.md`'s one chokepoint).
+//! `Dispatcher` directly (`AGENTS.md`'s one chokepoint). `POST /api/launch`
+//! runs a program, but as the operator's act; see `crate::launch`.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -24,9 +25,11 @@ use tokio::net::TcpListener;
 use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
 
+use crate::attach::{self, ImageIn};
 use crate::driver::{Handle, Say};
 use crate::files::{self, Static};
-use crate::user::{Answer, WebUser};
+use crate::launch::{Launch, Window};
+use crate::user::{self, Answer, WebUser};
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -39,10 +42,12 @@ pub struct Ctx {
     /// Never rendered into a response, a frame or a log line.
     pub token: Arc<str>,
     pub ui: Option<Static>,
+    pub launch: Option<Arc<dyn Launch>>,
 }
 
 /// Refused at the cap before the rest is buffered, as `eidolon_core::ipc`
-/// does for a socket request. Nothing legitimate comes near it.
+/// does for a socket request. Only a say's base64 images come near it, and
+/// it is also the most they can add up to.
 pub const MAX_BODY: usize = 8 * 1024 * 1024;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -191,6 +196,7 @@ async fn route(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, In
         }
         (&Method::POST, "/api/say") => post_say(ctx, req).await,
         (&Method::POST, "/api/answer") => post_answer(ctx, req).await,
+        (&Method::POST, "/api/launch") => post_launch(ctx, req).await,
         (&Method::POST, "/api/cancel") => {
             if ctx.driver.cancel().await {
                 Ok(status(StatusCode::NO_CONTENT))
@@ -273,12 +279,18 @@ fn static_headers(mut response: Response<BoxBody>) -> Response<BoxBody> {
     response
 }
 
-/// `mode` defaults to `send` ([`Say`]).
+/// `mode` defaults to `send` ([`Say`]); `documents` is read only to be refused
+/// ([`attach::NO_DOCUMENTS`]).
 #[derive(serde::Deserialize)]
 struct SayBody {
-    text: String,
+    #[serde(default)]
+    text: Option<String>,
     #[serde(default)]
     mode: Option<String>,
+    #[serde(default)]
+    images: Vec<ImageIn>,
+    #[serde(default)]
+    documents: Option<serde_json::Value>,
 }
 
 /// The refusal is a pair, not a `Response`, to keep the `Err` small.
@@ -297,10 +309,34 @@ async fn post_say(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>,
         Ok(bytes) => bytes,
         Err((code, why)) => return Ok(json_status(code, serde_json::json!({"error": why}))),
     };
-    let Ok(SayBody { text, mode }) = serde_json::from_slice::<SayBody>(&bytes) else {
-        return Ok(json_status(StatusCode::BAD_REQUEST, serde_json::json!({"error": "bad request body"})));
+    let bad = || Ok(json_status(StatusCode::BAD_REQUEST, serde_json::json!({"error": "bad request body"})));
+    let unprocessable = |why: &str| Ok(json_status(StatusCode::UNPROCESSABLE_ENTITY, serde_json::json!({"error": why})));
+    // Words-only bodies keep the 400 they always had; the new attachment
+    // shapes get `post_launch`'s 422.
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return bad();
     };
-    let blocks = vec![ContentBlock::text(text)];
+    let attaches = value.get("images").is_some() || value.get("documents").is_some();
+    let Ok(SayBody { text, mode, images, documents }) = serde_json::from_value::<SayBody>(value) else {
+        return if attaches { unprocessable(attach::SHAPE) } else { bad() };
+    };
+    if documents.is_some() {
+        return unprocessable(attach::NO_DOCUMENTS);
+    }
+    // `eidolon_tui::app::Utterance::blocks`'s order: images, then any words.
+    let blocks = if images.is_empty() {
+        let Some(text) = text else { return bad() };
+        vec![ContentBlock::text(text)]
+    } else {
+        let mut blocks = match attach::blocks(images) {
+            Ok(blocks) => blocks,
+            Err(why) => return unprocessable(&why),
+        };
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
+            blocks.push(ContentBlock::text(text));
+        }
+        blocks
+    };
     let say = match mode.as_deref().unwrap_or("send") {
         "steer" => Say::Steer(blocks),
         "send" => Say::Send(blocks),
@@ -318,26 +354,92 @@ async fn post_say(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>,
 #[derive(serde::Deserialize)]
 struct AnswerBody {
     ask_id: u64,
-    answer: String,
+    #[serde(default)]
+    answer: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
 }
+
+const ANSWER_SHAPE: &str = "an answer body is {\"ask_id\": N, \"answer\": \"...\", \"note\"?: \"...\"}";
 
 async fn post_answer(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, Infallible> {
     let bytes = match json_body(req).await {
         Ok(bytes) => bytes,
         Err((code, why)) => return Ok(json_status(code, serde_json::json!({"error": why}))),
     };
-    let Ok(body) = serde_json::from_slice::<AnswerBody>(&bytes) else {
-        return Ok(json_status(StatusCode::BAD_REQUEST, serde_json::json!({"error": "bad request body"})));
+    let bad = || Ok(json_status(StatusCode::BAD_REQUEST, serde_json::json!({"error": "bad request body"})));
+    let unprocessable = |why: &str| Ok(json_status(StatusCode::UNPROCESSABLE_ENTITY, serde_json::json!({"error": why})));
+    // As in `post_say`: a body in the old shape keeps its 400, one using the new field gets a 422.
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return bad();
     };
-    match ctx.user.answer(body.ask_id, &body.answer) {
+    let has_note = value.get("note").is_some();
+    let Ok(AnswerBody { ask_id, answer, note }) = serde_json::from_value::<AnswerBody>(value) else {
+        return if has_note { unprocessable(ANSWER_SHAPE) } else { bad() };
+    };
+    let Some(answer) = answer else {
+        return bad();
+    };
+    let reply = match user::reply(answer, note) {
+        Ok(reply) => reply,
+        Err(why) => return unprocessable(&why),
+    };
+    match ctx.user.answer(ask_id, reply) {
         Answer::Accepted => Ok(status(StatusCode::NO_CONTENT)),
         Answer::Unknown => Ok(json_status(
             StatusCode::CONFLICT,
             serde_json::json!({"error": "that ask is no longer pending"}),
         )),
-        Answer::Rejected => Ok(json_status(
+        Answer::Rejected => unprocessable("that ask does not offer that answer"),
+    }
+}
+
+/// The path is passed on uninterpreted; its meaning is the launcher's.
+#[derive(serde::Deserialize)]
+struct LaunchBody {
+    window: String,
+    path: Option<String>,
+}
+
+/// The usual `PATH_MAX`: longer names nothing a launcher could open.
+const MAX_PATH: usize = 4096;
+
+/// The request's faults (422) are answered before a missing launcher (501).
+/// The spawn scans `PATH`, so it runs under `spawn_blocking`, as `statics` does.
+async fn post_launch(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, Infallible> {
+    let bytes = match json_body(req).await {
+        Ok(bytes) => bytes,
+        Err((code, why)) => return Ok(json_status(code, serde_json::json!({"error": why}))),
+    };
+    let Ok(LaunchBody { window, path }) = serde_json::from_slice::<LaunchBody>(&bytes) else {
+        return Ok(json_status(
             StatusCode::UNPROCESSABLE_ENTITY,
-            serde_json::json!({"error": "that ask does not offer that answer"}),
+            serde_json::json!({"error": "a launch body is {\"window\": \"terminal\"|\"editor\"|\"files\", \"path\"?}"}),
+        ));
+    };
+    let Some(window) = Window::parse(&window) else {
+        return Ok(json_status(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({"error": format!("no window called {window:?}")}),
+        ));
+    };
+    if let Some(p) = &path
+        && (p.len() > MAX_PATH || p.contains('\0'))
+    {
+        return Ok(json_status(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({"error": format!("a path of at most {MAX_PATH} bytes and no NUL is what this route takes")}),
+        ));
+    }
+    let Some(launch) = ctx.launch.clone() else {
+        return Ok(status(StatusCode::NOT_IMPLEMENTED));
+    };
+    match spawn_blocking(move || launch.open(window, path.as_deref())).await {
+        Ok(Ok(opened)) => Ok(json_status(StatusCode::OK, serde_json::json!({"opened": opened}))),
+        Ok(Err(e)) => Ok(json_status(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({"error": format!("{e:#}")}))),
+        Err(e) => Ok(json_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error": format!("the launcher did not answer: {e}")}),
         )),
     }
 }

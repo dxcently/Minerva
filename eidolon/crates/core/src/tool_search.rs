@@ -156,8 +156,10 @@ fn score(m: &ToolManifest, query: &str, qterms: &[String]) -> u32 {
 /// The tools a query finds, best first, at most `limit` of them; and how
 /// many more matched below the cut. Every registered tool is searched,
 /// deferred or not, because the search is also how a model finds out what
-/// it already has. Pure: the same query on the same registry always ranks
-/// the same, which [`Reach`] depends on.
+/// it already has — except a `script_only` one, which is nobody's search
+/// result because it is in no model's vocabulary at all. Pure: the same
+/// query on the same registry always ranks the same, which [`Reach`]
+/// depends on.
 pub fn search(reg: &ToolRegistry, query: &str, limit: usize) -> (Vec<ToolManifest>, usize) {
     let qterms = terms(query);
     if qterms.is_empty() {
@@ -166,6 +168,7 @@ pub fn search(reg: &ToolRegistry, query: &str, limit: usize) -> (Vec<ToolManifes
     let mut hits: Vec<(u32, usize, ToolManifest)> = reg
         .manifests()
         .into_iter()
+        .filter(|m| !m.script_only)
         .enumerate()
         .filter_map(|(i, m)| {
             let s = score(&m, query, &qterms);
@@ -183,7 +186,9 @@ pub fn search(reg: &ToolRegistry, query: &str, limit: usize) -> (Vec<ToolManifes
 /// The names the request offers: every tool that is not deferred, plus
 /// every deferred one the branch has reached — called by name, or found
 /// by a search re-run here. Registration order throughout, so the list
-/// is stable across requests on one branch.
+/// is stable across requests on one branch. A `script_only` tool is in
+/// no request ever: it is not a thing a model earns the sight of, it is
+/// a thing a model never sees.
 pub fn offered(reg: &ToolRegistry, reach: &Reach) -> Vec<String> {
     let mut opened: HashSet<String> = reach.called.clone();
     for q in &reach.queries {
@@ -193,6 +198,7 @@ pub fn offered(reg: &ToolRegistry, reach: &Reach) -> Vec<String> {
     }
     reg.manifests()
         .into_iter()
+        .filter(|m| !m.script_only)
         .filter(|m| !m.deferred || opened.contains(&m.name))
         .map(|m| m.name)
         .collect()
@@ -300,6 +306,9 @@ impl ToolSearch {
                 prompt: None,
                 render: None,
                 deferred: false,
+                script_only: false,
+                plugin: None,
+                source_hash: None,
             },
             dispatcher: OnceLock::new(),
         }
@@ -358,6 +367,24 @@ mod tests {
             prompt: None,
             render: None,
             deferred,
+            script_only: false,
+            plugin: None,
+            source_hash: None,
+        }))
+    }
+
+    fn script_only_tool(name: &str, description: &str) -> Arc<dyn Tool> {
+        Arc::new(Stub(ToolManifest {
+            name: name.into(),
+            description: description.into(),
+            input_schema: json!({ "type": "object" }),
+            approval: Approval::ReadOnly,
+            prompt: None,
+            render: None,
+            deferred: false,
+            script_only: true,
+            plugin: None,
+            source_hash: None,
         }))
     }
 
@@ -524,5 +551,31 @@ mod tests {
             !offered.contains(&"melete_job_status".to_string()),
             "{offered:?}"
         );
+    }
+
+    #[test]
+    fn a_script_only_tool_is_in_no_search_and_no_offer() {
+        let mut r = registry();
+        r.register(script_only_tool(
+            "ask_model",
+            "Make a single tool-less model call, answering an envelope.",
+        ));
+        // No query finds it — not its name, not a term of it, not its
+        // description's words.
+        for q in ["ask_model", "model", "ask", "envelope", "single call"] {
+            let (hits, _) = search(&r, q, LIMIT);
+            assert!(
+                !hits.iter().any(|m| m.name == "ask_model"),
+                "`{q}` found the script-only tool: {hits:?}"
+            );
+        }
+        // It is in no request, whatever the branch has reached: a model
+        // calling it by name does not *earn* the sight of it, because
+        // script-only is an audience statement and not a context cost.
+        let mut reach = Reach::default();
+        reach.note("ask_model", &json!({}));
+        reach.queries.push("model".into());
+        let offered = offered(&r, &reach);
+        assert_eq!(offered, vec!["read", "bash"], "{offered:?}");
     }
 }

@@ -32,7 +32,7 @@ eidolon-web = { path = "crates/web" }
 # sibling checkout, a consumer of it takes the tag. Bump the tag together with
 # Melete's — the two share `SecretStore` and the message model by type, and
 # two harnox revisions in one graph are two unrelated types.
-harnox = { git = "https://github.com/noah427/harnox", tag = "v0.3.8", default-features = false }
+harnox = { git = "https://github.com/noah427/harnox", tag = "v0.3.12", default-features = false }
 
 anyhow = "1"
 thiserror = "2"

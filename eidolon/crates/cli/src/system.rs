@@ -86,6 +86,7 @@ fn shipped() -> Vec<Shipped> {
         eidolon_rune::MNEME_BUILTINS,
         eidolon_rune::SWARM_BUILTINS,
         eidolon_rune::SEARCH_BUILTINS,
+        eidolon_rune::MODEL_BUILTINS,
     ] {
         for (name, src) in list {
             out.push(Shipped {
@@ -390,6 +391,7 @@ mod tests {
             .chain(eidolon_rune::MNEME_BUILTINS)
             .chain(eidolon_rune::SWARM_BUILTINS)
             .chain(eidolon_rune::SEARCH_BUILTINS)
+            .chain(eidolon_rune::MODEL_BUILTINS)
     }
 
     #[test]

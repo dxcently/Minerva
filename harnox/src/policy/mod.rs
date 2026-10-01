@@ -155,13 +155,19 @@ impl Verdict {
 
     /// A `Deny` of the same *kind* as `v` — merits or shape. Used where a
     /// composite is refused because one of its parts was, so the composite
-    /// answers the way the part would have.
+    /// answers the way the part would have. A *flagged* part has no kind
+    /// yet — a flag is a question, and the composite's refusal of it is the
+    /// algebra's "I cannot take this apart" rather than the table's "no" —
+    /// so it arrives as shape, not merits. Promoting a flag to a named
+    /// refusal would refuse an operator who should have been asked "run it
+    /// anyway?", and put the call beyond yolo, which waives questions and
+    /// by contract never refusals.
     pub(crate) fn deny_like(v: &Verdict) -> Self {
         Self {
             decision: Decision::Deny,
             reason: v.reason.clone(),
             read_only: false,
-            structural: v.structural,
+            structural: v.structural || matches!(v.decision, Decision::Flag),
         }
     }
 }

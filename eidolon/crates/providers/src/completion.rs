@@ -2,7 +2,7 @@
 //! request type *cannot* express a tool.
 //!
 //! This is the shape a consumer needs when it wants an answer rather than an
-//! agent: a skill's `ask_model`, a summary, a classification, a one-shot
+//! agent: an `ask_model` call, a summary, a classification, a one-shot
 //! prompt. The interactive harness reaches such answers through its agent
 //! loop — registry, dispatch, session log, persona, project instructions —
 //! and a consumer that wants none of that must not have to assemble a
@@ -34,7 +34,7 @@ use eidolon_core::provider::{CacheOptions, ChatRequest, ThinkingConfig, ToolChoi
 use eidolon_core::provider::Provider;
 use harnox::llm::{Collected, QuietSink, RetryPolicy};
 
-use crate::catalog::{Catalog, ClaimedKey, Resolved, mock};
+use crate::catalog::{Catalog, ClaimedKey, Resolved, mock, mock_text};
 use crate::def::Cost;
 
 /// What to ask for: real messages, request settings, cancellation.
@@ -214,6 +214,10 @@ impl Catalog {
         let spec = req.model.clone();
         match self.resolve(&spec, req.provider.as_deref())? {
             Resolved::Mock => self.complete_with(mock(), "mock", None, req, cancel).await,
+            Resolved::MockText => {
+                self.complete_with(mock_text(), "mock-text", None, req, cancel)
+                    .await
+            }
             // A driver-backed spec (`claude-cli:sonnet`, or a bare `sonnet`)
             // is an **agent-turn** route: the Claude CLI driver serves turns
             // and has no tool-less completion to offer. Emulating one by

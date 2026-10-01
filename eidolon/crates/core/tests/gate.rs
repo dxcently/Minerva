@@ -41,6 +41,9 @@ fn echo() -> Arc<dyn Tool> {
         prompt: None,
         render: None,
         deferred: false,
+        script_only: false,
+        plugin: None,
+        source_hash: None,
     }))
 }
 
@@ -61,6 +64,7 @@ fn flagged(reason: &str) -> Ruling {
         structural: false,
         judged: None,
         yolo: false,
+        vouched: None,
     }
 }
 
@@ -71,6 +75,7 @@ fn refused(reason: &str) -> Ruling {
         structural: false,
         judged: None,
         yolo: false,
+        vouched: None,
     }
 }
 

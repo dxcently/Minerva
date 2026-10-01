@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::message::{ContentBlock, Json, Message, Role, StopReason, Usage};
 use crate::usage::TurnTiming;
+use crate::workflow::{Run, RunBudget, RunPin, RunStatus};
 pub use log::{RecordId, Refusal, SessionLog};
 
 /// The typed payload of one record.
@@ -248,7 +249,11 @@ pub enum RecordKind {
         /// so a ledger must not offer it as a promotion candidate.
         structural: bool,
         outcome: PolicyOutcome,
-        /// The judge's one-line reasoning, on [`PolicyOutcome::Judged`].
+        /// Who answered, when the answer was nobody the transcript shows:
+        /// the judge's one-line reasoning on [`PolicyOutcome::Judged`], and
+        /// on [`PolicyOutcome::Approved`], either nothing — the operator
+        /// said yes in person — or the **vouch row's naming**, when the yes
+        /// was the operator's standing grant and not a live answer at all.
         /// Nothing carries one on [`PolicyOutcome::Yolo`]: there was no
         /// reasoning, which is the point of it.
         note: Option<String>,
@@ -398,6 +403,10 @@ pub enum RecordKind {
     /// A log written before it exists has none, which reads as
     /// *unknown*: what an older cancel spent was never recorded and
     /// cannot be recovered.
+    ///
+    /// The sibling is [`RecordKind::ModelSpend`], one tool-less model
+    /// call's spend, appended after the workflow records — same
+    /// arithmetic, same unpriced-is-never-zero rule, one call down.
     TurnSpend {
         usage: Usage,
         calls: u32,
@@ -544,6 +553,257 @@ pub enum RecordKind {
         /// What became of it, in the words the model reads.
         outcome: String,
     },
+    /// A **workflow run** began — the opening record, and the run's identity.
+    ///
+    /// Its own kind for [`RecordKind::PeerMessage`]'s reason, one step
+    /// further out: a run is neither the operator's word nor the model's, and
+    /// what it has to carry is not a label but a **pin**. A run is pinned to
+    /// the workflow that started it, so `hash` is the identity of the program
+    /// whose steps follow: a resume whose file hash differs refuses rather
+    /// than replaying into a changed program (memoization keyed by one
+    /// program does not transfer to another).
+    ///
+    /// The id this append returns *is* the run id: every `WorkflowStep` and
+    /// the `WorkflowEnd` name it. A run that is its own session carries the
+    /// record in that session's log; a run in the caller's session carries it
+    /// where the caller's own records are, which is why the pin cannot be
+    /// left to `SessionStart`.
+    ///
+    /// Deliberately **not** conversation-shaped: what the model is told about
+    /// a run — the report, or nothing at all — is still open on the design
+    /// note, and the safe half of an open question is to keep the record out
+    /// of `Session::messages_after` until it is ruled.
+    WorkflowStart {
+        /// The plugin directory that ships the workflow, by name.
+        plugin: String,
+        /// The workflow file, by name — the program the interpreter runs.
+        workflow: String,
+        /// The version the plugin's manifest declared.
+        version: String,
+        /// The hash of the compiled source set (the workflow file plus the
+        /// `lib/*.rn` compiled in front of it): the pin, and what a venue
+        /// checks its own copy against before it replays anything.
+        hash: String,
+        /// The arguments the run was started with, verbatim.
+        args: Json,
+    },
+    /// One **step** of a workflow run: the request, journaled before the
+    /// chokepoint runs it, so the `ToolResult` that follows has something to
+    /// pair with.
+    ///
+    /// [`RecordKind::UserToolCall`] closes that gap for the operator; for a
+    /// script it is wider, because a script's call is in no assistant message
+    /// either — without this record a run's results belong to nothing and a
+    /// replay cannot find the answers it already has.
+    ///
+    /// `call_id` is the **run's own** id, not one `dispatch` mints: the shape
+    /// is `w<run>-<index>`, deterministic, because that determinism is the
+    /// whole mechanism. A resume looks the step up by the id its program will
+    /// dispatch under; a fresh id would make every step a first visit and
+    /// re-fire every side effect the log already settled.
+    WorkflowStep {
+        /// The `WorkflowStart` record this step belongs to.
+        run: RecordId,
+        /// Its position in the run, from zero.
+        index: u32,
+        /// The call id the step dispatches under.
+        call_id: String,
+        /// The tool the step calls.
+        tool: String,
+        /// The input it calls it with, verbatim.
+        input: Json,
+    },
+    /// A workflow run stopped: its program finished, failed, or **parked** on
+    /// a question.
+    ///
+    /// The latest ending on the branch wins, so a resumed run appends another
+    /// one rather than rewriting this — the same "latest one wins" a
+    /// [`RecordKind::BackendSession`] mark uses, and for the same reason: a
+    /// journaled record is a thing that happened, not a field to edit.
+    WorkflowEnd {
+        /// The `WorkflowStart` record this ends.
+        run: RecordId,
+        /// What became of it.
+        status: RunStatus,
+    },
+    /// One **tool-less model call's** spend: what the answering attempt
+    /// measured, on the catalog key it resolved to — the sibling of
+    /// [`RecordKind::TurnSpend`], which is a *turn's* spend and rides the
+    /// agent loop, while this is one call's and rides the `ask_model`
+    /// tool. The family reads from either end: every summing site in the
+    /// harness sees both, in the same commit, because a spend-bearing
+    /// record the totals do not see makes a partial total look final.
+    ///
+    /// Written by the completion path itself, inside the tool call's
+    /// execution — after the stream has answered and before the
+    /// `ToolResult` that carries the reply — so the log reads: the step
+    /// (if a workflow journaled one), the spend, the answer. It is only
+    /// there that the usage and the key exist; the tool's output is the
+    /// envelope string, and nothing else on the branch could pair a spend
+    /// with the call that caused it.
+    ///
+    /// `call_id` is the pairing: the dispatch id the call ran under — a
+    /// model call's `tool_use` id, the operator's minted one, or a
+    /// workflow step's deterministic `w<run>-<index>`. A reader joins
+    /// spend to step through it; the record deliberately carries no `run`
+    /// of its own, because [`RecordKind::WorkflowStep`] already carries
+    /// `run` and `call_id`, and a second identity here would be a second
+    /// thing to keep true.
+    ///
+    /// **The key is priced at render time, and absence is not zero.** The
+    /// record holds what was measured; the dollars are a lookup a reader
+    /// makes against its own catalog, which may have no row for the key —
+    /// a mock, a gateway model nobody priced. Such a call is an *unpriced*
+    /// row and is said so, never summed in as free: an empty or
+    /// unresolved `key` prices as unknown, and a session whose model never
+    /// resolved must not quietly vanish from the dollars line. This is
+    /// the same discipline [`RecordKind::TurnSpend`] keeps, one call
+    /// down.
+    ModelSpend {
+        /// The catalog key the call resolved to (`provider:id`) — never
+        /// the bare wire id, because the rates are keyed on the key.
+        key: String,
+        /// The dispatch id the call ran under: the join to the
+        /// `ToolResult` that carries the reply, and to a workflow step's
+        /// recorded request.
+        call_id: String,
+        /// What the answering attempt measured — a floor, never an
+        /// invented total, on a cancelled or truncated stream.
+        usage: Usage,
+    },
+    /// One `api_request` a script made, journaled at the attempt — before
+    /// the egress, because the attempt is the fact: a failed request still
+    /// left the machine, and a later reader should not "fix" this into an
+    /// after-the-fact record. Count-bearing and not a step: no memo, no
+    /// replay coupling, and a script that re-runs journals again — the
+    /// ledger counts egress, it does not replay it.
+    ///
+    /// The ledger could not see a wrapper's request at all before this
+    /// record existed: the primitive dispatches nothing and journals
+    /// nothing, so a plugin's calls were invisible to spend and usage,
+    /// and invisible reads as free. What a third-party API charges is
+    /// unknown, and unknown is not zero.
+    ///
+    /// Never a payload, never a token, never a full URL — whose the
+    /// request was and what it was to is the whole of it.
+    ApiRequest {
+        /// Whose request: `plugin:<name>` when a plugin's tool made it,
+        /// the tool's own name otherwise — the same string the
+        /// `api_request` audit line writes, from the same producer, so
+        /// the line and the record cannot disagree.
+        consumer: String,
+        /// What the request was to: the endpoint descriptor's name, or —
+        /// unnamed — the base_url's host. The third party a reader can
+        /// recognize; never the path, never the query, never a
+        /// credential.
+        service: String,
+    },
+    /// The **per-run budget** a caller set when starting a workflow run
+    /// (ruling 4): the most steps it may take, the most it may spend, in
+    /// micros of a dollar — either or both, and a record exists only when
+    /// at least one half constrains.
+    ///
+    /// **A record of its own, not a field on the pin.** The pin
+    /// ([`RecordKind::WorkflowStart`]) is a pinned record: a field added to
+    /// it would move every older log's start to a different shape, and the
+    /// budget is not part of what the pin is *for* — the pin says what ran;
+    /// this says what the caller let run. Journaled because a resume reads
+    /// its constraint from the branch, not from the caller: the resume call
+    /// carries no budget and cannot name a larger one, so the walk cannot
+    /// escape what started it. Latest-wins per `run`, like the endings, so
+    /// a future caller that may legitimately tighten a budget appends
+    /// rather than edits.
+    ///
+    /// Enforcement reads the branch back: spend is priced from the
+    /// [`RecordKind::ModelSpend`] records the run's own call ids carry, at
+    /// the key each names — an unpriced call is a floor, named in the
+    /// refusal, never summed in as free.
+    WorkflowBudget {
+        /// The `WorkflowStart` record this budget belongs to.
+        run: RecordId,
+        /// The most steps the run may dispatch, when the caller set one.
+        steps: Option<u32>,
+        /// The most the run may spend, in micros of a dollar, when the
+        /// caller set one.
+        spend_micros: Option<u64>,
+    },
+    /// An accepted **peer answer**: the provenance of who answered a
+    /// session's outstanding question, when the answerer was neither the
+    /// operator, a model, nor a waived question — the fourth producer the
+    /// ledger keeps distinct (2026-09-27).
+    ///
+    /// The question itself and its answer are the [`RecordKind::AskUser`]
+    /// this names — the answer text rides there, under the question's own
+    /// call id, exactly as an operator's answer does, so what a resume or
+    /// a replay reads is the same either way. This record is the *decision*
+    /// that the answer came from a peer: human, model and waived outcomes
+    /// stay distinct in the ledger, and a peer is none of those three, so
+    /// the fact is journaled rather than folded into a field nobody
+    /// agreed to.
+    ///
+    /// **Gate questions never get here.** An ask from the classifier is a
+    /// refusal wearing a question mark, and approving a tool call or
+    /// confirming a destructive step is operator-only: a peer's attempt at
+    /// one is refused at the door with the reason, and journals nothing.
+    PeerAnswer {
+        /// The question answered — the `AskUser` call id the answer is
+        /// journaled under.
+        call_id: String,
+        /// The peer that answered, as `peers` names it.
+        peer: String,
+    },
+    /// The **operator's own word**, delivered through the override path
+    /// (`eidolon send --operator`) — the emergency way to reach a session
+    /// parked deaf to peers, and journaled as its own kind so replay
+    /// frames it as what it is: the operator speaking, the one sender
+    /// every wake level admits.
+    ///
+    /// Its own variant rather than a flag on [`RecordKind::PeerMessage`]
+    /// or [`RecordKind::ExternalMessage`] for the same reason those are
+    /// variants and not flags: bitcode encodes a variant's payload
+    /// densely, and a field added to one changes its bytes and misreads
+    /// every log already holding one.
+    ///
+    /// Written only by the delivery of a message the envelope marked as
+    /// the operator's — and the envelope's flag is written only by the
+    /// operator's own CLI act: no peer session and no tool can set it,
+    /// which is what keeps a level-0 park deaf to peers but not to the
+    /// person who parked it.
+    ///
+    /// **Appended, as a journaled enum must be** — after
+    /// [`RecordKind::PeerAnswer`], the last variant, with its ordinal in
+    /// `crates/core/tests/pins.rs`.
+    OperatorMessage {
+        /// Who the operator's shell said it was — the `--from` name, for
+        /// the transcript's "who"; the frame already says the weight.
+        from: String,
+        /// What they said, verbatim.
+        text: String,
+    },
+    /// A turn the **provider** killed, after the retry classifier gave up:
+    /// the wire's own sentence for the failure — provider, and since the
+    /// in-band rendering dresses it, the status — so the row is countable
+    /// by what went wrong and not merely that something did. Without it a
+    /// provider death left no record anywhere: the error reached the bus
+    /// as prose and the journal simply stopped mid-turn.
+    ///
+    /// Its own kind for the reason [`RecordKind::TurnSpend`] is one: no
+    /// existing record can be made to carry it. Not a
+    /// [`RecordKind::TurnSettled`], deliberately — a settle is the
+    /// boundary resume lands on, and a turn the provider killed is work
+    /// still owed: the turn ends unsettled, the same way a cancelled one
+    /// does, and resuming re-enters it. The floors a cancellation writes
+    /// are written here too ([`RecordKind::ContextSize`],
+    /// [`RecordKind::TurnSpend`]) — the spend is measured, the reason
+    /// labels it — and the prose is already on the bus as an error event;
+    /// what this record adds is the row.
+    ///
+    /// **Appended, as a journaled enum must be** — after
+    /// [`RecordKind::OperatorMessage`], the last variant, with its ordinal
+    /// in `crates/core/tests/pins.rs`.
+    TurnFailed {
+        error: String,
+    },
 }
 
 /// What became of a call the gate did not wave through silently.
@@ -555,7 +815,13 @@ pub enum PolicyOutcome {
     /// Refused on the merits. Never put to anybody — the table said no, and
     /// that is the answer.
     Refused,
-    /// Asked, and the operator said yes.
+    /// Asked, and the operator said yes — or never asked at all, because
+    /// their **vouch** had already answered: a call the store waved through
+    /// rides this outcome too, with the grant's naming in the record's
+    /// `note`. The note is the difference: a live yes has none, and a
+    /// vouched one names the row that answered, so a ledger reads them
+    /// apart without a variant apiece — a vouch is the operator's own
+    /// prior act, not a fourth answerer.
     Approved,
     /// Asked, and the operator said no — or there was nobody to ask, which
     /// [`crate::user::NoUser`] answers the same way and on purpose.
@@ -1064,6 +1330,20 @@ impl Session {
                         }
                     }
                 }
+                // The operator's word rides the same place with the
+                // frame that says the third thing: this IS the operator,
+                // and the model weighs it as the person it works for.
+                RecordKind::OperatorMessage { text, .. } => {
+                    let message = Message::user_text(crate::peer::operator_frame(text));
+                    if pending.is_empty() {
+                        out.push(message);
+                    } else {
+                        flush(&mut out, &mut pending);
+                        if let Some(last) = out.last_mut() {
+                            last.content.extend(message.content.iter().cloned());
+                        }
+                    }
+                }
                 // A park resolving rides exactly where a peer's note does,
                 // and must: it is user-shaped input to the model, it arrives
                 // after a turn settled rather than mid-call, and a frame is
@@ -1164,6 +1444,23 @@ impl Session {
                         });
                     }
                 }
+                // A workflow run's own records are deliberately **not** here.
+                // What a caller learns from a run is the report the driving
+                // call returns — `dispatch` journals that result like any
+                // other — and not the steps that produced it: a run is a tool
+                // call whose work happens to be long. Exhaustive arms rather
+                // than the catch-all below, so that the day the design note's
+                // open question ("whether a run's steps appear in the
+                // transcript at all") is ruled, this is the place it is
+                // answered and not a line nobody looks at again.
+                RecordKind::WorkflowStart { .. }
+                | RecordKind::WorkflowStep { .. }
+                | RecordKind::WorkflowEnd { .. } => {}
+                // A spend record is never conversation-shaped either — it
+                // is what a call cost, not something the model said or was
+                // told — and unlike the run's records it carries no open
+                // question: no surface shows a spend to the model.
+                RecordKind::ModelSpend { .. } => {}
                 _ => {}
             }
             // For the next record's `stacked` check: the last record this
@@ -1272,6 +1569,132 @@ impl Session {
             // point, and the opposite of what returning the position would
             // do.
             .filter(|(_, id)| !id.is_empty())
+    }
+
+    /// Begin a workflow run: journal its pin and return the id that names it.
+    ///
+    /// The caller computes the hash over the program it is about to run; this
+    /// is the last moment at which the two are known to be the same thing,
+    /// which is why the pin is written before the first step rather than
+    /// after the last one.
+    pub fn start_workflow(&mut self, pin: RunPin) -> anyhow::Result<RecordId> {
+        self.append(RecordKind::WorkflowStart {
+            plugin: pin.plugin,
+            workflow: pin.workflow,
+            version: pin.version,
+            hash: pin.hash,
+            args: pin.args,
+        })
+    }
+
+    /// Journal one step of a run, before the chokepoint runs it.
+    ///
+    /// `call_id` is the run's own and deterministic — `w<run>-<index>` is the
+    /// shape — because the step is dispatched under that id and a resume looks
+    /// its answer up by it: an id minted afresh at each step would make every
+    /// resume a first visit and re-fire every side effect the log holds.
+    pub fn workflow_step(
+        &mut self,
+        run: RecordId,
+        index: u32,
+        call_id: &str,
+        tool: &str,
+        input: Json,
+    ) -> anyhow::Result<RecordId> {
+        self.append(RecordKind::WorkflowStep {
+            run,
+            index,
+            call_id: call_id.to_string(),
+            tool: tool.to_string(),
+            input,
+        })
+    }
+
+    /// Close a run. The **latest** ending on the branch is the one that
+    /// counts, so a resumed run appends its own rather than editing this one.
+    pub fn end_workflow(&mut self, run: RecordId, status: RunStatus) -> anyhow::Result<RecordId> {
+        self.append(RecordKind::WorkflowEnd { run, status })
+    }
+
+    /// Journal the budget a caller set for a run. Appended only when the
+    /// budget constrains something — a record with neither half would be a
+    /// lie about a constraint nobody made.
+    pub fn workflow_budget(&mut self, run: RecordId, budget: RunBudget) -> anyhow::Result<()> {
+        if budget.is_empty() {
+            return Ok(());
+        }
+        self.append(RecordKind::WorkflowBudget {
+            run,
+            steps: budget.steps,
+            spend_micros: budget.spend_micros,
+        })?;
+        Ok(())
+    }
+
+    /// The budget a run is held to, as the branch holds it: the **latest**
+    /// [`RecordKind::WorkflowBudget`] naming the run, the same latest-wins
+    /// the endings keep. `None` is a run with no budget — including one
+    /// whose caller set nothing, which is a run with nothing to escape.
+    ///
+    /// Read off the replay like the steps are: a struck budget record is
+    /// not a budget, and an operator striking it is a decision about the
+    /// run the same way a strike is about any record.
+    pub fn run_budget(&self, run: RecordId) -> Option<RunBudget> {
+        self.replayable()
+            .into_iter()
+            .rev()
+            .find_map(|r| match &r.kind {
+                RecordKind::WorkflowBudget {
+                    run: target,
+                    steps,
+                    spend_micros,
+                } if *target == run => Some(RunBudget {
+                    steps: *steps,
+                    spend_micros: *spend_micros,
+                }),
+                _ => None,
+            })
+    }
+
+    /// Journal an accepted **peer answer**'s provenance: the answer text
+    /// itself is the [`RecordKind::AskUser`] `call_id` names — the same
+    /// record an operator's answer rides — and this is the decision that
+    /// the answerer was a peer, the fourth producer the ledger keeps
+    /// distinct. Gate questions never reach here: a peer's attempt at one
+    /// is refused at the door, and journals nothing.
+    pub fn peer_answer(&mut self, call_id: &str, peer: &str) -> anyhow::Result<()> {
+        self.append(RecordKind::PeerAnswer {
+            call_id: call_id.to_string(),
+            peer: peer.to_string(),
+        })?;
+        Ok(())
+    }
+
+    /// Every workflow run on this branch, in the order they started.
+    pub fn workflow_runs(&self) -> Vec<Run> {
+        let branch = self.replayable();
+        crate::workflow::runs(&branch)
+    }
+
+    /// One run as a resume reads it: the pin, the answers already in hand in
+    /// index order, and the latest ending.
+    ///
+    /// Read off the **replay**, not the file: a step struck by an
+    /// [`RecordKind::Excluded`] is not here, and the hole it leaves is what
+    /// [`Run::gap`] reports — an interpreter that walked past it would
+    /// dispatch the step again.
+    pub fn workflow_run(&self, run: RecordId) -> Option<Run> {
+        let branch = self.replayable();
+        crate::workflow::run(&branch, run)
+    }
+
+    /// The branch with its struck records left out: what a replay sees.
+    fn replayable(&self) -> Vec<&Record> {
+        let struck = self.excluded();
+        self.branch()
+            .into_iter()
+            .filter(|r| !struck.contains(&r.id))
+            .collect()
     }
 
     /// The records struck from the replay on this branch.
@@ -1484,6 +1907,11 @@ impl Session {
                         from, text,
                     )));
                 }
+                // The operator's word is as pending as any other, framed
+                // as the one sender it actually is.
+                RecordKind::OperatorMessage { text, .. } => {
+                    pending = Some(Message::user_text(crate::peer::operator_frame(text)));
+                }
                 RecordKind::AssistantMessage(_) | RecordKind::TurnSettled { .. } => pending = None,
                 _ => {}
             }
@@ -1569,6 +1997,11 @@ impl Session {
                 RecordKind::TurnSettled { usage, .. } | RecordKind::TurnSpend { usage, .. } => {
                     u += *usage
                 }
+                // One tool-less call's spend, measured on the same
+                // arithmetic as a turn's — the two are the whole of what
+                // the harness has measured, and leaving either out would
+                // make the total a partial answer that reads as final.
+                RecordKind::ModelSpend { usage, .. } => u += *usage,
                 _ => {}
             }
         }

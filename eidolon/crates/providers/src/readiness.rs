@@ -320,10 +320,17 @@ impl Catalog {
         Ok(match self.resolve_unclaimed(spec, None)? {
             // The mock is the harness's own scripted provider: it needs no
             // account because it goes nowhere, and a row claiming otherwise
-            // would be asking for a key to reach a fixture.
+            // would be asking for a key to reach a fixture. Its text-first
+            // sibling is the same fixture by another name.
             Resolved::Mock => ModelReadiness {
                 key: "mock".into(),
                 provider: "mock".into(),
+                model: String::new(),
+                state: Readiness::NoCredentialNeeded,
+            },
+            Resolved::MockText => ModelReadiness {
+                key: "mock-text".into(),
+                provider: "mock-text".into(),
                 model: String::new(),
                 state: Readiness::NoCredentialNeeded,
             },

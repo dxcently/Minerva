@@ -78,7 +78,7 @@
 //! for the duration of each call ([`Scope`]), which is sound because a
 //! call runs the VM to completion on the calling thread.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -123,6 +123,16 @@ pub struct ProviderScript {
     def: ProviderDef,
     store: Option<Arc<harnox::secrets::SecretStore>>,
     fetch: Fetch,
+    /// Whether the listing this script answered with is the declared floor
+    /// because its fetch found nothing — a launch with no cached copy, a
+    /// `--live` listing whose gateway could not be reached. The loader's
+    /// own knowledge, carried so a listing surface can mark a floor as a
+    /// floor; see [`Self::listing_fell_back`].
+    listing_fell_back: bool,
+    /// The script's source digest — the listing memo's identity for this
+    /// script, so two scripts that read one cache file never answer one
+    /// another. Empty when there is no `models()` to memoize.
+    digest: String,
 }
 
 /// What the `eidolon` module knows about the script it is serving, for
@@ -137,6 +147,25 @@ struct Scope {
 
 thread_local! {
     static SCOPE: RefCell<Option<Scope>> = const { RefCell::new(None) };
+    /// Set by `http_get` when its fetch found nothing to answer — a cache
+    /// miss, or a gateway that could not be reached — and read by the load
+    /// and rediscovery paths the moment their `models()` call returns: the
+    /// loader's own knowledge that what stands is the declared floor, the
+    /// honest marker a listing surface draws instead of a count that reads
+    /// as a total. The quota and request hooks run outside those windows,
+    /// so their failures mark nothing; each listing run resets the flag
+    /// before it calls and takes it after.
+    static LISTING_FETCH_FAILED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Clear the listing-failure flag ahead of a `models()` run, and read it
+/// off after one — see [`LISTING_FETCH_FAILED`].
+fn listing_fetch_failed_reset() {
+    LISTING_FETCH_FAILED.with(|f| f.set(false));
+}
+
+fn listing_fetch_failed_take() -> bool {
+    LISTING_FETCH_FAILED.with(|f| f.replace(false))
 }
 
 struct Compiler {
@@ -178,6 +207,36 @@ pub fn warm() {
     let _ = compiler();
 }
 
+/// Whether a provider script's source declares a `models()` of its own —
+/// the textual shadow of the compiled unit's `has("models")`, askable
+/// *before* anything is parsed.
+///
+/// The real flag lives on the loaded [`ProviderScript`](crate::script::ProviderScript),
+/// and it costs the very parse this question exists to avoid: the shadow
+/// rule (see `Catalog::load_builtins_except`) must decide whether a
+/// built-in's discovery is worth running while the script that would make
+/// it worthless is still an unparsed file. A line beginning `pub fn models`
+/// is the shape every provider script uses, and nothing else in one is
+/// spelled that way; the probe is deliberately line-anchored so a mention
+/// in a comment cannot answer for a definition.
+///
+/// The probe can only be wrong in one direction that matters — claiming a
+/// `models()` that is not really there — and that direction is priced:
+/// the built-in then loads without a discovery it would not have survived
+/// anyway, because the script that shadows it replaces the entry whole and
+/// the discovered rows were going in the bin regardless. The other lie —
+/// missing a real `models()` — changes nothing: the built-in's discovery
+/// runs exactly as it always did.
+pub fn source_defines_models(src: &str) -> bool {
+    src.lines().any(|l| {
+        let l = l.trim_start();
+        l.starts_with("pub fn models")
+            && l["pub fn models".len()..]
+                .trim_start()
+                .starts_with('(')
+    })
+}
+
 impl ProviderScript {
     /// Compile, run `provider()`, run `models()` if present.
     pub fn load(name: &str, src: &str) -> anyhow::Result<(ProviderDef, Arc<ProviderScript>)> {
@@ -200,6 +259,39 @@ impl ProviderScript {
         src: &str,
         store: Option<Arc<harnox::secrets::SecretStore>>,
         fetch: Fetch,
+    ) -> anyhow::Result<(ProviderDef, Arc<ProviderScript>)> {
+        Self::load_inner(name, src, store, fetch, true)
+    }
+
+    /// As [`load_with_fetch`](Self::load_with_fetch), with the listing
+    /// deliberately not run: everything else about the load is true — the
+    /// script compiles, `provider()` ran, `has_models` and the listing
+    /// digest say what the script *could* discover — and only the
+    /// `models()` call and its parse are left undone.
+    ///
+    /// This is the catalog's side of the shadow rule: a user script in
+    /// `providers_dir` that replaces a built-in under the same name and
+    /// defines its own `models()` discards the built-in's discovered rows
+    /// wholesale ([`Catalog::add_def`] keeps no trace of the entry it
+    /// replaces), so running the built-in's discovery is a parse whose
+    /// every byte is thrown away. See `Catalog::load_builtins_except` for
+    /// the ruling, and [`source_defines_models`] for how the shadow is
+    /// recognized.
+    pub fn load_with_fetch_without_discovery(
+        name: &str,
+        src: &str,
+        store: Option<Arc<harnox::secrets::SecretStore>>,
+        fetch: Fetch,
+    ) -> anyhow::Result<(ProviderDef, Arc<ProviderScript>)> {
+        Self::load_inner(name, src, store, fetch, false)
+    }
+
+    fn load_inner(
+        name: &str,
+        src: &str,
+        store: Option<Arc<harnox::secrets::SecretStore>>,
+        fetch: Fetch,
+        run_models: bool,
     ) -> anyhow::Result<(ProviderDef, Arc<ProviderScript>)> {
         let compiler = compiler()?;
         let mut sources = Sources::new();
@@ -251,11 +343,30 @@ impl ProviderScript {
         }
         scope.def = Some(def.clone());
         let declared = def.models.clone();
-        if has_models {
-            let v = call_sync(&unit, "models", Vec::new(), &scope)?;
-            let extra: Vec<ModelDef> = serde_json::from_value(v).with_context(|| {
-                format!("provider script `{name}`: models() has the wrong shape")
-            })?;
+        // The script's identity for the listing memo — a digest of its own
+        // source, so two scripts that read one cache file (the shipped
+        // openrouter and a user copy of that gateway, say) can never answer
+        // one another. Empty where there is no `models()` to memoize.
+        let digest = if has_models && run_models { cache::digest(src) } else { String::new() };
+        let mut listing_fell_back = false;
+        if has_models && run_models {
+            // The memo first: a listing this process has already parsed
+            // and mapped is reused whole, and only a miss runs the
+            // script's `models()` against the cache file. See
+            // [`listing_memo`].
+            let extra = match listing_memo::get(&def, &digest) {
+                Some(rows) => rows,
+                None => {
+                    listing_fetch_failed_reset();
+                    let v = call_sync(&unit, "models", Vec::new(), &scope)?;
+                    listing_fell_back = listing_fetch_failed_take();
+                    let extra: Vec<ModelDef> = serde_json::from_value(v).with_context(|| {
+                        format!("provider script `{name}`: models() has the wrong shape")
+                    })?;
+                    listing_memo::put(&def, &digest, &extra);
+                    extra
+                }
+            };
             merge_models(&mut def.models, extra);
         }
         let script = Arc::new(ProviderScript {
@@ -267,12 +378,42 @@ impl ProviderScript {
             def: def.clone(),
             store: scope.store,
             fetch,
+            listing_fell_back,
+            digest,
         });
         Ok((def, script))
     }
 
     pub fn has_request_hook(&self) -> bool {
         self.has_request
+    }
+
+    /// Whether the listing this script answered with is the declared floor
+    /// because its fetch found nothing — no cached copy on a launch, a
+    /// gateway that could not be reached under `--live`. This is the
+    /// loader's own knowledge, not a guess from a row count: the surfaces
+    /// that draw a listing mark it, because a count that is a floor must
+    /// not be drawn as a total, and a provider whose floor is zero rows
+    /// otherwise vanishes without a word.
+    pub fn listing_fell_back(&self) -> bool {
+        self.listing_fell_back
+    }
+
+    /// Say whether the listing fell back, as the patch path needs: a
+    /// rediscovery run replaces the outcome, a skipped one carries it. See
+    /// [`Catalog::patch`](crate::catalog::Catalog::patch).
+    pub fn with_listing_fell_back(mut self, listing_fell_back: bool) -> Self {
+        self.listing_fell_back = listing_fell_back;
+        self
+    }
+
+    /// Whether the script declares a `models()` of its own — true even
+    /// when the load deliberately left the listing unrun (the shadow
+    /// rule): the hook is still there, and a patch's rediscovery would
+    /// still find it, which is why the catalog holds skipped names
+    /// beside the flag rather than clearing it.
+    pub fn has_models_hook(&self) -> bool {
+        self.has_models
     }
 
     /// This script over a different definition — the one a
@@ -298,6 +439,8 @@ impl ProviderScript {
             def,
             store: self.store.clone(),
             fetch: self.fetch,
+            listing_fell_back: self.listing_fell_back,
+            digest: self.digest.clone(),
         }
     }
 
@@ -318,27 +461,51 @@ impl ProviderScript {
     /// the load-time run did, and a listing is worth a stale answer but
     /// never a failed start. The fetch answers from the cache as
     /// [`Fetch::Cached`] does when the script was so loaded.
-    pub fn rediscover_models(&self, mut def: ProviderDef) -> ProviderDef {
+    ///
+    /// Returns the rebuilt definition *and whether this run's fetch found
+    /// nothing* — the load-time flag when no run happened, the run's own
+    /// outcome when it did, so the caller can replace rather than OR the
+    /// marker: a rediscovery that succeeded has made the listing fresh,
+    /// and a floor's marker must not outlive the floor.
+    pub fn rediscover_models(&self, mut def: ProviderDef) -> (ProviderDef, bool) {
         if !self.has_models {
-            return def;
+            return (def, self.listing_fell_back);
         }
         let scope = Scope {
             def: Some(def.clone()),
             store: self.store.clone(),
             fetch: self.fetch,
         };
-        let extra = call_sync(&self.unit, "models", Vec::new(), &scope)
-            .and_then(|v| {
-                serde_json::from_value::<Vec<ModelDef>>(v).with_context(|| {
-                    format!("provider script `{}`: models() has the wrong shape", self.def.name)
-                })
-            })
-            .inspect_err(|e| tracing::debug!(provider = %self.def.name, error = %format_args!("{e:#}"), "patch-time model rediscovery failed"));
+        let mut fell_back = self.listing_fell_back;
+        // The same memo the load-time run used: a rediscover whose moved
+        // definition still reads the same cache file reuses its rows, and
+        // one whose endpoint moved keys a different file and parses it.
+        let extra = match listing_memo::get(&def, &self.digest) {
+            Some(rows) => Ok(rows),
+            None => {
+                listing_fetch_failed_reset();
+                let ran = call_sync(&self.unit, "models", Vec::new(), &scope).and_then(|v| {
+                    serde_json::from_value::<Vec<ModelDef>>(v).with_context(|| {
+                        format!("provider script `{}`: models() has the wrong shape", self.def.name)
+                    })
+                });
+                fell_back = listing_fetch_failed_take();
+                ran
+            }
+        }
+        .inspect_err(|e| {
+            tracing::debug!(
+                provider = %self.def.name,
+                error = %format_args!("{e:#}"),
+                "patch-time model rediscovery failed"
+            )
+        })
+        .inspect(|rows| listing_memo::put(&def, &self.digest, rows));
         def.models = self.declared.clone();
         if let Ok(extra) = extra {
             merge_models(&mut def.models, extra);
         }
-        def
+        (def, fell_back)
     }
 
     /// Whether the script can say what its subscription has left.
@@ -459,6 +626,77 @@ fn merge_models(base: &mut Vec<ModelDef>, extra: Vec<ModelDef>) {
     }
 }
 
+/// The listings a process has already parsed and mapped.
+///
+/// A catalog build runs every provider script's `models()`, and the
+/// convention of those scripts is one `http_get("/models")` answered —
+/// under [`Fetch::Cached`] — from a file under the http cache. The
+/// rune-side JSON parse of that body and the serde map of its rows are
+/// the catalog build's heavy half (openrouter's listing is three
+/// quarters of a megabyte), and within one process the same file is
+/// parsed more than once: a `[[providers]]` patch re-runs `models()`
+/// against the patched definition, and the `models` command builds its
+/// own catalog after the launch path built one. This memo keys the
+/// mapped rows by the cache file's identity — path, length, mtime — *and
+/// by the script that parsed it*, its own source digest, so a repeat
+/// parse of the same file by the same script is skipped whole, while a
+/// changed, moved or absent file is a miss and takes the ordinary road.
+/// The script half of the key is what keeps one gateway's two scripts
+/// apart: the shipped openrouter and a user copy of the same gateway
+/// read one file, and the shipped one's answer — empty, on a machine
+/// that holds neither its secret nor a listing its filters accept — must
+/// never stand in for the user copy's parse. A script whose `models()`
+/// fetches some other path never hits; it pays what it always paid. The
+/// key is deliberately *not* consulted across processes: nothing here
+/// outlives the run.
+mod listing_memo {
+    use super::{cache, ModelDef, ProviderDef};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::SystemTime;
+
+    #[derive(Hash, PartialEq, Eq)]
+    struct ListingKey {
+        path: PathBuf,
+        len: u64,
+        modified: SystemTime,
+        script: String,
+    }
+
+    fn book() -> &'static Mutex<HashMap<ListingKey, Vec<ModelDef>>> {
+        static BOOK: OnceLock<Mutex<HashMap<ListingKey, Vec<ModelDef>>>> = OnceLock::new();
+        BOOK.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// The identity of the cache entry a `models()` run would read: the
+    /// convention's GET under this definition's endpoint, fingerprinted
+    /// by the file itself and by the script about to parse it. `None` —
+    /// no file, or one the filesystem will not fingerprint — is "nothing
+    /// to key on", and the caller takes the ordinary road.
+    fn key(def: &ProviderDef, script: &str) -> Option<ListingKey> {
+        let url = format!("{}/models", def.base_url.trim_end_matches('/'));
+        let path = cache::path(&def.name, &url)?;
+        let meta = std::fs::metadata(&path).ok()?;
+        Some(ListingKey {
+            path,
+            len: meta.len(),
+            modified: meta.modified().ok()?,
+            script: script.to_string(),
+        })
+    }
+
+    pub(super) fn get(def: &ProviderDef, script: &str) -> Option<Vec<ModelDef>> {
+        let key = key(def, script)?;
+        book().lock().unwrap().get(&key).cloned()
+    }
+
+    pub(super) fn put(def: &ProviderDef, script: &str, rows: &[ModelDef]) {
+        let Some(key) = key(def, script) else { return };
+        book().lock().unwrap().insert(key, rows.to_vec());
+    }
+}
+
 fn host_module() -> Result<Module, rune::ContextError> {
     let mut m = Module::with_crate("eidolon")?;
     m.function("epoch_ms", |s: String| -> Option<i64> {
@@ -549,11 +787,16 @@ fn host_module() -> Result<Module, rune::ContextError> {
             store: scope.store.clone(),
         };
         match scope.fetch {
-            Fetch::Live => {
-                let body = req.fetch_blocking()?;
-                cache::store(&req.provider, &req.key(), &body);
-                Ok(body)
-            }
+            Fetch::Live => match req.fetch_blocking() {
+                Ok(body) => {
+                    cache::store(&req.provider, &req.key(), &body);
+                    Ok(body)
+                }
+                Err(e) => {
+                    LISTING_FETCH_FAILED.with(|f| f.set(true));
+                    Err(e)
+                }
+            },
             Fetch::Cached => match cache::load(&req.provider, &req.key()) {
                 Some((body, age)) => {
                     if age > REFRESH_AFTER {
@@ -564,6 +807,7 @@ fn host_module() -> Result<Module, rune::ContextError> {
                 None => {
                     let url = req.url.clone();
                     req.refresh_in_background();
+                    LISTING_FETCH_FAILED.with(|f| f.set(true));
                     Err(format!(
                         "GET {url}: not cached yet; fetching in the background for the next launch"
                     ))
@@ -867,6 +1111,43 @@ pub(crate) mod test_cache {
 mod tests {
     use super::*;
 
+    /// The shadow rule's load half: a listing deliberately left unrun
+    /// changes nothing but the listing. The declared floor, the wire, the
+    /// endpoint and the costs stand exactly as a full load left them, and
+    /// the script still says it has a `models()` — what the skip turns off
+    /// is the run, not the hook.
+    #[test]
+    fn a_load_without_discovery_differs_only_by_the_listing() {
+        let src = r#"
+pub fn provider() {
+    #{ name: "gw", wire: "openai", base_url: "http://gw.example/v1",
+       models: [ #{ id: "declared-row", name: "Declared", context: 1000 } ] }
+}
+pub fn models() { [ #{ id: "discovered-row", name: "Discovered", context: 2000 } ] }
+"#;
+        let (ran, _) = ProviderScript::load("gw", src).unwrap();
+        let ran_ids: Vec<&str> = ran.models.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            ran_ids.contains(&"declared-row") && ran_ids.contains(&"discovered-row"),
+            "a full load merges discovery: {ran_ids:?}"
+        );
+        let (skipped, script) =
+            ProviderScript::load_with_fetch_without_discovery("gw", src, None, Fetch::default())
+                .unwrap();
+        let skip_ids: Vec<&str> = skipped.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            skip_ids,
+            vec!["declared-row"],
+            "the skipped load answers with the declared floor alone: {skip_ids:?}"
+        );
+        assert_eq!(skipped.base_url, ran.base_url);
+        assert_eq!(skipped.wire, ran.wire);
+        assert!(
+            script.has_models_hook(),
+            "the hook is still there for a patch's rediscovery to find"
+        );
+    }
+
     #[test]
     fn loads_a_gateway_script_and_rewrites() {
         let src = r#"
@@ -1163,6 +1444,116 @@ pub fn models() {
         }
     }
 
+    /// The memo's hit is the one way it can be wrong, and the hit is the
+    /// path worth pinning: a second load of the same provider must see a
+    /// REWRITTEN listing, not the first parse. The truly nasty rewrite —
+    /// same length inside one mtime tick — is deliberately not constructed
+    /// here: the key's mtime component is only as fine as the filesystem's,
+    /// and a test that sleeps on granularity would be flakier than the bug.
+    /// Changed length pins the identity question deterministically.
+    #[test]
+    fn a_rewritten_listing_is_parsed_again_not_served_from_the_memo() {
+        let url = "http://127.0.0.1:1/models";
+        test_cache::prime("memo-rewrite", url, r#"[{ "id": "first" }]"#);
+        let cleanup = test_cache::path_of("memo-rewrite", url);
+
+        let src = r#"
+pub fn provider() {
+    #{ name: "memo-rewrite", wire: "openai", base_url: "http://127.0.0.1:1",
+       token: "x", models: [ #{ id: "declared" } ] }
+}
+pub fn models() {
+    match eidolon::http_get("/models") {
+        Ok(b) => match json::from_string(b) { Ok(v) => v, Err(_) => [] },
+        Err(_) => [],
+    }
+}
+"#;
+        let (def, _) = ProviderScript::load("memo-rewrite", src).unwrap();
+        assert_eq!(
+            def.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["declared", "first"],
+            "the primed listing parses and maps"
+        );
+
+        // The rewrite: different content, different length, same path. A
+        // memo that keyed on anything coarser than the file's own identity
+        // would serve `first` again here.
+        test_cache::prime("memo-rewrite", url, r#"[{ "id": "second" }, { "id": "third" }]"#);
+        let (def2, _) = ProviderScript::load("memo-rewrite", src).unwrap();
+        assert_eq!(
+            def2.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["declared", "second", "third"],
+            "the rewritten listing is a miss and parses fresh"
+        );
+
+        if let Some(p) = cleanup {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// The memo's key pins the script as well as the file, and this is the
+    /// incident that demands it: the shipped openrouter and a user copy of
+    /// the same gateway carry one provider name and one base URL, so both
+    /// read one cache file — and the shipped one answers empty on a machine
+    /// that holds neither its secret nor a listing its filters accept. Keyed
+    /// on the file alone, the memo served that empty answer to the user
+    /// copy, whose `models()` then never ran at all: nine declared rows
+    /// where three hundred discovered ones belonged. Two sources, one file,
+    /// the first dropping what it fetched: the second load must parse for
+    /// itself.
+    #[test]
+    fn one_scripts_empty_listing_is_not_served_to_another_reading_the_same_file() {
+        let url = "http://127.0.0.1:1/models";
+        test_cache::prime("memo-cross", url, r#"[{ "id": "first" }]"#);
+        let cleanup = test_cache::path_of("memo-cross", url);
+
+        let ships = r#"
+pub fn provider() {
+    #{ name: "memo-cross", wire: "openai", base_url: "http://127.0.0.1:1",
+       token: "x", models: [] }
+}
+pub fn models() {
+    // The shipped script's shape: it fetches, and its own filters keep
+    // nothing — an empty list, which is what goes into the memo.
+    match eidolon::http_get("/models") {
+        Ok(_) => [],
+        Err(_) => [],
+    }
+}
+"#;
+        let (def, _) = ProviderScript::load("memo-cross", ships).unwrap();
+        assert!(
+            def.models.is_empty(),
+            "the shipped script answers empty, and that is what it memoized"
+        );
+
+        let users = r#"
+pub fn provider() {
+    #{ name: "memo-cross", wire: "openai", base_url: "http://127.0.0.1:1",
+       token_file: "/nonexistent/eidolon-token", models: [] }
+}
+pub fn models() {
+    // The user copy's shape: it fetches the same file and keeps what it
+    // parses — a different script, and the only rows this provider serves.
+    match eidolon::http_get("/models") {
+        Ok(b) => match json::from_string(b) { Ok(v) => v, Err(_) => [] },
+        Err(_) => [],
+    }
+}
+"#;
+        let (def2, _) = ProviderScript::load("memo-cross", users).unwrap();
+        assert_eq!(
+            def2.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["first"],
+            "the user copy parses the file itself; the shipped script's empty answer is not served to it"
+        );
+
+        if let Some(p) = cleanup {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     /// And the same for a POST, whose key is the request — URL *and* body —
     /// so a primed entry is answered exactly as a GET's is.
     #[test]
@@ -1263,6 +1654,238 @@ pub fn provider() {
         );
         let (def, _) = ProviderScript::load("early", &src).unwrap();
         assert_eq!(def.models[0].id, "refused");
+    }
+
+    /// The shipped openrouter's funnel, against rows in the gateway's
+    /// real wire shapes. The gateway prices in JSON *strings* —
+    /// `"prompt": "0"`, not `0` — and the `f64` filter that used to sit
+    /// here answered zero rows for it. The funnel drops a `:batch`
+    /// variant (the same model at a bulk rate, not a second model), a row
+    /// without `tools` in `supported_parameters`, and anything whose
+    /// `architecture.output_modalities` is not text only — in either
+    /// order the wire spells an image output.
+    #[test]
+    fn openrouter_funnel_keeps_text_tool_rows_and_parses_string_prices() {
+        let (_, script) = ProviderScript::load_with_fetch_without_discovery(
+            "openrouter",
+            include_str!("../builtin/openrouter.rn"),
+            None,
+            Fetch::default(),
+        )
+        .unwrap();
+        let listing = serde_json::json!([
+            {
+                "id": "stealth/space-bunny-alpha",
+                "name": "Stealth: Space Bunny Alpha",
+                "context_length": 1000000,
+                "pricing": { "prompt": "0", "completion": "0",
+                             "input_cache_read": null, "input_cache_write": null },
+                "supported_parameters": ["temperature", "tools"],
+                "architecture": { "input_modalities": ["text", "image"],
+                                  "output_modalities": ["text"] }
+            },
+            {
+                "id": "anthropic/claude-sonnet-5.5",
+                "name": "Anthropic: Claude Sonnet 5.5",
+                "context_length": 1000000,
+                "pricing": { "prompt": "0.000002", "completion": "0.00001",
+                             "input_cache_read": "0.0000002",
+                             "input_cache_write": "0.0000025" },
+                "supported_parameters": ["include_reasoning", "tools", "temperature"],
+                "architecture": { "input_modalities": ["text", "image", "file"],
+                                  "output_modalities": ["text"] }
+            },
+            {
+                "id": "anthropic/claude-sonnet-5.5:batch",
+                "name": "Anthropic: Claude Sonnet 5.5 (batch)",
+                "context_length": 1000000,
+                "pricing": { "prompt": "0.000001", "completion": "0.000005" },
+                "supported_parameters": ["tools"],
+                "architecture": { "input_modalities": ["text"],
+                                  "output_modalities": ["text"] }
+            },
+            {
+                "id": "vendor/text-embedder",
+                "name": "Vendor: Text Embedder",
+                "context_length": 8192,
+                "pricing": { "prompt": "0.0000001", "completion": "0" },
+                "supported_parameters": ["temperature"],
+                "architecture": { "input_modalities": ["text"],
+                                  "output_modalities": ["text"] }
+            },
+            {
+                "id": "vendor/painter",
+                "name": "Vendor: Painter",
+                "context_length": 1000000,
+                "pricing": { "prompt": "0.000002", "completion": "0.00001" },
+                "supported_parameters": ["tools"],
+                "architecture": { "input_modalities": ["text"],
+                                  "output_modalities": ["text", "image"] }
+            },
+            {
+                "id": "vendor/painter-xl",
+                "name": "Vendor: Painter XL",
+                "context_length": 1000000,
+                "pricing": { "prompt": "0.000002", "completion": "0.00001" },
+                "supported_parameters": ["tools"],
+                "architecture": { "input_modalities": ["text"],
+                                  "output_modalities": ["image", "text"] }
+            },
+            {
+                "id": "vendor/voice",
+                "name": "Vendor: Voice",
+                "context_length": 1000000,
+                "pricing": { "prompt": "0.000002", "completion": "0.00001" },
+                "supported_parameters": ["tools"],
+                "architecture": { "input_modalities": ["text"],
+                                  "output_modalities": ["text", "audio"] }
+            }
+        ]);
+        let rows = script.call("funnel", listing).unwrap();
+        let rows = rows.as_array().unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            vec!["stealth/space-bunny-alpha", "anthropic/claude-sonnet-5.5"],
+            "the batch variant, the no-tools row and every non-text output drop, in listing order"
+        );
+
+        let sonnet = &rows[1];
+        let cost = &sonnet["cost"];
+        assert!((cost["input"].as_f64().unwrap() - 2.0).abs() < 1e-9, "stringly dollars parse: {cost}");
+        assert!((cost["output"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+        assert!((cost["cache_read"].as_f64().unwrap() - 0.2).abs() < 1e-9);
+        assert!((cost["cache_write"].as_f64().unwrap() - 2.5).abs() < 1e-9);
+        assert_eq!(sonnet["context"], 1000000);
+        assert_eq!(sonnet["vision"], true);
+
+        let bunny = &rows[0];
+        assert_eq!(bunny["cost"]["input"].as_f64().unwrap(), 0.0, "a free row prices at its honest zero");
+        assert_eq!(
+            bunny["cost"]["cache_read"].as_f64().unwrap(),
+            0.0,
+            "a null rate reads as zero — the Cost doc's priced-as-fresh-input reading"
+        );
+        assert_eq!(bunny["vision"], true);
+    }
+
+    /// The funnel against the gateway's real listing, as served — run
+    /// with `cargo test -p eidolon-providers openrouter_funnel_live --
+    /// --ignored --nocapture`. Reads the http cache the launch path
+    /// itself reads, reaches no network, and demands what an operator
+    /// without a user copy sees: hundreds of rows, none of them a
+    /// `:batch` variant.
+    #[test]
+    #[ignore = "live: reads the real openrouter listing out of the http cache"]
+    fn openrouter_funnel_live() {
+        let path = dirs::cache_dir().expect("no cache dir on this machine")
+            .join("eidolon").join("http").join("openrouter")
+            .join("https___openrouter.ai_api_v1_models");
+        let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("no cached listing at {}: {e} — prime it with `eidolon models --live`", path.display())
+        });
+        let listing: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let (_, script) = ProviderScript::load_with_fetch_without_discovery(
+            "openrouter",
+            include_str!("../builtin/openrouter.rn"),
+            None,
+            Fetch::default(),
+        )
+        .unwrap();
+        let rows = script.call("funnel", listing["data"].clone()).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert!(
+            rows.len() > 100,
+            "the gateway's rows funnel to hundreds, not the zero the stringly prices used to answer: {}",
+            rows.len()
+        );
+        for r in rows {
+            let id = r["id"].as_str().unwrap();
+            assert!(!id.contains(":batch"), "{id} is a batch variant");
+        }
+        println!("funnel: {} rows survive the gateway's listing", rows.len());
+    }
+
+    /// The degraded-listing marker, host half: a `models()` whose fetch
+    /// found nothing to answer — no cached copy, or a gateway that could
+    /// not be reached — marks the script. The marker is the loader's own
+    /// knowledge that what stands is the declared floor, not a guess from
+    /// a row count; a fetched listing does not carry it.
+    #[test]
+    fn a_fetch_failure_marks_the_listing_fell_back() {
+        let src_of = |name: &str, base: &str| {
+            let src = r#"
+pub fn provider() {
+    #{ name: "@NAME@", wire: "openai", base_url: "@BASE@", token: "t",
+       models: [ #{ id: "floor-row", name: "Floor" } ] }
+}
+pub fn models() {
+    let body = match eidolon::http_get("/models") { Ok(b) => b, Err(_) => return [] };
+    let listing = match json::from_string(body) { Ok(v) => v, Err(_) => return [] };
+    match listing.get("data") {
+        Some(d) => [ #{ id: "discovered-row", name: "Found", context: 1000 } ],
+        None => [],
+    }
+}
+"#;
+            src.replace("@NAME@", name).replace("@BASE@", base)
+        };
+
+        // A cache miss: the fetch answered nothing, the floor stood, and
+        // the script says so. The background refresh the miss spawns dies
+        // on the refused port, as every test here assumes.
+        let (def, script) = ProviderScript::load_with_fetch(
+            "fbx-miss",
+            &src_of("fbx-miss", "http://127.0.0.1:1/v1"),
+            None,
+            Fetch::Cached,
+        )
+        .unwrap();
+        assert_eq!(
+            def.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["floor-row"],
+            "the floor is all a failed fetch leaves"
+        );
+        assert!(
+            script.listing_fell_back(),
+            "a cache miss is the loader falling back, and it says so"
+        );
+
+        // The same script against a primed listing: rows discovered, no
+        // marker — a fresh answer is not a degraded one.
+        let url = "http://127.0.0.1:1/v1/models";
+        test_cache::prime("fbx-ok", url, r#"{ "data": [ { "id": "x" } ] }"#);
+        let cleanup = test_cache::path_of("fbx-ok", url);
+        let (def, script) = ProviderScript::load_with_fetch(
+            "fbx-ok",
+            &src_of("fbx-ok", "http://127.0.0.1:1/v1"),
+            None,
+            Fetch::Cached,
+        )
+        .unwrap();
+        assert_eq!(
+            def.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["floor-row", "discovered-row"]
+        );
+        assert!(
+            !script.listing_fell_back(),
+            "a fetched listing is not a fallback"
+        );
+        if let Some(p) = cleanup {
+            let _ = std::fs::remove_file(p);
+        }
+
+        // Live, against a gateway that refuses: the marker too, since
+        // `--live` is exactly where an operator asked for the truth and
+        // must not read a floor as if it were one.
+        let (_, script) = ProviderScript::load_with_fetch(
+            "fbx-live",
+            &src_of("fbx-live", "http://127.0.0.1:1/v1"),
+            None,
+            Fetch::Live,
+        )
+        .unwrap();
+        assert!(script.listing_fell_back(), "a refused gateway is a fallback too");
     }
 }
 

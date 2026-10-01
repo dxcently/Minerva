@@ -152,6 +152,44 @@ async fn wrapping_a_refused_command_does_not_launder_it_into_a_question() {
 }
 
 #[tokio::test]
+async fn a_flagged_stage_in_a_substitution_stays_a_question_yolo_can_answer() {
+    // The failure an armed-yolo session hit in the wild: an unrecognized
+    // program — flagged, so a *question* — rode into a command substitution
+    // inside a sequence and came out a plain refusal, which the switch may
+    // not answer. The algebra's half is pinned in harnox
+    // (a_flag_carried_into_a_refusal_stays_a_shape_refusal); this is the
+    // harness's half, all the way to the waived call.
+    let settings = PolicySettings { default: BashDefault::Flag, ..Default::default() };
+    let p = ScriptPolicy::builtin(&host(), settings).unwrap();
+    let cmd = "ls && echo $(some-unheard-of-prog --version)";
+    let v = shell(&p, cmd).await;
+    assert!(asked(&v), "a flagged stage asks rather than refuses, got {v:?}");
+
+    // Armed, the switch answers the question the gate raised — the entire
+    // surface of yolo, and the reason the refusal this used to be was wrong.
+    let yolo = eidolon_core::yolo::Yolo::new(Arc::new(p), eidolon_core::yolo::Switch::new(true));
+    let r = yolo
+        .pre_tool(
+            &call("bash", json!({ "command": cmd })),
+            &manifest("bash", Approval::Mutating),
+            Path::new("/ws"),
+        )
+        .await;
+    assert!(matches!(r.verdict, Verdict::Allow), "yolo answers the question, got {:?}", r.verdict);
+    assert!(r.yolo, "the ledger must be able to tell this yes from a person's");
+
+    // A named refusal inside the same composite still refuses, switch or no.
+    let r = yolo
+        .pre_tool(
+            &call("bash", json!({ "command": "ls && echo $(sudo id)" })),
+            &manifest("bash", Approval::Mutating),
+            Path::new("/ws"),
+        )
+        .await;
+    assert!(denied(&r.verdict), "got {:?}", r.verdict);
+}
+
+#[tokio::test]
 async fn an_unparseable_command_is_never_silently_allowed() {
     let v = shell(&policy(), "ls |").await;
     assert!(asked(&v), "got {v:?}");
@@ -638,6 +676,52 @@ async fn melete_tools_are_gated_by_their_declared_tier() {
     );
 }
 
+/// A tool a plugin contributed is asked about *by its plugin*, so the
+/// person answering knows whose effect they are approving. The
+/// classifier's own reason — the unit a ledger groups by — stays the
+/// table's: whose the tool is is a fact about the call, not a thing a
+/// table edit flips.
+#[tokio::test]
+async fn a_plugin_tool_is_asked_about_by_its_plugin() {
+    let p = policy();
+    let mut m = manifest("browser_open", Approval::Mutating);
+    m.plugin = Some("browser".into());
+    let ruling = p
+        .pre_tool(
+            &call("browser_open", json!({})),
+            &m,
+            Path::new("/ws"),
+        )
+        .await;
+    match &ruling.verdict {
+        Verdict::Ask(prompt) => {
+            assert!(prompt.contains("browser_open"), "{prompt}");
+            assert!(prompt.contains("(plugin browser)"), "{prompt}");
+        }
+        other => panic!("expected a question, got {other:?}"),
+    }
+    let reason = ruling.reason.as_deref().expect("the fallthrough gives one");
+    assert!(
+        !reason.contains("plugin"),
+        "the reason stays the table's unit: {reason}"
+    );
+    // The same manifest without the tag asks the bare question it always
+    // did — the plugin is the only difference in the sentence.
+    let ruling = p
+        .pre_tool(
+            &call("browser_open", json!({})),
+            &manifest("browser_open", Approval::Mutating),
+            Path::new("/ws"),
+        )
+        .await;
+    match ruling.verdict {
+        Verdict::Ask(prompt) => {
+            assert!(!prompt.contains("plugin"), "{prompt}");
+        }
+        other => panic!("expected a question, got {other:?}"),
+    }
+}
+
 /// Searching for a tool is free and silent; what a search finds is
 /// classified when it is called.
 #[tokio::test]
@@ -654,3 +738,181 @@ async fn tool_search_is_never_asked_about() {
     assert!(allowed(&v));
 }
 
+// --- the vouch store, consulted at the fallthrough ------------------------
+
+/// A vouch row for `browser_open`, over the given script text — the exact
+/// bytes the tool's compile will hash.
+fn vouched_rows(src: &str) -> crate::permits::Rows {
+    crate::permits::Rows {
+        vouch: vec![crate::permits::VouchRow {
+            plugin: "browser".into(),
+            verb: "browser_open".into(),
+            hash: crate::permits::content_hash(src),
+            granted_by: "noah".into(),
+            granted_at: "2026-09-28T00:00:00Z".into(),
+        }],
+        grant: vec![],
+        attest: vec![],
+    }
+}
+
+fn browser_manifest(src: &str, hash: &str) -> ToolManifest {
+    let mut m = manifest("browser_open", Approval::Mutating);
+    m.plugin = Some("browser".into());
+    m.source_hash = Some(if hash.is_empty() { crate::permits::content_hash(src) } else { hash.into() });
+    m
+}
+
+/// The load path with a store and no operator table: the shipped table is
+/// in force, the store composes in front of it, and a plugin verb the
+/// table has never heard of is allowed by data — the ruling's own words —
+/// with the grant's naming riding the ruling for the record. An edited
+/// plugin, its hash stale, re-asks: it is not the tool that was vouched.
+#[tokio::test]
+async fn a_vouch_lifts_the_fallthrough_and_an_edited_plugin_re_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = "pub async fn call(input) { \"ok\" }";
+    std::fs::write(
+        dir.path().join("policy.permits.rn"),
+        crate::permits::compose(&vouched_rows(src)),
+    )
+    .unwrap();
+    // No `policy.rn` at the path: the built-in table loads beside the store.
+    let (p, note) =
+        ScriptPolicy::load(&dir.path().join("policy.rn"), &host(), PolicySettings::default())
+            .unwrap();
+    assert_eq!(note, None, "the shipped table is the one in force");
+    let r = p
+        .pre_tool(&call("browser_open", json!({})), &browser_manifest(src, ""), Path::new("/ws"))
+        .await;
+    assert!(allowed(&r.verdict), "{r:?}");
+    assert!(
+        r.vouched
+            .as_deref()
+            .is_some_and(|v| v.starts_with("vouched for browser_open by noah")),
+        "{r:?}"
+    );
+    // A hash that does not match what is loaded is not the tool that was
+    // trusted: the question stands, and nothing erred on the way to it.
+    let edited = browser_manifest(src, "sha256:stale");
+    let r = p
+        .pre_tool(&call("browser_open", json!({})), &edited, Path::new("/ws"))
+        .await;
+    assert!(asked(&r.verdict), "{r:?}");
+    assert!(r.vouched.is_none());
+    // So does a verb whose plugin attribution disagrees with the row's.
+    let mut other = browser_manifest(src, "");
+    other.plugin = Some("other".into());
+    let r = p.pre_tool(&call("browser_open", json!({})), &other, Path::new("/ws")).await;
+    assert!(asked(&r.verdict), "{r:?}");
+}
+
+/// The coupling, named and pinned: the stage knows the fallthrough by the
+/// table's own words. A table whose fallthrough says anything else is
+/// never lifted — the vouched verb gets the ordinary question, with no
+/// error on the way. This is what makes vouches work for an operator's
+/// existing `policy.rn` copy (same vocabulary) and what makes a rewritten
+/// one safe (fail-closed).
+#[tokio::test]
+async fn a_table_whose_fallthrough_speaks_differently_is_never_lifted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("policy.rn"),
+        r#"fn v(d, r, ro) { #{decision: d, reason: r, read_only: ro} }
+const ALLOW = "allow";
+const FLAG = "flag";
+const DENY = "deny";
+pub fn shell_arg(tool) { "" }
+pub fn classify_tool(tool, approval, input) {
+    v(FLAG, `unknown tool (declared ${approval})`, false)
+}
+pub fn fs_verb_tier(prog) { "flag" }
+pub fn bash_default(posture) { "allow" }
+pub fn classify_program(argv, ctx) { v(FLAG, "unknown command", false) }
+"#,
+    )
+    .unwrap();
+    let src = "pub async fn call(input) { \"ok\" }";
+    std::fs::write(
+        dir.path().join("policy.permits.rn"),
+        crate::permits::compose(&vouched_rows(src)),
+    )
+    .unwrap();
+    let (p, note) =
+        ScriptPolicy::load(&dir.path().join("policy.rn"), &host(), PolicySettings::default())
+            .unwrap();
+    assert!(note.is_some(), "the operator's own table is in force");
+    let r = p
+        .pre_tool(&call("browser_open", json!({})), &browser_manifest(src, ""), Path::new("/ws"))
+        .await;
+    assert!(asked(&r.verdict), "{r:?}");
+    assert!(r.vouched.is_none(), "no store answer may ride a named word");
+}
+
+/// The staleness pair, ruled 2026-09-28: a version marker in the shipped
+/// header, and the two tables compared in *rows* — never a line diff,
+/// because behaviour differs per row. The live case this pins: this box's
+/// copy carries a `read_url` row the harness has never seen and lacks
+/// `wait_for`, which the shipped table gained 2026-09-22.
+#[test]
+fn the_shipped_table_is_marked_and_its_rows_are_findable() {
+    assert_eq!(
+        table_version(DEFAULT_POLICY),
+        Some((1, "2026-09-28".into())),
+        "the shipped table must carry the marker, or nothing can date a copy"
+    );
+    let rows = table_rows(DEFAULT_POLICY);
+    for name in ["read", "grep", "write", "edit", "fetch", "search", "wait_for", "peers", "send", "tool_search"] {
+        assert!(rows.contains(name), "`{name}` missing from the shipped table's rows");
+    }
+    // the fallthrough is not a row, and other functions' arms are not
+    // `classify_tool`'s
+    assert!(!rows.contains("_"));
+    assert!(!rows.contains("sudo"), "classify_program's leaves are not tool rows");
+}
+
+#[test]
+fn an_unmarked_stale_copy_dates_itself_and_diffs_by_rows() {
+    // an operator copy: their own `read_url` row, the shipped `wait_for`
+    // row not yet taken, no marker — every shape the command must answer
+    let stale = r#"
+// an old copy, predating the marker
+fn v(decision, reason, read_only) {
+    #{decision: decision, reason: reason, read_only: read_only}
+}
+
+pub fn classify_tool(tool, approval, input) {
+    match tool {
+        "read" => v(ALLOW, "read", true),
+        "fetch" => v(ALLOW, "fetch a URL", true),
+        // "commented_out" => v(ALLOW, "not a row any more", true),
+        "read_url" => v(ALLOW, "fetches a URL for a page row", true),
+        _ => v(FLAG, `unclassified tool (declared ${approval})`, false),
+    }
+}
+
+pub fn bash_default(posture) {
+    posture
+}
+"#;
+    assert_eq!(table_version(stale), None, "no marker line: the copy predates versioning");
+    let rows = table_rows(stale);
+    assert!(rows.contains("read"), "a plain row is found");
+    assert!(!rows.contains("commented_out"), "a commented-out row is not a row");
+    let shipped = table_rows(DEFAULT_POLICY);
+    let mine_only: Vec<_> = rows.difference(&shipped).collect();
+    let harness_added: Vec<_> = shipped.difference(&rows).collect();
+    assert_eq!(mine_only, [&"read_url".to_string()], "the operator's own rows");
+    assert!(harness_added.contains(&&"wait_for".to_string()), "the row this box's copy lacks");
+}
+
+#[test]
+fn a_marker_parses_only_when_it_means_one() {
+    assert_eq!(
+        table_version("// table-version: 7 (2027-01-01)\nfn x {}\n"),
+        Some((7, "2027-01-01".into()))
+    );
+    assert_eq!(table_version("// table-version: 9\n"), Some((9, String::new())));
+    assert_eq!(table_version("// table-version: banana\n"), None);
+    assert_eq!(table_version("fn x {} // table-version: 3\n"), None);
+}

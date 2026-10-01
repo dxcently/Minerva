@@ -11,15 +11,16 @@ use async_trait::async_trait;
 use eidolon_core::agent::{Agent, AgentConfig};
 use eidolon_core::dispatch::Dispatcher;
 use eidolon_core::event::EventBus;
-use eidolon_core::message::Message;
+use eidolon_core::message::{ContentBlock, Message};
 use eidolon_core::policy::{AllowAll, Approval, PolicyHook, Ruling, Verdict};
 use eidolon_core::provider::Provider;
 use eidolon_core::session::{RecordKind, Session};
 use eidolon_core::testing::ScriptedProvider;
 use eidolon_core::tool::{CallContext, Tool, ToolCall, ToolManifest, ToolOutput, ToolRegistry};
-use eidolon_core::user::{Choice, UserIo};
+use eidolon_core::user::{Choice, Reply, UserIo, Words};
 use eidolon_web::driver::Handle;
 use eidolon_web::files::Static;
+use eidolon_web::launch::{Launch, Window};
 use eidolon_web::serve::{self, Ctx};
 use eidolon_web::user::WebUser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -66,6 +67,7 @@ impl PolicyHook for AskNote {
                 structural: true,
                 judged: None,
                 yolo: false,
+                vouched: None,
             }
         } else {
             Ruling::allow()
@@ -103,6 +105,9 @@ async fn asking_app() -> (Arc<Agent>, Arc<WebUser>, Arc<AtomicUsize>, tempfile::
             prompt: None,
             render: None,
             deferred: false,
+            script_only: false,
+            plugin: None,
+            source_hash: None,
         },
         calls: calls.clone(),
     }));
@@ -114,7 +119,7 @@ async fn asking_app() -> (Arc<Agent>, Arc<WebUser>, Arc<AtomicUsize>, tempfile::
     (agent, user, calls, dir)
 }
 
-fn question(user: Arc<WebUser>, prompt: &'static str) -> (tokio::task::JoinHandle<Option<String>>, CancellationToken) {
+fn question(user: Arc<WebUser>, prompt: &'static str) -> (tokio::task::JoinHandle<Option<Reply>>, CancellationToken) {
     let cancel = CancellationToken::new();
     let opts = [Choice { label: "a".into(), description: None }, Choice { label: "b".into(), description: None }];
     let handle = tokio::spawn({
@@ -128,17 +133,26 @@ fn question(user: Arc<WebUser>, prompt: &'static str) -> (tokio::task::JoinHandl
 /// `serve::run` directly, since `lib::run` prints its port rather than
 /// returning it. The token is a real one, so no short string passes by accident.
 async fn serve(agent: Arc<Agent>, user: Arc<WebUser>) -> (SocketAddr, String, CancellationToken) {
-    serve_with(agent, user, None).await
+    serve_with(agent, user, None, None).await
 }
 
 async fn serve_ui(agent: Arc<Agent>, user: Arc<WebUser>, ui: &Path) -> (SocketAddr, String, CancellationToken) {
-    serve_with(agent, user, Some(Static::new(ui).unwrap())).await
+    serve_with(agent, user, Some(Static::new(ui).unwrap()), None).await
+}
+
+async fn serve_launching(
+    agent: Arc<Agent>,
+    user: Arc<WebUser>,
+    launch: Arc<FakeLaunch>,
+) -> (SocketAddr, String, CancellationToken) {
+    serve_with(agent, user, None, Some(launch)).await
 }
 
 async fn serve_with(
     agent: Arc<Agent>,
     user: Arc<WebUser>,
     ui: Option<Static>,
+    launch: Option<Arc<dyn Launch>>,
 ) -> (SocketAddr, String, CancellationToken) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bound = listener.local_addr().unwrap();
@@ -152,6 +166,7 @@ async fn serve_with(
         yolo: false,
         token: Arc::from(token.as_str()),
         ui,
+        launch,
     };
     let cancel = CancellationToken::new();
     let c = cancel.clone();
@@ -355,7 +370,7 @@ async fn an_ask_reaches_the_stream_and_an_answer_resolves_it() {
     )
     .await;
     assert_eq!(code, 204, "{body:?}");
-    assert_eq!(asking.await.unwrap().as_deref(), Some("b"));
+    assert_eq!(asking.await.unwrap(), Some(Reply::picked("b")));
     let settled = sse.til("\"answer\":\"b\"}").await;
     assert!(settled.contains(&format!("\"ask_id\":{id}")), "{settled:?}");
     assert!(settled.contains("\"how\":\"answered\""), "{settled:?}");
@@ -488,7 +503,7 @@ async fn two_pending_asks_are_answered_independently_over_http() {
     // Newest first, so the older ask is not merely queued behind it.
     let (code, _) = call(bound, &token, "POST", "/api/answer", &host, Some(&format!("{{\"ask_id\":{second_id},\"answer\":\"b\"}}"))).await;
     assert_eq!(code, 204);
-    assert_eq!(second.await.unwrap().as_deref(), Some("b"));
+    assert_eq!(second.await.unwrap(), Some(Reply::picked("b")));
     assert!(!first.is_finished(), "the first ask survived the second's answer");
 
     let ask = format!("{{\"ask_id\":{first_id},\"answer\":\"c\"}}");
@@ -496,7 +511,7 @@ async fn two_pending_asks_are_answered_independently_over_http() {
     assert_eq!(code, 422, "a label neither ask offers: {body:?}");
     let (code, _) = call(bound, &token, "POST", "/api/answer", &host, Some(&format!("{{\"ask_id\":{first_id},\"answer\":\"a\"}}"))).await;
     assert_eq!(code, 204, "a rejected answer leaves the ask pending");
-    assert_eq!(first.await.unwrap().as_deref(), Some("a"));
+    assert_eq!(first.await.unwrap(), Some(Reply::picked("a")));
 
     let (code, _) = call(bound, &token, "POST", "/api/answer", &host, Some(&format!("{{\"ask_id\":{first_id},\"answer\":\"a\"}}"))).await;
     assert_eq!(code, 409, "and now nothing is pending under it");
@@ -522,6 +537,116 @@ async fn an_approval_refuses_an_answer_that_is_neither_yes_nor_no() {
     assert_eq!(code, 204, "the ask was still pending and still answerable");
     let after = sse.til("\"outcome\":\"declined\"}").await;
     assert!(after.contains("\"outcome\":\"declined\""), "{after:?}");
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn a_yes_with_a_note_hands_the_model_the_output_then_the_note() {
+    let (agent, user, calls, _dir) = asking_app().await;
+    let (bound, token, cancel) = serve(agent.clone(), user).await;
+    let host = bound.to_string();
+    let mut sse = Sse::open(bound, &token).await;
+    sse.til("\"type\":\"caught-up\"").await;
+
+    call(bound, &token, "POST", "/api/say", &host, Some("{\"text\":\"note it\"}")).await;
+    let id = ask_id(&sse.til("\"answers\":[\"yes\",\"no\"]}").await);
+
+    let answer = format!("{{\"ask_id\":{id},\"answer\":\"yes\",\"note\":\"only this once\"}}");
+    let (code, body) = call(bound, &token, "POST", "/api/answer", &host, Some(&answer)).await;
+    assert_eq!(code, 204, "{body:?}");
+    let after = sse.til("\"is_error\":false}").await;
+    assert!(after.contains("\"answer\":\"yes\",\"note\":\"only this once\"}"), "{after:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    sse.til("\"type\":\"turn-settled\"").await;
+    assert_eq!(answering_result(&agent).await, ("ran\n\n[The operator's note on call t1:]\nonly this once".into(), false));
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn a_no_with_a_note_reads_as_a_no_and_hands_the_model_the_note_after_it() {
+    let (agent, user, calls, _dir) = asking_app().await;
+    let (bound, token, cancel) = serve(agent.clone(), user).await;
+    let host = bound.to_string();
+    let mut sse = Sse::open(bound, &token).await;
+    sse.til("\"type\":\"caught-up\"").await;
+
+    call(bound, &token, "POST", "/api/say", &host, Some("{\"text\":\"note it\"}")).await;
+    let id = ask_id(&sse.til("\"answers\":[\"yes\",\"no\"]}").await);
+
+    let answer = format!("{{\"ask_id\":{id},\"answer\":\"no\",\"note\":\"write it to the scratch file\"}}");
+    let (code, body) = call(bound, &token, "POST", "/api/answer", &host, Some(&answer)).await;
+    assert_eq!(code, 204, "{body:?}");
+    sse.til("\"is_error\":true}").await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    sse.til("\"type\":\"turn-settled\"").await;
+    assert_eq!(
+        answering_result(&agent).await,
+        ("the user declined this tool call\n\n[The operator's note on call t1:]\nwrite it to the scratch file".into(), true)
+    );
+    cancel.cancel();
+}
+
+async fn answering_result(agent: &Agent) -> (String, bool) {
+    let messages = agent.session().lock().await.messages();
+    let blocks = messages
+        .into_iter()
+        .find(|m| matches!(m.content.first(), Some(ContentBlock::ToolResult { .. })))
+        .expect("the call was answered")
+        .content;
+    match blocks.as_slice() {
+        [ContentBlock::ToolResult { content, is_error, .. }] => (content.clone(), *is_error),
+        other => panic!("expected the call's result alone, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_question_answered_with_a_note_settles_with_the_pick_and_the_note() {
+    let (agent, user, _dir) = app().await;
+    let (bound, token, cancel) = serve(agent, user.clone()).await;
+    let mut sse = Sse::open(bound, &token).await;
+    sse.til("\"type\":\"caught-up\"").await;
+
+    let (asking, _c) = question(user.clone(), "pick one");
+    let id = ask_id(&sse.til("\"prompt\":\"pick one\",\"options\":[{\"label\":\"a\"},{\"label\":\"b\"}]}").await);
+
+    let answer = format!("{{\"ask_id\":{id},\"answer\":\"b\",\"note\":\"  but keep a's tests \"}}");
+    let (code, body) = call(bound, &token, "POST", "/api/answer", &bound.to_string(), Some(&answer)).await;
+    assert_eq!(code, 204, "{body:?}");
+    assert_eq!(asking.await.unwrap(), Some(Reply { label: "b".into(), operator_note: Some(Words::new("but keep a's tests").unwrap()) }));
+    let settled = sse.til("\"note\":\"but keep a's tests\"}").await;
+    assert!(settled.contains(&format!("\"ask_id\":{id},\"how\":\"answered\",\"answer\":\"b\",\"note\"")), "{settled:?}");
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn a_bad_note_is_422_and_the_ask_stays_pending() {
+    let (agent, user, calls, _dir) = asking_app().await;
+    let (bound, token, cancel) = serve(agent, user).await;
+    let host = bound.to_string();
+    let mut sse = Sse::open(bound, &token).await;
+    sse.til("\"type\":\"caught-up\"").await;
+
+    call(bound, &token, "POST", "/api/say", &host, Some("{\"text\":\"note it\"}")).await;
+    let id = ask_id(&sse.til("\"answers\":[\"yes\",\"no\"]}").await);
+
+    let long = "x".repeat(eidolon_core::user::MAX_WORDS_BYTES + 1);
+    for (body, why) in [
+        (format!("{{\"ask_id\":{id},\"answer\":\"yes\",\"note\":\"{long}\"}}"), "note is over"),
+        (format!("{{\"ask_id\":{id},\"answer\":\"yes\",\"note\":\"a\\u0000b\"}}"), "control character"),
+        (format!("{{\"ask_id\":{id},\"answer\":\"yes\",\"note\":5}}"), "an answer body is"),
+    ] {
+        let (code, resp) = call(bound, &token, "POST", "/api/answer", &host, Some(&body)).await;
+        assert_eq!(code, 422, "{body}: {resp:?}");
+        assert!(resp.contains(why), "{body} is refused for {why:?}: {resp:?}");
+    }
+    let (code, resp) = call(bound, &token, "POST", "/api/answer", &host, Some(&format!("{{\"ask_id\":{id},\"note\":\"n\"}}"))).await;
+    assert_eq!(code, 400, "a note without an answer is the missing answer it always was: {resp:?}");
+    let (code, resp) = call(bound, &token, "POST", "/api/answer", &host, Some(&format!("{{\"ask_id\":{id},\"answer\":5}}"))).await;
+    assert_eq!(code, 400, "an old-shaped body of the wrong type keeps its 400: {resp:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let (code, _) = call(bound, &token, "POST", "/api/answer", &host, Some(&format!("{{\"ask_id\":{id},\"answer\":\"yes\"}}"))).await;
+    assert_eq!(code, 204, "every refusal left the ask pending");
     cancel.cancel();
 }
 
@@ -685,6 +810,88 @@ async fn an_oversize_body_is_refused_at_the_cap_and_starts_no_turn() {
     cancel.cancel();
 }
 
+/// The user messages on the session's branch, in order.
+async fn said(agent: &Agent) -> Vec<Vec<ContentBlock>> {
+    let session = agent.session().lock().await;
+    session
+        .branch()
+        .iter()
+        .filter_map(|r| match &r.kind {
+            RecordKind::UserMessage(m) => Some(m.content.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The eight-byte PNG signature, base64: the smallest thing the magic check
+/// takes as a PNG.
+const PNG: &str = "iVBORw0KGgo=";
+
+/// An image said with words becomes one user message: the image first, then
+/// the words, in the TUI's order, with the name as the block's `alt`. The live
+/// `user-message` frame counts it. An image with no words at all is said too.
+#[tokio::test]
+async fn an_attached_image_is_said_before_the_words_it_came_with() {
+    let (agent, user, _dir) = app().await;
+    let (bound, token, cancel) = serve(agent.clone(), user).await;
+    let mut sse = Sse::open(bound, &token).await;
+    sse.til("caught-up").await;
+
+    let body = format!(
+        "{{\"text\":\"what is this\",\"images\":[{{\"name\":\"shot.png\",\"media_type\":\"image/png\",\"data\":\"{PNG}\"}}]}}"
+    );
+    let (code, resp) = call(bound, &token, "POST", "/api/say", &bound.to_string(), Some(&body)).await;
+    assert_eq!(code, 202, "{resp:?}");
+    let live = sse.til("\"type\":\"turn-settled\"").await;
+    assert!(live.contains("\"images\":1"), "{live:?}");
+    assert_eq!(
+        said(&agent).await,
+        vec![vec![ContentBlock::image("image/png", PNG, Some("shot.png".into())), ContentBlock::text("what is this")]]
+    );
+    cancel.cancel();
+}
+
+/// Every refusal of an attachment is a 422 with a reason, and the say is not
+/// made at all: its words are not said without the image that failed.
+/// `documents` is refused by name rather than dropped. An attachment in a
+/// shape the route does not read is a 422 too, as it would be on
+/// `/api/launch`. A body with no image and no `text`, or one that is not
+/// JSON, is still the 400 it always was.
+#[tokio::test]
+async fn a_bad_attachment_is_422_and_says_nothing() {
+    let (agent, user, _dir) = app().await;
+    let (bound, token, cancel) = serve(agent.clone(), user).await;
+    let host = bound.to_string();
+    let image = |t: &str, d: &str| format!("{{\"media_type\":\"{t}\",\"data\":\"{d}\"}}");
+    let nine = vec![image("image/png", PNG); 9].join(",");
+    for body in [
+        format!("{{\"text\":\"x\",\"images\":[{}]}}", image("image/bmp", PNG)),
+        format!("{{\"text\":\"x\",\"images\":[{}]}}", image("image/jpeg", PNG)),
+        format!("{{\"text\":\"x\",\"images\":[{}]}}", image("image/png", "")),
+        format!("{{\"text\":\"x\",\"images\":[{}]}}", image("image/png", "%%%%")),
+        format!("{{\"text\":\"x\",\"images\":[{nine}]}}"),
+        format!("{{\"text\":\"x\",\"images\":[{{\"name\":\"../a.png\",\"media_type\":\"image/png\",\"data\":\"{PNG}\"}}]}}"),
+        "{\"text\":\"x\",\"documents\":[]}".to_string(),
+        // Shapes this route does not read, once attachments are in the body:
+        // `post_launch`'s 422, not the words-only 400.
+        format!("{{\"text\":\"x\",\"images\":[{{\"data\":\"{PNG}\"}}]}}"),
+        "{\"text\":\"x\",\"images\":[{\"media_type\":7,\"data\":\"\"}]}".to_string(),
+        "{\"text\":\"x\",\"images\":\"shot.png\"}".to_string(),
+        "{\"text\":5,\"documents\":\"a.pdf\"}".to_string(),
+    ] {
+        let (code, resp) = call(bound, &token, "POST", "/api/say", &host, Some(&body)).await;
+        assert_eq!(code, 422, "{body}: {resp:?}");
+        assert!(resp.contains("\"error\":"), "{resp:?}");
+    }
+    // Words-only bodies keep the 400 they always had.
+    for body in ["{\"images\":[]}", "{\"text\":5}", "not json"] {
+        let (code, resp) = call(bound, &token, "POST", "/api/say", &host, Some(body)).await;
+        assert_eq!(code, 400, "{body}: {resp:?}");
+    }
+    assert!(said(&agent).await.is_empty(), "nothing refused was said");
+    cancel.cancel();
+}
+
 fn token_files(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut names: Vec<String> = entries
@@ -714,6 +921,7 @@ async fn a_cancelled_run_removes_its_token_file() {
             yolo: Default::default(),
             doorbell: None,
             presence: None,
+            launch: None,
         },
         cancel.clone(),
     ));
@@ -751,6 +959,7 @@ async fn run_refuses_a_bind_that_is_not_loopback() {
         yolo: Default::default(),
         doorbell: None,
         presence: None,
+        launch: None,
     };
     let err = eidolon_web::run(agent, user, opts, CancellationToken::new()).await.unwrap_err();
     let msg = format!("{err:#}");
@@ -781,6 +990,164 @@ async fn the_verbs_answer_statuses_and_nothing_else_is_served() {
         let (code, body) = call(bound, &token, "GET", path, &host, None).await;
         assert_eq!(code, 404, "{path} is not this door's: {body:?}");
     }
+    cancel.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// `POST /api/launch`, against a fake launcher: no test opens a window.
+// ---------------------------------------------------------------------------
+
+struct FakeLaunch {
+    calls: std::sync::Mutex<Vec<(Window, Option<String>)>>,
+    answer: Result<String, String>,
+}
+
+impl FakeLaunch {
+    fn answering(line: &str) -> Arc<Self> {
+        Arc::new(FakeLaunch {
+            calls: Default::default(),
+            answer: Ok(line.to_string()),
+        })
+    }
+
+    fn failing(message: &str) -> Arc<Self> {
+        Arc::new(FakeLaunch {
+            calls: Default::default(),
+            answer: Err(message.to_string()),
+        })
+    }
+
+    fn calls(&self) -> Vec<(Window, Option<String>)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl Launch for FakeLaunch {
+    fn open(&self, window: Window, path: Option<&str>) -> anyhow::Result<String> {
+        self.calls.lock().unwrap().push((window, path.map(str::to_string)));
+        match &self.answer {
+            Ok(line) => Ok(line.clone()),
+            Err(why) => anyhow::bail!("{why}"),
+        }
+    }
+}
+
+/// The door cleans nothing up: `..` and spaces reach the launcher as sent.
+#[tokio::test]
+async fn each_window_reaches_the_seam_with_its_path_unchanged() {
+    let (agent, user, _dir) = app().await;
+    let fake = FakeLaunch::answering("foot -D /tmp/notes -e hx");
+    let (bound, token, cancel) = serve_launching(agent, user, fake.clone()).await;
+    let host = bound.to_string();
+    let path = "notes/../foo bar.md";
+
+    for (wire, want) in [("terminal", Window::Terminal), ("editor", Window::Editor), ("files", Window::Files)] {
+        let body = Some(format!("{{\"window\":\"{wire}\",\"path\":\"{path}\"}}"));
+        let (code, resp) = call(bound, &token, "POST", "/api/launch", &host, body.as_deref()).await;
+        assert_eq!(code, 200, "{wire}: {resp:?}");
+        let sent: serde_json::Value = serde_json::from_str(body_of(&resp)).unwrap();
+        assert_eq!(sent, serde_json::json!({"opened": "foot -D /tmp/notes -e hx"}), "{wire}");
+        assert_eq!(fake.calls().last(), Some(&(want, Some(path.to_string()))), "{wire}");
+    }
+
+    // `None`, not an empty string.
+    let (code, resp) = call(bound, &token, "POST", "/api/launch", &host, Some("{\"window\":\"files\"}")).await;
+    assert_eq!(code, 200, "{resp:?}");
+    assert_eq!(fake.calls().last(), Some(&(Window::Files, None)));
+    assert_eq!(fake.calls().len(), 4);
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn the_launch_gates_run_before_the_launcher_does() {
+    let (agent, user, _dir) = app().await;
+    let fake = FakeLaunch::answering("foot -D /tmp");
+    let (bound, token, cancel) = serve_launching(agent, user, fake.clone()).await;
+    let host = bound.to_string();
+    let body = Some("{\"window\":\"terminal\"}");
+
+    let (code, resp) = call_auth(bound, None, "POST", "/api/launch", &host, body).await;
+    assert_eq!(code, 401, "{resp:?}");
+
+    let (code, resp) = call(bound, &token, "POST", "/api/launch", "evil.example:4477", body).await;
+    assert_eq!(code, 403, "{resp:?}");
+
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn a_launch_body_this_door_will_not_pass_on_is_422() {
+    let (agent, user, _dir) = app().await;
+    let fake = FakeLaunch::answering("foot -D /tmp");
+    let (bound, token, cancel) = serve_launching(agent, user, fake.clone()).await;
+    let host = bound.to_string();
+    let long = "a".repeat(4097);
+
+    let cases = [
+        ("a window that is not one of the three", "{\"window\":\"browser\"}".to_string()),
+        ("a body that is not JSON at all", "{\"window\":".to_string()),
+        ("a body that names no window", "{}".to_string()),
+        ("a path with a NUL in it", "{\"window\":\"editor\",\"path\":\"a\\u0000b\"}".to_string()),
+        ("a path over 4096 bytes", format!("{{\"window\":\"editor\",\"path\":\"{long}\"}}")),
+    ];
+    for (why, body) in cases {
+        let (code, resp) = call(bound, &token, "POST", "/api/launch", &host, Some(&body)).await;
+        assert_eq!(code, 422, "{why}: {resp:?}");
+    }
+
+    // The control: at the limit is taken.
+    let body = format!("{{\"window\":\"editor\",\"path\":\"{}\"}}", "a".repeat(4096));
+    let (code, resp) = call(bound, &token, "POST", "/api/launch", &host, Some(&body)).await;
+    assert_eq!(code, 200, "{resp:?}");
+
+    assert_eq!(fake.calls().len(), 1, "{:?}", fake.calls());
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn a_door_with_no_launcher_answers_501() {
+    let (agent, user, _dir) = app().await;
+    let (bound, token, cancel) = serve(agent, user).await;
+    let host = bound.to_string();
+
+    let (code, resp) = call(bound, &token, "POST", "/api/launch", &host, Some("{\"window\":\"terminal\"}")).await;
+    assert_eq!(code, 501, "{resp:?}");
+    assert_eq!(body_of(&resp), "");
+
+    let (code, _) = call(bound, &token, "POST", "/api/cancel", &host, None).await;
+    assert_eq!(code, 409);
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn a_launcher_that_fails_answers_500_with_its_message() {
+    let why = "no display server: there is nowhere to open a window";
+    let (agent, user, _dir) = app().await;
+    let fake = FakeLaunch::failing(why);
+    let (bound, token, cancel) = serve_launching(agent, user, fake.clone()).await;
+
+    let (code, resp) = call(bound, &token, "POST", "/api/launch", &bound.to_string(), Some("{\"window\":\"terminal\"}")).await;
+    assert_eq!(code, 500, "{resp:?}");
+    let sent: serde_json::Value = serde_json::from_str(body_of(&resp)).unwrap();
+    assert_eq!(sent, serde_json::json!({"error": why}));
+    assert_eq!(fake.calls().len(), 1);
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn get_on_the_launch_route_is_the_404_the_other_posts_give() {
+    let (agent, user, _dir) = app().await;
+    let fake = FakeLaunch::answering("foot -D /tmp");
+    let (bound, token, cancel) = serve_launching(agent, user, fake.clone()).await;
+    let host = bound.to_string();
+
+    for path in ["/api/launch", "/api/say", "/api/answer"] {
+        let (code, resp) = call(bound, &token, "GET", path, &host, None).await;
+        assert_eq!(code, 404, "GET {path}: {resp:?}");
+    }
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
     cancel.cancel();
 }
 
@@ -1038,6 +1405,7 @@ async fn a_served_file_carries_no_token_of_the_run() {
             yolo: Default::default(),
             doorbell: None,
             presence: None,
+            launch: None,
         },
         cancel.clone(),
     ));
@@ -1130,6 +1498,7 @@ async fn run_refuses_a_ui_dir_that_is_not_a_directory() {
                 yolo: Default::default(),
                 doorbell: None,
                 presence: None,
+                launch: None,
             },
             CancellationToken::new(),
         )

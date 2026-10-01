@@ -85,6 +85,9 @@ mod tests {
             prompt: None,
             render: None,
             deferred: false,
+            script_only: false,
+            plugin: None,
+            source_hash: None,
         };
         let s = templates_skeleton(&[m]);
         let f = &s["functions"][0];

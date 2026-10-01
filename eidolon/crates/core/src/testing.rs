@@ -11,7 +11,7 @@ use crate::message::{StopReason, Usage};
 use crate::policy::{PolicyHook, Ruling};
 use crate::provider::{ChatRequest, EventStream, Provider, StreamEvent};
 use crate::tool::{ToolCall, ToolManifest};
-use crate::user::{Choice, UserIo};
+use crate::user::{Choice, Reply, UserIo};
 
 /// Plays back a fixed sequence of responses, one per model call. Each
 /// response is a list of stream events; `Stop` is appended if missing.
@@ -112,13 +112,71 @@ impl UserIo for ScriptedUser {
         prompt: &str,
         options: &[Choice],
         _: &CancellationToken,
-    ) -> Option<String> {
+    ) -> Option<Reply> {
         self.asked.lock().unwrap().push(prompt.to_string());
         if self.confirm {
-            options.first().map(|c| c.label.clone())
+            options.first().map(|c| Reply::picked(&c.label))
         } else {
             None
         }
+    }
+}
+
+/// A user whose answers wait until the test lets them go: the operator
+/// mid-dialog. `entered` fires when a seam starts blocking, `release`
+/// lets every waiter through with the answer the test set — the shape
+/// that lets a test stand on the *other* side of a live question and
+/// knock.
+pub struct HeldUser {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+    pub approve_with: std::sync::atomic::AtomicBool,
+    pub respond_with: Mutex<Option<String>>,
+    pub asked: Mutex<Vec<String>>,
+}
+
+impl Default for HeldUser {
+    fn default() -> Self {
+        HeldUser {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            approve_with: std::sync::atomic::AtomicBool::new(true),
+            respond_with: Mutex::new(Some("the operator's word".into())),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl HeldUser {
+    pub fn new() -> Arc<Self> {
+        Arc::new(HeldUser::default())
+    }
+}
+
+#[async_trait]
+impl UserIo for HeldUser {
+    async fn choose(
+        &self,
+        prompt: &str,
+        options: &[Choice],
+        _: &CancellationToken,
+    ) -> Option<Reply> {
+        use std::sync::atomic::Ordering;
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.asked.lock().unwrap().push(prompt.to_string());
+        if self.approve_with.load(Ordering::SeqCst) {
+            options.first().map(|c| Reply::picked(&c.label))
+        } else {
+            None
+        }
+    }
+
+    async fn respond(&self, prompt: &str, _: &CancellationToken) -> Option<String> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.asked.lock().unwrap().push(prompt.to_string());
+        self.respond_with.lock().unwrap().clone()
     }
 }
 

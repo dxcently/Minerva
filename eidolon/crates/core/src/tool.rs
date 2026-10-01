@@ -8,7 +8,7 @@
 //! from `pi-extensions` — keep it whole.
 //!
 //! A `Tool` is *anything* callable by name with a JSON input. Built-in tools
-//! are Rune scripts wrapping Rust primitives; user skills are Rune scripts;
+//! are Rune scripts wrapping Rust primitives; user tools are Rune scripts;
 //! `choices_user` is a tool. There is no privileged native path, so nothing can
 //! bypass the dispatcher by being "built in".
 
@@ -44,6 +44,36 @@ pub struct ToolManifest {
     /// by calling it. See [`crate::tool_search`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
+    /// Registered for scripts, never offered to a model: the dispatcher
+    /// runs it by name, the gate classifies it, the log journals it, but
+    /// it is in no request's tool list and no `tool_search` finds it.
+    /// Where `deferred` is a *context-cost* setting — a tool a model may
+    /// earn the sight of — this is an *audience* statement: a tool whose
+    /// caller is always a script (a workflow's `ask_model`), which a model
+    /// reaching for it could only misuse (vault, *The Workflow Interpreter
+    /// (spec)*, §The model call).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub script_only: bool,
+    /// The plugin that contributed this tool, when it came from one — the
+    /// directory name under `plugins/` whose `tools/` carried the file.
+    /// **Attributed, never claimed**: `skip` keeps the field out of both
+    /// directions of serde, so a script's own `manifest()` cannot name an
+    /// origin — only the adoption path that read the directory does. This
+    /// is the one home of the tag: the gate's question reads it to say
+    /// whose effect is being asked about, the audit line on the effects a
+    /// script causes (`consumer=plugin:<name>`) reads it, and spend
+    /// attribution will (the plugin system, slice P6).
+    #[serde(skip)]
+    pub plugin: Option<String>,
+    /// The content hash of the script this manifest came from, set by the
+    /// compile that read it. `#[serde(skip)]` like [`Self::plugin`], and for
+    /// the same reason in mirror image: a manifest cannot vouch for itself
+    /// any more than it can claim an origin — only the path that read the
+    /// file knows what it loaded. The vouch store's rows carry the hash the
+    /// operator trusted; the policy stage compares the two at its
+    /// fallthrough, and an edited plugin re-asks.
+    #[serde(skip)]
+    pub source_hash: Option<String>,
 }
 
 impl ToolManifest {
@@ -59,6 +89,9 @@ impl ToolManifest {
             prompt: None,
             render: None,
             deferred: false,
+            script_only: false,
+            plugin: None,
+            source_hash: None,
         }
     }
 
@@ -80,7 +113,8 @@ impl ToolManifest {
 pub enum CallOrigin {
     /// A `tool_use` block in an assistant message.
     Model,
-    /// A running Rune script (a skill, a built-in, a panel).
+    /// A call another Rune script drove: a tool calling a tool, or a
+    /// workflow step reaching the chokepoint on its own.
     Script,
     /// The person at the keyboard (slash command, palette).
     User,
@@ -333,6 +367,9 @@ mod tests {
             prompt: prompt.map(str::to_string),
             render: None,
             deferred: false,
+            script_only: false,
+            plugin: None,
+            source_hash: None,
         }))
     }
 

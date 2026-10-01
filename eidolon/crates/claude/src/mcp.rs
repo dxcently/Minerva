@@ -46,6 +46,7 @@ use tokio_util::sync::CancellationToken;
 use eidolon_core::dispatch::Dispatcher;
 use eidolon_core::ipc;
 use eidolon_core::tool::{CallOrigin, ToolCall};
+use eidolon_core::user::with_operator_note;
 
 /// The MCP server name the CLI knows us by. Tools therefore reach the model
 /// as `mcp__eidolon__<tool>`; [`crate::is_eidolon_tool`] recognises them.
@@ -127,8 +128,9 @@ async fn answer(d: &Dispatcher, payload: &[u8], cancel: &CancellationToken) -> V
             };
             // `execute`, not `dispatch`: the stream sink journals and
             // publishes this call in stream order. See `Dispatcher::execute`.
-            let out = d.execute(&call, cancel.child_token()).await;
-            json!({ "content": out.content, "is_error": out.is_error })
+            let (out, operator_note) = d.execute(&call, cancel.child_token()).await;
+            let content = with_operator_note(&out.content, &call.id, operator_note.as_ref());
+            json!({ "content": content, "is_error": out.is_error })
         }
         other => json!({ "error": format!("unknown bridge op {other:?}") }),
     }
@@ -275,10 +277,11 @@ fn bridge(socket: Option<&str>, request: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eidolon_core::policy::AllowAll;
+    use eidolon_core::policy::{AllowAll, Ruling};
     use eidolon_core::testing::AlwaysAsk;
     use eidolon_core::testing::ScriptedUser;
     use eidolon_core::tool::{CallContext, Tool, ToolManifest, ToolOutput};
+    use eidolon_core::user::{Choice, Consent, Reply, UserIo, Words};
     use eidolon_core::{EventBus, Session, ToolRegistry};
     use tokio::sync::Mutex;
 
@@ -310,6 +313,9 @@ mod tests {
             prompt: None,
             render: None,
             deferred: false,
+            script_only: false,
+            plugin: None,
+            source_hash: None,
         })));
         r
     }
@@ -385,6 +391,9 @@ mod tests {
             prompt: None,
             render: None,
             deferred: false,
+            script_only: false,
+            plugin: None,
+            source_hash: None,
         })));
         let session = Session::create(&dir.path().join("s.log"), "m", dir.path(), None).unwrap();
         let d = Arc::new(Dispatcher::new(
@@ -408,6 +417,38 @@ mod tests {
             out["content"].as_str().unwrap().contains("declined"),
             "{out}"
         );
+        task.abort();
+    }
+
+    struct Consenting(Consent);
+
+    #[async_trait::async_trait]
+    impl UserIo for Consenting {
+        async fn choose(&self, _: &str, _: &[Choice], _: &CancellationToken) -> Option<Reply> {
+            None
+        }
+        async fn approve(&self, _: &ToolCall, _: &ToolManifest, _: &Ruling, _: &CancellationToken) -> Consent {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_approval_note_joins_the_bridged_result_after_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let consent = Consent {
+            given: true,
+            operator_note: Some(Words::new("only this once").unwrap()),
+        };
+        let d = dispatcher(dir.path(), Arc::new(AlwaysAsk), Arc::new(Consenting(consent)));
+        let sock = dir.path().join("m.sock");
+        let task = serve(&sock, d, CancellationToken::new()).await.unwrap();
+        let out = bridged(
+            &sock,
+            json!({ "op": "call", "id": "t9", "name": "echo", "input": { "text": "hi" } }),
+        )
+        .await;
+        assert_eq!(out["is_error"], false);
+        assert_eq!(out["content"], "hi\n\n[The operator's note on call t9:]\nonly this once");
         task.abort();
     }
 

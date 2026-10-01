@@ -27,7 +27,7 @@
     # resolved the tag and failed `eidolon-core`. Only a tag moves both, so
     # 0.3.8 is what this names, with Cargo.toml's pin beside it.
     harnox = {
-      url = "github:noah427/harnox/v0.3.8";
+      url = "github:noah427/harnox/v0.3.12";
       flake = false;
     };
   };

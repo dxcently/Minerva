@@ -94,6 +94,13 @@ pub struct Config {
     pub providers_dir: Option<PathBuf>,
     /// Directory of the user's own Rune tools (default `~/.config/eidolon/tools`).
     pub tools_dir: Option<PathBuf>,
+    /// Directory of installed plugins (default `~/.config/eidolon/plugins`).
+    /// Reader-side, and absent in the ordinary case: it exists so a test can
+    /// aim the whole plugin surface — discovery, adoption, the store beside
+    /// it, the door's enabled check — at a temporary directory instead of
+    /// the operator's own, which otherwise means mutating `XDG_CONFIG_HOME`
+    /// and hand-running the binary. Same reading `[policy] path` got.
+    pub plugins_dir: Option<PathBuf>,
     /// Where `secrets.enc` and `secret.key` live (default `~/.config/eidolon/secrets`).
     pub secrets_dir: Option<PathBuf>,
     pub mneme: Option<MnemeEntry>,
@@ -272,6 +279,14 @@ pub struct SwarmEntry {
 pub struct PolicyEntry {
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// Where the operator's own leaf table lives, when it is not the usual
+    /// place. Absent is the ordinary case and means
+    /// `~/.config/eidolon/policy.rn`; the permission store composes beside
+    /// **this** file — `policy.permits.rn` in the same directory — so
+    /// relocating the table relocates the store with it, which is the whole
+    /// of the tree-shape freedom the plugin spec leaves open.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
     /// What a command matching nothing in the table gets.
     ///
     /// `allow` because every command is on screen as it runs, so an
@@ -666,10 +681,26 @@ impl Config {
             .unwrap_or_else(|| config_dir().join("tools"))
     }
 
+    /// Installed plugins: `~/.config/eidolon/plugins/<name>/`. The path is
+    /// part of what makes an installed plugin findable, so the default is
+    /// the whole story for an operator; the override is for a test that
+    /// needs a whole plugin surface of its own. Read on demand (`eidolon
+    /// plugins`, adoption), never in the startup path: discovery is lazy.
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.plugins_dir
+            .as_deref()
+            .map(expand_home)
+            .unwrap_or_else(|| config_dir().join("plugins"))
+    }
     /// The operator's own leaf table, if they wrote one. Absent is the
-    /// ordinary case and means the table compiled into the binary.
+    /// ordinary case and means the table compiled into the binary. The
+    /// permission store is this file's sibling, wherever this is.
     pub fn policy_path(&self) -> PathBuf {
-        config_dir().join("policy.rn")
+        self.policy
+            .as_ref()
+            .and_then(|p| p.path.as_deref())
+            .map(|p| expand_home(Path::new(p)).to_path_buf())
+            .unwrap_or_else(|| config_dir().join("policy.rn"))
     }
 
     /// How to build the classifier, or `None` when the operator turned it
@@ -795,7 +826,12 @@ pub fn catalog(cfg: &Config, fetch: eidolon_providers::Fetch) -> eidolon_provide
         .with_claude(claude)
         .with_store(std::sync::Arc::new(secret_store(cfg)))
         .with_fetch(fetch);
-    cat.load_builtins();
+    // The shadow rule, before the built-ins it governs: a user script
+    // under a built-in's name that defines its own `models()` makes the
+    // built-in's discovery a parse whose result the replacement discards,
+    // so it does not run. See `Catalog::load_builtins_except`.
+    let shadowed = eidolon_providers::catalog::shadowed_builtins(&cfg.providers_dir());
+    cat.load_builtins_except(&shadowed);
     // An entry that names a provider already loaded — a built-in, or one
     // an earlier entry declared — *patches* it: `name` plus the one field
     // being changed, with everything else inherited. Anything else is a
@@ -844,6 +880,23 @@ mod tests {
     /// `[policy] yolo` is the flag said once. It is read only where there
     /// is a gate to arm: with `enabled = false` there is no switch, and
     /// saying yes to questions nobody asks would be a claim about nothing.
+    /// `plugins_dir` is reader-side and absent in the ordinary case — the
+    /// default is the whole story for an operator — and it exists so a test
+    /// can aim the whole plugin surface (discovery, adoption, the store
+    /// beside it, the door's enabled check) at a temporary directory, the
+    /// same reading `[policy] path` got.
+    #[test]
+    fn the_plugins_directory_is_overridable_and_defaults() {
+        let cfg: Config = toml::from_str("plugins_dir = '/tmp/meli-plugins'").unwrap();
+        assert_eq!(cfg.plugins_dir(), std::path::PathBuf::from("/tmp/meli-plugins"));
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(
+            cfg.plugins_dir().ends_with("plugins"),
+            "the default is the operator's own directory: {:?}",
+            cfg.plugins_dir()
+        );
+    }
+
     #[test]
     fn yolo_is_a_standing_answer_only_where_there_is_a_gate() {
         let cfg: Config = toml::from_str("[policy]\nyolo = true\n").unwrap();

@@ -304,4 +304,35 @@ fn needs_finishing_reads_the_direction_of_an_unsettled_branch() {
     };
     assert!(!dangling.is_settled());
     assert!(dangling.needs_finishing());
+
+    // A settle short-circuits the check entirely: the same dangling tool
+    // use with a boundary recorded behind it owes nothing — the turn was
+    // finished and the wall or a harness close said so — and finishing
+    // would re-ask a branch that was already closed out. The exhaustion
+    // settle lives exactly here: the wall used to leave such a branch
+    // unsettled, so a resume re-asked a turn that had spent its whole
+    // budget and owed nothing.
+    let closed = {
+        let mut s = Session::create(&dir.path().join("closed.eid"), "prov:m", dir.path(), None)
+            .unwrap();
+        s.append(RecordKind::AssistantMessage(Message::assistant(vec![
+            ContentBlock::ToolUse {
+                id: "tu_1".into(),
+                name: "bash".into(),
+                input: json!({ "command": "ls" }).into(),
+            },
+        ])))
+        .unwrap();
+        s.append(RecordKind::TurnSettled {
+            stop_reason: eidolon_core::StopReason::IterationLimit,
+            usage: eidolon_core::Usage::default(),
+        })
+        .unwrap();
+        s
+    };
+    assert!(closed.is_settled(), "the boundary is the accounting truth");
+    assert!(
+        !closed.needs_finishing(),
+        "a settle short-circuits the owed-work check — dangling below it is history, not debt"
+    );
 }

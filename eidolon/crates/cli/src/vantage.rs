@@ -69,8 +69,8 @@ impl Facts {
         log.with_extension("exit")
     }
 
-    /// Ask a session what it is doing. Nothing answering is expected rather
-    /// than an error: a session that died is a fact about the condition.
+    /// Ask a session what it is doing. The roster is what says a session is
+    /// gone; this only asks a session the roster has already called live.
     fn peer_state(&self, id: &str) -> Answer {
         if self.swarm.is_none() {
             return gone(id);
@@ -83,22 +83,12 @@ impl Facts {
         let Some(peer) = found else {
             return gone(id);
         };
-        // The peer answers about its own loop — the only answer that is not
-        // a guess. The roster's `busy` is written by one driver only, so it
-        // reads as permanently idle for a headless `run` or `chat` peer and
-        // must never be what a wait is decided on.
-        match socket::request(&peer.socket(), &serde_json::json!({ "op": "state" })) {
-            Ok(reply) if reply.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
-                match reply.get("busy").and_then(serde_json::Value::as_bool) {
-                    Some(true) => Answer::No,
-                    _ => Answer::Yes,
-                }
-            }
-            // No answer at all: gone, or wedged. Nothing can be asked of it
-            // either way, which is the whole of what "gone" means — and it
-            // resolves the park instead of burning its deadline.
-            _ => gone(id),
-        }
+        // Gone is the roster's word, not this probe's. `scan` keeps a
+        // registration whose socket is silent for as long as the pid it names
+        // is alive, precisely because a busy session fails this socket's
+        // quarter-second timeout while it works — so asking the same socket
+        // the same question must not turn that same silence into a verdict.
+        answer_about_turn(id, socket::request(&peer.socket(), &serde_json::json!({ "op": "state" })))
     }
 
     /// Has the background command finished? The exit file is written by the
@@ -171,6 +161,32 @@ fn answer(holds: bool) -> Answer {
 
 fn gone(id: &str) -> Answer {
     Answer::Unanswerable(format!("session {id} is gone"))
+}
+
+/// What a doorbell's reply says about a peer the roster has already called
+/// live — the peer's own loop, which no file can be asked: the roster's
+/// `busy` is written by one driver only, so it reads as permanently idle for
+/// a headless `run` or `chat` peer and must never be what a wait is decided
+/// on.
+///
+/// Silence is `No`, not a verdict. A busy session fails the probe's quarter
+/// second while it works — that is `presence::scan`'s own reading of the same
+/// silence, and why its sweep asks the registration's pid before deleting
+/// anything — so a park that answered `Unanswerable` here would end saying a
+/// working session is gone, handing the model a conclusion where it asked for
+/// a wait. A peer that answers with anything other than a turn state is a
+/// different fact: alive, and asked a question it does not know.
+fn answer_about_turn(id: &str, reply: anyhow::Result<serde_json::Value>) -> Answer {
+    let Ok(reply) = reply else {
+        return Answer::No;
+    };
+    if reply.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Answer::Unanswerable(format!("session {id} does not answer about its turn"));
+    }
+    match reply.get("busy").and_then(serde_json::Value::as_bool) {
+        Some(true) => Answer::No,
+        _ => Answer::Yes,
+    }
 }
 
 #[async_trait]
@@ -263,5 +279,35 @@ mod tests {
             Answer::Unanswerable(why) => assert!(why.contains("no vault"), "{why}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    /// The incident, at the leaf. A peer mid-turn fails the doorbell's
+    /// quarter-second probe while it works — the same silence
+    /// `presence::scan` deliberately keeps a live pid through — and a park
+    /// told "unanswerable" ends right there, claiming a session that is
+    /// compiling is gone. Silence is "not yet", and only the roster says
+    /// "never".
+    #[test]
+    fn a_silent_doorbell_keeps_the_park_waiting() {
+        let silent = Err(anyhow::anyhow!("no answer inside the probe's quarter second"));
+        assert_eq!(
+            answer_about_turn("peer", silent),
+            Answer::No,
+            "silence is not a verdict"
+        );
+        assert_eq!(
+            answer_about_turn("peer", Ok(json!({ "ok": true, "busy": true }))),
+            Answer::No,
+            "a peer that says it is mid-turn is not idle"
+        );
+        assert_eq!(
+            answer_about_turn("peer", Ok(json!({ "ok": true, "busy": false }))),
+            Answer::Yes
+        );
+        assert_eq!(
+            answer_about_turn("peer", Ok(json!({ "ok": false, "error": "unknown op `state`" }))),
+            Answer::Unanswerable("session peer does not answer about its turn".into()),
+            "alive and answering, but not about the thing the park is asking"
+        );
     }
 }

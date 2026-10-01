@@ -214,7 +214,8 @@
 //! to own the keyboard in Rust; now `command`, `search`, `dispatch`,
 //! `confirm`, `choose` and `pick` are tables like `normal` is,
 //! resolved by the same [`keys`] and drawn in the same which-key popup,
-//! with `submit`, `cancel`, `dialog_deny` and the buffer's motion names
+//! with `submit`, `cancel`, `dialog_allow`, `dialog_deny`, `dialog_note`,
+//! `dialog_chat` and the buffer's motion names
 //! meaning the obvious thing there. A script that leaves a dialog's
 //! table out gets the default's, since an approval box nothing can
 //! answer is a hang; one that leaves out a one-line mode's gets

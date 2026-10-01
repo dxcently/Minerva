@@ -181,10 +181,31 @@ pub struct ToolTally {
     pub failures: u32,
 }
 
+/// One tool-less model call's spend, as the panel sees it — a
+/// [`RecordKind::ModelSpend`](eidolon_core::session::RecordKind::ModelSpend)
+/// priced where it is counted, at the rates of *its* key and not the
+/// model in play.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelCall {
+    /// The catalog key the call resolved to.
+    pub model: String,
+    pub usage: Usage,
+    /// Dollars at the key's rates, or `None` when the catalog prices no
+    /// such key — an unpriced call is said so, never summed as free.
+    pub cost: Option<f64>,
+    pub ts_ms: u64,
+}
+
 /// The per-turn record of a session, derived from its branch.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Ledger {
     pub turns: Vec<Turn>,
+    /// One tool-less call's spend each — the [`ModelCall`] rows, kept
+    /// beside the turns rather than folded into them, because a call is
+    /// not a turn: it has no tools, no context figure, no settle.
+    /// Totals that mean "the session" sum both; nothing here may print a
+    /// total that quietly leaves these out.
+    pub model_calls: Vec<ModelCall>,
     /// Every tool ever reached for, by name, in first-use order — the
     /// order the transcript's clusters use, so the two tables agree on
     /// what came first.
@@ -194,6 +215,12 @@ pub struct Ledger {
     /// to a settle afterwards.
     pub cancelled: u32,
     pub compactions: u32,
+    /// A plugin's `api_request`s, counted. What they cost is unknown —
+    /// a third party's rates are not in any catalog this harness holds —
+    /// and the ledger says so beside the priced dollars rather than
+    /// letting absence read as free. Every request journals; these are
+    /// the `plugin:`-tagged ones.
+    pub plugin_requests: usize,
     open: Open,
 }
 
@@ -300,6 +327,19 @@ impl Ledger {
         });
     }
 
+    /// One tool-less call's spend, priced by the caller at *its* key's
+    /// rates — `None` when the catalog prices no such key. A row beside
+    /// the turns, never folded into one: a call is not a turn. Every
+    /// total that means "the session" reads this list too.
+    pub fn model_call(&mut self, model: &str, usage: Usage, cost: Option<f64>, ts_ms: u64) {
+        self.model_calls.push(ModelCall {
+            model: model.to_string(),
+            usage,
+            cost,
+            ts_ms,
+        });
+    }
+
     /// What the turn in flight has done so far, for the panel's
     /// *in flight* line: `(model calls, tool calls, since ms)`.
     pub fn in_flight(&self) -> (u32, u32, u64) {
@@ -312,16 +352,55 @@ impl Ledger {
         for t in &self.turns {
             total += t.usage;
         }
+        // The tool-less calls spent real tokens on the same session; a
+        // total that skipped them would be a partial total reading as
+        // final — which is the one thing spend arithmetic may not be.
+        for c in &self.model_calls {
+            total += c.usage;
+        }
         total
     }
 
-    /// Dollars over the priced turns, and how many turns were not priced.
-    /// `None` when nothing has been priced at all, which is a session on
-    /// a backend that bills elsewhere and not a session that cost nothing.
-    pub fn spend(&self) -> Option<(f64, usize)> {
-        let priced: Vec<f64> = self.turns.iter().filter_map(|t| t.cost).collect();
-        let unpriced = self.turns.len() - priced.len();
-        (!priced.is_empty()).then(|| (priced.iter().sum(), unpriced))
+    /// Dollars over everything priced — turns and tool-less calls. `None`
+    /// when nothing was priced at all, which is a session on a backend
+    /// that bills elsewhere and not a session that cost nothing; what
+    /// went unpriced is [`Ledger::unpriced`]'s to say, and the page says
+    /// it beside this or instead of it.
+    pub fn spend(&self) -> Option<f64> {
+        let mut priced = 0.0;
+        let mut anything = false;
+        for t in &self.turns {
+            if let Some(c) = t.cost {
+                priced += c;
+                anything = true;
+            }
+        }
+        for c in &self.model_calls {
+            if let Some(cost) = c.cost {
+                priced += cost;
+                anything = true;
+            }
+        }
+        anything.then_some(priced)
+    }
+
+    /// What could not be priced: `(unpriced turns, unpriced model
+    /// calls)`. Both are figures the harness does not have, and saying
+    /// so is the alternative to summing them in as free — a zero there
+    /// would be a bill, not a number.
+    pub fn unpriced(&self) -> (usize, usize) {
+        let turns = self.turns.iter().filter(|t| t.cost.is_none()).count();
+        let calls = self.model_calls.iter().filter(|c| c.cost.is_none()).count();
+        (turns, calls)
+    }
+
+    /// Count one journaled `api_request`. The plugin-tagged ones are
+    /// what the unpriced line counts; the rest name the tool that made
+    /// them, and are the operator's own.
+    pub fn api_request(&mut self, consumer: &str) {
+        if consumer.starts_with("plugin:") {
+            self.plugin_requests += 1;
+        }
     }
 
     /// Milliseconds the model was actually working, summed over the turns
@@ -384,6 +463,7 @@ pub fn report(ledger: &Ledger, now: &Now) -> String {
     let mut lines: Vec<String> = Vec::new();
     let total = ledger.total();
     let spend = ledger.spend();
+    let unpriced = ledger.unpriced();
 
     // ---------------------------------------------------------- headline
     let turns = ledger.turns.len();
@@ -395,7 +475,13 @@ pub fn report(ledger: &Ledger, now: &Now) -> String {
             plural(ledger.calls() as usize)
         ));
     }
-    if let Some((usd, _)) = spend {
+    // The headline carries dollars only when something was actually
+    // priced: a `$0.00` over an all-unpriced session would be a zero
+    // bill wearing the costume of a figure. What is unpriced is said on
+    // the spend line below, whatever the priced total is.
+    if let Some(usd) = spend
+        && usd > 0.0
+    {
         head.push(dollars(usd));
     }
     let active = ledger.active_ms();
@@ -500,11 +586,20 @@ pub fn report(ledger: &Ledger, now: &Now) -> String {
         ));
         lines.push(kv("output", &human(total.output_tokens)));
         lines.push(kv("total", &format!("{} tokens", human(total.total()))));
+    }
 
-        match spend {
-            Some((usd, unpriced)) => {
+    // The spend line says what is priced and names what is not — turns,
+    // model calls, and a plugin's requests each in their own words — and
+    // it is drawn whenever there is anything to say about money or its
+    // absence. Not inside the turns branch: a session of nothing but
+    // plugin egress has no settled turn, and a page that never mentioned
+    // its unaccounted cost would be the quiet omission this line exists
+    // to end.
+    if spend.is_some() || unpriced != (0, 0) || ledger.plugin_requests > 0 {
+        match (spend, unpriced) {
+            (Some(usd), (ut, uc)) => {
                 let mut s = dollars(usd);
-                if unpriced > 0 {
+                if ut > 0 {
                     let on: Vec<&str> = {
                         let mut seen: Vec<&str> = Vec::new();
                         for t in ledger.turns.iter().filter(|t| t.cost.is_none()) {
@@ -515,16 +610,69 @@ pub fn report(ledger: &Ledger, now: &Now) -> String {
                         seen
                     };
                     s.push_str(&format!(
-                        " \u{b7} {unpriced} turn{} unpriced (on {})",
-                        plural(unpriced),
+                        " \u{b7} {ut} turn{} unpriced (on {})",
+                        plural(ut),
                         on.join(", ")
+                    ));
+                }
+                if uc > 0 {
+                    let on: Vec<&str> = {
+                        let mut seen: Vec<&str> = Vec::new();
+                        for c in ledger.model_calls.iter().filter(|c| c.cost.is_none()) {
+                            if !seen.contains(&c.model.as_str()) {
+                                seen.push(&c.model);
+                            }
+                        }
+                        seen
+                    };
+                    s.push_str(&format!(
+                        " \u{b7} {uc} model call{} unpriced (on {})",
+                        plural(uc),
+                        on.join(", ")
+                    ));
+                }
+                if ledger.plugin_requests > 0 {
+                    s.push_str(&format!(
+                        " \u{b7} {} plugin request{} unpriced",
+                        ledger.plugin_requests,
+                        plural(ledger.plugin_requests)
                     ));
                 }
                 lines.push(kv("spend", &s));
             }
-            None => lines.push(kv(
+            // Nothing priced. What ran unpriced is named — keys and all —
+            // because "unpriced" said without what it covers is how a
+            // partial total starts looking final. The last arm is a
+            // session that never touched billable arithmetic at all.
+            (None, (ut, uc)) if ut + uc > 0 || ledger.plugin_requests > 0 => {
+                let mut s = String::from("unpriced:");
+                if ut > 0 {
+                    s.push_str(&format!(" {ut} turn{}", plural(ut)));
+                }
+                if uc > 0 {
+                    if ut > 0 {
+                        s.push_str(" and");
+                    }
+                    s.push_str(&format!(" {uc} model call{}", plural(uc)));
+                }
+                if ut + uc > 0 {
+                    s.push_str(" ran on models whose definitions declare no rates");
+                }
+                if ledger.plugin_requests > 0 {
+                    if ut + uc > 0 {
+                        s.push(';');
+                    }
+                    s.push_str(&format!(
+                        " {} plugin request{} to third-party endpoints, whose cost is not known here",
+                        ledger.plugin_requests,
+                        plural(ledger.plugin_requests)
+                    ));
+                }
+                lines.push(kv("spend", &s));
+            }
+            (None, _) => lines.push(kv(
                 "spend",
-                "unpriced: no turn ran on a model whose definition declares rates",
+                "unpriced: nothing ran on billable arithmetic",
             )),
         }
 
@@ -534,7 +682,9 @@ pub fn report(ledger: &Ledger, now: &Now) -> String {
         if active >= RATE_FLOOR_MS {
             let hours = active as f64 / 3_600_000.0;
             let mut parts = Vec::new();
-            if let Some((usd, 0)) = spend {
+            if let Some(usd) = spend
+                && unpriced == (0, 0)
+            {
                 parts.push(format!("{}/h", dollars(usd / hours)));
             }
             parts.push(format!(
@@ -974,6 +1124,10 @@ pub fn ended(stop: StopReason) -> &'static str {
         // The operator closed the question; not a failure, like
         // `cancelled` above.
         StopReason::Dismissed => "dismissed",
+        // The harness's own cap, not the model finishing and not a human
+        // stopping it — the most expensive way a turn can finish, and as
+        // visible in the table as the truncation it resembles.
+        StopReason::IterationLimit => "\u{26a0} limit",
     }
 }
 
@@ -1203,14 +1357,34 @@ mod tests {
         assert_eq!(t.total_input(), 3_900 + 82_000 + 110_012);
         assert_eq!(t.output_tokens, 812 + 2_100 + 4_700);
         assert_eq!(t.cache_read_input_tokens, 165_000);
-        let (usd, unpriced) = l.spend().unwrap();
+        let usd = l.spend().unwrap();
         assert!((usd - 0.0326).abs() < 1e-9);
         assert_eq!(
-            unpriced, 1,
+            l.unpriced(),
+            (1, 0),
             "the CLI turn is counted, not summed in as free"
         );
         assert_eq!(l.calls(), 4);
         assert_eq!(l.active_ms(), 5_000 + 60_000 + 30_000);
+    }
+
+    #[test]
+    fn a_model_call_is_in_the_totals_and_its_unpriced_calls_are_said() {
+        let mut l = session();
+        // Priced: the dollars move by exactly the row's worth.
+        l.model_call("zai:glm", u(10, 1_000, 0, 500), Some(0.002), 200_000);
+        let usd = l.spend().unwrap();
+        assert!((usd - 0.0346).abs() < 1e-9, "{usd}");
+        assert_eq!(l.unpriced(), (1, 0));
+        // `u`'s fresh, cached and written tokens all bill as input.
+        assert_eq!(l.total().total_input(), 3_900 + 82_000 + 110_012 + 1_010);
+        // Unpriced: the dollars hold still — nothing invents a zero — and
+        // the row is counted where the page can say it.
+        l.model_call("mock", u(1, 2, 3, 4), None, 200_001);
+        let usd = l.spend().unwrap();
+        assert!((usd - 0.0346).abs() < 1e-9);
+        assert_eq!(l.unpriced(), (1, 1));
+        assert_eq!(l.total().output_tokens, 812 + 2_100 + 4_700 + 500 + 4);
     }
 
     #[test]

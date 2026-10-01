@@ -26,6 +26,20 @@ pub async fn watch(
     close: CancellationToken,
 ) {
     let mut parks = agent.parks().events();
+    // The branch may end parked: the wait a session died holding is
+    // re-armed here, after this task's own subscription (a resolved re-arm
+    // rings the wake, and a ring sent before anyone subscribed is lost) and
+    // before the first turn the door can start — a re-armed park belongs to
+    // no turn, and the next `begin_turn` retires it exactly per the
+    // existing turn-scoping semantics.
+    match agent
+        .rearm_from_branch(eidolon_core::wait::DEFAULT_TIMEOUT, eidolon_core::wait::MAX_TIMEOUT)
+        .await
+    {
+        Ok(Some(note)) => println!("[wait] {note}"),
+        Ok(None) => {}
+        Err(e) => println!("[wait] could not re-arm the branch's parked wait: {e:#}"),
+    }
     loop {
         let rang = async {
             match &mut doorbell {
@@ -76,9 +90,34 @@ pub async fn watch(
 /// `app.rs`'s `collect`. Mail the park does not admit is still delivered.
 async fn collect(agent: &Arc<Agent>, idle: Idle<'_>) {
     let messages = agent.drain_peers().await;
-    if messages.iter().any(|m| agent.parks().admits(m.wake)) {
-        idle.start_continue();
+    // The facts travel with the message: waking is the sender's mark,
+    // operator the override — and retirement ORs them, because a park
+    // any single message would end is ended.
+    let mut waking = false;
+    let mut operator = false;
+    let asked = messages.iter().any(|m| {
+        let keep = agent.parks().admits(eidolon_core::wait::Delivery {
+            waking: m.wake,
+            operator: m.operator,
+        });
+        if keep {
+            waking |= m.wake;
+            operator |= m.operator;
+        }
+        keep
+    });
+    if !asked {
+        return;
     }
+    // Mail the park's own level admits ends that park — the level is how
+    // much mail may end the wait, said at arm time — so it is retired here
+    // with its cause, not left to the turn's `begin_turn` to sweep as
+    // overtaken. The retirement has no display to reach in this driver;
+    // the park coming to rest is the fact that matters.
+    agent
+        .parks()
+        .retire_for_mail(eidolon_core::wait::Delivery { waking, operator });
+    idle.start_continue();
 }
 
 /// The steps `crates/cli/src/main.rs` takes, in its order, then the door's
@@ -221,6 +260,7 @@ mod tests {
             text: "out of driver.rs".into(),
             wake: true,
             external: false,
+            operator: false,
         }
     }
 
@@ -368,6 +408,7 @@ mod tests {
                 wake: Wake::Waking,
                 timeout: Duration::from_secs(30),
                 epoch: door.parks.begin_turn(),
+                note: None,
             })
             .await;
         assert!(matches!(armed, Arm::Armed(_)), "{armed:?}");
@@ -431,6 +472,50 @@ mod tests {
         assert_eq!(inbox.handed(), 1);
         until("the roster idle again", || door.roster.busy.lock().unwrap().as_slice() == [true, false]).await;
         assert!(door.roster.titles.lock().unwrap().is_empty(), "a peer's note is not the operator's words");
+    }
+
+    /// The half `begin_turn` only sweeps generically: mail the park's own
+    /// level admits retires it at the door, before the turn it bought —
+    /// the level is how much mail may end the wait, and the door says so.
+    #[tokio::test]
+    async fn an_admitted_message_retires_the_park_it_admits() {
+        let provider = ScriptedProvider::new(vec![ScriptedProvider::text("on it")]);
+        let mut door = door(provider).await;
+        let inbox = Mail::with(vec![note()]);
+        door.agent.set_inbox(inbox.clone());
+        let mut bus = door.agent.bus().subscribe();
+        let _close = door.start();
+
+        // False when armed: one that already held would answer `Arm::Already` and never fire.
+        let watched = door._dir.path().join("ready");
+        let condition =
+            Condition::parse(&serde_json::json!({"file_exists": watched.display().to_string()})).unwrap();
+        let armed = door
+            .parks
+            .arm(Spec {
+                call_id: "call-1".into(),
+                condition,
+                wake: Wake::Waking,
+                timeout: Duration::from_secs(30),
+                epoch: door.parks.begin_turn(),
+                note: None,
+            })
+            .await;
+        assert!(matches!(armed, Arm::Armed(_)), "{armed:?}");
+        assert!(door.parks.is_armed());
+
+        door.ring.send(()).unwrap();
+        event(&mut bus, "a delivered note", |e| matches!(e, Event::PeerMessage { .. })).await;
+        event(&mut bus, "the woke turn", |e| matches!(e, Event::TurnSettled { .. })).await;
+        assert!(
+            !door.parks.is_armed(),
+            "the mail the door answered retires the park that admitted it"
+        );
+        assert!(
+            door.parks.take_fires().is_empty(),
+            "retired, not fired: the condition never resolved, so nothing journals"
+        );
+        until("the roster idle again", || door.roster.busy.lock().unwrap().as_slice() == [true, false]).await;
     }
 }
 

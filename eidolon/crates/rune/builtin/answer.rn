@@ -1,0 +1,32 @@
+//! Built-in `answer`: carry this session's answer to a question another
+//! session has outstanding.
+//!
+//! The asking side is blocked on the question — a workflow park waiting
+//! inline — and its door credits the answer to this session by name, so a
+//! delivered answer is one the asking run actually reads. The reply says
+//! what became of it: a question already answered tells who won, a
+//! question that is gone says so, and a gate question is refused with the
+//! reason, because approval is the operator's alone. `peers` shows the
+//! questions that are; nothing here is worth guessing at.
+
+pub fn manifest() {
+    #{
+        name: "answer",
+        description: "Carry this session's answer to a question another session has asked and is blocked on. `peers` shows which sessions are asking, each question's id and kind — call it before answering, and never guess an id. The reply says what became of the answer: delivered, already answered by someone else, or refused with the reason (a gate question is the operator's alone; no answer reaches it). Use `send` for everything else — a note to a colleague is not an answer to a question it is blocked on.",
+        prompt: "Answer only questions `peers` shows as asking. One answer per question: the first lands and the loser is told, so a second is noise. Never guess an id; a stale roster is one `peers` call away.",
+        approval: "mutating",
+        input_schema: #{
+            "type": "object",
+            "properties": #{
+                "to": #{ "type": "string", "description": "The asking session's id, from `peers`" },
+                "id": #{ "type": "string", "description": "The question's id, from `peers`'s asking line" },
+                "text": #{ "type": "string", "description": "The answer, in the form the question asked for" },
+            },
+            "required": ["to", "id", "text"],
+        },
+    }
+}
+
+pub async fn call(input) {
+    eidolon::swarm_call("answer", input).await
+}

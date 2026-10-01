@@ -3,16 +3,16 @@
     "harnox": {
       "flake": false,
       "locked": {
-        "lastModified": 1790154485,
-        "narHash": "sha256-lavbU6T1N9AsJUgKhp8dz6MQeOwzCgRzFOKY+hNl9KY=",
+        "lastModified": 1790656926,
+        "narHash": "sha256-/hy/jHmcPXUFQZE+eiX9X27EDwVn5lPo5/bJLjbpxv0=",
         "owner": "noah427",
         "repo": "harnox",
-        "rev": "3c1fe7d4157210db4cc367655db40e9fc598bb86",
+        "rev": "daf3ffe598983033126b4665a0621c21964e21aa",
         "type": "github"
       },
       "original": {
         "owner": "noah427",
-        "ref": "v0.3.8",
+        "ref": "v0.3.12",
         "repo": "harnox",
         "type": "github"
       }

@@ -72,7 +72,7 @@ pub mod keypool;
 pub mod presence;
 pub mod socket;
 
-pub use api::{CHANNEL, roster, roster_of, send, send_external, tilde};
+pub use api::{CHANNEL, answer, roster, roster_of, send, send_external, tilde};
 pub use inbox::Envelope;
 pub use presence::{Delivery, Meta, Peer, Presence, channel_key_of, scan};
 

@@ -112,6 +112,7 @@ async fn a_quiesced_door_says_goodbye_and_the_run_returns() {
             yolo: Default::default(),
             doorbell: Some(doorbell),
             presence: Some(roster.clone() as Arc<dyn Presence>),
+            launch: None,
         },
         CancellationToken::new(),
     ));

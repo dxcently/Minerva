@@ -58,7 +58,15 @@
 //! `read` tool, which already offsets and limits. The journal holds the
 //! pointer the model saw, so a resume replays the same bounded text rather
 //! than the flood.
+//!
+//! One exemption, because the advice above is what a spill *chain* is made
+//! of: a call that names its own read length ([`named_read_length`]) is
+//! never spilled — the built-in `read`'s `limit`, or the `limit` inside the
+//! envelope a wrapper passes its arguments through, as the vault's
+//! `mneme_rpc` does with `args`. Spilling the page the receipt asked for
+//! answers it with a second pointer, and the model pages again.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -73,8 +81,8 @@ use tokio_util::sync::CancellationToken;
 use crate::event::{Event, EventBus};
 use crate::policy::{PolicyHook, Ruling, Verdict};
 use crate::session::{PolicyOutcome, RecordId, RecordKind, Session};
-use crate::tool::{CallContext, CallOrigin, ToolCall, ToolManifest, ToolOutput, ToolRegistry};
-use crate::user::UserIo;
+use crate::tool::{CallContext, CallOrigin, Tool, ToolCall, ToolManifest, ToolOutput, ToolRegistry};
+use crate::user::{UserIo, Words, with_operator_note};
 
 /// A reader of calls that ran — telemetry, never a decision.
 ///
@@ -120,6 +128,97 @@ pub struct Dispatcher {
     /// `None` (tests, the Claude driver's throwaway sessions) means the
     /// spill names itself off the tools' working directory instead.
     spill_dir: std::sync::RwLock<Option<PathBuf>>,
+    /// The outstanding-question registry: what the door's `answer` op
+    /// serves against, and what the roster's projection publishes. Owned
+    /// by an `Arc` so the guard a asking seam holds can remove its entry
+    /// on every exit without a reference back to the dispatcher.
+    questions: Arc<std::sync::Mutex<QuestionBook>>,
+    /// Set once, after construction, by whoever owns the roster-facing
+    /// projection of the registry — the swarm writes what a peer's
+    /// `peers` read shows. `None` (tests, sessions without a swarm) costs
+    /// one `Option`.
+    question_board: OnceLock<Arc<dyn QuestionBoard>>,
+}
+
+/// The kind of question a peer's answer may — or may never — resolve.
+/// `Approve` is the gate's: approval decides what runs on this session,
+/// and that decision is the operator's alone. `Respond` is a workflow
+/// park's inline question, which is exactly what the door exists to
+/// carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuestionKind {
+    Approve,
+    Respond,
+}
+
+impl QuestionKind {
+    /// The word the roster and the refusals use.
+    pub fn word(self) -> &'static str {
+        match self {
+            QuestionKind::Approve => "approve",
+            QuestionKind::Respond => "respond",
+        }
+    }
+}
+
+/// A question the asking seam raised and is blocking on — the fact a
+/// peer's answer answers. `text` is the short form a roster shows; the
+/// full prompt already sits in the asker's journal as the
+/// [`crate::session::RecordKind::AskUser`] the answer will ride.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutstandingQuestion {
+    pub id: String,
+    pub kind: QuestionKind,
+    pub text: String,
+}
+
+/// What a peer's answer carries, delivered to the seam that asked.
+#[derive(Clone, Debug)]
+pub struct PeerDelivery {
+    pub text: String,
+    pub peer: String,
+}
+
+/// The book behind the registry: the open questions with the channel each
+/// answer rides, and the tombstones that let the door tell "already
+/// answered" from "no question outstanding" instead of teaching the loser
+/// to retry blind.
+#[derive(Default)]
+struct QuestionBook {
+    open: HashMap<String, (OutstandingQuestion, tokio::sync::oneshot::Sender<PeerDelivery>)>,
+    answered: HashMap<String, String>,
+}
+
+/// The roster-facing projection of the registry. Implemented by whoever
+/// owns both — the swarm writes the file a peer's `peers` read shows.
+/// Called on every change, so a question exists to a peer exactly while
+/// the asking seam holds it: nothing is advertised before the seam agrees
+/// to ask, and nothing after it stops.
+pub trait QuestionBoard: Send + Sync {
+    fn publish(&self, questions: &[OutstandingQuestion]);
+}
+
+/// Held by the asking seam for exactly as long as its question stands.
+/// Dropping it removes the registration — answer, refusal, cancel, error,
+/// every exit — so the door and the roster see the question end when the
+/// wait does, not when somebody remembers to say so.
+pub struct QuestionGuard {
+    book: Arc<std::sync::Mutex<QuestionBook>>,
+    board: Option<Arc<dyn QuestionBoard>>,
+    id: String,
+}
+
+impl Drop for QuestionGuard {
+    fn drop(&mut self) {
+        let mut book = self.book.lock().unwrap();
+        if book.open.remove(&self.id).is_some() {
+            let qs: Vec<OutstandingQuestion> =
+                book.open.values().map(|(q, _)| q.clone()).collect();
+            if let Some(board) = &self.board {
+                board.publish(&qs);
+            }
+        }
+    }
 }
 
 impl Dispatcher {
@@ -140,6 +239,110 @@ impl Dispatcher {
             observer: OnceLock::new(),
             cwd: std::sync::RwLock::new(cwd),
             spill_dir: std::sync::RwLock::new(None),
+            questions: Arc::new(std::sync::Mutex::new(QuestionBook::default())),
+            question_board: OnceLock::new(),
+        }
+    }
+
+    /// Publish the registry's changes to the roster's projection. Set once
+    /// at startup, by whoever owns both the dispatcher and the swarm.
+    pub fn set_question_board(&self, board: Arc<dyn QuestionBoard>) {
+        let _ = self.question_board.set(board);
+        self.publish_questions();
+    }
+
+    /// Register a question the asking seam is blocking on, and take the
+    /// guard that removes it on every exit. The receiver is what a
+    /// door-carried answer arrives on — the seam races it against its own
+    /// [`UserIo`] wait.
+    pub fn question_open(
+        &self,
+        kind: QuestionKind,
+        id: &str,
+        text: String,
+    ) -> (QuestionGuard, tokio::sync::oneshot::Receiver<PeerDelivery>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut book = self.questions.lock().unwrap();
+            book.open.insert(
+                id.to_string(),
+                (OutstandingQuestion { id: id.to_string(), kind, text }, tx),
+            );
+        }
+        self.publish_questions();
+        (
+            QuestionGuard {
+                book: Arc::clone(&self.questions),
+                board: self.question_board.get().cloned(),
+                id: id.to_string(),
+            },
+            rx,
+        )
+    }
+
+    /// The door's `answer`: carry a peer's text to the question `id`
+    /// names. The refusals teach — each names which of the ways the
+    /// answer cannot land, and "already answered" is told apart from "no
+    /// question outstanding". An `Approve` question is never delivered:
+    /// the entry goes back, because the operator's dialog is still
+    /// standing and the reason says why no peer answer reaches it.
+    pub fn deliver_answer(&self, id: &str, text: &str, peer: &str) -> Result<(), String> {
+        if peer.is_empty() {
+            return Err("the answer names no peer — the door credits an answer to the session that sent it, and this one claimed nothing".into());
+        }
+        let verdict = {
+            let mut book = self.questions.lock().unwrap();
+            match book.open.remove(id) {
+                Some((q, tx)) if q.kind == QuestionKind::Approve => {
+                    book.open.insert(id.to_string(), (q, tx));
+                    Err(format!(
+                        "the question `{id}` is a gate question — approval decides what runs on \
+this session, and that is the operator's alone; a peer's answer is refused and the \
+operator's dialog still stands"
+                    ))
+                }
+                Some((_, tx)) => {
+                    let peer = peer.to_string();
+                    let delivered = tx
+                        .send(PeerDelivery { text: text.to_string(), peer: peer.clone() })
+                        .is_ok();
+                    book.answered.insert(id.to_string(), peer.clone());
+                    match delivered {
+                        true => Ok(()),
+                        false => Err(format!(
+                            "the asking seam for `{id}` ended before the answer landed — the \
+wait is over, and the answer nobody read is recorded as answered by `{peer}`"
+                        )),
+                    }
+                }
+                None => Err(match book.answered.get(id).cloned() {
+                    Some(p) => format!("the question `{id}` was already answered by `{p}`"),
+                    None => format!(
+                        "no question `{id}` is outstanding here — `peers` shows the \
+questions that are"
+                    ),
+                }),
+            }
+        };
+        if verdict.is_ok() {
+            self.publish_questions();
+        }
+        verdict
+    }
+
+    /// What stands, for the roster and for tests: the questions the asking
+    /// seams hold right now, by id.
+    pub fn outstanding_questions(&self) -> Vec<OutstandingQuestion> {
+        let book = self.questions.lock().unwrap();
+        let mut qs: Vec<OutstandingQuestion> =
+            book.open.values().map(|(q, _)| q.clone()).collect();
+        qs.sort_by(|a, b| a.id.cmp(&b.id));
+        qs
+    }
+
+    fn publish_questions(&self) {
+        if let Some(board) = self.question_board.get() {
+            board.publish(&self.outstanding_questions());
         }
     }
 
@@ -228,9 +431,13 @@ impl Dispatcher {
     /// Cap one call's output for context: short outputs pass through; a
     /// long one is written whole to its spill file and replaced by its
     /// head plus the path. Error outputs are never spilled — they are the
-    /// model's debugging, and a denial or a traceback arrives short.
+    /// model's debugging, and a denial or a traceback arrives short. Nor is
+    /// a call that named its own read length (see [`named_read_length`]).
     fn spill(&self, call: &ToolCall, output: ToolOutput) -> ToolOutput {
-        if output.is_error || output.content.chars().count() <= MAX_INLINE_CHARS {
+        if output.is_error
+            || named_read_length(call)
+            || output.content.chars().count() <= MAX_INLINE_CHARS
+        {
             return output;
         }
         let path = self.spill_path(call);
@@ -309,12 +516,14 @@ impl Dispatcher {
             self.journal_user_call(&call, utterance).await;
         }
 
-        let output = self.execute(&call, cancel).await;
+        let (output, operator_note) = self.execute(&call, cancel).await;
         // Spill before journaling: the record holds the bounded text the
         // model was actually given, so a resume replays the pointer and not
         // the flood — and re-running the spill would rename nothing, the
         // path derives from the call id.
-        let output = self.spill(&call, output);
+        let mut output = self.spill(&call, output);
+        // After the spill, so the spill and its file hold only what the tool wrote.
+        output.content = with_operator_note(&output.content, &call.id, operator_note.as_ref());
         let record = self.journal(&call, &output).await;
         self.bus.publish(Event::ToolCallFinished {
             record,
@@ -350,55 +559,78 @@ impl Dispatcher {
             })
     }
 
-    /// Policy verdict plus, on `Ask`, the user's answer. `Err` carries the
-    /// reason the call must not run. Fails closed on a hook failure.
+    /// Policy verdict plus, on `Ask`, the user's answer and whatever note
+    /// came with it. `Err` carries the reason the call must not run. Fails
+    /// closed on a hook failure.
     pub async fn adjudicate(
         &self,
         call: &ToolCall,
         manifest: &ToolManifest,
         cancel: &CancellationToken,
-    ) -> Result<(), String> {
+    ) -> (Result<(), String>, Option<Words>) {
         let cwd = self.cwd();
         let ruling = match catch(self.policy.pre_tool(call, manifest, &cwd)).await {
             Ok(r) => r,
             Err(reason) => Ruling::deny(format!("policy hook failed ({reason}); denied")),
         };
-        let (result, outcome) = match &ruling.verdict {
+        let (result, outcome, operator_note) = match &ruling.verdict {
             // A question the operator's armed switch answered before it was
             // a question. It journals — unlike the silent yes below —
             // because the record of what ran while the gate was blind is
             // the whole of what a yolo session leaves behind.
-            Verdict::Allow if ruling.yolo => (Ok(()), PolicyOutcome::Yolo),
+            Verdict::Allow if ruling.yolo => (Ok(()), PolicyOutcome::Yolo, None),
+            // A question the store answered before it was asked: the vouch
+            // the operator granted covered this call, and the table's
+            // fallthrough never became a question at all. It journals with
+            // the grant's naming in the note, because a silent yes here
+            // would be indistinguishable from a table row's — and the whole
+            // point of a vouch is that it is *data* said yes, a record the
+            // operator wrote once, not a rule they hand-edited. See
+            // [`Ruling::vouched`].
+            //
+            // No operator note: nobody was asked, so there are no words
+            // said at a dialog to carry.
+            Verdict::Allow if ruling.vouched.is_some() => (Ok(()), PolicyOutcome::Approved, None),
             // The only path that journals nothing. See
             // [`RecordKind::PolicyVerdict`] for why a silent yes stays
             // silent in the log too.
-            Verdict::Allow => return Ok(()),
+            Verdict::Allow => return (Ok(()), None),
             Verdict::Deny(reason) => (
                 Err(format!("denied by policy: {reason}")),
                 PolicyOutcome::Refused,
+                None,
             ),
             // A question the context-aware layer already answered. It reached
             // that answer without running anything, and it could only ever
             // have reached it *here*, on a call the deterministic pass had
             // decided to raise — so what is left is to record that a model
             // and not the operator said yes, and to say so on the bus.
-            Verdict::Ask(_) if ruling.judged.is_some() => (Ok(()), PolicyOutcome::Judged),
+            Verdict::Ask(_) if ruling.judged.is_some() => (Ok(()), PolicyOutcome::Judged, None),
             Verdict::Ask(prompt) => {
                 self.bus.publish(Event::AskUser {
                     prompt: prompt.clone(),
                 });
-                if self.user.approve(call, manifest, &ruling, cancel).await {
-                    (Ok(()), PolicyOutcome::Approved)
+                // Registered while the seam blocks, so the door can say
+                // what an attempt is aimed at: a peer's answer to a gate
+                // question is refused with the reason and journals
+                // nothing — approval decides what runs, and that is the
+                // operator's alone. The guard is what removes the entry
+                // when the dialog ends, one way or the other.
+                let _question = self.question_open(QuestionKind::Approve, &call.id, prompt.clone());
+                let consent = self.user.approve(call, manifest, &ruling, cancel).await;
+                if consent.given {
+                    (Ok(()), PolicyOutcome::Approved, consent.operator_note)
                 } else {
                     (
                         Err("the user declined this tool call".into()),
                         PolicyOutcome::Declined,
+                        consent.operator_note,
                     )
                 }
             }
         };
         self.journal_verdict(call, &ruling, outcome).await;
-        result
+        (result, operator_note)
     }
 
     /// Write what the gate decided, and publish it.
@@ -418,7 +650,10 @@ impl Dispatcher {
             reason: reason.clone(),
             structural: ruling.structural,
             outcome: outcome.clone(),
-            note: ruling.judged.clone(),
+            // The judge's reasoning on `Judged`; on the store's yes, the
+            // grant's naming. One slot, two producers, never both — each
+            // says who answered, which is the fact a ledger reads.
+            note: ruling.judged.clone().or_else(|| ruling.vouched.clone()),
         }) {
             tracing::error!(error = %e, "failed to journal a policy verdict");
             self.bus.publish(Event::Error(format!(
@@ -430,7 +665,7 @@ impl Dispatcher {
             tool: call.name.clone(),
             reason,
             outcome,
-            note: ruling.judged.clone(),
+            note: ruling.judged.clone().or_else(|| ruling.vouched.clone()),
         });
     }
 
@@ -469,22 +704,24 @@ impl Dispatcher {
     ///
     /// Every outcome, including the refusals that never ran, is then handed
     /// to the [`ToolObserver`] if one is attached — see that trait for why
-    /// this is telemetry and not a second decision.
-    pub async fn execute(&self, call: &ToolCall, cancel: CancellationToken) -> ToolOutput {
-        let output = self.run(call, cancel).await;
+    /// this is telemetry and not a second decision. The operator's note on
+    /// the call comes back beside the output, for the caller to join after
+    /// whatever it does to the output.
+    pub async fn execute(&self, call: &ToolCall, cancel: CancellationToken) -> (ToolOutput, Option<Words>) {
+        let (output, operator_note) = self.run(call, cancel).await;
         if let Some(observer) = self.observer.get().cloned() {
             // Caught, and its answer dropped: an observer that panics or
             // hangs is its own problem, and this call has already happened.
             // `catch` is the same net the tools themselves run under.
             let _ = catch(observer.observed(call, &output)).await;
         }
-        output
+        (output, operator_note)
     }
 
     /// [`Self::execute`]'s body: lookup, validation, policy, run.
-    async fn run(&self, call: &ToolCall, cancel: CancellationToken) -> ToolOutput {
+    async fn run(&self, call: &ToolCall, cancel: CancellationToken) -> (ToolOutput, Option<Words>) {
         let Some(tool) = self.registry.get(&call.name).cloned() else {
-            return ToolOutput::error(self.unknown_tool(&call.name));
+            return (ToolOutput::error(self.unknown_tool(&call.name)), None);
         };
         let manifest = tool.manifest().clone();
 
@@ -501,13 +738,18 @@ impl Dispatcher {
         let mut input = call.input.clone();
         crate::schema::coerce(&manifest.input_schema, &mut input);
         if let Err(reason) = crate::schema::validate(&call.name, &manifest.input_schema, &input) {
-            return ToolOutput::error(reason);
+            return (ToolOutput::error(reason), None);
         }
 
-        if let Err(reason) = self.adjudicate(call, &manifest, &cancel).await {
-            return ToolOutput::error(reason);
-        }
+        let (cleared, operator_note) = self.adjudicate(call, &manifest, &cancel).await;
+        let output = match cleared {
+            Ok(()) => self.invoke(tool, input, call, cancel).await,
+            Err(reason) => ToolOutput::error(reason),
+        };
+        (output, operator_note)
+    }
 
+    async fn invoke(&self, tool: Arc<dyn Tool>, input: serde_json::Value, call: &ToolCall, cancel: CancellationToken) -> ToolOutput {
         if cancel.is_cancelled() {
             return ToolOutput::error("cancelled before the tool ran");
         }
@@ -568,10 +810,75 @@ impl Dispatcher {
 /// Outputs at or under this many characters travel inline. Above it they
 /// spill to a file and only the head goes to context. 8k chars is ~2k
 /// tokens: a full default `read` (2000 short lines) still fits, while a
-/// build log does not.
+/// build log does not — and a `read` that names its own `limit` skips the
+/// cap altogether ([`named_read_length`]).
 pub const MAX_INLINE_CHARS: usize = 8_000;
 /// How much of a spilled output stays inline, ahead of the spill path.
 pub const SPILL_HEAD_CHARS: usize = 2_000;
+
+/// Whether the call names its own read length: a value under one of
+/// [`READ_LENGTH_KEYS`], anywhere in its arguments — at the call's own
+/// level or inside the envelope a wrapper passes them through.
+///
+/// The cap exists for output nobody chose — a build log, a whole-file dump,
+/// whatever a `bash` command decided to say. A length is the caller saying
+/// how much it is about to pull into context, which is the one thing the
+/// cap cannot know better than it does.
+///
+/// Spilling it is also what makes a chain. A spilled output's receipt says
+/// "page it with `read` (offset/limit)"; the model does exactly that, the
+/// page is over the cap again, and the answer is a pointer to a *second*
+/// file holding the same text under a new name. Every step obeys the
+/// receipt and no step gets closer to the bytes, until the context is spent
+/// on heads and paths. A named length travels whole however long it is.
+///
+/// The walk goes through nested objects because the length is not always at
+/// the call's own level: `read` takes `limit` beside `path`, while the
+/// vault's `mneme_rpc` is `{function, args}` and pages with `args.limit` —
+/// `read_note` called with `offset`/`limit` under `args` is the same
+/// page-length request wearing the envelope, and a model obeying the
+/// receipt would otherwise re-spill on every call. Which word a tool picked
+/// for its envelope is not the dispatcher's to know, so any nested object
+/// is walked rather than `args` by name.
+fn named_read_length(call: &ToolCall) -> bool {
+    names_a_length(&call.input)
+}
+
+/// The words a call has used for how much it wants back. **`limit` is the
+/// surface's own**: `read`, `grep`, `fetch` and `search` all name it that
+/// now (standardized 2026-09-29 — they had shipped `limit`, `max`, `max`
+/// and `count`, four words and three units for one idea), and the vault's
+/// functions below `mneme_rpc` take `limit` too.
+///
+/// The older spellings stay readable, because the dispatcher does not get
+/// to rename what it is handed. A built-in's copy on disk is a live source
+/// — an older release's seed that an upgrade has not refreshed, or the
+/// operator's own edit — and a foreign tool's schema (the vault's, a
+/// user's wrapper) is not the harness's to standardize; a call that names
+/// `max` there means what a `limit` means here.
+const READ_LENGTH_KEYS: &[&str] = &["limit", "max", "count"];
+
+/// A read length in this value or in any object under it.
+fn names_a_length(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.iter().any(|(key, v)| {
+        (READ_LENGTH_KEYS.contains(&key.as_str()) && is_a_length(v)) || names_a_length(v)
+    })
+}
+
+/// A value that names a length: a positive count, or the same count
+/// streamed as a string — the schema's coercion already takes `"40"` as 40,
+/// and the model that emitted it meant the same thing.
+fn is_a_length(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+    .is_some_and(|limit| limit > 0)
+}
 
 /// Write a spilled output whole. Parent directories are created; the bytes
 /// are the output's, and the count is returned for the receipt.

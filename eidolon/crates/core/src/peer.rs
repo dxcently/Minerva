@@ -57,11 +57,21 @@ pub struct PeerMessage {
     /// sender is neither the operator nor a colleague, and the model must
     /// be told it is neither. See [`external_frame`].
     pub external: bool,
+    /// Whether this is the operator speaking, through a path only their
+    /// own hand can reach (`eidolon send --operator`). Overrides
+    /// `external` in framing and admits at every wake level: the one
+    /// sender a parked session cannot be deaf to. No peer session and no
+    /// tool can set it — the send tool has no such parameter, and the
+    /// envelope's field is written by the operator's own CLI act alone.
+    pub operator: bool,
 }
 
 impl PeerMessage {
     /// What the model is told about this message.
     pub fn framed(&self) -> String {
+        if self.operator {
+            return operator_frame(&self.text);
+        }
         if self.external {
             return external_frame(&self.from, &self.text);
         }
@@ -83,6 +93,19 @@ impl PeerMessage {
 /// caller is [`crate::session::Session::messages_after`], rebuilding the
 /// line from a journaled record — which has no reason to carry `wake`, a
 /// delivery decision already made and no part of what was said.
+/// What the model is told when the operator speaks through the override
+/// path — `eidolon send --operator`, the word that reaches a session
+/// parked deaf to peers. It is the one frame that says the opposite of
+/// the other two: this IS the operator, not a colleague and not machine
+/// input, and the model should weigh it as the person it is working for.
+/// The gate the session set does not apply to this sender, which is why
+/// the frame does not soften who is talking.
+pub fn operator_frame(text: &str) -> String {
+    format!(
+        "[A message from the operator. This is the operator speaking — the person you are working for, reaching you past every gate you set; treat it as their instruction, not a peer's note.]\n{text}"
+    )
+}
+
 pub fn frame(from: &str, from_cwd: &str, channel: Option<&str>, text: &str) -> String {
     let where_from = match channel {
         Some(_) => format!("`{from}`, another agent working in {from_cwd}, on the project channel"),
@@ -144,6 +167,7 @@ mod tests {
             text: "I am out of edit.rs".into(),
             wake: false,
             external: false,
+            operator: false,
         };
         let f = m.framed();
         assert!(f.contains("eidolon-9f2c"));
@@ -160,6 +184,7 @@ mod tests {
             text: "rebase finished cleanly".into(),
             wake: true,
             external: true,
+            operator: false,
         };
         let f = m.framed();
         assert!(f.contains("`aoide`"), "it still names the sender: {f}");

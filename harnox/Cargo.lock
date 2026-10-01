@@ -478,7 +478,7 @@ checksum = "21fef0953c54fd3de2f44b743fbf77e044c81a25faee03636dfccc0d35135e23"
 
 [[package]]
 name = "harnox"
-version = "0.3.8"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "async-stream",

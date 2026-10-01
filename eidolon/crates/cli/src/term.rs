@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use eidolon_core::UsageExt;
 use eidolon_core::event::Event;
-use eidolon_core::user::{Choice, UserIo};
+use eidolon_core::user::{Choice, Reply, UserIo};
 
 /// One line describing a record, for `:log`, `:tree` and `eidolon log`.
 pub fn record_line(r: &eidolon_core::session::Record) -> String {
@@ -63,6 +63,10 @@ pub fn record_line(r: &eidolon_core::session::Record) -> String {
             }
             s
         }
+        // The wire's own sentence for a provider-killed turn, redacted at
+        // the write and shown as it was journaled — the row that makes the
+        // next occurrence countable.
+        TurnFailed { error } => format!("failed: {error}"),
         // What a turn that never settled had already spent. Written only
         // when there was a cost to write, so its absence beside a
         // `cancelled` means the backend never said — not that the turn
@@ -73,6 +77,20 @@ pub fn record_line(r: &eidolon_core::session::Record) -> String {
             eidolon_core::usage::human(usage.output_tokens),
             if *calls == 1 { "" } else { "s" }
         ),
+        // One tool-less call's spend. The key is in the record; whether
+        // it priced is a lookup `eidolon log` does not make, and the row
+        // says the measured truth it has.
+        ModelSpend { key, usage, .. } => format!(
+            "model call on {key}: in={} out={}",
+            eidolon_core::usage::human(usage.total_input()),
+            eidolon_core::usage::human(usage.output_tokens)
+        ),
+        // One script's egress. Whose it was and what it was to — the
+        // row's whole story, and whether it priced is a question for the
+        // usage line, not this one.
+        ApiRequest { consumer, service } => {
+            format!("api request: {consumer} → {service}")
+        }
         // The wrap-up nudge: the harness told the model the turn was near
         // its limit, with this many model calls to go.
         TurnBudget { calls_left } => format!("wrap-up: {calls_left} calls left"),
@@ -144,6 +162,12 @@ pub fn record_line(r: &eidolon_core::session::Record) -> String {
             Some(c) => format!("external {from} → {c}: {}", preview(text)),
             None => format!("external {from}: {}", preview(text)),
         },
+        // The override path: the one sender the log names as the person
+        // speaking, because the model was told exactly that when it
+        // arrived and the ledger says the same thing on replay.
+        OperatorMessage { from, text } => {
+            format!("operator {from}: {}", preview(text))
+        }
         // A park the session armed has resolved and the turn is about to
         // continue on it. Its own line, because the headless ledger is read
         // back later and "why did this session wake" has no other answer.
@@ -205,12 +229,66 @@ pub fn record_line(r: &eidolon_core::session::Record) -> String {
                 .unwrap_or_default();
             let what = match outcome {
                 Refused => format!("refused ({reason})"),
-                Approved => format!("{asked} ({reason}) — approved by you"),
+                // The invariant at the producers: an `Approved` *with* a note
+                // is only ever the store's yes — the vouch the record names —
+                // and one without is the person at the console; a plain table
+                // `Allow` journals nothing at all. So this arm sees exactly
+                // those two, and the line must say which one answered: going
+                // quiet here would be the log hiding a record.
+                Approved => match note {
+                    Some(_) => format!("allowed ({reason}){by}"),
+                    None => format!("{asked} ({reason}) — approved by you"),
+                },
                 Declined => format!("{asked} ({reason}) — declined by you"),
                 Judged => format!("{asked} ({reason}) — allowed by the judge{by}"),
                 Yolo => format!("{asked} ({reason}) — waived, yolo"),
             };
             format!("policy [{tool_use_id}] {tool} {what}")
+        }
+        // A run's own records, on the ledger's terms: the pin says which
+        // program, at which version and hash; each step names the call it
+        // dispatched under; and the ending says how it stopped — `parked`
+        // spelled out rather than left as an absence, because a log read back
+        // later has to be able to tell "waiting on a person" from "never
+        // finished".
+        WorkflowStart {
+            plugin,
+            workflow,
+            version,
+            hash,
+            ..
+        } => format!("workflow {plugin}/{workflow} {version} hash={}", preview(hash)),
+        WorkflowStep {
+            run,
+            index,
+            call_id,
+            tool,
+            ..
+        } => format!("workflow #{run} step {index} [{call_id}] {tool}"),
+        WorkflowEnd { run, status } => {
+            use eidolon_core::workflow::RunStatus;
+            let how = match status {
+                RunStatus::Completed => "completed",
+                RunStatus::Failed => "failed",
+                RunStatus::Parked => "parked on a question",
+            };
+            format!("workflow #{run} {how}")
+        }
+        WorkflowBudget {
+            run,
+            steps,
+            spend_micros,
+        } => {
+            let what = match (steps, spend_micros) {
+                (Some(s), Some(m)) => format!("{s} steps, ${:.4}", *m as f64 / 1e6),
+                (Some(s), None) => format!("{s} steps"),
+                (None, Some(m)) => format!("${:.4}", *m as f64 / 1e6),
+                (None, None) => "nothing".into(),
+            };
+            format!("workflow #{run} budget: {what}")
+        }
+        PeerAnswer { call_id, peer } => {
+            format!("answered by peer `{peer}`: {call_id}")
         }
     }
 }
@@ -363,7 +441,7 @@ impl UserIo for StdinUser {
         prompt: &str,
         options: &[Choice],
         cancel: &CancellationToken,
-    ) -> Option<String> {
+    ) -> Option<Reply> {
         let labels: Vec<String> = options.iter().map(|c| c.label.clone()).collect();
         let p = format!("\n? {prompt} [{}]\n>", labels.join("/"));
         let answer = tokio::select! {
@@ -375,6 +453,53 @@ impl UserIo for StdinUser {
             .iter()
             .find(|l| l.to_lowercase() == a)
             .or_else(|| labels.iter().find(|l| l.to_lowercase().starts_with(&a)))
-            .cloned()
+            .map(Reply::picked)
+    }
+
+    async fn respond(&self, prompt: &str, cancel: &CancellationToken) -> Option<String> {
+        let p = format!("\n? {prompt}\n> ");
+        let answer = tokio::select! {
+            r = tokio::task::spawn_blocking(move || read_line(p)) => r.ok().flatten()?,
+            _ = cancel.cancelled() => return None,
+        };
+        Some(answer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eidolon_core::session::{PolicyOutcome, Record, RecordKind};
+
+    /// The two `Approved` shapes the producers can write — the invariant the
+    /// arm above rests on. The store's yes carries the vouch in the note; the
+    /// person's yes carries none; nothing else arrives as `Approved`.
+    fn approved(note: Option<&str>) -> String {
+        record_line(&Record {
+            id: 1,
+            parent: None,
+            ts_ms: 0,
+            kind: RecordKind::PolicyVerdict {
+                tool_use_id: "t1".into(),
+                tool: "demo_echo".into(),
+                reason: "unclassified tool (declared read_only)".into(),
+                structural: false,
+                outcome: PolicyOutcome::Approved,
+                note: note.map(String::from),
+            },
+        })
+    }
+
+    #[test]
+    fn a_vouched_allow_names_the_vouch_not_you() {
+        let line = approved(Some("vouched for demo_echo by noah at 2026-09-28T08:59:32Z"));
+        assert!(line.contains("allowed (unclassified tool (declared read_only)): vouched for demo_echo by noah"), "{line}");
+        assert!(!line.contains("by you"), "a store's yes must not read as the operator's: {line}");
+    }
+
+    #[test]
+    fn a_console_allow_still_says_who_answered() {
+        let line = approved(None);
+        assert!(line.contains("asked (unclassified tool (declared read_only)) — approved by you"), "{line}");
     }
 }

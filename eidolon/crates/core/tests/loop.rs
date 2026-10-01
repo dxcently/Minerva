@@ -40,6 +40,9 @@ fn echo(approval: Approval) -> Arc<dyn Tool> {
         prompt: Some("guidance for echo".into()),
         render: None,
         deferred: false,
+        script_only: false,
+        plugin: None,
+        source_hash: None,
     }))
 }
 
@@ -1806,6 +1809,7 @@ async fn peer_messages_land_ahead_of_the_turn_that_collected_them() {
             text: "edit.rs is yours".into(),
             wake: false,
             external: false,
+            operator: false,
         },
     ]))));
 
@@ -1891,6 +1895,7 @@ async fn a_waking_peer_message_mid_turn_rides_the_results_into_the_next_call() {
                 text: "rebased onto master".into(),
                 wake: true,
                 external: false,
+            operator: false,
             }],
         ]
         .into(),
@@ -1980,6 +1985,7 @@ async fn a_note_that_did_not_wake_waits_out_the_turn() {
                 text: "heads up, master moved".into(),
                 wake: false,
                 external: false,
+            operator: false,
             }],
         ]
         .into(),
@@ -2120,6 +2126,7 @@ async fn a_waking_peer_message_after_a_driver_turn_runs_the_next_driver_turn() {
             text: "rebased onto master".into(),
             wake: true,
             external: false,
+            operator: false,
         },
     ]))));
 
@@ -2182,6 +2189,7 @@ async fn a_note_that_did_not_wake_buys_no_second_driver_pass() {
             text: "heads up, master moved".into(),
             wake: false,
             external: false,
+            operator: false,
         },
     ]))));
 
@@ -2549,6 +2557,117 @@ impl Provider for CancellingProvider {
         }
         self.inner.stream(req, cancel)
     }
+}
+
+/// A gateway that served one call and then died — the shape of a
+/// provider whose upstream went away mid-turn. Every call after the
+/// first fails with the same sentence, credential-shaped noise included,
+/// because that is what some gateways actually echo.
+struct FlakyThenDead {
+    inner: Arc<ScriptedProvider>,
+    seen: std::sync::atomic::AtomicUsize,
+}
+
+impl FlakyThenDead {
+    fn new(inner: Arc<ScriptedProvider>) -> Arc<Self> {
+        Arc::new(FlakyThenDead {
+            inner,
+            seen: Default::default(),
+        })
+    }
+}
+
+impl Provider for FlakyThenDead {
+    fn name(&self) -> &str {
+        "flaky-gw"
+    }
+    fn stream<'a>(
+        &'a self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> eidolon_core::provider::EventStream<'a> {
+        let n = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            return self.inner.stream(req, cancel);
+        }
+        Box::pin(futures_util::stream::once(async {
+            Err(anyhow::anyhow!(
+                // The KELVIN SIGN lowercases to one byte where it was
+                // three, which is exactly the kind of thing third-party
+                // text carries: a redactor that scans a lowercased copy
+                // on the original's offsets panics here, on the error
+                // path, where a panic is least welcome.
+                "flaky-gw returned HTTP 502: K\u{212a}auth failed for Bearer sk-abcdef0123456789"
+            ))
+        }))
+    }
+}
+
+/// A turn the provider killed **leaves a row, not an anecdote**: the
+/// floors a cancellation writes (the context the last call measured, the
+/// spend already made) and the failure itself in the wire's own words —
+/// credential-shaped noise scrubbed, status kept — and no settle, on
+/// purpose: a settle is the boundary resume lands on, and the work is
+/// still owed. Before this record a provider death left the journal
+/// simply stopping mid-turn, the error prose on a bus and nothing
+/// anywhere else.
+#[tokio::test]
+async fn a_provider_killed_turn_journals_the_failure_and_no_settle() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripted = ScriptedProvider::new(vec![
+        ScriptedProvider::tool("t1", "echo", json!({"s":"hi"})),
+        ScriptedProvider::text("never reached"),
+    ]);
+    let (agent, session) = over(dir.path(), FlakyThenDead::new(scripted));
+    let e = agent
+        .run_turn(vec![ContentBlock::text("go")], CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("HTTP 502"), "{e:#}");
+
+    let s = session.lock().await;
+    let kinds: Vec<&RecordKind> = s.branch().iter().map(|r| &r.kind).collect();
+    assert!(
+        !kinds.iter().any(|k| matches!(k, RecordKind::TurnSettled { .. })),
+        "no settle: the turn did not settle, and the work is owed"
+    );
+    let fail = kinds
+        .iter()
+        .filter_map(|k| match k {
+            RecordKind::TurnFailed { error } => Some(error.as_str()),
+            _ => None,
+        })
+        .next()
+        .expect("a failure record");
+    assert!(
+        fail.contains("returned HTTP 502"),
+        "the status travels in the recorded sentence: {fail}"
+    );
+    assert!(
+        fail.contains("bearer [redacted]") && !fail.contains("sk-abcdef0123456789"),
+        "a credential a gateway echoed does not survive into the journal: {fail}"
+    );
+
+    // The floors, before the record they explain, exactly as a
+    // cancellation writes them.
+    let spend = kinds
+        .iter()
+        .position(|k| matches!(k, RecordKind::TurnSpend { .. }))
+        .expect("the measured spend, as a floor");
+    let fail_at = kinds
+        .iter()
+        .position(|k| matches!(k, RecordKind::TurnFailed { .. }))
+        .unwrap();
+    assert!(spend < fail_at);
+    // One: the call that reported. The call that died is not in the
+    // spend — it reported nothing, and a zero for it would claim it was
+    // measured and found free.
+    assert!(matches!(kinds[spend], RecordKind::TurnSpend { calls: 1, .. }));
+    assert_eq!(
+        s.usage().output_tokens,
+        1,
+        "the one call that reported is counted"
+    );
 }
 
 /// A turn that is stopped mid-loop **says what it had already spent**.
@@ -3073,7 +3192,7 @@ struct Approver(std::sync::Mutex<Vec<(String, String)>>);
 #[async_trait]
 impl UserIo for Approver {
     // Declines: proof that the override below is what answered.
-    async fn choose(&self, _: &str, _: &[Choice], _: &CancellationToken) -> Option<String> {
+    async fn choose(&self, _: &str, _: &[Choice], _: &CancellationToken) -> Option<Reply> {
         None
     }
     async fn approve(
@@ -3082,13 +3201,87 @@ impl UserIo for Approver {
         _: &ToolManifest,
         ruling: &Ruling,
         _: &CancellationToken,
-    ) -> bool {
+    ) -> Consent {
         self.0
             .lock()
             .unwrap()
             .push((call.name.clone(), ruling.reason_or_prompt().to_string()));
-        true
+        Consent { given: true, operator_note: None }
     }
+}
+
+struct Consenting(Consent);
+
+#[async_trait]
+impl UserIo for Consenting {
+    async fn choose(&self, _: &str, _: &[Choice], _: &CancellationToken) -> Option<Reply> {
+        None
+    }
+    async fn approve(&self, _: &ToolCall, _: &ToolManifest, _: &Ruling, _: &CancellationToken) -> Consent {
+        self.0.clone()
+    }
+}
+
+fn consent(given: bool, operator_note: Option<&str>) -> Consent {
+    Consent { given, operator_note: operator_note.map(|n| user::Words::new(n).unwrap()) }
+}
+
+/// The one result the model is handed for an echo of `s` put to `consent`.
+async fn echo_answer_under(s: &str, consent: Consent) -> (String, bool, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(vec![
+        ScriptedProvider::tool("t1", "echo", json!({ "s": s })),
+        ScriptedProvider::text("ok"),
+    ]);
+    let (agent, session) = harness(
+        dir.path(),
+        provider,
+        Arc::new(AlwaysAsk),
+        Arc::new(Consenting(consent)),
+        Approval::Mutating,
+        false,
+    );
+    agent.run_turn(vec![ContentBlock::text("go")], CancellationToken::new()).await.unwrap();
+    let blocks = session.lock().await.messages()[2].content.clone();
+    match blocks.as_slice() {
+        [ContentBlock::ToolResult { content, is_error, .. }] => (content.clone(), *is_error, dir),
+        other => panic!("expected the echo's result alone, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_approval_without_a_note_hands_the_model_the_output_alone() {
+    let (content, is_error, _dir) = echo_answer_under("hi", consent(true, None)).await;
+    assert_eq!((content.as_str(), is_error), ("echo:hi", false));
+}
+
+#[tokio::test]
+async fn an_approval_note_follows_the_untouched_output_in_the_harness_frame() {
+    let (content, is_error, _dir) = echo_answer_under("hi", consent(true, Some("only this once"))).await;
+    assert_eq!((content.as_str(), is_error), ("echo:hi\n\n[The operator's note on call t1:]\nonly this once", false));
+}
+
+#[tokio::test]
+async fn a_declined_call_reads_as_it_always_has_and_its_note_follows_it() {
+    let (content, is_error, _dir) = echo_answer_under("hi", consent(false, None)).await;
+    assert_eq!((content.as_str(), is_error), ("the user declined this tool call", true));
+
+    let (content, is_error, _dir) = echo_answer_under("hi", consent(false, Some("use the staging copy"))).await;
+    assert_eq!(
+        (content.as_str(), is_error),
+        ("the user declined this tool call\n\n[The operator's note on call t1:]\nuse the staging copy", true)
+    );
+}
+
+#[tokio::test]
+async fn a_note_joins_a_spilled_output_after_the_spill_and_stays_out_of_its_file() {
+    let long = "x".repeat(eidolon_core::dispatch::MAX_INLINE_CHARS + 1);
+    let (content, _, dir) = echo_answer_under(&long, consent(true, Some("only this once"))).await;
+    let spilled = content.strip_suffix("\n\n[The operator's note on call t1:]\nonly this once").expect("the note comes last");
+    assert!(spilled.contains("output too long for context"), "the echo spilled: {spilled:.80}");
+    assert!(!spilled.contains("only this once"));
+    let file = std::fs::read_to_string(dir.path().join("t1-echo.txt")).unwrap();
+    assert_eq!(file, format!("echo:{long}"));
 }
 
 #[tokio::test]
@@ -3223,6 +3416,9 @@ async fn a_deferred_tool_is_offered_once_the_branch_has_reached_for_it() {
             prompt: Some("guidance for hidden".into()),
             render: None,
             deferred: true,
+            script_only: false,
+            plugin: None,
+            source_hash: None,
         }))
     }
     let build = |provider: Arc<ScriptedProvider>, resume: bool| -> (Agent, Arc<Mutex<Session>>) {
@@ -3381,6 +3577,9 @@ async fn a_deferred_tool_called_by_name_is_offered_from_then_on() {
         prompt: None,
         render: None,
         deferred: true,
+        script_only: false,
+        plugin: None,
+        source_hash: None,
     })));
     let d = Arc::new(Dispatcher::new(
         reg,
@@ -3579,22 +3778,46 @@ async fn a_turn_that_ignores_the_nudge_exhausts_with_it_journaled() {
         .position(|k| matches!(k, RecordKind::ContextSize { .. }))
         .expect("the exhausted turn measured a context");
     assert!(matches!(kinds[context], RecordKind::ContextSize { tokens: 10 }));
-    let spend = kinds
+    // The wall is a settle, and the settle is the turn's one
+    // spend-bearing record — a TurnSpend beside it would double the turn
+    // in the usage walker, which reads the two as alternatives. The
+    // measurement precedes the boundary that closes the turn.
+    let settle = kinds
         .iter()
-        .position(|k| matches!(k, RecordKind::TurnSpend { .. }))
-        .expect("the exhausted turn priced its calls");
-    assert!(context < spend, "the measurement precedes the spend");
+        .position(|k| matches!(k, RecordKind::TurnSettled { .. }))
+        .expect("the exhausted turn journals its settle");
+    assert!(context < settle, "the measurement precedes the boundary");
+    assert!(matches!(
+        kinds[settle],
+        RecordKind::TurnSettled { stop_reason: StopReason::IterationLimit, .. }
+    ));
+    assert!(
+        matches!(branch.last().map(|r| &r.kind), Some(RecordKind::TurnSettled { .. })),
+        "the wall leaves a settled branch, so a resume opens clean"
+    );
+    assert!(
+        !kinds.iter().any(|k| matches!(k, RecordKind::TurnSpend { .. })),
+        "never both spend records for one turn"
+    );
     assert_eq!(s.last_input_tokens(), Some(10));
-    assert_eq!(s.usage().input_tokens, 30);
+    assert_eq!(
+        s.usage().input_tokens,
+        30,
+        "the settle carries the turn's spend, once"
+    );
     drop(s);
 
-    // The error names the limit and the way out, in the same breath.
+    // The error names the limit and the way out, in the same breath — and
+    // the settle is published behind its journal, so a live ledger closes
+    // the turn's accounting instead of leaving it open.
     let mut error = None;
     let mut gauged = None;
+    let mut settled = None;
     while let Ok(ev) = rx.try_recv() {
         match ev {
             Event::Error(e) => error = Some(e),
             Event::ContextSize { tokens } => gauged = Some(tokens),
+            Event::TurnSettled { stop_reason, .. } => settled = Some(stop_reason),
             _ => {}
         }
     }
@@ -3602,6 +3825,11 @@ async fn a_turn_that_ignores_the_nudge_exhausts_with_it_journaled() {
     assert!(error.contains("3 model calls"), "{error}");
     assert!(error.contains("continues from where this stopped"), "{error}");
     assert_eq!(gauged, Some(10), "and a live consumer is told the context");
+    assert_eq!(
+        settled,
+        Some(StopReason::IterationLimit),
+        "the wall publishes the settle it journaled"
+    );
 }
 
 /// The nudge only exists for turns that get deep: a turn that settles in

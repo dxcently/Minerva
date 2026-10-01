@@ -13,6 +13,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use eidolon_core::agent::Agent;
 use eidolon_core::event::EventBus;
+use eidolon_core::user::Words;
 use http_body_util::StreamBody;
 use hyper::body::Frame;
 use tokio::sync::broadcast;
@@ -54,7 +55,9 @@ enum Local<'a> {
         ask_id: u64,
         how: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
-        answer: Option<String>,
+        answer: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<&'a str>,
     },
     Lagged {
         dropped: u64,
@@ -114,8 +117,10 @@ pub fn body(agent: Arc<Agent>, user: Arc<WebUser>, bus: EventBus, driver: Handle
                 a = asks.recv() => match a {
                     Ok(AskEvent::Opened(ask)) => yield Ok(frame_json(&Local::Ask(&ask))),
                     Ok(AskEvent::Settled { ask_id, how }) => {
-                        let answer = how.answer().map(str::to_string);
-                        yield Ok(frame_json(&Local::AskSettled { ask_id, how: how.how(), answer }));
+                        let reply = how.reply();
+                        let answer = reply.map(|r| r.label.as_str());
+                        let note = reply.and_then(|r| r.operator_note.as_ref()).map(Words::as_str);
+                        yield Ok(frame_json(&Local::AskSettled { ask_id, how: how.how(), answer, note }));
                     }
                     Err(broadcast::error::RecvError::Lagged(dropped)) => {
                         yield Ok(frame_json(&Local::Lagged { dropped }));

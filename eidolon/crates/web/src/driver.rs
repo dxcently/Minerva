@@ -34,6 +34,7 @@ impl Idle<'_> {
     }
 }
 
+/// Empty for images alone, rather than a placeholder title.
 fn said_text(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()

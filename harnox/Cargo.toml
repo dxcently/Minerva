@@ -1,6 +1,6 @@
 [package]
 name = "harnox"
-version = "0.3.8"
+version = "0.3.12"
 edition = "2024"
 description = "The shared Rust foundation under Mneme, Melete, and the interactive harness — OAuth 2.1 server + browserless client, the custodied secret store, Claude credential acquisition — feature-gated so each consumer compiles only what it uses."
 license = "MIT"

@@ -11,7 +11,7 @@ pub fn manifest() {
             "type": "object",
             "properties": #{
                 "query": #{ "type": "string", "description": "What to search for" },
-                "count": #{ "type": "integer", "description": "Results to return (default 5, max 20)" },
+                "limit": #{ "type": "integer", "description": "Results to return (default 5, at most 20)" },
             },
             "required": ["query"],
         },
@@ -19,5 +19,5 @@ pub fn manifest() {
 }
 
 pub async fn call(input) {
-    eidolon::web_search(input.query, input.get("count")).await
+    eidolon::web_search(input.query, input.get("limit")).await
 }

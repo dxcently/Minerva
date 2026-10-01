@@ -333,9 +333,6 @@ fn fields(e: &Entry) -> Vec<&str> {
         // so `/eidolon-9f2c` finds everything one session said without
         // the scan having to build a joined string per keystroke.
         Entry::Peer { from, text, .. } => vec![from.as_str(), text.as_str()],
-        // A wake is found by what it was waiting on or what came of it:
-        // `/it fired` lands on the morning the build finished.
-        Entry::Woke { condition, outcome } => vec![condition.as_str(), outcome.as_str()],
         // A marked line and the answer it was given, both searchable —
         // `/list notes` finds the command as readily as what came back —
         // and kept apart rather than joined for the same reason a tool's

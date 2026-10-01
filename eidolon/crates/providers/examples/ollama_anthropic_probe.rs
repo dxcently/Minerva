@@ -56,6 +56,9 @@ fn agent(provider: Arc<Observed>, session: Arc<Mutex<Session>>, dir: &std::path:
             input_schema: json!({"type":"object","properties":{"label":{"type":"string","enum":["cloud-probe"]}},
                 "required":["label"],"additionalProperties":false}),
             approval: Approval::ReadOnly, prompt: None, render: None, deferred: false,
+            script_only: false,
+            plugin: None,
+            source_hash: None,
         },
         receipt: receipt.into(),
     }));

@@ -25,12 +25,14 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use eidolon_core::user::Reply;
+use eidolon_core::user::tools::choices_of;
 use serde_json::Value;
 
 use std::ops::Range;
 
 use crate::modes::ModeDef;
-use crate::state::{Anchor, Detail, DialogKind, Entry, Fold, Level, Selection, UiState};
+use crate::state::{Anchor, CHAT_ROW, Detail, Dialog, DialogKind, Entry, Fold, Level, NOTE_ROW, Selection, UiState, is_question};
 
 use crate::theme::Theme;
 
@@ -52,6 +54,10 @@ pub struct Renderer<'a> {
     menu_drawn: bool,
     /// Where the caret is, if the prompt was drawn.
     pub cursor: Option<(u16, u16)>,
+    /// The width the prompt's text wrapped at, if the prompt was drawn —
+    /// the width its vertical motion walks, recorded on the buffer by the
+    /// app after the draw.
+    pub prompt_width: Option<usize>,
     /// Whether that caret is a block (normal/select) or a bar.
     pub block_cursor: bool,
     /// Visible transcript lines, for scroll clamping.
@@ -96,6 +102,7 @@ impl<'a> Renderer<'a> {
             dialog_drawn: false,
             menu_drawn: false,
             cursor: None,
+            prompt_width: None,
             block_cursor: false,
             covered: Vec::new(),
             images: Vec::new(),
@@ -212,6 +219,42 @@ impl<'a> Renderer<'a> {
                 if let Some(c) = n.get("child") {
                     self.node(f, inner, c);
                 }
+            }
+            "plugin_panel" => {
+                // A plugin's panel, placed by the frame's own view: the
+                // node names the plugin, the content is that payload's
+                // `plugin_panel(s)` answer, drawn in a titled box like any
+                // other panel. (`panel()` is the Rust accessor's name —
+                // script.rs — never the payload's.) No compiled payload,
+                // no `plugin_panel` in it, or a panel that fails — the
+                // slot draws as nothing. An empty slot is the design, not
+                // a defect: a plugin that is not here is not an error on
+                // screen, it is absent, and the snapshot's `plugins`
+                // never names it in the first place.
+                let name = n
+                    .get("plugin")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let drawn = self
+                    .state
+                    .plugin_uis
+                    .iter()
+                    .find(|p| p.plugin == name)
+                    .and_then(|p| p.script.panel(self.state.snapshot()))
+                    .and_then(|r| r.ok());
+                let Some(child) = drawn else {
+                    return;
+                };
+                let title =
+                    n.get("title").cloned().unwrap_or(Value::String(name));
+                let mut block = Block::default().borders(Borders::ALL).title(spans_of(&title));
+                if let Some(fg) = n.get("fg").and_then(Value::as_str) {
+                    block = block.border_style(Style::default().fg(color(fg)));
+                }
+                let inner = block.inner(area);
+                f.render_widget(block, area);
+                self.node(f, inner, &child);
             }
             "transcript" => self.transcript(f, area),
             "prompt" => self.prompt(f, area, n),
@@ -647,7 +690,6 @@ impl<'a> Renderer<'a> {
     /// wrong column would highlight the wrong text rather than merely look
     /// untidy.
     fn prompt(&mut self, f: &mut Frame, area: Rect, n: &Value) {
-        let b = &self.state.prompt;
         let m = mode_style(self.state);
         let hue = m.colour.as_str();
         // Red the moment a pattern stops matching, so the keystroke that
@@ -680,6 +722,13 @@ impl<'a> Renderer<'a> {
         };
         let inner = block.inner(area);
         let width = inner.width.max(1) as usize;
+        // The prompt's vertical motion walks the rows this pass is about
+        // to draw, so the width they wrap at is reported to the app —
+        // which records it on the buffer after the draw, the same
+        // after-the-draw channel the caret and the scroll anchor ride.
+        // The buffer has no other source for the width, and a stale one
+        // survives only until the next frame.
+        self.prompt_width = Some(width);
         // The bottom border carries one of two things, and the line
         // being typed wins: an attachment strip is a standing fact about
         // the next message and comes back the moment the line is gone.
@@ -716,6 +765,7 @@ impl<'a> Renderer<'a> {
         }
         f.render_widget(block, area);
 
+        let b = &self.state.prompt;
         let text = b.text().to_string();
         let cursor = b.range.cursor();
         let (row, col) = cursor_rc(
@@ -1118,18 +1168,49 @@ impl<'a> Renderer<'a> {
         let theme = &self.state.theme;
         let width = (area.width * 3 / 4).clamp(20, 80);
         let body: Vec<Line> = match d.kind {
+            // The rows and the legend always fit; a long prompt gives way.
             DialogKind::Confirm => {
-                let mut v: Vec<Line> = wrap(&d.prompt, width as usize - 4)
-                    .into_iter()
-                    .map(Line::raw)
-                    .collect();
-                v.push(Line::default());
-                v.push(Line::from(vec![
-                    Span::styled("[y]", theme.fg("ok").add_modifier(Modifier::BOLD)),
-                    Span::raw(" allow   "),
-                    Span::styled("[n]", theme.fg("error").add_modifier(Modifier::BOLD)),
-                    Span::raw(" deny"),
-                ]));
+                let inner = width as usize - 4;
+                let mut tail: Vec<Line> = vec![Line::default()];
+                tail.extend(d.answers().into_iter().chain([NOTE_ROW, CHAT_ROW]).enumerate().map(|(i, label)| {
+                    row_line(label.to_string(), i == d.selected, theme)
+                }));
+                tail.push(Line::default());
+                tail.extend(note_lines(d, inner, theme));
+                if d.noting {
+                    tail.push(Line::from(Span::styled(NOTE_LEGEND, theme.fg("faint"))));
+                } else if d.steadying() {
+                    tail.push(Line::from(Span::styled(STEADY_LEGEND, theme.fg("faint"))));
+                } else {
+                    // Wrapped a whole key at a time, so a narrow box never cuts one off.
+                    let keys = [("[y]", "ok", " allow"), ("[n]", "error", " deny"), ("[tab]", "faint", " note"), ("[c]", "faint", " chat")];
+                    let (mut line, mut used) = (Vec::new(), 0);
+                    for (key, colour, what) in keys {
+                        let w = key.len() + what.len();
+                        if used > 0 && used + 2 + w > inner {
+                            tail.push(Line::from(std::mem::take(&mut line)));
+                            used = 0;
+                        }
+                        if used > 0 {
+                            line.push(Span::raw("  "));
+                            used += 2;
+                        }
+                        line.push(Span::styled(key, theme.fg(colour).add_modifier(Modifier::BOLD)));
+                        line.push(Span::raw(what));
+                        used += w;
+                    }
+                    tail.push(Line::from(line));
+                }
+                let room = (area.height as usize).saturating_sub(2 + tail.len()).max(1);
+                let mut prompt = wrap(&d.prompt, inner);
+                if prompt.len() > room {
+                    prompt.truncate(room);
+                    if let Some(last) = prompt.last_mut() {
+                        last.push_str(" …");
+                    }
+                }
+                let mut v: Vec<Line> = prompt.into_iter().map(Line::raw).collect();
+                v.extend(tail);
                 v
             }
             // A multiple-choice question. The question and every option's
@@ -1147,7 +1228,10 @@ impl<'a> Renderer<'a> {
                 // description rows, so the scroll below budgets in what
                 // is actually drawn.
                 let block = |i: usize| -> Vec<Line> {
-                    let (label, desc) = &d.options[i];
+                    let Some((label, desc)) = d.options.get(i) else {
+                        let label = if i == d.options.len() { NOTE_ROW } else { CHAT_ROW };
+                        return vec![row_line(label.to_string(), i == d.selected, theme)];
+                    };
                     let sel = i == d.selected;
                     let head = format!("{}{}. ", if sel { "▶ " } else { "  " }, i + 1);
                     let mut rows = vec![Line::from(vec![
@@ -1182,6 +1266,7 @@ impl<'a> Renderer<'a> {
                             .map(|t| wrap(t, inner.saturating_sub(4)).len().min(DESC_ROWS))
                             .unwrap_or(0)
                     })
+                    .chain([1, 1])
                     .collect();
                 // The window that keeps the selected block whole and fills
                 // the rest of the budget from whichever side has room:
@@ -1203,13 +1288,18 @@ impl<'a> Renderer<'a> {
                     v.extend(block(i));
                 }
                 v.push(Line::default());
+                v.extend(note_lines(d, inner, theme));
+                let legend = if d.noting {
+                    NOTE_LEGEND
+                } else if d.steadying() {
+                    STEADY_LEGEND
+                } else {
+                    "ret takes the arrowed row · a digit takes its number · esc dismisses · tab notes · c chats"
+                };
                 // The legend is wrapped like everything else in the box: a
                 // hint clipped off the edge of a narrow terminal is a
                 // promise the dialog did not make.
-                for l in wrap(
-                    "ret takes the arrowed option · a digit takes its number · esc dismisses",
-                    inner,
-                ) {
+                for l in wrap(legend, inner) {
                     v.push(Line::from(Span::styled(l, theme.fg("faint"))));
                 }
                 v
@@ -1283,6 +1373,23 @@ impl<'a> Renderer<'a> {
                     )),
                 ]
             }
+            // The park's text hop: the question as a paragraph, one field
+            // under it — the run is blocked on the words, so the words
+            // get the room.
+            DialogKind::Respond => {
+                let inner = width as usize - 4;
+                let mut v: Vec<Line> = wrap(&d.prompt, inner).into_iter().map(Line::raw).collect();
+                v.push(Line::default());
+                v.push(Line::from(vec![
+                    Span::raw(d.input.text().to_string()),
+                    Span::styled("▌", theme.fg("dialog")),
+                ]));
+                v.push(Line::default());
+                for l in wrap("ret answers the run · esc leaves it parked", inner) {
+                    v.push(Line::from(Span::styled(l, theme.fg("faint"))));
+                }
+                v
+            }
             // Drawn by `page` above; here so the match stays whole.
             DialogKind::Page => Vec::new(),
         };
@@ -1314,6 +1421,10 @@ impl<'a> Renderer<'a> {
                 // hands it " provider · API key ", so the box says whose
                 // key it is without the value ever needing to.
                 DialogKind::Ask => d.prompt.clone(),
+                // The park names the situation rather than a tool: the
+                // run itself is what is waiting, and the question is the
+                // body of the box.
+                DialogKind::Respond => " a run is waiting on you ".to_string(),
             });
         let inner = block.inner(rect);
         f.render_widget(block, rect);
@@ -1353,7 +1464,7 @@ impl<'a> Renderer<'a> {
         let lines = self.tagged(self.lit(lines, &owner), &owner, inner);
         let loading = if self.state.vault.pending.is_some() { "reading… · " } else { "" };
         let hint = if self.state.vault.tree.is_some() {
-            "K trace · / search · tab record · enter inspect · space f fork · backspace back · q close"
+            "K trace · / search · tab record · enter inspect/open · space f fork · backspace back/close · q close"
         } else { "K trace · v select / Q reference in trace · gw jump · backspace back · i compose (no send)" };
         let block = Block::default().borders(Borders::ALL).border_style(self.state.theme.fg("dialog"))
             .title(format!(" {} ", d.prompt))
@@ -1839,6 +1950,35 @@ pub(crate) fn color(name: &str) -> Color {
     }
 }
 
+const NOTE_LEGEND: &str = "ret done · esc drops it";
+const STEADY_LEGEND: &str = "steady…";
+
+/// A dialog row that is not a numbered option: an approval's answer, `+ note`, `chat about it`.
+fn row_line(label: String, sel: bool, theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(if sel { "▶ " } else { "  " }, theme.fg(if sel { "dialog" } else { "faint" })),
+        Span::styled(label, if sel { theme.fg("dialog").add_modifier(Modifier::BOLD) } else { Style::default() }),
+    ])
+}
+
+/// The note under a confirm or a question: with the cursor
+/// while typed into, without it while a kept note waits for the answer.
+fn note_lines(d: &Dialog, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let text = d.input.text();
+    if !d.noting && text.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut rows: Vec<Line<'static>> =
+        wrap(&format!("note: {text}"), width).into_iter().map(|l| Line::from(Span::styled(l, theme.fg("dialog")))).collect();
+    if d.noting
+        && let Some(last) = rows.last_mut()
+    {
+        last.spans.push(Span::styled("▌", theme.fg("dialog")));
+    }
+    rows.push(Line::default());
+    rows
+}
+
 /// Word-wrap to `width` columns (chars, not cells — good enough for a
 /// first slice), preserving explicit newlines.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -2036,20 +2176,34 @@ fn keep(line: &Line<'static>, spans: Vec<Span<'static>>) -> Line<'static> {
 }
 
 /// Row and column of the cursor given the text before it, under the same
-/// hard wrapping `wrap_rows` applies.
+/// hard wrapping `wrap_rows` applies: every hard line but the caret's own
+/// occupies the rows `wrap_rows` draws for it — `n` divided by the width
+/// rounded up, and never fewer than one, an empty line drawing an empty
+/// row — and the newline itself occupies no row of its own. (Rounding
+/// down plus a row for the newline agrees with that everywhere except
+/// after a line whose length is an exact multiple of the width, where the
+/// ledger ran one row ahead and the caret painted low for the rest of the
+/// frame.) The caret's own line then places it at `n / width`, `n % width`;
+/// a caret on the newline of a line so sized lands at the next row's
+/// column zero, and at the very end of the text one row past the last
+/// drawn one.
 fn cursor_rc(before: &str, width: usize) -> (usize, usize) {
     let width = width.max(1);
-    let mut row = 0;
-    let mut col = 0;
-    for (i, para) in before.split('\n').enumerate() {
-        if i > 0 {
-            row += 1;
-        }
-        let n = para.chars().count();
-        row += n / width;
-        col = n % width;
-    }
-    (row, col)
+    // The lines before the caret's own, each at its drawn height — and
+    // nothing at all when there is no newline, since a text with none has
+    // no earlier line to ledger.
+    let (earlier, last) = match before.rsplit_once('\n') {
+        Some((head, tail)) => (
+            head.split('\n')
+                .map(|para| para.chars().count().div_ceil(width).max(1))
+                .sum::<usize>(),
+            tail,
+        ),
+        None => (0, before),
+    };
+    let n = last.chars().count();
+    let row = earlier + n / width;
+    (row, n % width)
 }
 
 fn one_line(s: &str, width: usize) -> String {
@@ -2266,6 +2420,9 @@ fn entry_lines(
             waits.get(id),
             width,
         )),
+        Entry::Tool { name, input, output: Some((result, _)), .. } if is_question(name) => {
+            lines.extend(question_block(input, result, width, detail, theme))
+        }
         Entry::Tool {
             name,
             input,
@@ -2293,20 +2450,6 @@ fn entry_lines(
                     theme,
                 ));
             }
-        }
-        // A park resolving: the mark says *harness*, the words say what
-        // came of the wait. The tool colour, not the faint italic of a
-        // note — this is the third way a turn starts, and it reads at a
-        // glance or the morning's transcript has a hole in it.
-        Entry::Woke { condition, outcome } => {
-            let mark = theme.fg("tool");
-            let head = vec![
-                Span::styled("\u{263e} ", mark.add_modifier(Modifier::BOLD)),
-                Span::styled("woke ", mark.add_modifier(Modifier::BOLD)),
-                Span::styled(format!("{outcome} — waiting on {condition}"), mark),
-            ];
-            lines.extend(crate::markdown::wrap_spans(head, width, &[], &[Span::raw("  ")]));
-            lines.push(Line::default());
         }
         Entry::Info(t) => {
             for (i, l) in wrap(t, width.saturating_sub(2)).into_iter().enumerate() {
@@ -2592,7 +2735,7 @@ fn cluster_end(state: &UiState, entry: usize) -> usize {
 }
 
 /// Presentation only: how a run of one tool reads in prose. A tool not on
-/// this list — a user's skill, a tool served over MCP — falls back to its
+/// this list — a user's own tool, a tool served over MCP — falls back to its
 /// own name (`Ran 3 mneme_rpc calls`), which is why this can stay short
 /// and why nothing breaks by being left off it. Matched case-insensitively,
 /// because a backend that runs its own tools spells them `Bash` and `Read`.
@@ -3202,17 +3345,37 @@ fn wait_block(
                                 s => {
                                     let left =
                                         s.saturating_sub(view.armed_at.elapsed().as_secs());
-                                    format!(" \u{b7} {} left", fmt_deadline(left))
+                                    format!(" \u{b7} wakes in {}", fmt_deadline(left))
                                 }
                             },
                             faint.add_modifier(Modifier::ITALIC),
                         ),
                         Span::styled(
-                            format!(" \u{b7} wake {wake}"),
+                            format!(
+                                " \u{b7} ends on {}",
+                                match wake {
+                                    0 => "no mail",
+                                    1 => "only mail marked to wake",
+                                    _ => "any mail",
+                                }
+                            ),
                             faint.add_modifier(Modifier::ITALIC),
                         ),
                     ]));
                 }
+            }
+            // A wait that is neither resolved nor the last thing on
+            // the branch is the state the one-wait invariant makes
+            // impossible — drawn as the inconsistency it is, never as
+            // an active wait.
+            if view.stale && view.settled.is_none() {
+                lines.push(Line::from(vec![
+                    Span::styled("  \u{26a0} ", theme.fg("error")),
+                    Span::styled(
+                        "armed, unresolved, and not the last thing on this branch — the log cannot say how it ended",
+                        quiet,
+                    ),
+                ]));
             }
         }
         // No live view — a resume, mostly: the block collapses, because
@@ -3222,14 +3385,23 @@ fn wait_block(
         None => {
             if let Some(out) = output {
                 let first = out.lines().next().unwrap_or_default();
-                let rest = first
-                    .strip_prefix("[armed #")
-                    .map(|r| match r.split_once(']') {
-                        Some((n, _)) => format!("armed #{n}"),
+                // An already-true wait is its own state, not a failed
+                // arming: the ✓ says nothing is running, and the words
+                // name which leaves held.
+                let already = first.starts_with("[already true]");
+                // The id the model never typed is not the label — the
+                // note is, when there is one, and the words of the wait
+                // are always better than `armed #N`.
+                let body = match first.split_once("] ").map(|(_, what)| what.to_string()) {
+                    Some(what) => match note {
+                        Some(n) => format!("because: {n} — {what}"),
+                        None => what,
+                    },
+                    None => match note {
+                        Some(n) => format!("because: {n}"),
                         None => first.to_string(),
-                    })
-                    .or_else(|| first.split_once("] ").map(|(_, what)| what.to_string()));
-                let body = rest.unwrap_or_else(|| first.to_string());
+                    },
+                };
                 let deadline = out
                     .lines()
                     .find_map(|l| {
@@ -3242,12 +3414,25 @@ fn wait_block(
                     Span::styled("  \u{21b3} ", tool),
                     Span::styled(
                         match deadline {
-                            Some(d) => format!("{body} \u{b7} deadline {d}"),
+                            Some(d) => format!("{body} \u{b7} wakes in {d}"),
                             None => body,
                         },
-                        theme.fg("text"),
+                        if already {
+                            theme.fg("ok")
+                        } else {
+                            theme.fg("text")
+                        },
                     ),
                 ]));
+                if already {
+                    lines.push(Line::from(vec![
+                        Span::styled("  \u{2713} ", theme.fg("ok")),
+                        Span::styled(
+                            "nothing armed — the condition already held; carry on",
+                            quiet,
+                        ),
+                    ]));
+                }
             } else {
                 lines.push(Line::from(vec![
                     Span::styled("  \u{21b3} ", tool),
@@ -3271,6 +3456,61 @@ fn wait_block(
             &[Span::styled(lead.to_string(), quiet)],
             &[Span::styled(hang, quiet)],
         ));
+    }
+    lines.push(Line::default());
+    lines
+}
+
+/// A settled question put to the operator: its prompt and every option, the pick marked, then the note or the
+/// dismissal. One wrapped line while the view is folded, a line per option otherwise.
+fn question_block(input: &str, result: &str, width: usize, detail: Detail, theme: &Theme) -> Vec<Line<'static>> {
+    let input: Value = serde_json::from_str(input).unwrap_or_default();
+    let prompt = input.get("prompt").and_then(Value::as_str).unwrap_or("?").to_string();
+    let options = choices_of(&input);
+    let reply = Reply::read_back(result, &options);
+    let picked = reply.as_ref().map(|r| r.label.as_str());
+    let mark = theme.fg("tool").add_modifier(Modifier::BOLD);
+    let faint = theme.fg("faint");
+    let chosen = theme.fg("dialog").add_modifier(Modifier::BOLD);
+    let tail = match &reply {
+        Some(Reply { operator_note: Some(note), .. }) => Some(format!("note: {note}")),
+        Some(_) => None,
+        None => Some("dismissed".to_string()),
+    };
+    let head = vec![Span::styled("? ", mark), Span::raw(prompt)];
+    let cont = [Span::raw("  ")];
+    let mut lines = Vec::new();
+    if detail == Detail::Folded {
+        let mut spans = head;
+        for o in &options {
+            spans.push(Span::styled(" · ", faint));
+            spans.push(if picked == Some(o.label.as_str()) {
+                Span::styled(format!("▶ {}", o.label), chosen)
+            } else {
+                Span::styled(o.label.clone(), faint)
+            });
+        }
+        if let Some(tail) = tail {
+            spans.push(Span::styled(format!(" · {}", tail.replace('\n', " ")), faint));
+        }
+        lines.extend(crate::markdown::wrap_spans(spans, width, &[], &cont));
+    } else {
+        lines.extend(crate::markdown::wrap_spans(head, width, &[], &cont));
+        for (i, o) in options.iter().enumerate() {
+            let sel = picked == Some(o.label.as_str());
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}{}. ", if sel { "  ▶ " } else { "    " }, i + 1), if sel { chosen } else { faint }),
+                Span::styled(o.label.clone(), if sel { chosen } else { Style::default() }),
+            ]));
+            if detail == Detail::Full
+                && let Some(desc) = &o.description
+            {
+                lines.extend(wrap(desc, width.saturating_sub(7)).into_iter().map(|l| Line::styled(format!("       {l}"), faint)));
+            }
+        }
+        if let Some(tail) = tail {
+            lines.extend(wrap(&tail, width.saturating_sub(4)).into_iter().map(|l| Line::styled(format!("    {l}"), faint)));
+        }
     }
     lines.push(Line::default());
     lines
@@ -3478,6 +3718,52 @@ mod tests {
         (terminal.backend().buffer().clone(), renderer.link_hits)
     }
 
+    /// The three wrappings of one truth — `wrap_rows` draws the rows,
+    /// `cursor_rc` places the caret among them, and edit.rs's visual walk
+    /// mirrors the same arithmetic — pinned to each other, not just each
+    /// to itself: over pseudo-random text and a plausible terminal's
+    /// widths, every caret maps to a row the composer drew (the one row
+    /// past the end that a final exact multiple of the width allows, at
+    /// column zero) and its column fits the row's content.
+    #[test]
+    fn the_caret_lands_on_the_rows_the_composer_draws() {
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..64 {
+            let text: String = (0..next() % 80)
+                .map(|_| match next() % 8 {
+                    0 | 1 => ' ',
+                    2 => '\n',
+                    _ => char::from(b'a' + (next() % 26) as u8),
+                })
+                .collect();
+            let chars = text.chars().count();
+            for width in 1..=12usize {
+                let drawn = wrap_rows(&text, width);
+                let count = drawn.len();
+                for p in 0..=chars {
+                    let (row, col) = cursor_rc(&text[..p], width);
+                    assert!(
+                        row < count || (row == count && col == 0),
+                        "caret {p} at width {width}: row {row} col {col} over {count} drawn rows of {text:?}"
+                    );
+                    if row < count {
+                        let row_len = drawn[row].1.chars().count();
+                        assert!(
+                            col <= row_len,
+                            "caret {p} at width {width}: col {col} past the {row_len} chars of drawn row {row} in {text:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn clicks_use_painted_alias_cells_including_wide_prefixes_scroll_and_resize() {
         let mut s = UiState::new("m".into(), "log".into(), "/".into());
@@ -3604,6 +3890,64 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// A panel node draws the named plugin's `plugin_panel(s)` answer
+    /// inside a titled box; a name with no compiled payload behind it
+    /// draws as nothing — an absent plugin is not an error on screen.
+    #[test]
+    fn a_panel_node_draws_its_plugin_and_vanishes_without_one() {
+        let mut state = UiState::new("m".into(), "/tmp/s.eid".into(), "/".into());
+        let script = crate::script::UiScript::compile(
+            "pub fn plugin_panel(s) { #{ kind: \"text\", content: \"hello from pinger\" } }",
+        )
+        .unwrap();
+        state.plugin_uis.push(crate::script::PluginUi {
+            plugin: "pinger".into(),
+            script,
+        });
+        let (glyphs, _) = draw(
+            &state,
+            serde_json::json!({ "kind": "plugin_panel", "plugin": "pinger" }),
+            40,
+            5,
+        );
+        let screen = glyphs.join("\n");
+        assert!(screen.contains("pinger"), "{screen}");
+        assert!(screen.contains("hello from pinger"), "{screen}");
+        let (glyphs, _) = draw(
+            &state,
+            serde_json::json!({ "kind": "plugin_panel", "plugin": "absent" }),
+            40,
+            5,
+        );
+        assert!(glyphs.join("").trim().is_empty(), "{glyphs:?}");
+    }
+
+    /// The shipped default view gives a plugin's slot three rows, not
+    /// one: a panel draws as a titled box, and a box needs its two
+    /// borders plus a content row. This composes the two halves the
+    /// other panel tests each held alone — the script's `panels(s)` and
+    /// the renderer's `plugin_panel` node — because a one-row slot
+    /// passed every one of them while drawing the title alone on a real
+    /// frame, the payload's answer with nowhere to land.
+    #[test]
+    fn the_default_view_gives_a_panel_slot_its_box_room() {
+        let mut state = UiState::new("m".into(), "/tmp/s.eid".into(), "/".into());
+        state.plugin_uis.push(crate::script::PluginUi {
+            plugin: "pinger".into(),
+            script: crate::script::UiScript::compile(
+                "pub fn plugin_panel(s) { #{ kind: \"text\", content: \"hello from pinger\" } }",
+            )
+            .unwrap(),
+        });
+        let script = crate::script::UiScript::compile(crate::DEFAULT_UI).unwrap();
+        let tree = script
+            .view(state.snapshot())
+            .expect("the default view answers a plain state");
+        let (glyphs, _) = draw(&state, tree, 120, 40);
+        let screen = glyphs.join("\n");
+        assert!(screen.contains("hello from pinger"), "{screen}");
     }
 
     /// Draw an arbitrary tree and hand back both the glyphs and, per cell,
@@ -3737,9 +4081,22 @@ mod tests {
 
     #[test]
     fn no_frame_ever_shows_the_terminal_caret() {
+        // The one test that writes to a real crossterm backend — the bytes a
+        // terminal would get — rather than inspecting a buffer. Its size is
+        // stated instead of asked for: `Terminal::new` calls `size()`, which
+        // reaches for `/dev/tty` and then shells out to `tput`, so a runner
+        // with neither had this test panic before it drew anything
+        // (`WouldBlock` out of `unwrap`) while a terminal on the author's
+        // machine answered with its own width. Whether a frame shows the
+        // caret is not a size question, and 80x24 is a frame like any other.
         let sink = Bytes::default();
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(sink.clone())).unwrap();
+        let mut terminal = ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(sink.clone()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
         let st = with_prompt("hi");
         let mut r = Renderer::new(&st);
         terminal
@@ -3973,6 +4330,8 @@ mod tests {
             pick: Some(crate::state::PickAction::Run("model".into())),
             body: String::new(),
             masked: false,
+            noting: false,
+            steady: None,
         });
         let mut r = Renderer::new(&st);
         terminal
@@ -4256,6 +4615,8 @@ mod tests {
             pick: None,
             body: String::new(),
             masked: false,
+            noting: false,
+            steady: None,
         });
         // 30 rows: the box holds every block plus the legend without the
         // frame's height cap clipping the tail.
@@ -4313,6 +4674,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_open_note_is_drawn_in_the_confirm_box_with_its_cursor_and_its_own_legend() {
+        let mut st = with_prompt("");
+        let mut input = crate::state::Dialog::field();
+        input.insert("not on main");
+        st.dialog = Some(crate::state::Dialog {
+            kind: DialogKind::Confirm,
+            prompt: "run it?".into(),
+            options: Vec::new(),
+            keys: Vec::new(),
+            weights: Vec::new(),
+            selected: 0,
+            input,
+            reply: None,
+            pick: None,
+            body: String::new(),
+            masked: false,
+            noting: true,
+            steady: None,
+        });
+        let (glyphs, _) = draw(&st, serde_json::json!({ "kind": "dialog" }), 60, 20);
+        let text = glyphs.join("\n");
+        assert!(text.contains("note: not on main▌"), "{text}");
+        assert!(text.contains(super::NOTE_LEGEND) && !text.contains("[y] allow"), "{text}");
+    }
+
+    #[test]
+    fn a_confirm_draws_its_rows_and_says_steady_while_it_refuses_answers() {
+        let mut st = with_prompt("");
+        st.dialog = Some(crate::state::Dialog {
+            kind: DialogKind::Confirm,
+            prompt: "run it?".into(),
+            options: Vec::new(),
+            keys: Vec::new(),
+            weights: Vec::new(),
+            selected: 0,
+            input: crate::state::Dialog::field(),
+            reply: None,
+            pick: None,
+            body: String::new(),
+            masked: false,
+            noting: false,
+            steady: None,
+        });
+        let (glyphs, _) = draw(&st, serde_json::json!({ "kind": "dialog" }), 60, 20);
+        let text = glyphs.join("\n");
+        assert!(text.contains("▶ yes") && text.contains("  no") && text.contains("+ note") && text.contains("chat about it"), "{text}");
+        assert!(text.contains("[c] chat") && !text.contains(super::STEADY_LEGEND), "{text}");
+        st.dialog.as_mut().unwrap().steady = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let (glyphs, _) = draw(&st, serde_json::json!({ "kind": "dialog" }), 60, 20);
+        let text = glyphs.join("\n");
+        assert!(text.contains(super::STEADY_LEGEND) && !text.contains("[y] allow"), "{text}");
+    }
+
+    #[test]
+    fn a_long_approval_gives_way_to_its_rows_and_a_narrow_one_wraps_its_legend() {
+        let mut st = with_prompt("");
+        st.dialog = Some(crate::state::Dialog {
+            kind: DialogKind::Confirm,
+            prompt: "word ".repeat(400),
+            options: Vec::new(),
+            keys: Vec::new(),
+            weights: Vec::new(),
+            selected: 0,
+            input: crate::state::Dialog::field(),
+            reply: None,
+            pick: None,
+            body: String::new(),
+            masked: false,
+            noting: false,
+            steady: None,
+        });
+        let (glyphs, _) = draw(&st, serde_json::json!({ "kind": "dialog" }), 40, 14);
+        let text = glyphs.join("\n");
+        assert!(text.contains("word …") && text.contains("chat about it") && text.contains("[c] chat"), "{text}");
+        assert!(glyphs.iter().filter(|r| r.contains('[')).count() > 1, "the legend wrapped: {text}");
+    }
+
     /// The scroll window budgets in whole blocks, so the selected option's
     /// paragraph is never half-drawn to fit the frame.
     #[test]
@@ -4332,6 +4771,8 @@ mod tests {
             pick: None,
             body: String::new(),
             masked: false,
+            noting: false,
+            steady: None,
         });
         let (glyphs, _) = draw(&st, serde_json::json!({ "kind": "dialog" }), 40, 16);
         let text = glyphs.join("\n");
@@ -4595,6 +5036,7 @@ mod tests {
         st.waits.insert(
             "w1".into(),
             crate::state::WaitView {
+                stale: false,
                 rows: vec![
                     eidolon_core::wait::ParkRow { met: true, gone: None },
                     eidolon_core::wait::ParkRow { met: false, gone: None },
@@ -4628,8 +5070,8 @@ mod tests {
             "{out:?}"
         );
         assert!(
-            out.iter().any(|r| r.contains("parked") && r.contains("left")),
-            "the footer says parked with a countdown: {out:?}"
+            out.iter().any(|r| r.contains("parked") && r.contains("wakes in")),
+            "the footer says parked with a countdown to the wake: {out:?}"
         );
         // And no raw JSON anywhere.
         assert!(!out.iter().any(|r| r.contains("{\"")), "{out:?}");
@@ -4655,11 +5097,11 @@ mod tests {
         let out = rows(&st, 70, 10);
         assert!(out.iter().any(|r| r.contains("→ Waiting")), "{out:?}");
         assert!(
-            out.iter().any(|r| r.contains("armed #3")),
-            "{out:?}"
+            !out.iter().any(|r| r.contains("armed #")),
+            "the id the model typed is not the label: {out:?}"
         );
         assert!(
-            out.iter().any(|r| r.contains("15m")),
+            out.iter().any(|r| r.contains("wakes in 15m")),
             "the deadline is a time a person reads: {out:?}"
         );
         assert!(
@@ -4721,6 +5163,7 @@ mod tests {
         st.waits.insert(
             "w1".into(),
             crate::state::WaitView {
+                stale: false,
                 rows: vec![eidolon_core::wait::ParkRow {
                     met: false,
                     gone: None,
@@ -4751,6 +5194,7 @@ mod tests {
         st.waits.insert(
             "w1".into(),
             crate::state::WaitView {
+                stale: false,
                 rows: vec![eidolon_core::wait::ParkRow { met: true, gone: None }],
                 armed_at: std::time::Instant::now() - std::time::Duration::from_secs(362),
                 deadline_s: 900,
@@ -4795,6 +5239,7 @@ mod tests {
         st.waits.insert(
             "w1".into(),
             crate::state::WaitView {
+                stale: false,
                 rows: vec![eidolon_core::wait::ParkRow {
                     met: false,
                     gone: None,
@@ -4869,6 +5314,7 @@ mod tests {
         st.waits.insert(
             "w1".into(),
             crate::state::WaitView {
+                stale: false,
                 rows: vec![eidolon_core::wait::ParkRow {
                     met: false,
                     gone: None,
@@ -4900,17 +5346,64 @@ mod tests {
         );
     }
 
-    /// The wake is its own line, in the tool's colour and with its own
-    /// mark — not the operator's green, not a faint note.
+    /// The wake level is a phrase a person can act on, not a number that
+    /// needs the machinery memorized: the footer says what mail may end
+    /// the wait, in the words the arm-time output uses.
     #[test]
-    fn a_wake_draws_as_its_own_kind_of_line() {
-        let st = with_calls(vec![Entry::Woke {
-            condition: "background bg-1 finished".into(),
-            outcome: "it fired".into(),
+    fn the_wake_level_reads_as_a_phrase() {
+        let mut st = with_calls(vec![Entry::Tool {
+            id: "w1".into(),
+            name: "wait_for".into(),
+            input: r#"{"condition": {"peer_idle": "eidolon-b26d"}, "timeout_s": 900, "wake": 2}"#
+                .into(),
+            output: Some(("[armed #3] waiting for …".into(), false)),
         }]);
-        let out = rows(&st, 70, 4);
+        st.detail = Detail::Full;
+        st.waits.insert(
+            "w1".into(),
+            crate::state::WaitView {
+                stale: false,
+                rows: vec![],
+                armed_at: std::time::Instant::now(),
+                deadline_s: 900,
+                settled: None,
+            },
+        );
+        let out = rows(&st, 78, 20);
+        assert!(out.iter().any(|r| r.contains("ends on any mail")), "{out:?}");
+        assert!(!out.iter().any(|r| r.contains("wake 2")), "{out:?}");
+    }
+
+    /// An armed wait that is neither resolved nor the last thing on the
+    /// branch is a state the one-wait invariant makes unproducible live —
+    /// a session that died mid-wait — and the block says so instead of
+    /// ticking on like an active wait.
+    #[test]
+    fn an_armed_wait_left_behind_by_later_records_says_so() {
+        let mut st = with_calls(vec![
+            Entry::Tool {
+                id: "w1".into(),
+                name: "wait_for".into(),
+                input: r#"{"condition": {"peer_idle": "eidolon-b26d"}, "timeout_s": 900}"#.into(),
+                output: Some(("[armed #3] waiting for …".into(), false)),
+            },
+            Entry::Info("the session ended here".into()),
+        ]);
+        st.detail = Detail::Full;
+        st.waits.insert(
+            "w1".into(),
+            crate::state::WaitView {
+                stale: true,
+                rows: vec![],
+                armed_at: std::time::Instant::now(),
+                deadline_s: 900,
+                settled: None,
+            },
+        );
+        let out = rows(&st, 78, 20);
         assert!(
-            out.iter().any(|r| r.contains("\u{263e}") && r.contains("woke it fired — waiting on background bg-1 finished")),
+            out.iter()
+                .any(|r| r.contains("not the last thing on this branch")),
             "{out:?}"
         );
     }
@@ -5052,6 +5545,43 @@ mod tests {
             dim_of("compacted") == theme.fg("faint").add_modifier.contains(Modifier::DIM),
             "an ordinary info line is still faint"
         );
+    }
+
+    fn question(result: &str) -> Entry {
+        let input = serde_json::json!({
+            "prompt": "Which store should the cache use?",
+            "options": ["sqlite", {"label": "redis", "description": "a server to run"}, "in-memory"],
+        });
+        Entry::Tool { id: "q1".into(), name: "choices_user".into(), input: input.to_string(), output: Some((result.into(), false)) }
+    }
+
+    #[test]
+    fn a_settled_question_keeps_its_choices_on_one_line_with_the_pick_marked_and_opens_to_a_list() {
+        let mut st = with_calls(vec![
+            Entry::User("go".into()),
+            call("bash", true),
+            question("redis\n\n[The operator's note:]\nbut keep the sqlite tests"),
+            call("bash", true),
+        ]);
+        let out = rows(&st, 100, 10);
+        let row = "? Which store should the cache use? · sqlite · ▶ redis · in-memory · note: but keep the sqlite tests";
+        assert!(out.iter().any(|r| r.contains(row)), "{out:?}");
+        assert_eq!(out.iter().filter(|r| r.contains("Ran 1 shell command")).count(), 2, "the calls either side fold on their own: {out:?}");
+        st.detail = Detail::Full;
+        let out = rows(&st, 100, 24);
+        let list = ["? Which store should the cache use?", "    1. sqlite", "  ▶ 2. redis", "       a server to run", "    3. in-memory"];
+        for row in list.into_iter().chain(["    note: but keep the sqlite tests"]) {
+            assert!(out.iter().any(|r| r.trim_end() == row), "{row:?} in {out:?}");
+        }
+    }
+
+    #[test]
+    fn a_dismissed_question_keeps_its_choices_and_says_so() {
+        let dismissed = question("the question was dismissed without an answer, and the turn ended there.");
+        let st = with_calls(vec![Entry::User("go".into()), dismissed]);
+        let out = rows(&st, 100, 6);
+        let row = "? Which store should the cache use? · sqlite · redis · in-memory · dismissed";
+        assert!(out.iter().any(|r| r.contains(row)), "{out:?}");
     }
 
     #[test]
@@ -5879,6 +6409,8 @@ mod tests {
             pick: None,
             body,
             masked: false,
+            noting: false,
+            steady: None,
         });
         let (rows, _) = draw(&st, serde_json::json!({ "kind": "transcript" }), 40, 12);
         let all = rows.join("\n");
@@ -6342,6 +6874,8 @@ mod tests {
             pick: Some(crate::state::PickAction::Run("login".into())),
             body: String::new(),
             masked: true,
+            noting: false,
+            steady: None,
         });
         let (buf, _) = painted_links(&s, 40, 12);
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
@@ -6374,6 +6908,8 @@ mod tests {
             pick: None,
             body: String::new(),
             masked: false,
+            noting: false,
+            steady: None,
         });
         let (buf, _) = painted_links(&s, 40, 12);
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();

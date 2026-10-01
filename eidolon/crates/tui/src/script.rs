@@ -148,6 +148,74 @@ pub fn warm() {
     let _ = default_script();
 }
 
+/// One plugin's compiled ui payload: the script, and the plugin's name —
+/// the namespace its panel answers to and its commands print under.
+/// One entry per `ui/*.rn` that compiled; a plugin with two payload
+/// files appears twice, and the first `panel` among them is the one the
+/// slot draws.
+#[derive(Clone)]
+pub struct PluginUi {
+    pub plugin: String,
+    pub script: UiScript,
+}
+
+/// The ui sources every installed plugin carries: `(plugin, stem,
+/// source)`, plugins in discovery order and stems sorted inside, so a
+/// merge is deterministic and a listing cannot flip on readdir order.
+/// Each `Err` is the line a broken payload costs — a plugin whose
+/// manifest does not compile, a ui file that cannot be read — and
+/// contributes nothing else: presence is not permission, and a broken
+/// plugin is a notice, never a hole in the frame.
+pub fn plugin_ui_sources(dir: &std::path::Path) -> Vec<Result<(String, String, String), String>> {
+    let plugins = match eidolon_rune::plugins::discover(dir) {
+        Ok(p) => p,
+        Err(e) => return vec![Err(format!("reading {}: {e:#}", dir.display()))],
+    };
+    let mut out = Vec::new();
+    for entry in plugins {
+        let name = entry.name().to_string();
+        match entry {
+            eidolon_rune::plugins::Plugin::Installed { dir: pdir, manifest } => {
+                // The record consult: a plugin the operator disabled is
+                // present but loads nothing — its ui does not merge, its
+                // panel slot draws as nothing, and the snapshot's
+                // `plugins` does not name it. Fails open: no record says
+                // nothing, and a directory the operator can see is then
+                // enabled, the same as before records existed.
+                if !eidolon_rune::store::Store::is_enabled(dir, &manifest.name) {
+                    continue;
+                }
+                let ui = pdir.join("ui");
+                let mut stems: Vec<String> = match std::fs::read_dir(&ui) {
+                    Ok(entries) => entries
+                        .filter_map(Result::ok)
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "rn"))
+                        .filter_map(|e| e.path().file_stem()?.to_str().map(String::from))
+                        .collect(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        out.push(Err(format!("plugin {name}: reading ui/: {e:#}")));
+                        continue;
+                    }
+                };
+                stems.sort();
+                for stem in stems {
+                    match std::fs::read_to_string(ui.join(format!("{stem}.rn"))) {
+                        Ok(src) => out.push(Ok((manifest.name.clone(), stem, src))),
+                        Err(e) => out.push(Err(format!(
+                            "plugin {name}: reading ui/{stem}.rn: {e:#}"
+                        ))),
+                    }
+                }
+            }
+            eidolon_rune::plugins::Plugin::Broken { dir: _, reason } => {
+                out.push(Err(format!("plugin {name}: {reason}")));
+            }
+        }
+    }
+    out
+}
+
 impl UiScript {
     /// Compile the prelude plus `ui_src` into one unit sharing a namespace.
     /// The default script is compiled once per process ([`default_script`]);
@@ -249,6 +317,25 @@ impl UiScript {
     /// checklist names, as short words or glyphs in colours of their own.
     pub fn wait_tags(&self) -> Option<anyhow::Result<serde_json::Value>> {
         self.has("wait_tags").then(|| self.call("wait_tags", vec![]))
+    }
+
+    /// The plugins' panel nodes, if the payload defines a
+    /// `plugin_panel` — the name the prelude leaves free (`panel` is the
+    /// boxed-container builder every ui script already has). `None`
+    /// is not an error: a ui payload may carry tables or commands only,
+    /// and a slot that names such a plugin draws as nothing.
+    pub fn panel(&self, state: serde_json::Value) -> Option<anyhow::Result<serde_json::Value>> {
+        self.has("plugin_panel").then(|| self.call("plugin_panel", vec![state]))
+    }
+
+    /// The payload's live-source declarations, if it defines `sources` —
+    /// name → `{ tool, args, every }`, what to fetch and how often,
+    /// never how. Read **once**, at load, with an empty snapshot: the
+    /// declaration bounds itself to fixed args, and nothing on the draw
+    /// path is consulted to read it. `None` is not an error — a payload
+    /// may carry a panel that reads no live source at all.
+    pub fn sources(&self) -> Option<anyhow::Result<serde_json::Value>> {
+        self.has("sources").then(|| self.call("sources", vec![serde_json::json!({})]))
     }
 
     /// The script's own commands, if it declares any — see
@@ -456,6 +543,7 @@ mod tests {
             "following": true, "detail": "folded", "mode": "insert", "mode_colour": "green", "mode_label": "INS", "mode_sigil": "",
             "mode_kind": "insert", "pending": "", "empty": true, "copied": false,
             "queued": 0, "transcript_len": 0, "fresh": false, "tick": 0, "dispatch": "mneme",
+            "plugins": [],
             "tracing": false, "trace_at": 0, "trace_blocks": 0, "trace_kind": "", "trace_open": false,
             "trace_extend": false, "trace_span": 0, "yolo": false });
         let tree = s.view(state.clone()).unwrap();

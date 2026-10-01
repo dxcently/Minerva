@@ -1,0 +1,66 @@
+// policy.permits.rn — what the operator has granted. **Machine-edited: hand
+// edits are lost.** This file is rewritten whole, rows sorted, by
+// `eidolon plugins trust` / `untrust` / `grant` / `revoke` and by the
+// ask-once answers a session records; a write whose composed unit would not
+// compile is refused and the previous file stays on disk — a stale vouch
+// beats a broken gate.
+//
+// It is compiled **in front of** `policy.rn` into one unit and shares its
+// namespace, so the table may call `vouched` and `granted` in its own words
+// where it wants nuance; the policy stage calls them where the table has no
+// answer. A vouch's content hash is compared in Rust against the tool that
+// is actually loaded — an edited plugin re-asks — and no value of any
+// granted secret ever passes through here, only the fact of the grant.
+const VOUCHE = [];
+const GRANT = [];
+const ATTEST = [];
+
+/// Everything the file holds, for the reader in Rust. Not a lookup: the
+/// stage and the table use `vouched` and `granted` below.
+pub fn permit_rows() {
+    #{ vouch: VOUCHE, grant: GRANT, attest: ATTEST }
+}
+
+/// The vouch row for one verb, or nothing. The row carries the plugin, the
+/// verb, who granted it and when, and the **tool script's content hash** the
+/// Rust side compares against what is loaded.
+pub fn vouched(tool) {
+    for row in VOUCHE {
+        if row.verb == tool {
+            return row;
+        }
+    }
+    None
+}
+
+/// The grant row covering one tool's reach for one source, or nothing.
+/// The source is matched the way the gate resolves it: a stored `~/`
+/// spelling and the expanded path it names are one source, whichever side
+/// carries the tilde — `grant_source_eq` resolves a leading `~/` the way
+/// the host resolves a `token_file`, and every other spelling matches
+/// only itself. There is no plugin-wide shorthand: grouping is a CLI act
+/// that writes one row per installed verb at the moment of the yes, so a
+/// row exists only for a verb the operator could name when they gave it.
+/// A legacy wide row's `wide_plugin` is carried in the file and honoured
+/// by nothing — the verbs it covered ask again.
+pub fn granted(tool, source) {
+    for row in GRANT {
+        if grant_source_eq(row.source, source) && row.tool == tool {
+            return row;
+        }
+    }
+    None
+}
+
+/// The attestation for one plugin's service declaration, if the operator
+/// approved one and its hash is still what the plugin declares — the
+/// caller passes the hash computed from the declaration at hand, so a
+/// changed command simply does not match.
+pub fn attested(plugin, hash) {
+    for row in ATTEST {
+        if row.plugin == plugin && row.hash == hash {
+            return row;
+        }
+    }
+    None
+}

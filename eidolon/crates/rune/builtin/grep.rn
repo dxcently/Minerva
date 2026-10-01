@@ -13,7 +13,7 @@ pub fn manifest() {
                 "path": #{ "type": "string", "description": "File or directory to search (default: working directory)" },
                 "glob": #{ "type": "string", "description": "Comma-separated file globs to include, e.g. \"*.rs,*.toml\"" },
                 "case_insensitive": #{ "type": "boolean", "description": "Ignore case (default false)" },
-                "max": #{ "type": "integer", "description": "Maximum matches to return (default 200)" },
+                "limit": #{ "type": "integer", "description": "Maximum matches to return (default 200)" },
             },
             "required": ["pattern"],
         },
@@ -25,5 +25,5 @@ pub async fn call(input) {
         Some(b) => b == true,
         None => false,
     };
-    eidolon::grep(input.pattern, input.get("path"), input.get("glob"), ci, input.get("max")).await
+    eidolon::grep(input.pattern, input.get("path"), input.get("glob"), ci, input.get("limit")).await
 }

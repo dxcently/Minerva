@@ -133,6 +133,20 @@ pub struct Ruling {
     /// only annotate — and that is precisely what the operator asked for
     /// when they armed it.
     pub yolo: bool,
+    /// Set when the policy store answered a question the table could not: a
+    /// **vouch** the operator granted (`eidolon plugins trust`), matched at
+    /// the table's fallthrough with the tool's content hash intact, so the
+    /// tool that runs is exactly the tool that was vouched.
+    ///
+    /// Like [`Self::judged`] it annotates rather than rewrites — the
+    /// [`Verdict::Allow`] it rides is this hook's own answer, reached
+    /// without running anything or asking anybody. It is kept apart from
+    /// `judged` because the two are different kinds of yes: this one is
+    /// **data said yes** — a record the operator wrote once, mechanically —
+    /// where the judge's is a model's opinion of one call. The record's
+    /// `note` carries the grant's naming, so a ledger reading the log can
+    /// tell the three apart.
+    pub vouched: Option<String>,
 }
 
 impl Ruling {
@@ -171,6 +185,7 @@ impl From<Verdict> for Ruling {
             structural: false,
             judged: None,
             yolo: false,
+            vouched: None,
         }
     }
 }

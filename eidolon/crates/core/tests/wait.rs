@@ -1,13 +1,16 @@
 //! Parks, end to end on the loop.
 //!
-//! Three properties, and each is one the design leans on: the turn a
+//! Four properties, and each is one the design leans on: the turn a
 //! `wait_for` call is made in **ends there** (the harness owns that decision,
 //! because a model left to stop on its own goes and polls instead), a fire is
 //! **journaled before it reaches the model** so replay can say why the session
-//! woke, and a park from an earlier turn **cannot** cut short a later one (or
-//! a typed message could never be answered).
+//! woke, a park from an earlier turn **cannot** cut short a later one (or a
+//! typed message could never be answered), and a session that **died parked**
+//! wakes on resume — the park is rebuilt from the branch alone, the deadline
+//! it was given is the deadline it keeps, and a wait the branch shows
+//! finished is left finished.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -72,6 +75,14 @@ struct Harness {
 
 fn harness(dir: &Path, provider: Arc<ScriptedProvider>, fake: Arc<Fake>) -> Harness {
     let session = Session::create(&dir.join("s.log"), "m", dir, Some("sys".into())).unwrap();
+    harness_on(session, provider, fake)
+}
+
+/// The same wiring over a session the caller made — the shape a resume
+/// builds: the log is the one the dead process wrote, the parks and the
+/// tool are new, and the cwd comes from the log, not the caller.
+fn harness_on(session: Session, provider: Arc<ScriptedProvider>, fake: Arc<Fake>) -> Harness {
+    let cwd = PathBuf::from(session.cwd().unwrap_or_else(|| ".".into()));
     let session = Arc::new(Mutex::new(session));
     // The parks are the consumer's: the tool is built against them, the
     // dispatcher is built against that registry, and the agent is handed the
@@ -94,6 +105,9 @@ fn harness(dir: &Path, provider: Arc<ScriptedProvider>, fake: Arc<Fake>) -> Harn
             prompt: None,
             render: None,
             deferred: false,
+            script_only: false,
+            plugin: None,
+            source_hash: None,
         },
     }));
     let dispatcher = Arc::new(Dispatcher::new(
@@ -102,7 +116,7 @@ fn harness(dir: &Path, provider: Arc<ScriptedProvider>, fake: Arc<Fake>) -> Harn
         ScriptedUser::new(true),
         EventBus::default(),
         session.clone(),
-        dir.to_path_buf(),
+        cwd,
     ));
     let agent = Arc::new(Agent::new(
         provider,
@@ -263,7 +277,10 @@ async fn an_already_true_condition_does_not_park() {
 }
 
 /// A park belongs to the turn that asked for it. One armed earlier and still
-/// waiting must not end a turn the operator's own message started.
+/// waiting must not end a turn the operator's own message started — and the
+/// turn it does not end is the turn that **retires** it: the session is not
+/// still waiting on a condition it was woken away from, and the one slot has
+/// to be free for a `wait_for` in the new turn (bugs tracker #21).
 #[tokio::test]
 async fn a_park_from_an_earlier_turn_cannot_end_a_later_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -293,10 +310,22 @@ async fn a_park_from_an_earlier_turn_cannot_end_a_later_one() {
         "a park from the previous turn ended this one: {out:?}"
     );
     assert_eq!(provider.requests.lock().unwrap().len(), 3);
+    // The wait the message interrupted ends as that turn begins, and the
+    // driver is handed the fact so it can say so. Until 2026-09-28 the park
+    // simply stayed armed, holding the one slot: arming a corrected
+    // condition was then refused with no way to cancel it.
+    let retired = h.agent.parks().take_retired();
+    assert_eq!(retired.len(), 1, "one wait ended: {retired:?}");
     assert!(
-        h.agent.parks().is_armed(),
-        "the older park was spent by an unrelated turn"
+        retired[0].condition.contains("never"),
+        "and it is named: {:?}",
+        retired[0]
     );
+    assert!(
+        !h.agent.parks().is_armed(),
+        "the interrupted wait is over, and the slot is free"
+    );
+    assert!(h.agent.parks().take_retired().is_empty(), "taken once, not twice");
 }
 
 /// `any` names the leaf that actually fired, not the condition whole: the
@@ -390,4 +419,355 @@ async fn the_deadline_names_what_stayed_open() {
 /tmp/also-never exists",
         "the deadline does not name what stayed open: {outcome}"
     );
+}
+
+/// The property the resume leans on: a session that died parked wakes anyway.
+/// The park is rebuilt from the branch — the same registration, the same
+/// deadline — and the wake is the ordinary one: a `TriggerFired` on the
+/// branch, a frame to the model, a turn to answer it in.
+#[tokio::test]
+async fn a_session_that_died_parked_wakes_when_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.log");
+    let provider = ScriptedProvider::new(vec![ScriptedProvider::tool(
+        "call-1",
+        "wait_for",
+        json!({
+            "condition": { "peer_idle": "eidolon-5a0e" },
+            "timeout_s": 600,
+            "note": "before I touch the shared file"
+        }),
+    )]);
+    let fake = Arc::new(Fake::default());
+    let h = harness(dir.path(), provider, fake);
+    let out = h.turn("wait for the peer before editing").await;
+    assert!(
+        matches!(out, TurnOutcome::Settled { stop_reason: StopReason::Waiting, .. }),
+        "the turn did not park: {out:?}"
+    );
+    assert!(h.agent.parks().is_armed());
+    drop(h); // The process is gone. The branch is what survives.
+
+    // The resume: the log is reopened, and nothing is armed until the
+    // branch says there was a wait.
+    let fake = Arc::new(Fake::default());
+    let provider = ScriptedProvider::new(vec![ScriptedProvider::text("awake — carrying on")]);
+    let h = harness_on(Session::open(&path).unwrap(), provider.clone(), fake.clone());
+    assert!(
+        !h.agent.parks().is_armed(),
+        "a fresh resume armed something on its own"
+    );
+    let note = h
+        .agent
+        .rearm_from_branch(eidolon_core::wait::DEFAULT_TIMEOUT, eidolon_core::wait::MAX_TIMEOUT)
+        .await
+        .unwrap()
+        .expect("the branch ends with a parked wait and nothing was re-armed");
+    assert!(note.contains("eidolon-5a0e"), "{note}");
+    assert!(h.agent.parks().is_armed(), "the re-arm did not arm");
+    let waiting = h.agent.parks().waiting_on().unwrap();
+    assert!(waiting.contains("eidolon-5a0e"), "{waiting}");
+    assert!(
+        !waiting.contains("(deadline in 600s)"),
+        "the deadline restarted instead of being kept: {waiting}"
+    );
+
+    // The world changes while the resumed session waits: the ordinary wake.
+    fake.idle.store(true, Ordering::SeqCst);
+    h.settled().await;
+    let fires = h.agent.take_fires().await;
+    assert_eq!(fires.len(), 1, "the re-armed park's fire was not journaled");
+    let out = h.agent.continue_turn(CancellationToken::new()).await.unwrap();
+    assert!(
+        matches!(out, TurnOutcome::Settled { stop_reason: StopReason::EndTurn, .. }),
+        "{out:?}"
+    );
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "the wake cost more than one model call");
+    assert!(
+        requests.last().unwrap().messages.iter().any(|m| {
+            m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call-1"
+            ))
+        }),
+        "the resumed transcript lost the registration"
+    );
+    let said = requests
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .map(|m| m.text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        said.contains("You asked to be woken when session eidolon-5a0e is idle"),
+        "the model was not told what it had been waiting for: {said}"
+    );
+    assert!(
+        said.contains("It resolved: it fired — session eidolon-5a0e is idle"),
+        "the model was not told how the wait resolved: {said}"
+    );
+}
+
+/// A deadline that passed while the process was down is not restarted: the
+/// first evaluation after the resume resolves the wait, through the ordinary
+/// wake — the model is told the deadline arrived, not left waiting a second
+/// full timeout for a fact already settled.
+#[tokio::test]
+async fn a_deadline_that_passed_while_down_fires_at_the_first_evaluation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.log");
+    let provider = ScriptedProvider::new(vec![ScriptedProvider::tool(
+        "call-1",
+        "wait_for",
+        json!({ "condition": { "peer_idle": "slow-peer" }, "timeout_s": 1 }),
+    )]);
+    let h = harness(dir.path(), provider, Arc::new(Fake::default()));
+    let out = h.turn("wait one second for something that will not come").await;
+    assert!(
+        matches!(out, TurnOutcome::Settled { stop_reason: StopReason::Waiting, .. }),
+        "the turn did not park: {out:?}"
+    );
+    assert!(h.agent.parks().is_armed());
+    drop(h);
+    tokio::time::sleep(Duration::from_millis(1150)).await; // The deadline passes in the dark.
+
+    let fake = Arc::new(Fake::default());
+    let provider = ScriptedProvider::new(vec![ScriptedProvider::text("it will never come")]);
+    let h = harness_on(Session::open(&path).unwrap(), provider.clone(), fake);
+    h.agent
+        .rearm_from_branch(eidolon_core::wait::DEFAULT_TIMEOUT, eidolon_core::wait::MAX_TIMEOUT)
+        .await
+        .unwrap()
+        .expect("the branch ends with a parked wait");
+    h.settled().await; // The first evaluation is enough.
+    let fires = h.agent.take_fires().await;
+    assert_eq!(fires.len(), 1);
+    {
+        let s = h.session.lock().await;
+        assert!(
+            s.records().iter().any(|r| matches!(&r.kind,
+                RecordKind::TriggerFired { outcome, .. }
+                    if outcome.starts_with("the deadline arrived first"))),
+            "the fire does not say the deadline arrived"
+        );
+    }
+    let out = h.agent.continue_turn(CancellationToken::new()).await.unwrap();
+    assert!(
+        matches!(out, TurnOutcome::Settled { stop_reason: StopReason::EndTurn, .. }),
+        "{out:?}"
+    );
+    let said = provider
+        .requests
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .map(|m| m.text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        said.contains("It resolved: the deadline arrived first"),
+        "the model was not told the deadline passed: {said}"
+    );
+}
+
+/// A wait the branch shows resolved stays resolved: its `TriggerFired` is on
+/// the branch, the wake happened, and a resume that re-armed it would wake
+/// the model twice for one wait.
+#[tokio::test]
+async fn a_wait_the_branch_says_resolved_is_not_rearmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.log");
+    let provider = ScriptedProvider::new(vec![ScriptedProvider::tool(
+        "call-1",
+        "wait_for",
+        json!({ "condition": { "peer_idle": "eidolon-5a0e" }, "timeout_s": 600 }),
+    )]);
+    let fake = Arc::new(Fake::default());
+    let h = harness(dir.path(), provider, fake.clone());
+    let out = h.turn("wait for the peer").await;
+    assert!(
+        matches!(out, TurnOutcome::Settled { stop_reason: StopReason::Waiting, .. }),
+        "the turn did not park: {out:?}"
+    );
+    fake.idle.store(true, Ordering::SeqCst);
+    h.settled().await;
+    h.agent.take_fires().await; // The wake is on the branch.
+    drop(h);
+
+    let fake = Arc::new(Fake::default());
+    let provider = ScriptedProvider::new(vec![]);
+    let h = harness_on(Session::open(&path).unwrap(), provider, fake);
+    let rearmed = h
+        .agent
+        .rearm_from_branch(eidolon_core::wait::DEFAULT_TIMEOUT, eidolon_core::wait::MAX_TIMEOUT)
+        .await
+        .unwrap();
+    assert!(rearmed.is_none(), "a resolved wait was re-armed: {rearmed:?}");
+    assert!(!h.agent.parks().is_armed(), "and it armed a park");
+}
+
+/// The reading rule itself, over records written by hand: what the branch
+/// says ended the wait (its own resolution, a later turn's opening, mail the
+/// park's level admitted) and what did not (mail the level refused, a
+/// fan-out, an operator tool dispatch). Also here: the operator's own
+/// `wait_for` dispatch arms a park the walk can read, and a branch with no
+/// settle re-arms nothing — an unsettled turn is `continue_turn`'s to
+/// resume, not a park's.
+#[tokio::test]
+async fn the_walk_reads_retirement_off_the_branch() {
+    let walk = |s: &Session| {
+        eidolon_core::wait::parked_wait(
+            s.branch().as_slice(),
+            Duration::from_secs(900),
+            Duration::from_secs(6 * 60 * 60),
+        )
+    };
+    let input = |wake: Option<u8>| {
+        let mut v = json!({ "condition": { "peer_idle": "p" }, "timeout_s": 600 });
+        if let Some(w) = wake {
+            v["wake"] = json!(w);
+        }
+        Json::from_value(&v)
+    };
+
+    // The branch ends on the armed result and its `Waiting` settle: live.
+    let (dir, s) = parked_branch(input(None), true);
+    let parked = walk(&s).expect("the live park was not found");
+    assert_eq!(parked.call_id, "call-1");
+    assert_eq!(parked.timeout, Duration::from_secs(600));
+    drop(s);
+    drop(dir);
+
+    // Its own resolution on the branch: finished.
+    let (dir, mut s) = parked_branch(input(None), true);
+    s.append(RecordKind::TriggerFired {
+        call_id: "call-1".into(),
+        condition: "session p is idle".into(),
+        outcome: "it fired".into(),
+    })
+    .unwrap();
+    assert!(walk(&s).is_none(), "a resolved wait was found live");
+    drop(s);
+    drop(dir);
+
+    // A later turn the operator started: retired, not live.
+    let (dir, mut s) = parked_branch(input(None), true);
+    s.append(RecordKind::UserMessage(Message::user_text("never mind")))
+        .unwrap();
+    assert!(walk(&s).is_none(), "a retired wait was found live");
+    drop(s);
+    drop(dir);
+
+    // Direct mail at the default level is admitted: retired.
+    let (dir, mut s) = parked_branch(input(None), true);
+    s.append(peer_record(None)).unwrap();
+    assert!(walk(&s).is_none(), "admitted mail left the wait live");
+    drop(s);
+    drop(dir);
+
+    // The same mail at `wake: 0` is refused: the level the model chose
+    // holds, and the wait is still live.
+    let (dir, mut s) = parked_branch(input(Some(0)), true);
+    s.append(peer_record(None)).unwrap();
+    assert!(walk(&s).is_some(), "mail the level refused retired the wait");
+    drop(s);
+    drop(dir);
+
+    // A fan-out is not waking mail: still live at the default level.
+    let (dir, mut s) = parked_branch(input(None), true);
+    s.append(peer_record(Some("general".into()))).unwrap();
+    assert!(walk(&s).is_some(), "a fan-out retired the wait");
+    drop(s);
+    drop(dir);
+
+    // An operator tool dispatch begins no turn: retires nothing.
+    let (dir, mut s) = parked_branch(input(None), true);
+    s.append(RecordKind::UserToolCall {
+        tool_use_id: "op-1".into(),
+        name: "search".into(),
+        input: Json::from_value(&json!({})),
+        utterance: None,
+    })
+    .unwrap();
+    assert!(walk(&s).is_some(), "an operator tool dispatch retired the wait");
+    drop(s);
+    drop(dir);
+
+    // No settle: the turn never finished. Not a parked branch — the
+    // unsettled-turn resume path owns this one.
+    let (dir, s) = parked_branch(input(None), false);
+    assert!(walk(&s).is_none(), "an unsettled turn was read as a park");
+    drop(s);
+    drop(dir);
+
+    // The operator's own `wait_for` dispatch carries its input the same
+    // way, and the walk reads it the same way.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(&dir.path().join("s.log"), "m", dir.path(), Some("sys".into())).unwrap();
+    s.append(RecordKind::UserToolCall {
+        tool_use_id: "op-2".into(),
+        name: "wait_for".into(),
+        input: input(None),
+        utterance: Some("wait_for peer p".into()),
+    })
+    .unwrap();
+    s.append(RecordKind::ToolResult {
+        tool_use_id: "op-2".into(),
+        content: format!(
+            "{}2] waiting for session p\nwoken by a frame or the deadline, whichever is first; \
+the turn ends here; deadline: 600s",
+            eidolon_core::wait::ARMED_MARK
+        ),
+        is_error: false,
+    })
+    .unwrap();
+    s.append(RecordKind::TurnSettled { stop_reason: StopReason::Waiting, usage: Usage::default() })
+        .unwrap();
+    let parked = walk(&s).expect("the operator's park was not found");
+    assert_eq!(parked.call_id, "op-2");
+}
+
+fn peer_record(channel: Option<String>) -> RecordKind {
+    RecordKind::PeerMessage {
+        from: "eidolon-1111".into(),
+        from_cwd: "/tmp/elsewhere".into(),
+        channel,
+        text: "a note from a colleague".into(),
+    }
+}
+
+/// The prefix every live-at-death branch has: the armed `wait_for`, its
+/// result, and — when `settle` — the `Waiting` settle.
+fn parked_branch(input: Json, settle: bool) -> (tempfile::TempDir, Session) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(&dir.path().join("s.log"), "m", dir.path(), Some("sys".into())).unwrap();
+    s.append(RecordKind::UserMessage(Message::user_text("wait for p")))
+        .unwrap();
+    s.append(RecordKind::AssistantMessage(Message::assistant(vec![ContentBlock::ToolUse {
+        id: "call-1".into(),
+        name: "wait_for".into(),
+        input,
+    }])))
+    .unwrap();
+    s.append(RecordKind::ToolResult {
+        tool_use_id: "call-1".into(),
+        content: format!(
+            "{}1] waiting for session p\nwoken by a frame or the deadline, whichever is first; \
+the turn ends here; deadline: 600s",
+            eidolon_core::wait::ARMED_MARK
+        ),
+        is_error: false,
+    })
+    .unwrap();
+    if settle {
+        s.append(RecordKind::TurnSettled { stop_reason: StopReason::Waiting, usage: Usage::default() })
+            .unwrap();
+    }
+    (dir, s)
 }

@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use eidolon_core::dispatch::Dispatcher;
 use eidolon_core::ipc;
 use eidolon_core::tool::{CallOrigin, ToolCall, ToolManifest};
+use eidolon_core::user::operator_note_on;
 
 /// Listen on `path`; returns the task so the driver can abort it.
 pub async fn serve(
@@ -70,7 +71,7 @@ async fn decide(d: &Dispatcher, payload: &[u8], cancel: &CancellationToken) -> V
     // adjudicated *and* executed by `Dispatcher::dispatch`. Asking here as
     // well would put the same call in front of the user twice.
     if crate::is_eidolon_tool(&name) {
-        return json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "eidolon tool; adjudicated at dispatch" } });
+        return allow("eidolon tool; adjudicated at dispatch");
     }
     let input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
     let id = payload
@@ -85,12 +86,25 @@ async fn decide(d: &Dispatcher, payload: &[u8], cancel: &CancellationToken) -> V
         origin: CallOrigin::Model,
     };
     let manifest = ToolManifest::synthetic(&name, crate::approval_for(&name));
-    match d.adjudicate(&call, &manifest, cancel).await {
-        Ok(()) => {
-            json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "eidolon policy" } })
-        }
+    let (cleared, operator_note) = d.adjudicate(&call, &manifest, cancel).await;
+    // `permissionDecisionReason` reaches the model only on a deny;
+    // `additionalContext` reaches it either way, but only on Claude Code
+    // 2.1.9+ (2.1.110 fixed a case where it was dropped). Nothing here checks
+    // the CLI version: on an older CLI an operator's note is silently lost, so
+    // if a note never reaches the model, check `claude --version` first.
+    let context = operator_note.map(|note| operator_note_on(&call.id, note.as_str()));
+    let mut decision = match cleared {
+        Ok(()) => allow("eidolon policy"),
         Err(reason) => deny(&reason),
+    };
+    if let Some(context) = context {
+        decision["hookSpecificOutput"]["additionalContext"] = json!(context);
     }
+    decision
+}
+
+fn allow(reason: &str) -> Value {
+    json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": reason } })
 }
 
 fn deny(reason: &str) -> Value {
@@ -133,9 +147,10 @@ fn forward(path: &str, payload: &[u8]) -> anyhow::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eidolon_core::policy::AllowAll;
+    use eidolon_core::policy::{AllowAll, Ruling};
     use eidolon_core::testing::AlwaysAsk;
     use eidolon_core::testing::ScriptedUser;
+    use eidolon_core::user::{Choice, Consent, Reply, UserIo, Words};
     use eidolon_core::{EventBus, Session, ToolRegistry};
     use tokio::sync::Mutex;
 
@@ -252,5 +267,58 @@ mod tests {
         let out = fwd(&sock, br#"{"tool_name":"mcp__eidolon__bash","tool_input":{"command":"ls"},"tool_use_id":"t1"}"#).await;
         assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "allow");
         task.abort();
+    }
+
+    struct Consenting(Consent);
+
+    #[async_trait::async_trait]
+    impl UserIo for Consenting {
+        async fn choose(&self, _: &str, _: &[Choice], _: &CancellationToken) -> Option<Reply> {
+            None
+        }
+        async fn approve(&self, _: &ToolCall, _: &ToolManifest, _: &Ruling, _: &CancellationToken) -> Consent {
+            self.0.clone()
+        }
+    }
+
+    async fn decided(dir: &std::path::Path, given: bool, operator_note: Option<&str>) -> Value {
+        let session = Session::create(&dir.join(format!("{given}.log")), "m", dir, None).unwrap();
+        let consent = Consent {
+            given,
+            operator_note: operator_note.map(|n| Words::new(n).unwrap()),
+        };
+        let d = Dispatcher::new(
+            ToolRegistry::new(),
+            Arc::new(AlwaysAsk),
+            Arc::new(Consenting(consent)),
+            EventBus::default(),
+            Arc::new(Mutex::new(session)),
+            dir.to_path_buf(),
+        );
+        let payload = br#"{"tool_name":"Bash","tool_input":{"command":"ls"},"tool_use_id":"t1"}"#;
+        decide(&d, payload, &CancellationToken::new()).await["hookSpecificOutput"].clone()
+    }
+
+    #[tokio::test]
+    async fn an_allow_without_a_note_carries_no_additional_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = decided(dir.path(), true, None).await;
+        assert_eq!(out["permissionDecision"], "allow");
+        assert_eq!(out["permissionDecisionReason"], "eidolon policy");
+        assert!(out.get("additionalContext").is_none(), "{out}");
+    }
+
+    #[tokio::test]
+    async fn an_operators_note_reaches_the_model_as_additional_context_on_allow_and_on_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = decided(dir.path(), true, Some("only in /tmp")).await;
+        assert_eq!(out["permissionDecision"], "allow");
+        assert_eq!(out["permissionDecisionReason"], "eidolon policy");
+        assert_eq!(out["additionalContext"], "[The operator's note on call t1:]\nonly in /tmp");
+
+        let out = decided(dir.path(), false, Some("use the staging box")).await;
+        assert_eq!(out["permissionDecision"], "deny");
+        assert_eq!(out["permissionDecisionReason"], "eidolon: the user declined this tool call");
+        assert_eq!(out["additionalContext"], "[The operator's note on call t1:]\nuse the staging box");
     }
 }

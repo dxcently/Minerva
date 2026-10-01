@@ -235,6 +235,9 @@ do not copy Mneme's RPC argument shape into them. Read the scheduling, Rune, or 
         }),
         render: None,
         deferred: !opts.core.iter().any(|c| c == &listed.name),
+        script_only: false,
+        plugin: None,
+        source_hash: None,
     }
 }
 

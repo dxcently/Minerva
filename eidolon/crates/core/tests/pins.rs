@@ -23,6 +23,7 @@
 use eidolon_core::message::{ContentBlock, Json, Message, StopReason, Usage};
 use eidolon_core::session::{PolicyOutcome, RecordKind};
 use eidolon_core::usage::TurnTiming;
+use eidolon_core::workflow::RunStatus;
 
 /// Where each variant sits. Exhaustive: a variant missing here does not
 /// compile, which is the moment to ask where it goes (the end) and to pin
@@ -55,6 +56,15 @@ fn ordinal(k: &RecordKind) -> u8 {
         TurnPace { .. } => 22,
         CommandResults { .. } => 23,
         TriggerFired { .. } => 24,
+        WorkflowStart { .. } => 25,
+        WorkflowStep { .. } => 26,
+        WorkflowEnd { .. } => 27,
+        ModelSpend { .. } => 28,
+        ApiRequest { .. } => 29,
+        WorkflowBudget { .. } => 30,
+        PeerAnswer { .. } => 31,
+        OperatorMessage { .. } => 32,
+        TurnFailed { .. } => 33,
     }
 }
 
@@ -71,8 +81,16 @@ fn usage() -> Usage {
 /// nineteen were captured from a build at commit `152be41`; `TurnSpend`
 /// from the build that added it, at the end. `TurnPace` likewise, from the
 /// build that added it (2026-09-12), `CommandResults` from the build that
-/// added it (2026-09-14), and `TriggerFired` from the build that added it
-/// (2026-09-22).
+/// added it (2026-09-14), `TriggerFired` from the build that added it
+/// (2026-09-22), and the three `Workflow*` records from the build that added
+/// them (2026-09-27). `ModelSpend` likewise, appended after the workflow
+/// records (2026-09-27). `ApiRequest` likewise, appended after `ModelSpend`
+/// (2026-09-27). `WorkflowBudget` likewise, appended after `ApiRequest` —
+/// the caller's per-run budget, journaled so a resume reads its
+/// constraint from the branch (2026-09-27). `PeerAnswer` likewise,
+/// appended after `WorkflowBudget` — the fourth producer: an accepted
+/// peer answer's provenance (2026-09-27). `TurnFailed` likewise, appended
+/// after `OperatorMessage` — a provider-killed turn's row (2026-09-29).
 fn pinned() -> Vec<(RecordKind, &'static str)> {
     vec![
         (
@@ -227,6 +245,76 @@ fn pinned() -> Vec<(RecordKind, &'static str)> {
             },
             "1802743112746865206275696c642066696e6973686564086974206669726564",
         ),
+        (
+            RecordKind::WorkflowStart {
+                plugin: "jira".into(),
+                workflow: "triage".into(),
+                version: "0.1.0".into(),
+                hash: "ab12".into(),
+                args: Json("{\"since\":\"2026-09-01\"}".into()),
+            },
+            "19046a6972610674726961676505302e312e300461623132167b2273696e6365223a22323032362d30392d3031227d",
+        ),
+        (
+            RecordKind::WorkflowStep {
+                run: 3,
+                index: 0,
+                call_id: "w3-0".into(),
+                tool: "jira_search".into(),
+                input: Json("{\"jql\":\"x\"}".into()),
+            },
+            "1a060304000477332d300b6a6972615f7365617263680b7b226a716c223a2278227d",
+        ),
+        (
+            RecordKind::WorkflowEnd {
+                run: 3,
+                status: RunStatus::Parked,
+            },
+            "1b060302",
+        ),
+        (
+            RecordKind::ModelSpend {
+                key: "mock".into(),
+                call_id: "w3-1".into(),
+                usage: usage(),
+            },
+            "1c046d6f636b0477332d310605060306010602",
+        ),
+        (
+            RecordKind::ApiRequest {
+                consumer: "plugin:browser".into(),
+                service: "api.example.com".into(),
+            },
+            "1d0e706c7567696e3a62726f777365720f6170692e6578616d706c652e636f6d",
+        ),
+        (
+            RecordKind::WorkflowBudget {
+                run: 3,
+                steps: Some(2),
+                spend_micros: Some(500_000),
+            },
+            "1e0603010402010220a10700",
+        ),
+        (
+            RecordKind::PeerAnswer {
+                call_id: "w1-park0".into(),
+                peer: "eidolon-aaaa".into(),
+            },
+            "1f0877312d7061726b300c6569646f6c6f6e2d61616161",
+        ),
+        (
+            RecordKind::OperatorMessage {
+                from: "noah".into(),
+                text: "come back".into(),
+            },
+            "20046e6f616809636f6d65206261636b",
+        ),
+        (
+            RecordKind::TurnFailed {
+                error: "gw returned HTTP 502".into(),
+            },
+            "211467772072657475726e6564204854545020353032",
+        ),
     ]
 }
 
@@ -273,6 +361,3 @@ fn a_variant_sits_where_the_table_says() {
         );
     }
 }
-
-
-

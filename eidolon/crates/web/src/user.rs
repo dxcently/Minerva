@@ -14,8 +14,11 @@
 //!    "options":[{"label":"a"},{"label":"b","description":"…"}]}
 //! ```
 //!
+//! Any answer may carry a `note`.
+//!
 //! ```text
 //!   {"type":"ask-settled","ask_id":3,"how":"answered","answer":"yes"}
+//!   {"type":"ask-settled","ask_id":3,"how":"answered","answer":"no","note":"not on main"}
 //!   {"type":"ask-settled","ask_id":3,"how":"cancelled"}
 //! ```
 
@@ -29,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use eidolon_core::policy::{Ruling, Verdict};
 use eidolon_core::tool::{ToolCall, ToolManifest};
-use eidolon_core::user::{Choice, UserIo};
+use eidolon_core::user::{Choice, Consent, Reply, UserIo, Words, WordsRefused};
 
 const YES: &str = "yes";
 const NO: &str = "no";
@@ -76,9 +79,18 @@ impl Ask {
     }
 }
 
+/// A `POST /api/answer` body's `answer` and `note` as a [`Reply`]; a blank note is no note. `Err` is the 422's reason.
+pub fn reply(answer: String, note: Option<String>) -> Result<Reply, String> {
+    match note.as_deref().map(Words::new) {
+        None | Some(Err(WordsRefused::Blank)) => Ok(Reply::picked(answer)),
+        Some(Ok(note)) => Ok(Reply { label: answer, operator_note: Some(note) }),
+        Some(Err(why)) => Err(format!("note {why}")),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Settled {
-    Answered(String),
+    Answered(Reply),
     /// The token fired. Nothing above `UserIo` says why.
     Cancelled,
 }
@@ -91,9 +103,9 @@ impl Settled {
         }
     }
 
-    pub(crate) fn answer(&self) -> Option<&str> {
+    pub(crate) fn reply(&self) -> Option<&Reply> {
         match self {
-            Settled::Answered(a) => Some(a),
+            Settled::Answered(r) => Some(r),
             Settled::Cancelled => None,
         }
     }
@@ -117,7 +129,7 @@ pub enum Answer {
 
 struct Pending {
     ask: Ask,
-    reply: oneshot::Sender<Option<String>>,
+    reply: oneshot::Sender<Option<Reply>>,
 }
 
 pub struct WebUser {
@@ -161,25 +173,25 @@ impl WebUser {
         self.pending.lock().unwrap().len()
     }
 
-    pub fn answer(&self, ask_id: u64, answer: &str) -> Answer {
+    pub fn answer(&self, ask_id: u64, reply: Reply) -> Answer {
         let entry = {
             let mut pending = self.pending.lock().unwrap();
             let Some(entry) = pending.get(&ask_id) else { return Answer::Unknown };
-            if !entry.ask.accepts(answer) {
+            if !entry.ask.accepts(&reply.label) {
                 return Answer::Rejected;
             }
             pending.remove(&ask_id).expect("just looked it up")
         };
         let _ = self.asks.send(AskEvent::Settled {
             ask_id,
-            how: Settled::Answered(answer.to_string()),
+            how: Settled::Answered(reply.clone()),
         });
         // Fails only if the waiter's cancel fired first; nobody is left to tell.
-        let _ = entry.reply.send(Some(answer.to_string()));
+        let _ = entry.reply.send(Some(reply));
         Answer::Accepted
     }
 
-    async fn ask(&self, ask: Ask, cancel: &CancellationToken) -> Option<String> {
+    async fn ask(&self, ask: Ask, cancel: &CancellationToken) -> Option<Reply> {
         let ask_id = ask.ask_id();
         let (reply, rx) = oneshot::channel();
         // Registered before it is announced, so `pending` is complete for any
@@ -205,7 +217,7 @@ impl WebUser {
 
 #[async_trait]
 impl UserIo for WebUser {
-    async fn choose(&self, prompt: &str, options: &[Choice], cancel: &CancellationToken) -> Option<String> {
+    async fn choose(&self, prompt: &str, options: &[Choice], cancel: &CancellationToken) -> Option<Reply> {
         let ask = Ask::Question {
             ask_id: self.next_ask_id(),
             prompt: prompt.to_string(),
@@ -218,7 +230,7 @@ impl UserIo for WebUser {
     }
 
     /// Overridden so the page gets the call and the ruling, not a sentence.
-    async fn approve(&self, call: &ToolCall, _manifest: &ToolManifest, ruling: &Ruling, cancel: &CancellationToken) -> bool {
+    async fn approve(&self, call: &ToolCall, _manifest: &ToolManifest, ruling: &Ruling, cancel: &CancellationToken) -> Consent {
         // The fallback is the trait default's; the dispatcher only calls this on `Ask`.
         let prompt = match &ruling.verdict {
             Verdict::Ask(p) => p.clone(),
@@ -236,7 +248,7 @@ impl UserIo for WebUser {
             yolo: ruling.yolo,
             answers: [YES, NO],
         };
-        matches!(self.ask(ask, cancel).await.as_deref(), Some(YES))
+        self.ask(ask, cancel).await.into()
     }
 }
 
@@ -246,6 +258,7 @@ mod tests {
 
     use eidolon_core::policy::Approval;
     use eidolon_core::tool::CallOrigin;
+    use eidolon_core::user::MAX_WORDS_BYTES;
 
     use super::*;
 
@@ -269,6 +282,7 @@ mod tests {
             structural: true,
             judged: None,
             yolo: false,
+            vouched: None,
         }
     }
 
@@ -300,8 +314,8 @@ mod tests {
                 "answers": ["yes", "no"],
             })
         );
-        assert_eq!(user.answer(1, "yes"), Answer::Accepted);
-        assert!(approving.await.unwrap());
+        assert_eq!(user.answer(1, Reply::picked("yes")), Answer::Accepted);
+        assert!(approving.await.unwrap().given);
     }
 
     #[tokio::test]
@@ -325,8 +339,8 @@ mod tests {
                 "options": [{"label": "yes"}, {"label": "no"}],
             })
         );
-        assert_eq!(user.answer(1, "yes"), Answer::Accepted);
-        assert!(confirming.await.unwrap());
+        assert_eq!(user.answer(1, Reply::picked("yes")), Answer::Accepted);
+        assert!(confirming.await.unwrap().given);
     }
 
     #[tokio::test]
@@ -344,9 +358,9 @@ mod tests {
             AskEvent::Opened(a) => a.ask_id(),
             _ => panic!("expected Opened"),
         };
-        assert_eq!(user.answer(ask_id, "b"), Answer::Accepted);
-        assert_eq!(asked.await.unwrap().as_deref(), Some("b"));
-        assert_eq!(user.answer(ask_id, "a"), Answer::Unknown);
+        assert_eq!(user.answer(ask_id, Reply::picked("b")), Answer::Accepted);
+        assert_eq!(asked.await.unwrap(), Some(Reply::picked("b")));
+        assert_eq!(user.answer(ask_id, Reply::picked("a")), Answer::Unknown);
     }
 
     #[tokio::test]
@@ -364,11 +378,11 @@ mod tests {
             AskEvent::Opened(a) => a.ask_id(),
             _ => panic!("expected Opened"),
         };
-        assert_eq!(user.answer(ask_id, "c"), Answer::Rejected);
+        assert_eq!(user.answer(ask_id, Reply::picked("c")), Answer::Rejected);
         assert_eq!(user.pending_count(), 1, "a refused answer settles nothing");
         assert!(!asked.is_finished(), "the ask is still waiting");
-        assert_eq!(user.answer(ask_id, "a"), Answer::Accepted);
-        assert_eq!(asked.await.unwrap().as_deref(), Some("a"));
+        assert_eq!(user.answer(ask_id, Reply::picked("a")), Answer::Accepted);
+        assert_eq!(asked.await.unwrap(), Some(Reply::picked("a")));
         assert_eq!(user.pending_count(), 0);
     }
 
@@ -387,23 +401,23 @@ mod tests {
             AskEvent::Opened(a) => a.ask_id(),
             _ => panic!("expected Opened"),
         };
-        assert_eq!(user.answer(ask_id, "maybe"), Answer::Rejected);
+        assert_eq!(user.answer(ask_id, Reply::picked("maybe")), Answer::Rejected);
         assert_eq!(user.pending_count(), 1);
-        assert_eq!(user.answer(ask_id, "no"), Answer::Accepted);
-        assert!(!approving.await.unwrap(), "an approval only ever says yes to `yes`");
+        assert_eq!(user.answer(ask_id, Reply::picked("no")), Answer::Accepted);
+        assert!(!approving.await.unwrap().given, "an approval only ever says yes to `yes`");
     }
 
     #[tokio::test]
     async fn two_pending_asks_each_resolve_only_by_their_own_id_oldest_first() {
         let (user, first, second, ids) = two_open_asks().await;
 
-        assert_eq!(user.answer(ids[0], "a"), Answer::Accepted);
-        assert_eq!(first.await.unwrap().as_deref(), Some("a"));
+        assert_eq!(user.answer(ids[0], Reply::picked("a")), Answer::Accepted);
+        assert_eq!(first.await.unwrap(), Some(Reply::picked("a")));
         assert!(!second.is_finished(), "the first answer must not resolve the second ask");
         assert_eq!(user.pending_count(), 1);
 
-        assert_eq!(user.answer(ids[1], "b"), Answer::Accepted);
-        assert_eq!(second.await.unwrap().as_deref(), Some("b"));
+        assert_eq!(user.answer(ids[1], Reply::picked("b")), Answer::Accepted);
+        assert_eq!(second.await.unwrap(), Some(Reply::picked("b")));
         assert_eq!(user.pending_count(), 0);
     }
 
@@ -411,13 +425,13 @@ mod tests {
     async fn two_pending_asks_each_resolve_only_by_their_own_id_newest_first() {
         let (user, first, second, ids) = two_open_asks().await;
 
-        assert_eq!(user.answer(ids[1], "b"), Answer::Accepted);
-        assert_eq!(second.await.unwrap().as_deref(), Some("b"));
+        assert_eq!(user.answer(ids[1], Reply::picked("b")), Answer::Accepted);
+        assert_eq!(second.await.unwrap(), Some(Reply::picked("b")));
         assert!(!first.is_finished(), "the second answer must not resolve the first ask");
         assert_eq!(user.pending_count(), 1);
 
-        assert_eq!(user.answer(ids[0], "a"), Answer::Accepted);
-        assert_eq!(first.await.unwrap().as_deref(), Some("a"));
+        assert_eq!(user.answer(ids[0], Reply::picked("a")), Answer::Accepted);
+        assert_eq!(first.await.unwrap(), Some(Reply::picked("a")));
         assert_eq!(user.pending_count(), 0);
     }
 
@@ -445,7 +459,7 @@ mod tests {
             }
         };
         cancel.cancel();
-        assert!(!task.await.unwrap());
+        assert!(!task.await.unwrap().given);
         match asks.recv().await.unwrap() {
             AskEvent::Settled { ask_id: settled, how } => {
                 assert_eq!(settled, ask_id);
@@ -454,15 +468,61 @@ mod tests {
             _ => panic!("expected Settled"),
         }
         assert_eq!(user.pending_count(), 0);
-        assert_eq!(user.answer(ask_id, "yes"), Answer::Unknown, "a cancelled ask is nobody's to answer");
+        assert_eq!(user.answer(ask_id, Reply::picked("yes")), Answer::Unknown, "a cancelled ask is nobody's to answer");
+    }
+
+    fn words(text: &str) -> Words {
+        Words::new(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_approval_answered_with_a_note_hands_the_note_to_the_dispatcher_and_the_settle() {
+        let user = Arc::new(WebUser::new());
+        let mut asks = user.subscribe();
+        let cancel = CancellationToken::new();
+        let manifest = ToolManifest::synthetic("note", Approval::Mutating);
+        let approving = tokio::spawn({
+            let user = user.clone();
+            let cancel = cancel.clone();
+            async move { user.approve(&note_call(), &manifest, &asking_ruling(), &cancel).await }
+        });
+        let ask_id = next_opened(&mut asks).await;
+        let reply = Reply { label: "no".into(), operator_note: Some(words("not on main")) };
+        assert_eq!(user.answer(ask_id, reply.clone()), Answer::Accepted);
+        assert_eq!(approving.await.unwrap(), Consent { given: false, operator_note: Some(words("not on main")) });
+        match asks.recv().await.unwrap() {
+            AskEvent::Settled { how, .. } => assert_eq!(how, Settled::Answered(reply)),
+            _ => panic!("expected Settled"),
+        }
+    }
+
+    #[test]
+    fn an_answer_without_a_note_is_the_bare_pick() {
+        assert_eq!(reply("b".into(), None), Ok(Reply::picked("b")));
+    }
+
+    #[test]
+    fn a_note_is_trimmed_and_a_blank_one_is_no_note() {
+        assert_eq!(
+            reply("yes".into(), Some("  once\n\tonly \n".into())),
+            Ok(Reply { label: "yes".into(), operator_note: Some(words("once\n\tonly")) })
+        );
+        assert_eq!(reply("yes".into(), Some(" \n ".into())), Ok(Reply::picked("yes")));
+    }
+
+    #[test]
+    fn a_refused_note_is_named_with_the_core_reason() {
+        let long = "x".repeat(MAX_WORDS_BYTES + 1);
+        assert_eq!(reply("a".into(), Some(long)), Err(format!("note {}", WordsRefused::OverLong)));
+        assert_eq!(reply("a".into(), Some("bad\0note".into())), Err(format!("note {}", WordsRefused::ControlCharacter)));
     }
 
     /// Each `Opened` is awaited before the next raise, so which handle holds
     /// which id does not depend on the scheduler.
     async fn two_open_asks() -> (
         Arc<WebUser>,
-        tokio::task::JoinHandle<Option<String>>,
-        tokio::task::JoinHandle<Option<String>>,
+        tokio::task::JoinHandle<Option<Reply>>,
+        tokio::task::JoinHandle<Option<Reply>>,
         Vec<u64>,
     ) {
         let user = Arc::new(WebUser::new());
@@ -482,7 +542,7 @@ mod tests {
         }
     }
 
-    fn raise(user: &Arc<WebUser>, prompt: &'static str) -> tokio::task::JoinHandle<Option<String>> {
+    fn raise(user: &Arc<WebUser>, prompt: &'static str) -> tokio::task::JoinHandle<Option<Reply>> {
         let user = user.clone();
         let cancel = CancellationToken::new();
         tokio::spawn(async move { user.choose(prompt, &[choice("a"), choice("b")], &cancel).await })

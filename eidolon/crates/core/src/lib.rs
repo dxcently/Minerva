@@ -63,6 +63,7 @@ pub mod tool_search;
 pub mod usage;
 pub mod user;
 pub mod wait;
+pub mod workflow;
 pub mod yolo;
 
 pub use agent::{Agent, AgentConfig, Backend, TurnDriver, TurnOutcome};
@@ -81,5 +82,6 @@ pub use session::{
 pub use tool::{CallContext, CallOrigin, Tool, ToolCall, ToolManifest, ToolOutput, ToolRegistry};
 pub use tool_search::{Reach, ToolSearch};
 pub use usage::UsageExt;
-pub use user::{Choice, UserIo};
+pub use user::{Choice, Consent, Reply, UserIo};
 pub use wait::{Answer, Arm, Condition, Fired, Outcome, Parks, Term, Vantage, Wake, WaitFor};
+pub use workflow::{Run, RunPin, RunStatus, RunStep, StepResult};

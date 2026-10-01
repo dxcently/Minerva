@@ -166,9 +166,12 @@ pub async fn resolve(source: &dyn PersonaSource, pin: &str) -> Result<Resolved, 
 /// is still what reaches a flat note under the folder pinned by name, or a pin
 /// that is an `alias` of a folder entry.
 ///
-/// The order is this harness's. [`harnox::vault::persona_note_candidates`] and
-/// Agora's own copy of it both lead with the bare name, so the same shadowing
-/// is reachable there until the three are reconciled.
+/// The order is the library's. [`harnox::vault::persona_note_candidates`]
+/// carries the same order since v0.3.10, and Melete's copy — which Agora
+/// resolves through — was fixed beside it, so the wrapper is now the same
+/// list stated twice; what makes the order load-bearing is not another copy
+/// but Mneme's resolution rule itself: a bare title resolves by filename
+/// across the whole vault, which is why the vault-wide lookup can never lead.
 fn candidates(pin: &str) -> Vec<String> {
     if pin.contains('/') {
         return harnox::vault::persona_note_candidates(pin);

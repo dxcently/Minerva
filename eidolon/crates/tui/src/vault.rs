@@ -37,6 +37,31 @@ pub struct Page {
 pub struct Tree {
     pub body: String,
     pub records: std::collections::BTreeMap<usize, eidolon_core::Record>,
+    /// A workflow run's fold, keyed by the start line. A run's records
+    /// are one unit on this page the way a cluster of calls is on the
+    /// transcript: closed, the page draws the start line with a summary
+    /// and none of the run; opened, every line of it. Membership is
+    /// lineage, not position — the start, its steps, its budget and its
+    /// ending by kind, and whatever ran under a step's deterministic
+    /// `w<run>-<index>` call id (results, gate verdicts) by that join —
+    /// so records the run merely happened between stay drawn.
+    pub runs: std::collections::BTreeMap<usize, TreeRun>,
+    /// A hidden line → the start line whose fold hides it. The flat
+    /// form the document build asks once per line.
+    pub folds: std::collections::BTreeMap<usize, usize>,
+}
+
+/// One run's fold: the source lines it stands for, and the summary the
+/// closed start line carries. View data — rebuilt from the log each
+/// time the page opens, held by no record, and a reopened session
+/// folds the same because the records are the only input.
+pub struct TreeRun {
+    /// Every line of the group, start line included, in draw order.
+    pub lines: Vec<usize>,
+    /// How many steps the run journaled — resumed ones included.
+    pub steps: usize,
+    /// The latest ending's word, when an ending is on the tree.
+    pub status: Option<&'static str>,
 }
 
 struct TreeReturn {
@@ -58,6 +83,10 @@ pub struct Browser {
     pub trace: crate::trace::Trace,
     pub pending: Option<u64>,
     generation: u64,
+    /// The tree page's open run folds, as their start lines — the same
+    /// shape `state.opened` keeps for the transcript's clusters. Nothing
+    /// persists it: a page that closes comes back closed.
+    pub tree_opened: Vec<usize>,
     pub trace_focus: Option<(usize, usize)>,
     pub hits: Vec<Hit>,
 }
@@ -72,6 +101,7 @@ impl Browser {
         self.current = None;
         self.history.clear();
         self.hits.clear();
+        self.tree_opened.clear();
     }
 }
 
@@ -142,8 +172,28 @@ pub fn document_at(state: &UiState, width: usize) -> Document {
         // change row identity or turn a record into a vault read.
         let mut doc = Document { lines: vec![], source_lines: vec![], links: vec![], anchors: vec![] };
         for (i, line) in body.lines().enumerate() {
-            let rows = crate::render::styled_page_lines(line, width, &state.theme, true);
-            doc.source_lines.extend(std::iter::repeat_n(i + 1, rows.len()));
+            let n = i + 1;
+            // A closed run's fold hides its group by leaving the lines
+            // out of the document entirely — the cursor, the search and
+            // the scroll all read this one list, so what the draw
+            // hides, the walk cannot land on.
+            if tree_fold_at(state, n).is_some() {
+                continue;
+            }
+            // The summary rides the drawn start line the way a folded
+            // cluster's count rides its one line — composed here, never
+            // written into the body the yank reads. Opened, the line
+            // draws as itself; its parts carry the facts.
+            let text = match state.vault.tree.as_ref().and_then(|t| t.runs.get(&n)) {
+                Some(run) if !state.vault.tree_opened.contains(&n) => format!(
+                    "{line} · {} steps{}",
+                    run.steps,
+                    run.status.as_ref().map_or(String::new(), |s| format!(" · {s}"))
+                ),
+                _ => line.to_string(),
+            };
+            let rows = crate::render::styled_page_lines(&text, width, &state.theme, true);
+            doc.source_lines.extend(std::iter::repeat_n(n, rows.len()));
             doc.lines.extend(rows);
         }
         return doc;
@@ -172,8 +222,41 @@ pub fn tree_record(state: &UiState) -> Option<&eidolon_core::Record> {
     tree.records.get(&state.vault.trace.at)
 }
 
+/// The start line whose **closed** run fold hides `line` — the tree
+/// page's [`crate::render::fold_at`]. A line no fold hides, or one
+/// whose run is opened, answers `None`: it is drawn as itself.
+pub fn tree_fold_at(state: &UiState, line: usize) -> Option<usize> {
+    let tree = state.vault.tree.as_ref()?;
+    let start = *tree.folds.get(&line)?;
+    (!state.vault.tree_opened.contains(&start)).then_some(start)
+}
+
+/// The **open** run fold `line` belongs to, start lines included — the
+/// other half, [`crate::render::opened_at`]'s shape, and what `h`
+/// closes from anywhere inside the group.
+fn open_run_at(state: &UiState, line: usize) -> Option<usize> {
+    let tree = state.vault.tree.as_ref()?;
+    if tree.runs.contains_key(&line) && state.vault.tree_opened.contains(&line) {
+        return Some(line);
+    }
+    let start = *tree.folds.get(&line)?;
+    state.vault.tree_opened.contains(&start).then_some(start)
+}
+
 fn tree_follow(state: &mut UiState) {
     if state.tracing() { trace_sync(state); }
+    // `l` on a closed run's summary opens the fold — the same key the
+    // transcript's folds answer to, so a run folds like a cluster with
+    // no second vocabulary. Opened, the start line inspects like any
+    // record, and `h` (in [`back`]) closes the fold again.
+    let at = state.vault.trace.at;
+    let closed_run = state.vault.tree.as_ref().is_some_and(|t| {
+        t.runs.contains_key(&at) && !state.vault.tree_opened.contains(&at)
+    });
+    if closed_run {
+        state.vault.tree_opened.push(at);
+        return;
+    }
     let Some(record) = tree_record(state) else { state.info("select a record with K, or tab to one"); return; };
     if state.vault.tree_return.is_some() { return; }
     let id = record.id;
@@ -255,6 +338,18 @@ fn show(state: &mut UiState, mut note: Note) {
 pub fn back(state: &mut UiState) {
     if !state.vault.active { return; }
     state.vault.pending = None;
+    // `h` on a line an open run fold stands for — its summary or any
+    // part of it — closes the fold and puts the cursor back on the
+    // summary: the same one-level-up the transcript's `h` gives. Only
+    // on the tree page proper; on a record's own page `h` still returns.
+    if state.vault.tree.is_some()
+        && state.vault.tree_return.is_none()
+        && let Some(start) = open_run_at(state, state.vault.trace.at)
+    {
+        state.vault.tree_opened.retain(|l| *l != start);
+        trace_goto(state, start);
+        return;
+    }
     if let Some(back) = state.vault.tree_return.take() {
         state.vault.page = Some(back.page);
         state.vault.trace = back.trace;
@@ -403,7 +498,14 @@ fn trace_document(state: &UiState) -> Option<Document> {
 pub fn select(state: &mut UiState, backwards: bool) {
     if let Some(tree) = &state.vault.tree {
         if state.vault.tree_return.is_some() { return; }
-        let lines: Vec<_> = tree.records.keys().copied().collect();
+        // A closed run's hidden lines are not on the walk: tab hops
+        // records the page draws, and the page does not draw them.
+        let lines: Vec<_> = tree
+            .records
+            .keys()
+            .copied()
+            .filter(|l| tree_fold_at(state, *l).is_none())
+            .collect();
         let at = state.vault.trace.at;
         let next = if backwards { lines.iter().rev().find(|n| **n < at).or_else(|| lines.last()) }
             else { lines.iter().find(|n| **n > at).or_else(|| lines.first()) };

@@ -11,7 +11,7 @@ pub fn manifest() {
             "type": "object",
             "properties": #{
                 "url": #{ "type": "string", "description": "An http:// or https:// URL" },
-                "max": #{ "type": "integer", "description": "Maximum characters to return (default 40000); raise it for a page that is really that long" },
+                "limit": #{ "type": "integer", "description": "Maximum characters to return (default 40000); raise it for a page that is really that long" },
                 "timeout_s": #{ "type": "integer", "description": "Seconds to wait for the response (default 30)" },
                 "raw": #{ "type": "boolean", "description": "Return the HTML as it arrived instead of reducing it to text (default false)" },
             },
@@ -25,5 +25,5 @@ pub async fn call(input) {
         Some(b) => b == true,
         None => false,
     };
-    eidolon::web_fetch(input.url, input.get("max"), input.get("timeout_s"), raw).await
+    eidolon::web_fetch(input.url, input.get("limit"), input.get("timeout_s"), raw).await
 }

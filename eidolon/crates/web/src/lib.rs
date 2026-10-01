@@ -1,6 +1,6 @@
 //! The web door: `eidolon web` serves one session's event stream and its
 //! operator verbs over plain HTTP/1.1 on loopback, so any browser can draw
-//! the transcript and type into the turn. Four API routes, plus the UI files
+//! the transcript and type into the turn. Five API routes, plus the UI files
 //! `--ui-dir` names:
 //!
 //! ```text
@@ -8,12 +8,24 @@
 //!                      caught-up, then the bus live — and, when this
 //!                      session quiesced, one last `goodbye` frame before
 //!                      the stream ends (see `crate::wake`)
-//!   POST /api/say      {"text": "...", "mode": "send"|"steer"}
+//!   POST /api/say      {"text": "...", "mode": "send"|"steer",
+//!                       "images"?: [{"name"?, "media_type", "data"}]} —
+//!                      202, or 422 with the reason when an image is
+//!                      malformed, fails its checks or is over 4 MiB, or
+//!                      the body has a `documents` field (see
+//!                      `crate::attach`); a refused say is not said at all
 //!   POST /api/cancel   the running turn, or 409 when the session is idle
-//!   POST /api/answer   {"ask_id": N, "answer": "..."} for a pending ask —
-//!                      204, or 409 when nothing is pending under that id,
-//!                      or 422 when the answer is not one that ask offers
-//!                      (it stays pending)
+//!   POST /api/answer   {"ask_id": N, "answer": "...", "note"?: "..."} for a
+//!                      pending ask — 204, or 409 when nothing is pending
+//!                      under that id, or 422 when the answer is not one
+//!                      that ask offers (it stays pending) or the note is
+//!                      not a string, is over 1 KiB or carries a control
+//!                      character other than newline or tab; a blank note
+//!                      is no note (see `crate::user`)
+//!   POST /api/launch   {"window": "terminal"|"editor"|"files", "path"?} —
+//!                      200 {"opened": "<line>"} for the command line as
+//!                      spawned, or 501 when no launcher was given (see
+//!                      `crate::launch`; this opens a window, not a tool call)
 //!   GET  /other        with --ui-dir, a file from that directory: `/` is
 //!   HEAD               index.html, a directory names nothing, and any other
 //!                      method is 405. Without the flag, 404.
@@ -44,8 +56,10 @@
 //! does not know, which is what keeps an additive change additive; a breaking
 //! one bumps it.
 
+pub mod attach;
 pub mod driver;
 pub mod files;
+pub mod launch;
 pub mod serve;
 pub mod stream;
 pub mod user;
@@ -81,6 +95,8 @@ pub struct WebOptions {
     pub doorbell: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
     /// This session's roster entry, when the swarm is on.
     pub presence: Option<Arc<dyn driver::Presence>>,
+    /// `None` makes `POST /api/launch` a 501.
+    pub launch: Option<Arc<dyn launch::Launch>>,
 }
 
 /// Refuses anything but `127.0.0.0/8` and `::1`: the token is a file on this
@@ -160,6 +176,7 @@ pub async fn run(agent: Arc<Agent>, user: Arc<WebUser>, mut opts: WebOptions, ca
         yolo: opts.yolo.armed(),
         token: Arc::from(token.as_str()),
         ui,
+        launch: opts.launch.take(),
     };
     let served = serve::run(ctx, listener, cancel).await;
     if let Err(e) = std::fs::remove_file(&token_file) {

@@ -101,16 +101,22 @@ pub const PERSONA_ENTRY: &str = "index.md";
 /// they should be tried.
 ///
 /// A pin is whatever the operator gave — a frontmatter `name`, or a full vault
-/// path. The bare name goes first (it covers flat notes, and Mneme also
-/// resolves it through a folder entry's `aliases:`), then the folder entry
-/// path explicitly, so the folder form keeps working for a persona whose
-/// frontmatter carries no alias. A pin that already looks like a path gets
-/// only itself: joining [`PERSONA_FOLDER`] onto it would address nonsense.
+/// path. A bare name tries the persona folder's entry **first**, then the
+/// bare name itself: Mneme resolves a bare title by filename across the whole
+/// vault (and through frontmatter `name` and `aliases:`), so any note anywhere
+/// whose name matches the pin shadows the persona folder when the bare name
+/// leads — in the vault this was built against, a persona pinned by name wore
+/// her `wiki/agent-memory/` note as her persona, because the memory note
+/// carries the same `name:` and answered first. The folder is what a persona
+/// pin promises; the vault-wide lookup stays last as the fallback that still
+/// reaches a flat note under the folder, and a pin that is an `alias`. A pin
+/// that already looks like a path gets only itself: joining [`PERSONA_FOLDER`]
+/// onto it would address nonsense.
 pub fn persona_note_candidates(pin: &str) -> Vec<String> {
     if pin.contains('/') {
         return vec![pin.to_string()];
     }
-    vec![pin.to_string(), format!("{PERSONA_FOLDER}/{pin}/{PERSONA_ENTRY}")]
+    vec![format!("{PERSONA_FOLDER}/{pin}/{PERSONA_ENTRY}"), pin.to_string()]
 }
 
 /// Whether a path listed under [`PERSONA_FOLDER`] names a persona, as opposed
@@ -195,10 +201,16 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_pin_tries_the_flat_note_then_the_folder_entry() {
+    fn a_bare_pin_tries_the_folder_entry_before_the_flat_note() {
+        // Folder first: Mneme resolves a bare title by filename across the
+        // whole vault, so `wiki/agent-memory/μέλι.md` — her memory, whose
+        // frontmatter carries `name: μέλι` too — answers a bare lookup
+        // before her persona does. The folder is what `:persona` promises;
+        // the vault-wide lookup stays as the fallback that still reaches a
+        // flat note under the folder and a pin that is an `alias`.
         assert_eq!(
             persona_note_candidates("μέλι"),
-            vec!["μέλι".to_string(), "wiki/personalities/μέλι/index.md".to_string()]
+            vec!["wiki/personalities/μέλι/index.md".to_string(), "μέλι".to_string()]
         );
     }
 

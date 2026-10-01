@@ -144,7 +144,7 @@ impl Fill {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Command {
     pub name: &'static str,
     pub run: Run,
@@ -155,6 +155,34 @@ pub struct Command {
     /// The heading it files under on the `:` line and in `:help`.
     pub group: &'static str,
     pub help: &'static str,
+    /// Whether the command can do anything **where the operator is** —
+    /// the predicate `:help` and the `:` listings filter on, so the
+    /// vocabulary advertises what works here rather than everything the
+    /// harness owns. Resolving a typed name does not filter: a command
+    /// typed anyway answers as it always has, and [`Command::lookup`]
+    /// stays total. [`always`] for the rows that work everywhere.
+    pub when: fn(&UiState) -> bool,
+}
+
+/// The row that works everywhere.
+fn always(_: &UiState) -> bool {
+    true
+}
+
+/// The transcript's trace vocabulary, and the reading surfaces its
+/// cursor drives: on a vault page or a tree, or with trace mode entered.
+fn when_tracing_or_reading(state: &UiState) -> bool {
+    state.tracing() || state.vault.active
+}
+
+/// Trace-mode only — the command needs the cursor to be somewhere.
+fn when_tracing(state: &UiState) -> bool {
+    state.tracing()
+}
+
+/// Only while a dialog holds the screen.
+fn when_dialog_open(state: &UiState) -> bool {
+    state.dialog.is_some()
 }
 
 const fn ui(name: &'static str, group: &'static str, help: &'static str) -> Command {
@@ -165,6 +193,26 @@ const fn ui(name: &'static str, group: &'static str, help: &'static str) -> Comm
         fill: Fill::Free,
         group,
         help,
+        when: always,
+    }
+}
+
+/// A row scoped to where the operator is: `:help` and the `:` listings
+/// filter on it, resolution does not.
+const fn ui_when(
+    name: &'static str,
+    group: &'static str,
+    help: &'static str,
+    when: fn(&UiState) -> bool,
+) -> Command {
+    Command {
+        name,
+        run: Run::Ui,
+        arg: Arg::None,
+        fill: Fill::Free,
+        group,
+        help,
+        when,
     }
 }
 
@@ -176,6 +224,7 @@ const fn ch(name: &'static str, group: &'static str, help: &'static str) -> Comm
         fill: Fill::Free,
         group,
         help,
+        when: always,
     }
 }
 
@@ -187,6 +236,7 @@ const fn ch2(name: &'static str, group: &'static str, help: &'static str) -> Com
         fill: Fill::Free,
         group,
         help,
+        when: always,
     }
 }
 
@@ -204,6 +254,7 @@ const fn ui_text(
         fill,
         group,
         help,
+        when: always,
     }
 }
 
@@ -215,6 +266,7 @@ const fn driver(name: &'static str, group: &'static str, arg: Arg, help: &'stati
         fill: Fill::Free,
         group,
         help,
+        when: always,
     }
 }
 
@@ -232,6 +284,15 @@ const fn driver_text(
         fill,
         group,
         help,
+        when: always,
+    }
+}
+
+impl Command {
+    /// Whether the command can act where the operator is — the row's own
+    /// `when`, as `:help` and the `:` listings read it.
+    pub fn available(&self, state: &UiState) -> bool {
+        (self.when)(state)
     }
 }
 
@@ -445,25 +506,27 @@ pub const COMMANDS: &[Command] = &[
         Fill::Free,
         "walk only the blocks carrying WHAT — a tool name, a kind, or * for the calls that changed something",
     ),
-    ui("link_next", "trace", "select the next vault link in this block or note"),
-    ui("link_prev", "trace", "select the previous vault link"),
-    ui("link_open", "trace", "open the selected vault link (or the first)"),
-    ui("link_back", "trace", "return to the previous vault note"),
-    ui("link_close", "trace", "close the vault document and return to the conversation"),
-    ui("trace_next", "trace", "the next block"),
-    ui("trace_prev", "trace", "the previous block"),
-    ui("trace_first", "trace", "the first block of the session"),
-    ui("trace_last", "trace", "the last block"),
-    ui("trace_open", "trace", "open the fold here and step into it"),
-    ui(
+    ui_when("link_next", "trace", "select the next vault link in this block or note", when_tracing_or_reading),
+    ui_when("link_prev", "trace", "select the previous vault link", when_tracing_or_reading),
+    ui_when("link_open", "trace", "open the selected vault link (or the first)", when_tracing_or_reading),
+    ui_when("link_back", "trace", "return to the previous vault note", when_tracing_or_reading),
+    ui_when("link_close", "trace", "close the vault document and return to the conversation", when_tracing_or_reading),
+    ui_when("trace_next", "trace", "the next block", when_tracing),
+    ui_when("trace_prev", "trace", "the previous block", when_tracing),
+    ui_when("trace_first", "trace", "the first block of the session", when_tracing),
+    ui_when("trace_last", "trace", "the last block", when_tracing),
+    ui_when("trace_open", "trace", "open the fold here and step into it", when_tracing),
+    ui_when(
         "trace_close",
         "trace",
         "close the fold this block is inside",
+        when_tracing,
     ),
-    ui(
+    ui_when(
         "trace_toggle",
         "trace",
         "open the fold here, or close the one we are in",
+        when_tracing,
     ),
     ui(
         "trace_open_all",
@@ -471,13 +534,14 @@ pub const COMMANDS: &[Command] = &[
         "open every fold in the transcript",
     ),
     ui("trace_close_all", "trace", "close every fold again"),
-    ui(
+    ui_when(
         "trace_extend",
         "trace",
         "extend the transcript selection with every motion",
+        when_tracing,
     ),
-    ui("trace_yank", "trace", "copy the selected blocks"),
-    ui("trace_quote", "trace", "stage the selected vault source-line address in the draft"),
+    ui_when("trace_yank", "trace", "copy the selected blocks", when_tracing),
+    ui_when("trace_quote", "trace", "stage the selected vault source-line address in the draft", when_tracing),
     // ----------------------------------------------------------- search
     ui("search", "search", "search the transcript forwards"),
     ui("rsearch", "search", "search the transcript backwards"),
@@ -506,9 +570,22 @@ pub const COMMANDS: &[Command] = &[
     ui(
         "submit",
         "eidolon",
-        "send the prompt; accept a dialog or a search",
+        "send the prompt; take a dialog's highlighted row; accept a search",
     ),
-    ui("dialog_deny", "eidolon", "answer no to an approval"),
+    ui_when("dialog_allow", "eidolon", "answer yes to an approval", when_dialog_open),
+    ui_when("dialog_deny", "eidolon", "answer no to an approval", when_dialog_open),
+    ui_when(
+        "dialog_note",
+        "eidolon",
+        "add a note to an approval's or a question's answer",
+        when_dialog_open,
+    ),
+    ui_when(
+        "dialog_chat",
+        "eidolon",
+        "decline an approval or a question, stop the turn, and say why in the prompt",
+        when_dialog_open,
+    ),
     ui(
         "cancel",
         "eidolon",
@@ -540,10 +617,11 @@ pub const COMMANDS: &[Command] = &[
         "eidolon",
         "the keys, from the live keymap, and this vocabulary",
     ),
-    ui(
+    ui_when(
         "trace_strike",
         "trace",
         "strike the block under the cursor from the context, or put it back",
+        when_tracing,
     ),
     ui(
         "messages",
@@ -812,8 +890,10 @@ impl Scripted {
     }
 }
 
-/// A command from either table, once the lookup has found it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A command from either table, once the lookup has found it. Compared
+/// by name — a row's `when` is a function pointer, and comparing those
+/// says nothing.
+#[derive(Clone, Copy, Debug)]
 pub enum Entry<'a> {
     Builtin(&'static Command),
     Script(&'a Scripted),
@@ -881,7 +961,18 @@ impl<'a> Entry<'a> {
         }
     }
 
-    pub fn usage(&self) -> String {
+/// Whether this command can do anything where the operator is — the
+/// filter `:help` and the `:` listings read. A script's command is
+/// always listed: the script declared it, and no predicate vocabulary
+/// crosses into a string.
+pub fn available(&self, state: &UiState) -> bool {
+    match self {
+        Entry::Builtin(c) => (c.when)(state),
+        Entry::Script(_) => true,
+    }
+}
+
+pub fn usage(&self) -> String {
         match self {
             Entry::Builtin(c) => usage(c),
             Entry::Script(s) => match &s.arg {
@@ -898,9 +989,24 @@ impl<'a> Entry<'a> {
 /// for `se` — the least you could have meant by what you typed — and it
 /// ranks an exact match first for free, since nothing shorter can have it
 /// as a prefix. An empty query matches everything, which is what makes a
-/// bare `:` list the vocabulary rather than nothing.
-pub fn matches(query: &str) -> Vec<&'static Command> {
-    matches_in(query, &[])
+/// bare `:` list the vocabulary rather than nothing — **the vocabulary
+/// of where you are**: a row whose [`Command::when`] says the command
+/// cannot act here is not offered, though typing it still resolves.
+pub fn matches(state: &UiState, query: &str) -> Vec<&'static Command> {
+    ranked(query, &[], &|c| (c.when)(state))
+        .into_iter()
+        .filter_map(|e| match e {
+            Entry::Builtin(c) => Some(c),
+            Entry::Script(_) => None,
+        })
+        .collect()
+}
+
+/// The ranking with no state — the raw table, nothing scoped out — for
+/// the callers with no screen to be somewhere on: the headless
+/// `did you mean` beside an unknown `:name`.
+pub fn suggestions(query: &str) -> Vec<&'static Command> {
+    ranked(query, &[], &|_| true)
         .into_iter()
         .filter_map(|e| match e {
             Entry::Builtin(c) => Some(c),
@@ -911,10 +1017,25 @@ pub fn matches(query: &str) -> Vec<&'static Command> {
 
 /// [`matches`] over the built-ins and the script's commands together,
 /// the script's after the built-ins at equal rank.
-pub fn matches_in<'a>(query: &str, extra: &'a [Scripted]) -> Vec<Entry<'a>> {
+pub fn matches_in<'a>(
+    state: &UiState,
+    query: &str,
+    extra: &'a [Scripted],
+) -> Vec<Entry<'a>> {
+    ranked(query, extra, &|c| (c.when)(state))
+}
+
+/// The one walk both readings share: [`matches_in`] filters it to where
+/// the operator is, [`suggestions`] does not.
+fn ranked<'a>(
+    query: &str,
+    extra: &'a [Scripted],
+    available: &dyn Fn(&Command) -> bool,
+) -> Vec<Entry<'a>> {
     let q = query.trim().to_lowercase();
     let all = COMMANDS
         .iter()
+        .filter(|c| available(c))
         .map(Entry::Builtin)
         .chain(extra.iter().map(Entry::Script));
     let (mut head, mut tail): (Vec<Entry<'a>>, Vec<Entry<'a>>) = (Vec::new(), Vec::new());
@@ -978,18 +1099,21 @@ pub fn usage(c: &Command) -> String {
 }
 
 /// The whole vocabulary as text, grouped — what `:help` prints under its
-/// paragraph about the keys.
-pub fn reference() -> String {
-    reference_in(&[])
+/// paragraph about the keys. Only what works where the operator is: the
+/// same [`Command::when`] the `:` line filters on, so the help cannot
+/// advertise a command the screen cannot act on.
+pub fn reference(state: &UiState) -> String {
+    reference_in(state, &[])
 }
 
 /// [`reference`] with the script's commands after the built-ins, under
 /// their own groups.
-pub fn reference_in(extra: &[Scripted]) -> String {
+pub fn reference_in(state: &UiState, extra: &[Scripted]) -> String {
     let mut out = String::new();
     let mut group = "";
     for e in COMMANDS
         .iter()
+        .filter(|c| (c.when)(state))
         .map(Entry::Builtin)
         .chain(extra.iter().map(Entry::Script))
     {
@@ -1006,9 +1130,21 @@ pub fn reference_in(extra: &[Scripted]) -> String {
     out
 }
 
+/// What the command could complete against — the table is read on the
+/// UI thread, and [`crate::state::UiState`] is where the availability
+/// predicates answer from.
+use crate::state::UiState;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::UiState;
+
+    /// A bare state: not tracing, no vault page, no dialog — the shape
+    /// whose listings must hide what cannot act.
+    fn test_state() -> UiState {
+        UiState::new("m".into(), "/tmp/s.eid".into(), "/".into())
+    }
 
     #[test]
     fn no_command_is_declared_twice() {
@@ -1021,7 +1157,7 @@ mod tests {
 
     #[test]
     fn a_prefix_ranks_above_a_mere_substring() {
-        let names = |q| matches(q).iter().map(|c| c.name).collect::<Vec<_>>();
+        let names = |q| matches(&test_state(), q).iter().map(|c| c.name).collect::<Vec<_>>();
         // `search` prefixes `search_next`; `rsearch` only contains it, so
         // it comes after every one of them.
         let m = names("search");
@@ -1052,12 +1188,17 @@ mod tests {
         assert_eq!(names("se")[0], "search", "the shortest completion of `se`");
         // Reached through its help rather than its name.
         assert!(names("summarise").contains(&"compact"));
-        // A bare `:` is the table itself, in its own order.
+        // A bare `:` is the table as filtered for where we are — a bare
+        // state is nowhere a scoped command acts, so those stay hidden.
         assert_eq!(
             names(""),
-            COMMANDS.iter().map(|c| c.name).collect::<Vec<_>>()
+            COMMANDS
+                .iter()
+                .filter(|c| c.available(&test_state()))
+                .map(|c| c.name)
+                .collect::<Vec<_>>()
         );
-        assert!(matches("zzz").is_empty());
+        assert!(matches(&test_state(), "zzz").is_empty());
     }
 
     #[test]
@@ -1074,12 +1215,12 @@ mod tests {
         assert_eq!(lookup_in("shout", &extra).unwrap().usage(), ":shout TEXT");
         assert_eq!(lookup_in("shout", &extra).unwrap().run(), Run::Ui);
         assert!(lookup_in("model", &extra).is_some_and(|e| matches!(e, Entry::Builtin(_))));
-        let names: Vec<String> = matches_in("sho", &extra)
+        let names: Vec<String> = matches_in(&test_state(), "sho", &extra)
             .iter()
             .map(|e| e.name().to_string())
             .collect();
         assert_eq!(names, ["shout"]);
-        assert!(reference_in(&extra).contains(":shout TEXT"));
+        assert!(reference_in(&test_state(), &extra).contains(":shout TEXT"));
         assert!(Scripted::parse("two words", &serde_json::json!({})).is_err());
         assert!(Scripted::parse("x", &serde_json::json!("desc")).is_err());
     }
@@ -1087,13 +1228,81 @@ mod tests {
     /// `:login` is a real row in the table — driver-side, an optional
     /// provider argument, completed against the provider fill — the same
     /// three claims `:model` makes about itself.
+    /// The listings say what works **here**: a bare state hides the
+    /// trace and reading vocabulary and `dialog_deny` from `:help` and
+    /// from the `:` line, and shows each the moment its surface is live.
+    /// Resolution is untouched — the name typed anyway still resolves.
+    #[test]
+    fn the_listings_hide_what_cannot_act_where_you_are() {
+        let bare = test_state();
+        // Resolution is total even where the listing is not.
+        assert!(lookup("link_open").is_some());
+        let text = reference(&bare);
+        for absent in ["link_open", "trace_next", "trace_yank", "dialog_deny", "trace_strike"] {
+            assert!(
+                !text.contains(&format!(":{absent}")),
+                "{absent} is listed where it cannot act"
+            );
+        }
+        assert!(text.contains(":compact"), "the everywhere vocabulary stays listed");
+        assert!(text.contains(":trace"), ":trace enters the mode — it is how you get there");
+        assert!(
+            text.contains(":trace_open_all"),
+            "open/close-all work from anywhere by design"
+        );
+        // Trace mode entered: the walk and its folds are listed.
+        let mut traced = test_state();
+        // Trace mode is a normal-kind mode named `trace`; the predicate
+        // answers on the name, the way `UiState::tracing` does.
+        traced
+            .prompt
+            .enter(crate::edit::Mode::named("trace", crate::edit::Kind::Normal));
+        let text = reference(&traced);
+        for present in ["link_open", "trace_next", "trace_yank", "trace_strike"] {
+            assert!(text.contains(&format!(":{present}")), "{present} still hidden in trace mode");
+        }
+        // A reading surface — the tree page — lists the link family
+        // without trace mode, and still not dialog_deny.
+        let mut reading = test_state();
+        reading.vault.active = true;
+        let text = reference(&reading);
+        assert!(text.contains(":link_open"));
+        assert!(!text.contains(":trace_next"), "the walk is not the reading: {text}");
+        // A dialog on screen lists its own answer.
+        let mut asking = test_state();
+        asking.dialog = Some(crate::state::Dialog {
+            kind: crate::state::DialogKind::Page,
+            prompt: String::new(),
+            options: Vec::new(),
+            weights: Vec::new(),
+            keys: Vec::new(),
+            selected: 0,
+            input: crate::state::Dialog::field(),
+            reply: None,
+            noting: false,
+            pick: None,
+            body: String::new(),
+            masked: false,
+            steady: None,
+        });
+        assert!(reference(&asking).contains(":dialog_deny"));
+        // And the `:` line's suggestions filter the same way: nothing
+        // scoped on a bare state, the family back in trace mode.
+        let offered = |state: &UiState, q: &str| {
+            matches(state, q).iter().map(|c| c.name).collect::<Vec<_>>()
+        };
+        assert!(!offered(&bare, "link_").contains(&"link_open"));
+        assert!(!offered(&bare, "").contains(&"dialog_deny"));
+        assert!(offered(&traced, "link_").contains(&"link_open"));
+    }
+
     #[test]
     fn login_is_registered_as_a_driver_command_with_provider_completion() {
         let c = lookup("login").expect("login must be a command");
         assert_eq!(c.run, Run::Driver);
         assert_eq!(c.fill, Fill::Provider);
         assert_eq!(usage(c), ":login [PROVIDER]");
-        assert!(matches("log").iter().any(|c| c.name == "login"));
+        assert!(matches(&test_state(), "log").iter().any(|c| c.name == "login"));
         assert!(!wants_char("login"), "it takes text, not a bare char");
     }
 

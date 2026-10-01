@@ -5,7 +5,7 @@
 //! yes. The split is deliberate (vault, *Extension model*, 2026-09-03):
 //! the heavy lifting stays in Rust, and the *tool* the model sees is a Rune
 //! script that composes calls to these, on the same contract as any
-//! user-authored skill. There is nothing privileged about `read`; it is a
+//! user-authored tool. There is nothing privileged about `read`; it is a
 //! script that happens to ship with the harness.
 //!
 //! Day-one set, taken from pi's own core surface plus `grep`: [`fs::read`],

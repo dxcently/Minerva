@@ -201,10 +201,45 @@ pub mod doorbell {
                     "already": !fresh,
                 }))
             }
-            // What a peer asking to wait on this session needs: whether a
-            // turn is in flight. The same answer `quiesce-status` carries,
-            // asked without the quiesce — a park is not a hop.
-            "state" => Some(json!({ "ok": true, "busy": agent.turn_in_flight() })),
+            // What a peer asking to wait on this session needs: one word
+            // for the state a wait can distinguish. Four are answered
+            // live — `quiescing` (asked, boundary not reached), `busy`,
+            // `waiting` (a park armed), `idle` — and two belong to the
+            // reader of an absent reply, not to a session that is there
+            // to answer: `quiesced` is what the journal's marker says
+            // (`journal_says_quiesced`), `gone` what no answer at all
+            // means. `busy` stays beside the word: the quarter-second
+            // probe reads it, and its callers' words are pinned by the
+            // peer-wait tests.
+            "state" => {
+                let q = agent.quiesce_request();
+                let state = if q.as_ref().is_some_and(|q| q.settled()) {
+                    "quiesced"
+                } else if q.is_some() {
+                    "quiescing"
+                } else if agent.turn_in_flight() {
+                    "busy"
+                } else if agent.parks().is_armed() {
+                    "waiting"
+                } else {
+                    "idle"
+                };
+                Some(json!({ "ok": true, "state": state, "busy": agent.turn_in_flight() }))
+            }
+            // A peer's answer to a question the asking seam raised. The
+            // dispatcher's registry decides, and its refusals travel back
+            // verbatim — they are the teaching. Nothing journals here: the
+            // answer rides the `AskUser` record at the seam that receives
+            // it, and `PeerAnswer` is that record's provenance.
+            "answer" => {
+                let id = req.get("id").and_then(Value::as_str).unwrap_or("");
+                let text = req.get("text").and_then(Value::as_str).unwrap_or("");
+                let peer = req.get("peer").and_then(Value::as_str).unwrap_or("");
+                match agent.answer_question(id, text, peer) {
+                    Ok(()) => Some(json!({ "ok": true })),
+                    Err(why) => Some(json!({ "ok": false, "error": why })),
+                }
+            }
             "quiesce-status" => {
                 let q = agent.quiesce_request();
                 Some(json!({

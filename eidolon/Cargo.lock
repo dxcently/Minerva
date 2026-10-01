@@ -769,6 +769,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -849,6 +850,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "eidolon-core",
+ "eidolon-providers",
  "eidolon-remote",
  "eidolon-swarm",
  "eidolon-tools",
@@ -857,9 +859,11 @@ dependencies = [
  "rune-modules",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "zeroize",
 ]
@@ -1252,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "harnox"
-version = "0.3.8"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "async-stream",

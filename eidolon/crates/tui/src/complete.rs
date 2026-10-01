@@ -122,7 +122,7 @@ pub fn complete(state: &UiState, line: &str) -> Option<Completion> {
         // had, with one addition: a command that takes an argument
         // completes to `name ` with the space already there, so the next
         // `tab` is the argument's rather than a retype of the space.
-        let found = command::matches_in(line, &state.script_commands);
+        let found = command::matches_in(state, line, &state.script_commands);
         if found.is_empty() {
             return None;
         }

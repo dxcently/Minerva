@@ -465,6 +465,25 @@ fn a_composite_inherits_the_kind_of_the_part_that_refused_it() {
     assert!(v.structural);
 }
 
+/// A flag is a question, not a verdict, and carrying one into a refusal must
+/// not upgrade it: the composite may refuse for *shape* — which a consumer
+/// still asks about — never on merits nobody read. This is the failure an
+/// armed-yolo session hit in the wild: "unsafe command in sequence blocked"
+/// standing over a stage the table never classified, beyond the switch,
+/// because yolo waives questions and, by contract, never refusals.
+#[test]
+fn a_flag_carried_into_a_refusal_stays_a_shape_refusal() {
+    // The stand-in table flags `git push`; it does not deny it.
+    assert_eq!(go("git push").decision, Decision::Flag);
+    for cmd in ["echo $(git push)", "ls && echo $(git push)", "echo $(git push) | cat"] {
+        let v = go(cmd);
+        assert_eq!(v.decision, Decision::Deny, "{cmd}");
+        assert!(v.structural, "{cmd}: refused for want of understanding, not on the merits");
+    }
+    // A named refusal inside the substitution is still on the merits.
+    assert!(!go("echo $(shutdown)").structural);
+}
+
 /// The composite's own reason is for a refusal on the merits. A shape
 /// refusal names the shape — the part's reason travels up — because that
 /// is what a consumer asking "run it anyway?" has to put in the question,

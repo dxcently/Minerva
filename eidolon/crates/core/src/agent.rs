@@ -40,6 +40,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -58,6 +59,16 @@ use crate::wait::Parks;
 use crate::session::{RecordId, RecordKind, Session};
 use crate::tool::{CallOrigin, ToolCall};
 use crate::usage::{CallTiming, TurnTiming, UsageExt};
+
+/// The wall clock in milliseconds, the way every `Record.ts_ms` is stamped
+/// — the re-arm reads a record's timestamp and judges it against this same
+/// clock, so both go through one definition.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 use harnox::llm::StreamSink;
 
 #[derive(Clone, Debug)]
@@ -279,12 +290,13 @@ pub enum TurnOutcome {
     /// exhausted its iteration limit is by definition one that made a
     /// great many calls.
     ///
-    /// The spend is journaled ([`RecordKind::TurnSpend`]) and **not**
-    /// published: there is no event carrying an exhausted turn's usage, so
-    /// a consumer counting live learns it on resume. The **context** is
-    /// both journaled and published ([`Event::ContextSize`]) — the gauge
-    /// has nowhere else to learn it, and a limit that fired is one more
-    /// way for a turn's number to go stale.
+    /// The spend rides the settle the wall writes
+    /// ([`RecordKind::TurnSettled`] with [`StopReason::IterationLimit`])
+    /// and is published like every settle's — a consumer counting live
+    /// learns it at the boundary, not on resume. The **context** is both
+    /// journaled and published ([`Event::ContextSize`]) — the gauge has
+    /// nowhere else to learn it, and a limit that fired is one more way
+    /// for a turn's number to go stale.
     Exhausted { usage: Usage, calls: u32 },
 }
 
@@ -294,6 +306,55 @@ pub enum TurnOutcome {
 /// four counters, because a turn that read its whole context from cache
 /// and was cancelled before a token came back spent real money on
 /// `cache_read_input_tokens` alone.
+/// The bound and the scrub a durable error sentence goes through before it
+/// is journaled. The journal is the artifact that gets shared, diffed and
+/// reviewed, and a gateway that fails an auth check sometimes echoes the
+/// credential it rejected — so the sentence is truncated to the same 2000
+/// characters the response path keeps, and the two credential shapes
+/// gateways actually echo (`Bearer <token>`, `sk-<token>`) are masked. A
+/// heuristic, not a promise: the promise that holds is harnox's — minted
+/// values never render at the source — and this pass is for what the
+/// other side says.
+fn redact(error: &str) -> String {
+    let bounded: String = error.chars().take(2000).collect();
+    let bytes = bounded.as_bytes();
+    let mut out = String::with_capacity(bounded.len());
+    let mut i = 0;
+    while i < bounded.len() {
+        // ASCII-case-insensitive compares against the original's bytes, on
+        // the original's offsets: a lowercased copy would drift (KELVIN
+        // SIGN shrinks three bytes to one; İ grows), and an offset taken
+        // from one string into the other panics — on the error path, the
+        // one place a panic is least welcome. Both patterns are ASCII, so
+        // ASCII folding is exact, and a multi-byte character's bytes are
+        // all non-ASCII, so none can match.
+        if bytes[i..].len() >= 7 && bytes[i..i + 7].eq_ignore_ascii_case(b"bearer ") {
+            out.push_str("bearer [redacted]");
+            i += "bearer ".len();
+            while i < bounded.len() && !bounded[i..].starts_with(|c: char| c.is_whitespace()) {
+                i += bounded[i..].chars().next().unwrap().len_utf8();
+            }
+        } else if bytes[i..].len() >= 3 && bytes[i..i + 3].eq_ignore_ascii_case(b"sk-") {
+            let run: usize = bounded[i + 3..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .map(char::len_utf8)
+                .sum();
+            if run >= 8 {
+                out.push_str("sk-[redacted]");
+                i += 3 + run;
+            } else {
+                i += bounded[i..].chars().next().unwrap().len_utf8();
+            }
+        } else {
+            let c = bounded[i..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
 fn spent(u: Usage) -> bool {
     u.input_tokens > 0
         || u.output_tokens > 0
@@ -579,6 +640,82 @@ impl Agent {
         ids
     }
 
+    /// Re-arm the wait the branch ends with, if it died parked.
+    ///
+    /// A park lives in this process, so the resume has to build it again —
+    /// and everything it needs is already on the branch: the registration
+    /// is the journaled `wait_for` input, the arming clock is the result
+    /// record's own timestamp, and [`crate::wait::parked_wait`] reads the
+    /// same records the replay does. The deadline is the original one, not
+    /// a fresh interval: a wait that outlived its deadline while the
+    /// process was down resolves at the first evaluation, through the
+    /// ordinary wake, so the model learns the wait is over rather than
+    /// waiting a second full timeout for a fact already true. A wait the
+    /// branch shows resolved or retired is left alone.
+    ///
+    /// Call once at startup, after the vantage is set and before the first
+    /// turn: the re-armed park belongs to no turn of this process, so the
+    /// next turn's `begin_turn` retires it exactly as a typed message
+    /// retires any park from an earlier turn. A door built without a
+    /// vantage — a test, an embedder — reports the skip instead of arming
+    /// what it cannot evaluate. The two timeouts are the ones
+    /// handed to [`crate::wait::WaitFor::new`] — the parse of `timeout_s`
+    /// must match the parse that armed the original park, and every driver
+    /// passes the constants. The return says what happened, for the driver
+    /// to trace: `None` is the ordinary branch (nothing parked at death),
+    /// and a resolved re-arm is already in the registry waiting for
+    /// [`Agent::take_fires`], which the driver's own wake will call.
+    pub async fn rearm_from_branch(
+        &self,
+        default_timeout: Duration,
+        max_timeout: Duration,
+    ) -> anyhow::Result<Option<String>> {
+        let parked = {
+            let s = self.session.lock().await;
+            crate::wait::parked_wait(s.branch().as_slice(), default_timeout, max_timeout)
+        };
+        let Some(p) = parked else {
+            return Ok(None);
+        };
+        if !self.parks().has_vantage() {
+            return Ok(Some(format!(
+                "the branch ends with a parked wait ({}), but this door has no vantage, so \
+conditions cannot be evaluated here and nothing was re-armed",
+                p.condition.describe(),
+            )));
+        }
+        let described = p.condition.describe();
+        let now = now_ms();
+        let deadline_ms = p.armed_ts_ms.saturating_add(p.timeout.as_millis() as u64);
+        let remaining = Duration::from_millis(deadline_ms.saturating_sub(now));
+        let waited_before = Duration::from_millis(now.saturating_sub(p.armed_ts_ms));
+        let spec = crate::wait::Spec {
+            call_id: p.call_id,
+            condition: p.condition,
+            wake: p.wake,
+            timeout: p.timeout,
+            epoch: self.parks().current_epoch(),
+            note: p.note,
+        };
+        match self
+            .parks()
+            .rearm(spec, Instant::now() + remaining, waited_before)
+            .await
+        {
+            crate::wait::Rearm::Armed(_) => Ok(Some(format!(
+                "re-armed the wait the branch ended with — {described} — deadline in {}s",
+                remaining.as_secs(),
+            ))),
+            crate::wait::Rearm::Resolved(fired) => Ok(Some(format!(
+                "the wait the branch ended with was already over ({}) — waking the session to it",
+                fired.outcome.words(),
+            ))),
+            crate::wait::Rearm::Refused(why) => {
+                anyhow::bail!("the branch ends with a parked wait and it could not be re-armed: {why}")
+            }
+        }
+    }
+
     /// Reach the boundary now, if one is waiting and no turn is in flight.
     ///
     /// An idle session's boundary *is* this instant, and no turn is coming to
@@ -805,7 +942,16 @@ impl Agent {
             // An external sender gets its own record: replay and every
             // consumer must be able to tell `eidolon send`'s machine
             // input from a colleague's note, exactly as the framing does.
-            let kind = if m.external {
+            let kind = if m.operator {
+                // The operator's word gets its own record too, for the
+                // same reason twice over: replay must frame it as the
+                // operator speaking, and a flag on a journaled variant
+                // would rewrite the bytes of every log holding one.
+                RecordKind::OperatorMessage {
+                    from: m.from.clone(),
+                    text: m.text.clone(),
+                }
+            } else if m.external {
                 RecordKind::ExternalMessage {
                     from: m.from.clone(),
                     channel: m.channel.clone(),
@@ -872,6 +1018,15 @@ impl Agent {
 
     pub fn dispatcher(&self) -> &Arc<Dispatcher> {
         &self.dispatcher
+    }
+
+    /// The door's `answer` op: carry a peer's text to a question one of
+    /// this session's asking seams raised. The registry owns the lookup,
+    /// the refusals and the tombstones; journaling happens at the seam
+    /// that receives the delivery — the answer rides the `AskUser` record
+    /// it was asked under, with `PeerAnswer` as its provenance.
+    pub fn answer_question(&self, id: &str, text: &str, peer: &str) -> Result<(), String> {
+        self.dispatcher().deliver_answer(id, text, peer)
     }
 
     /// Switch models mid-session. `key` is journaled (so a resume resolves
@@ -1609,6 +1764,15 @@ impl Agent {
                     });
                 }
                 Err(e) => {
+                    // The failure is a fact of the record, not only prose
+                    // on a bus: a provider-killed turn journals its floors
+                    // and the wire's own sentence for the death, so the
+                    // next occurrence is a row rather than an anecdote.
+                    // Journaling trouble does not mask the failure that
+                    // caused it.
+                    if let Err(je) = self.failed(&e, total, calls, context).await {
+                        tracing::error!(error = %format!("{je:#}"), "could not journal the turn failure");
+                    }
                     self.bus.publish(Event::Error(format!("{e:#}")));
                     return Err(e);
                 }
@@ -1857,31 +2021,45 @@ impl Agent {
 the branch, so a follow-up message continues from where this stopped; raise `max_iterations` \
 in the config if turns keep needing more"
         )));
-        // Journaled for the reason a cancel's spend is: this turn made
-        // `max_iterations` model calls and then ended without a settle,
-        // so it is the most expensive way a turn can finish and the one
-        // least excusable to price at nothing.
+        // The context rides with the settle, exactly as a cancel's does:
+        // the calls this turn made read the whole transcript, and a turn
+        // that ended at the iteration limit left the gauge on the previous
+        // turn's number just as surely as one the operator stopped.
         //
-        // The context rides with it, exactly as a cancel's does: the calls
-        // this turn made read the whole transcript, and a turn that ended
-        // at the iteration limit left the gauge on the previous turn's
-        // number just as surely as one the operator stopped. Written
-        // before the spend, like the settle's own, so the resume walk
-        // hands the measurement to this turn's ledger row.
+        // The wall is a settle: `StopReason::IterationLimit` is what the
+        // settle reason is *for*. Without the boundary record the most
+        // expensive way a turn can finish reads as unfinished — a resume
+        // runs its finishing pass on a branch that owes nothing, and every
+        // ledger that closes on a settle leaves this turn's spend standing
+        // open. The settle is this turn's one spend-bearing record — the
+        // usage walker reads a [`RecordKind::TurnSpend`] and a settle as
+        // alternatives for the same turn and would sum both — so the
+        // spend rides the settle instead of a TurnSpend beside it.
+        // Journaled before it is published, like every settle; the
+        // outcome stays `Exhausted` for the driver's own exit words.
         let mut session = self.session.lock().await;
         if let Some(tokens) = context.filter(|t| *t > 0) {
             session.append(RecordKind::ContextSize { tokens })?;
         }
-        if spent(total) {
-            session.append(RecordKind::TurnSpend {
-                usage: total,
-                calls,
+        if timing.calls > 0 {
+            session.append(RecordKind::TurnPace {
+                timing,
+                output_tokens: total.output_tokens,
             })?;
         }
+        session.append(RecordKind::TurnSettled {
+            stop_reason: StopReason::IterationLimit,
+            usage: total,
+        })?;
         drop(session);
         if let Some(tokens) = context.filter(|t| *t > 0) {
             self.bus.publish(Event::ContextSize { tokens });
         }
+        self.bus.publish(Event::TurnSettled {
+            stop_reason: StopReason::IterationLimit,
+            usage: total,
+            timing: Some(timing),
+        });
         Ok(TurnOutcome::Exhausted {
             usage: total,
             calls,
@@ -1945,6 +2123,42 @@ in the config if turns keep needing more"
         }
         self.bus.publish(Event::Cancelled { usage, calls });
         Ok(TurnOutcome::Cancelled { usage, calls })
+    }
+
+    /// The record side of a turn the **provider** killed, after the retry
+    /// classifier gave up: the floors a cancellation writes — the context
+    /// the last call measured, the spend already made — and then the
+    /// failure itself, in the wire's own words, as a
+    /// [`RecordKind::TurnFailed`]. One row per provider-killed turn is
+    /// what makes the next occurrence countable by what went wrong rather
+    /// than an anecdote on a bus.
+    ///
+    /// No settle rides beside it, deliberately: a settle is the boundary
+    /// resume lands on, and a turn the provider killed is work still owed
+    /// — resuming re-enters it, the same as a cancelled one.
+    async fn failed(
+        &self,
+        error: &anyhow::Error,
+        usage: Usage,
+        calls: u32,
+        context: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let context = context.filter(|t| *t > 0);
+        let mut session = self.session.lock().await;
+        if let Some(tokens) = context {
+            session.append(RecordKind::ContextSize { tokens })?;
+        }
+        if spent(usage) {
+            session.append(RecordKind::TurnSpend { usage, calls })?;
+        }
+        session.append(RecordKind::TurnFailed {
+            error: redact(&format!("{error:#}")),
+        })?;
+        drop(session);
+        if let Some(tokens) = context {
+            self.bus.publish(Event::ContextSize { tokens });
+        }
+        Ok(())
     }
 
     /// The settle a harness-owned end writes: the context as last

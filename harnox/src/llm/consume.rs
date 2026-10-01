@@ -134,6 +134,15 @@ struct StreamFailure {
 /// the answer while `"connect"` is on the list — it is kept so that narrowing
 /// the broader term later does not silently lose the narrower one (the
 /// connection-closed family, for instance, is matched through it).
+/// Every error site is obliged to spell the status into its sentence — this
+/// classifier reads prose, not structured fields — and the obligation is
+/// invisible from either side: the site cannot see the terms, and the terms
+/// cannot see the site. `openai.rs`'s in-band stream errors once rendered a
+/// bare error object (`"gw: {"code":502,…}"`), matched none of the terms
+/// below, and a transient gateway hiccup killed whole turns unretried while
+/// the *same* failure arriving as a non-2xx response retried four times.
+/// If you render an error anywhere on the wire path, dress the status the
+/// way the response path does.
 pub fn is_transient(e: &anyhow::Error) -> bool {
     let m = format!("{e:#}").to_lowercase();
     if m.contains("http 4") && !m.contains("http 408") && !m.contains("http 429") {

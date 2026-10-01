@@ -131,7 +131,9 @@ pub fn context_line(tokens: Option<u64>, limit: Option<u64>) -> String {
 /// tool run: a failure may not leave the screen quietly.
 ///
 /// `Cancelled` says nothing here because the operator is the one who did
-/// it and the consumers already report it.
+/// it and the consumers already report it. `Waiting` says nothing because
+/// the park says itself — the wait block on the transcript, the armed
+/// result in headless — and a settle note over it is clutter, not signal.
 pub fn stop_note(stop: StopReason) -> Option<&'static str> {
     match stop {
         StopReason::EndTurn | StopReason::ToolUse | StopReason::Cancelled => None,
@@ -143,18 +145,24 @@ pub fn stop_note(stop: StopReason) -> Option<&'static str> {
         StopReason::Other => Some(
             "response ended without a stop reason: the backend closed the stream without saying why",
         ),
-        // Not a failure: the session asked to be woken by a condition and
-        // the loop settled the turn so nothing would poll for it. Worth
-        // saying out loud all the same — a settle that is not the model
-        // finishing looks exactly like one that is.
-        StopReason::Waiting => Some(
-            "waiting: the session parked on a condition it named and will wake when it fires, or when its deadline arrives",
-        ),
-        // Same reason `Waiting` says itself out loud: a settle that is not
-        // the model finishing looks exactly like one that is. The operator
-        // closed the question; the turn ended rather than re-asking.
+        // Not a failure, and not this function's to say: the park renders
+        // itself. The TUI's wait block draws parked, the deadline and the
+        // mail level, and how the wait resolved when it does; headless
+        // prints the armed tool result, which ends "the turn ends here".
+        // A settle note would only repeat the block sitting above it.
+        StopReason::Waiting => None,
+        // A settle that is not the model finishing looks exactly like one
+        // that is, and unlike `Waiting` this one has no block of its own
+        // saying so. The operator closed the question; the turn ended
+        // rather than re-asking.
         StopReason::Dismissed => Some(
             "turn ended: the question was dismissed without an answer — send a message to continue",
+        ),
+        // The harness's own cap, not the model finishing and not a human
+        // stopping it: the most expensive way a turn can finish, and the
+        // settle says so rather than looking like a clean end.
+        StopReason::IterationLimit => Some(
+            "turn cut by the iteration limit — a follow-up message continues from where it stopped",
         ),
     }
 }
@@ -351,11 +359,12 @@ mod tests {
         );
         assert!(stop_note(StopReason::Other).is_some());
         assert!(stop_note(StopReason::Refusal).is_some());
-        // The two healthy endings, and the one the operator already knows
-        // about, stay quiet.
+        // The two healthy endings, the one the operator already knows
+        // about, and the park that renders itself, stay quiet.
         assert_eq!(stop_note(StopReason::EndTurn), None);
         assert_eq!(stop_note(StopReason::ToolUse), None);
         assert_eq!(stop_note(StopReason::Cancelled), None);
+        assert_eq!(stop_note(StopReason::Waiting), None);
     }
 
     #[test]

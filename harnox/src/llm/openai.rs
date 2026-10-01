@@ -317,7 +317,7 @@ impl Provider for OpenAiCompat {
                 if ev.data.is_empty() { continue; }
                 let chunk: Value = serde_json::from_str(&ev.data)?;
                 if let Some(err) = chunk.get("error") {
-                    Err(anyhow::anyhow!("{}: {}", self.name, err))?;
+                    Err(in_band_error(&self.name, err))?;
                 }
                 for out in mapper.map(&chunk) {
                     yield out;
@@ -327,6 +327,28 @@ impl Provider for OpenAiCompat {
                 yield stop;
             }
         })
+    }
+}
+
+/// The error an OpenAI-compatible gateway reports **in the stream** — an
+/// event whose JSON carries an `error` object instead of choices — as the
+/// failure the retry classifier reads.
+///
+/// [`is_transient`](crate::llm::is_transient) reads prose: it wants the
+/// status spelled the way the non-2xx response path spells one
+/// (`"gw returned HTTP 502: …"`), because that is the obligation every
+/// error site carries — put the status in the sentence. A gateway that
+/// fails in-band (OpenRouter does, when its own upstream hands back an
+/// empty body) carries the status as a numeric `code` on the error object,
+/// so the code is dressed as the status it is and a transient gateway
+/// hiccup retries instead of killing the turn. A string code is the
+/// gateway's own vocabulary rather than a status, and a missing code says
+/// nothing at all; both render as the bare object they always did, and
+/// neither may be dressed as a status it is not.
+fn in_band_error(name: &str, err: &Value) -> anyhow::Error {
+    match err.get("code").and_then(Value::as_i64) {
+        Some(code) => anyhow::anyhow!("{name} returned HTTP {code}: {err}"),
+        None => anyhow::anyhow!("{name}: {err}"),
     }
 }
 
@@ -349,6 +371,44 @@ mod tests {
             temperature: None,
             tool_choice: ToolChoice::Auto,
         }
+    }
+
+    /// An in-band gateway error carries its status as a numeric `code`, and
+    /// the retry classifier reads prose: rendered bare — today's rendering —
+    /// `openrouter: {"code":502,…}` matches none of `is_transient`'s terms,
+    /// so a transient gateway hiccup reads permanent and a turn dies
+    /// unretried. Dressed as the response path dresses one, the same
+    /// failure retries: one upstream hiccup must cost latency, not a turn.
+    #[test]
+    fn an_in_band_error_is_dressed_as_a_status_so_it_retries() {
+        let err = in_band_error(
+            "openrouter",
+            &json!({
+                "code": 502,
+                "message": "Provider returned an empty response",
+                "metadata": {"error_type": "provider_unavailable"}
+            }),
+        );
+        assert!(
+            format!("{err:#}").contains("returned HTTP 502"),
+            "the status travels in the sentence: {err:#}"
+        );
+        assert!(
+            crate::llm::is_transient(&err),
+            "a 502 in the stream is an outage, not a verdict: {err:#}"
+        );
+
+        // A string code is the gateway's own word, not a status, and must
+        // not be dressed as one.
+        let err = in_band_error("gw", &json!({"code": "provider_error", "message": "m"}));
+        assert!(
+            !format!("{err:#}").contains("HTTP"),
+            "a string code is not a status: {err:#}"
+        );
+
+        // No code at all renders as it always did.
+        let err = in_band_error("gw", &json!({"message": "m"}));
+        assert_eq!(format!("{err:#}"), "gw: {\"message\":\"m\"}");
     }
 
     /// Nobody said, so nothing is sent — an endpoint that has never heard of

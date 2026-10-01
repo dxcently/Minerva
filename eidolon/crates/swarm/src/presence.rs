@@ -58,6 +58,30 @@ pub struct Meta {
 pub struct Peer {
     pub meta: Meta,
     pub dir: PathBuf,
+    /// The questions this peer's asking seams hold right now — the
+    /// `questions.json` its dispatcher's registry publishes. Empty is the
+    /// ordinary case: nothing to answer, and nothing advertised.
+    pub questions: Vec<PeerQuestion>,
+}
+
+/// One outstanding question, as the roster shows it: what a peer's
+/// `answer` tool is aimed at. Written by the asking session, read by
+/// everyone else — the file is the whole of the advertisement, so a
+/// question exists to a peer exactly while the asking seam holds it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerQuestion {
+    pub id: String,
+    pub kind: String,
+    pub text: String,
+}
+
+impl PeerQuestion {
+    fn read(dir: &Path) -> Vec<PeerQuestion> {
+        match std::fs::read(dir.join("questions.json")) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 impl Peer {
@@ -100,6 +124,34 @@ pub struct Presence {
     dir: PathBuf,
     id: String,
     meta: RwLock<Meta>,
+}
+
+/// The dispatcher registry's projection, written where a peer's roster
+/// read finds it. Written on every registry change, temp-then-rename so a
+/// half-written file never advertises a question — and never hides one —
+/// mid-write.
+pub struct QuestionBoardFile(PathBuf);
+
+impl eidolon_core::dispatch::QuestionBoard for QuestionBoardFile {
+    fn publish(&self, questions: &[eidolon_core::dispatch::OutstandingQuestion]) {
+        let qs: Vec<PeerQuestion> = questions
+            .iter()
+            .map(|q| PeerQuestion {
+                id: q.id.clone(),
+                kind: q.kind.word().to_string(),
+                text: q.text.clone(),
+            })
+            .collect();
+        let bytes = match serde_json::to_vec_pretty(&qs) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let target = self.0.join("questions.json");
+        let temp = self.0.join("questions.json.new");
+        if std::fs::write(&temp, bytes).is_ok() {
+            let _ = std::fs::rename(&temp, &target);
+        }
+    }
 }
 
 impl Presence {
@@ -227,6 +279,14 @@ impl Presence {
         }
     }
 
+    /// The board this session's dispatcher publishes its outstanding
+    /// questions to — this registration's `questions.json`, what every
+    /// peer's roster read shows. Set on the dispatcher at startup; a
+    /// question is advertised exactly while an asking seam holds it.
+    pub fn question_board(&self) -> Arc<dyn eidolon_core::dispatch::QuestionBoard> {
+        Arc::new(QuestionBoardFile(self.dir.clone()))
+    }
+
     fn write_meta(&self) -> Result<()> {
         let body = serde_json::to_vec_pretty(&*self.meta.read().unwrap())?;
         let tmp = self.dir.join(".meta.tmp");
@@ -316,6 +376,7 @@ fn mail_of(envs: Vec<inbox::Envelope>) -> Vec<eidolon_core::peer::PeerMessage> {
             text: e.text,
             wake: e.wake,
             external: e.external,
+            operator: e.operator,
         })
         .collect()
 }
@@ -370,7 +431,8 @@ pub fn scan(root: &Path) -> Vec<Peer> {
         // roster: mail lands in its real inbox and reports `Queued`
         // while the doorbell is silent, which is the honest outcome.
         if socket::probe(&dir.join("sock")) || pid_live(meta.pid) {
-            out.push(Peer { meta, dir });
+            let questions = PeerQuestion::read(&dir);
+            out.push(Peer { meta, dir, questions });
         } else {
             sweep_if_stale(&dir, Some(meta.started_ms));
         }

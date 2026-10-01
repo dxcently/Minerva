@@ -54,9 +54,13 @@ mod config;
 mod chatgpt_login;
 mod google_login;
 mod persona;
+mod plugin_fetch;
+mod plugins;
+mod service;
 mod system;
 mod term;
 mod vantage;
+mod workflow;
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -76,11 +80,31 @@ use eidolon_core::session::RecordKind;
 use eidolon_core::user::tools::ChoicesUser;
 use eidolon_core::*;
 
+/// The `--version` line: the semver first, so whatever parses the line
+/// today keeps parsing it, then the source revision when the build knows
+/// it — `EIDOLON_BUILD_SHA` is the builder's to pass (`git rev-parse
+/// --short` of what was archived), because the fleet artifact is built
+/// from `git archive` in a container where there is no `.git` to ask. No
+/// sha is today's string exactly: an `unknown` suffix would be a fact
+/// wearing the costume of a value.
+fn version_line() -> &'static str {
+    static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LINE.get_or_init(|| {
+        match option_env!("EIDOLON_BUILD_SHA") {
+            Some(sha) if !sha.is_empty() => {
+                format!("{} ({sha})", env!("CARGO_PKG_VERSION"))
+            }
+            _ => env!("CARGO_PKG_VERSION").to_string(),
+        }
+    })
+    .as_str()
+}
+
 #[derive(Parser)]
 #[command(
     name = "eidolon",
     about = "Headless driver for the Eidolon core",
-    version
+    version = version_line()
 )]
 struct Cli {
     /// Config file (default: ~/.config/eidolon/config.toml)
@@ -104,6 +128,7 @@ struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
+
 
 #[derive(Subcommand)]
 enum Cmd {
@@ -187,6 +212,14 @@ enum Cmd {
         /// than steering a busy session or waking an idle one.
         #[arg(long)]
         no_wake: bool,
+        /// Mark the message as the operator speaking: the one sender a
+        /// session parked at `wake: 0` still hears, framed to the model
+        /// as the person it works for. The operator's own flag — a peer
+        /// session and the send tool have no such parameter, which is
+        /// what keeps a level-0 park deaf to peers but not to the person
+        /// who parked it.
+        #[arg(long)]
+        operator: bool,
         /// Resolve `channel` against this directory rather than the current one.
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -261,6 +294,20 @@ enum Cmd {
         #[arg(long)]
         live: bool,
     },
+    /// Everything about installed plugins: bare, the listing; with a verb,
+    /// the operator's act on one. Presence is not permission — the listing
+    /// is read-only presentation, and the verbs beside it are what change
+    /// the record.
+    Plugins {
+        /// List plugins from this directory instead of
+        /// `~/.config/eidolon/plugins` — for trying a plugin where it
+        /// lies before installing it. The listing's own flag: the verbs
+        /// below act on the operator's directory.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[command(subcommand)]
+        op: Option<plugins::Op>,
+    },
     /// Show how a shell command would be classified, without running it.
     Policy {
         /// The command, as you would type it. Quote it if it has shell
@@ -268,8 +315,26 @@ enum Cmd {
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
-    /// List every provider and model the catalog knows.
-    Models,
+    /// Compare the operator's `policy.rn` with the shipped table in **row
+    /// names** — which rows are yours alone, which the harness added — and
+    /// say what version marker each copy carries. Never a line diff,
+    /// because behaviour differs per row: a missing row is a question on
+    /// every call it names. Manual by ruling — nothing nags at startup.
+    ///
+    /// Flat, not a `policy` subcommand, on purpose: `policy` owns a
+    /// positional command, so `policy rows` would compete with classifying
+    /// a command literally named `rows`, and clap resolves a subcommand
+    /// first — the same reality that made the plugin verbs flat.
+    PolicyRows,
+    /// List every provider and model the catalog knows — from the http
+    /// cache, a launch's answer. `--live` asks the gateways instead.
+    Models {
+        /// Fetch every listing-bearing provider's models now, waiting on
+        /// the network, and write the cache a launch reads, instead of
+        /// printing what is cached.
+        #[arg(long)]
+        live: bool,
+    },
     /// Resolve a free-text command with Verba Volantia and run it through
     /// the dispatcher — no model turn. Quote values: `read the note "Groceries"`.
     Do {
@@ -289,6 +354,21 @@ enum Cmd {
     Secret {
         #[command(subcommand)]
         op: SecretOp,
+    },
+    /// The program's door into a workflow run: one JSON line on stdout,
+    /// the verdict in the exit code. A run is a session — the line names
+    /// its journal — and a parked run is its own status at exit 1, because
+    /// a run waiting on a person is not a success and not a failure:
+    ///
+    ///   0 completed   1 parked (the `question` says what it waits on)
+    ///   2 failed      3 refused (nothing ran; nothing was journaled)
+    ///
+    /// `resume` takes the session and run the line named, plus
+    /// `--answer` for a parked one, and prints the same shape back. The
+    /// gate classifies every step exactly as it does for any other run.
+    Workflow {
+        #[command(subcommand)]
+        op: workflow::WorkflowOp,
     },
     /// Claude Code PreToolUse hook client (invoked by the CLI, not by hand).
     #[command(hide = true)]
@@ -372,6 +452,11 @@ enum DoorOp {
         /// Leave the message for the recipient's next turn boundary.
         #[arg(long)]
         no_wake: bool,
+        /// Mark the message as the operator speaking — the override a
+        /// parked session hears at any wake level. The operator's own
+        /// flag: peers and tools have no such parameter.
+        #[arg(long)]
+        operator: bool,
         /// Resolve `channel` against this directory rather than the current one.
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -481,6 +566,22 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Hook | Cmd::Mcp => unreachable!("handled above"),
         Cmd::GoogleLogin => google_login::run_google_login().await,
         Cmd::ChatgptLogin => chatgpt_login::run_chatgpt_login().await,
+        Cmd::Workflow { op } => {
+            // Every outcome speaks JSON on stdout, refusals included — the
+            // door is for a program, and a program cannot read prose. The
+            // exit code is the verdict; stdout is flushed before it flies,
+            // because a piped stdout is block-buffered and `exit` does not
+            // drain it.
+            let out = match op {
+                workflow::WorkflowOp::Run(req) => workflow::start(&cfg, req, yolo).await,
+                workflow::WorkflowOp::Resume(req) => workflow::resume(&cfg, req, yolo).await,
+            };
+            let out = out.unwrap_or_else(|e| workflow::refused(format!("{e:#}")));
+            println!("{}", out.line);
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::process::exit(out.code);
+        }
         Cmd::Tui {
             session,
             model,
@@ -503,13 +604,17 @@ async fn main() -> anyhow::Result<()> {
             boot::mark("session");
             let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
             let user: Arc<dyn UserIo> = Arc::new(eidolon_tui::TuiUser::new(ui_tx.clone()));
-            let mut rt = build(&cfg, s, cwd, model.as_deref(), provider.as_deref(), user, yolo).await?;
+            let mut rt = build(&cfg, s, user, yolo, Launch { cwd, model, provider, plugin: None }).await?;
             let ui_script_path = config::config_dir().join("ui.rn");
             let ui_script = std::fs::read_to_string(&ui_script_path).ok();
             let opts = eidolon_tui::TuiOptions {
                 ui_script,
                 // Kept for `reload_ui`, which reads it again in place.
                 ui_script_path: Some(ui_script_path),
+                plugins_dir: Some(cfg.plugins_dir()),
+                // The permission store's file, for the live sources'
+                // may-fetch check — the same file the gate's store reads.
+                policy_path: Some(cfg.policy_path()),
                 catalog: Some(rt.catalog.clone()),
                 cwd: rt.cwd.clone(),
                 scratch: cfg.sessions_dir().join("claude-cli"),
@@ -553,7 +658,7 @@ async fn main() -> anyhow::Result<()> {
             boot::mark("session");
             let web_user = Arc::new(eidolon_web::WebUser::new());
             let user: Arc<dyn UserIo> = web_user.clone();
-            let mut rt = build(&cfg, s, cwd, model.as_deref(), provider.as_deref(), user, yolo).await?;
+            let mut rt = build(&cfg, s, user, yolo, Launch { cwd, model, provider, plugin: None }).await?;
             struct Roster(Arc<eidolon_swarm::Presence>);
 
             impl eidolon_web::driver::Presence for Roster {
@@ -576,6 +681,42 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Each window as the TUI's `open_window` opens it for its `T` chord.
+            struct Windows {
+                launcher: eidolon_tui::launch::Launcher,
+                cwd: PathBuf,
+            }
+
+            impl eidolon_web::launch::Launch for Windows {
+                fn open(&self, window: eidolon_web::launch::Window, path: Option<&str>) -> anyhow::Result<String> {
+                    use eidolon_tui::launch::{aim, with_path};
+                    use eidolon_web::launch::Window;
+                    let typed = path.filter(|p| !p.trim().is_empty()).map(eidolon_tools::image::expand_tilde);
+                    let (dir, file) = aim(&self.cwd, typed.as_deref());
+                    match window {
+                        // It runs the login shell; naming one would name it twice.
+                        Window::Terminal => self.launcher.open(&dir, &[]),
+                        // With no file, the directory: `hx DIR` is a picker, bare `hx` a scratch buffer.
+                        Window::Editor => {
+                            let argv = self.launcher.editor();
+                            if argv.is_empty() {
+                                bail!("no editor found; set `$EDITOR`, or `[terminal] editor` in config.toml");
+                            }
+                            let argv = with_path(argv, &file.unwrap_or_else(|| dir.clone()).display().to_string());
+                            self.launcher.open(&dir, &argv)
+                        }
+                        Window::Files => {
+                            let argv = self.launcher.files();
+                            if argv.is_empty() {
+                                bail!("no file manager found; set `[terminal] files` in config.toml");
+                            }
+                            let argv = with_path(argv, &file.unwrap_or_else(|| dir.clone()).display().to_string());
+                            self.launcher.open(&dir, &argv)
+                        }
+                    }
+                }
+            }
+
             // As in `drive`, so a signal still removes the token file.
             let cancel = CancellationToken::new();
             {
@@ -594,6 +735,11 @@ async fn main() -> anyhow::Result<()> {
                     yolo: rt.yolo.clone().unwrap_or_default(),
                     doorbell: rt.doorbell.take(),
                     presence: rt.swarm.clone().map(|p| Arc::new(Roster(p)) as Arc<dyn eidolon_web::driver::Presence>),
+                    // Always given: an empty `[terminal]` means resolve when asked, not disabled.
+                    launch: Some(Arc::new(Windows {
+                        launcher: cfg.launcher(),
+                        cwd: rt.cwd.clone(),
+                    })),
                 },
                 cancel,
             )
@@ -632,11 +778,14 @@ async fn main() -> anyhow::Result<()> {
             let mut rt = build(
                 &cfg,
                 session,
-                cwd,
-                Some(&model),
-                provider.as_deref(),
                 Arc::new(term::StdinUser),
                 yolo,
+                Launch {
+                    cwd,
+                    model: Some(model.clone()),
+                    provider,
+                    plugin: None,
+                },
             )
             .await?;
             report_persona(&rt).await;
@@ -680,11 +829,14 @@ async fn main() -> anyhow::Result<()> {
             let mut rt = build(
                 &cfg,
                 s,
-                cwd,
-                None,
-                provider.as_deref(),
                 Arc::new(term::StdinUser),
                 yolo,
+                Launch {
+                    cwd,
+                    model: None,
+                    provider,
+                    plugin: None,
+                },
             )
             .await?;
             let prompt = prompt.join(" ");
@@ -711,11 +863,14 @@ async fn main() -> anyhow::Result<()> {
             let mut rt = build(
                 &cfg,
                 s,
-                cwd,
-                model.as_deref(),
-                provider.as_deref(),
                 Arc::new(term::StdinUser),
                 yolo,
+                Launch {
+                    cwd,
+                    model,
+                    provider,
+                    plugin: None,
+                },
             )
             .await?;
             report_persona(&rt).await;
@@ -734,10 +889,11 @@ async fn main() -> anyhow::Result<()> {
             from,
             wake,
             no_wake,
+            operator,
             cwd,
             to,
             text,
-        } => door_send(from, wake, no_wake, cwd, to, text),
+        } => door_send(from, wake, no_wake, operator, cwd, to, text),
         // The same two, plus the settled close of a hop. `quiesce` leaves
         // the session's own process to notice the request at its next turn
         // boundary; this side only asks and waits.
@@ -747,10 +903,11 @@ async fn main() -> anyhow::Result<()> {
                 from,
                 wake,
                 no_wake,
+                operator,
                 cwd,
                 to,
                 text,
-            } => door_send(from, wake, no_wake, cwd, to, text),
+            } => door_send(from, wake, no_wake, operator, cwd, to, text),
             DoorOp::Quiesce {
                 session,
                 destination,
@@ -826,6 +983,19 @@ async fn main() -> anyhow::Result<()> {
                 println!("#{} ← {} {}", r.id, parent, term::record_line(r));
             }
             println!("head: {:?}  settled: {}", s.head(), s.is_settled());
+            // The spend line a session says on its exits — the run
+            // driver's, the interactive drivers' — said here too: the log
+            // is where a session's cost gets asked after, and a count
+            // that lives only in the exit path of a process already gone
+            // is a count nobody reads. The catalog is the cached one: a
+            // read-only command does not wake a gateway to price the
+            // past.
+            let catalog = config::catalog(&cfg, eidolon_providers::Fetch::Cached);
+            if let Some((spend, unpriced_turns, unpriced_calls, plugin_requests)) =
+                session_spend(&catalog, &s)
+            {
+                println!("[spend {}]", spend_segment(spend, unpriced_turns, unpriced_calls, plugin_requests));
+            }
             Ok(())
         }
         Cmd::Import {
@@ -991,13 +1161,16 @@ async fn main() -> anyhow::Result<()> {
             let rt = build(
                 &cfg,
                 session,
-                cwd,
-                // Named by this very command, so a resolution failure is a
-                // refused request, not a projection landing.
-                Some("mock"),
-                Some("mock"),
                 Arc::new(term::StdinUser),
                 yolo,
+                Launch {
+                    cwd,
+                    model: Some("mock".into()),
+                    // Named by this very command, so a resolution failure is a
+                    // refused request, not a projection landing.
+                    provider: Some("mock".into()),
+                    plugin: None,
+                },
             )
             .await?;
             let out = rt
@@ -1058,11 +1231,22 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
         },
-        Cmd::Models => {
-            // The listing is the one place a script's `models()` waits on
-            // its gateway: this command exists to say what is served now,
-            // and what it fetches is what the next launch answers from.
-            let cat = config::catalog(&cfg, eidolon_providers::Fetch::Live);
+        Cmd::Models { live } => {
+            // The cached answer, as a launch gives it: what the last fetch
+            // left, with a stale entry refreshed in its background — a
+            // listing is worth a stale answer, and a read-only command does
+            // not wake a gateway to print one. `--live` is the one place a
+            // script's `models()` waits on its gateway: this mode exists to
+            // say what is served now, and what it fetches is what the next
+            // launch answers from.
+            let cat = config::catalog(
+                &cfg,
+                if live {
+                    eidolon_providers::Fetch::Live
+                } else {
+                    eidolon_providers::Fetch::Cached
+                },
+            );
             for p in cat.providers() {
                 println!(
                     "{}\t{:?}\t{}\t({})",
@@ -1071,6 +1255,24 @@ async fn main() -> anyhow::Result<()> {
             }
             if cat.has_claude() {
                 println!("claude-cli\tClaude Code CLI");
+            }
+            // A listing that is only the declared floor says so: nine rows
+            // read as "that is all there is", and a provider whose floor is
+            // zero rows vanishes without a word. The knowledge is the
+            // loader's own, not a count.
+            let fell = cat.listings_fell_back();
+            if !fell.is_empty() {
+                if live {
+                    println!(
+                        "listing fetch failed, declared floor only: {}",
+                        fell.join(", ")
+                    );
+                } else {
+                    println!(
+                        "nothing cached for {} — declared floor only; `eidolon models --live` fetches for the next launch",
+                        fell.join(", ")
+                    );
+                }
             }
             println!();
             // Heaviest first, as the picker shows them; the column is the
@@ -1137,6 +1339,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Cmd::PolicyRows => policy_rows(&cfg),
         Cmd::Tools { live } => {
             let host = eidolon_rune::Host::new(std::env::current_dir()?);
             // The surface a session would have, which is the point of this
@@ -1155,6 +1358,14 @@ async fn main() -> anyhow::Result<()> {
                 &mut reg,
                 &host,
                 &cfg.tools_dir(),
+            ));
+            // The same adoption a session does, so the listing is the
+            // registry a session would have had: namespaced, attributed,
+            // and refused loudly where it would be refused there.
+            notes.extend(eidolon_rune::register_plugins(
+                &mut reg,
+                &host,
+                &cfg.plugins_dir(),
             ));
             for note in notes {
                 eprintln!("[tool] {note}");
@@ -1250,11 +1461,18 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Cmd::Plugins { dir, op } => plugins::run(&cfg, dir, op),
     }
 }
 
+
 struct Runtime {
     agent: Arc<Agent>,
+    /// The tools' host, carrying the dispatcher and every attachment the
+    /// scripts ride (search key, secrets, the completion handle). The
+    /// workflow door compiles its program against this host, because the
+    /// step door the program calls reads the dispatcher from it.
+    host: Arc<eidolon_rune::Host>,
     bus: EventBus,
     catalog: Arc<eidolon_providers::Catalog>,
     cwd: PathBuf,
@@ -1352,44 +1570,116 @@ fn usage_summary(rt: &Runtime, session: &Session) -> String {
     // Each turn at the rates of the model it ran on, since `:model` moves
     // a session between providers mid-branch. Turns on an unpriced model
     // are left out and said so, rather than summed in as free.
-    if let Some((spend, unpriced)) = session_spend(rt, session) {
-        s.push_str(&format!(" · {}", eidolon_core::usage::dollars(spend)));
-        if unpriced > 0 {
-            s.push_str(&format!(
-                " (+{unpriced} unpriced turn{})",
-                if unpriced == 1 { "" } else { "s" }
-            ));
-        }
+    if let Some((spend, unpriced_turns, unpriced_calls, plugin_requests)) =
+        session_spend(&rt.catalog, session)
+    {
+        s.push_str(&format!(" · {}", spend_segment(
+            spend,
+            unpriced_turns,
+            unpriced_calls,
+            plugin_requests,
+        )));
     }
     s
 }
 
-/// What the branch cost in dollars, and how many of its turns could not
-/// be priced. `None` when none could — a session entirely on the Claude
-/// CLI has a bill, but not one this harness can compute.
-fn session_spend(rt: &Runtime, session: &Session) -> Option<(f64, usize)> {
+/// The spend segment both surfaces say the same way: the priced dollars,
+/// or the honest absence of them, then every class that could not be
+/// priced, named and counted. One wording, two callers — the run
+/// driver's exit line and `eidolon log` — over the one walk
+/// (`session_spend`) that produces the numbers.
+fn spend_segment(
+    spend: f64,
+    unpriced_turns: usize,
+    unpriced_calls: usize,
+    plugin_requests: usize,
+) -> String {
+    let mut s = if spend > 0.0
+        || (unpriced_turns == 0 && unpriced_calls == 0 && plugin_requests == 0)
+    {
+        eidolon_core::usage::dollars(spend)
+    } else {
+        // Nothing priced: say so rather than print a $0.00 that reads
+        // as a bill.
+        "nothing priced".to_string()
+    };
+    if unpriced_turns > 0 {
+        s.push_str(&format!(
+            " (+{unpriced_turns} unpriced turn{})",
+            if unpriced_turns == 1 { "" } else { "s" }
+        ));
+    }
+    if unpriced_calls > 0 {
+        s.push_str(&format!(
+            " (+{unpriced_calls} unpriced model call{})",
+            if unpriced_calls == 1 { "" } else { "s" }
+        ));
+    }
+    if plugin_requests > 0 {
+        s.push_str(&format!(
+            " (+{plugin_requests} unpriced plugin request{})",
+            if plugin_requests == 1 { "" } else { "s" }
+        ));
+    }
+    s
+}
+
+/// What the branch cost in dollars, and what could not be priced: turns
+/// and tool-less model calls counted separately, because a record that
+/// carries no price must leave the dollars line honestly rather than be
+/// summed in as free. Plugin `api_request`s are counted — never priced:
+/// what a third-party API charges is unknown here, and unknown is not
+/// zero. `None` when nothing ran on billable arithmetic at all — a
+/// session entirely on the Claude CLI has a bill, but not one
+/// this harness can compute.
+fn session_spend(
+    catalog: &eidolon_providers::Catalog,
+    session: &Session,
+) -> Option<(f64, usize, usize, usize)> {
     let mut model: Option<String> = None;
     let mut spend = 0.0;
-    let mut priced = 0usize;
-    let mut unpriced = 0usize;
+    let mut anything = false;
+    let mut unpriced_turns = 0usize;
+    let mut unpriced_calls = 0usize;
+    let mut plugin_requests = 0usize;
     for r in session.branch() {
         match &r.kind {
             RecordKind::SessionStart { model: m, .. } | RecordKind::ModelChanged { model: m } => {
                 model = Some(m.clone())
             }
             RecordKind::TurnSettled { usage, .. } => {
-                match model.as_deref().and_then(|m| rt.catalog.cost(m)) {
+                match model.as_deref().and_then(|m| catalog.cost(m)) {
                     Some(c) => {
                         spend += c.price(usage);
-                        priced += 1;
+                        anything = true;
                     }
-                    None => unpriced += 1,
+                    None => unpriced_turns += 1,
                 }
+            }
+            // Priced at the key the record carries, not the model in
+            // play: the call named its own model, and that is the one
+            // the rates are keyed on.
+            RecordKind::ModelSpend { key, usage, .. } => {
+                match catalog.cost(key) {
+                    Some(c) => {
+                        spend += c.price(usage);
+                        anything = true;
+                    }
+                    None => unpriced_calls += 1,
+                };
+            }
+            // A plugin's egress: counted, never priced, never silently
+            // absent. Every `api_request` journals; the count is the
+            // plugin-tagged ones, the operator's own scripts naming
+            // their tools instead.
+            RecordKind::ApiRequest { consumer, .. } if consumer.starts_with("plugin:") => {
+                plugin_requests += 1
             }
             _ => {}
         }
     }
-    (priced > 0).then_some((spend, unpriced))
+    (anything || unpriced_turns > 0 || unpriced_calls > 0 || plugin_requests > 0)
+        .then_some((spend, unpriced_turns, unpriced_calls, plugin_requests))
 }
 
 fn cfg_scratch() -> PathBuf {
@@ -1402,7 +1692,80 @@ fn cfg_scratch() -> PathBuf {
 
 /// With the Claude CLI configured and no `default_model`, the CLI's own
 /// default (`sonnet`); otherwise the mock.
-fn default_model(cfg: &config::Config) -> String {
+/// The staleness check, ruled 2026-09-28 (option (a): visibility only —
+/// replacement stays, composition is not built). The operator's copy is
+/// carried forward untouched and left alone once edited, so a copy can
+/// silently predate the shipped table: a row the harness added is then a
+/// question on every call it names, which reads as a gate bug and not as
+/// the stale file it is. This says the two tables' row names and the
+/// version marker each carries — the rows because behaviour differs per
+/// row, the marker because it separates "your edits" from "your base is
+/// old". Manual by ruling: a line that fires every launch is a line
+/// people stop reading.
+fn policy_rows(cfg: &config::Config) -> anyhow::Result<()> {
+    let path = cfg.policy_path();
+    let theirs = match std::fs::read_to_string(&path) {
+        Ok(src) => Some(src),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
+    };
+    let shipped = eidolon_rune::policy::DEFAULT_POLICY;
+    let shipped_rows = eidolon_rune::policy::table_rows(shipped);
+    let shipped_version = eidolon_rune::policy::table_version(shipped);
+    let Some(src) = theirs else {
+        println!("no copy at {} — the shipped table is in force, nothing to compare", path.display());
+        println!("shipped: {} rows, {}", shipped_rows.len(), marker_line(shipped_version.clone()));
+        return Ok(());
+    };
+    let mine = eidolon_rune::policy::table_rows(&src);
+    let mine_version = eidolon_rune::policy::table_version(&src);
+    println!("yours:   {} — {}", path.display(), marker_line(mine_version.clone()));
+    println!("shipped: built into this binary — {}", marker_line(shipped_version.clone()));
+    let mine_only: Vec<_> = mine.difference(&shipped_rows).collect();
+    let added: Vec<_> = shipped_rows.difference(&mine).collect();
+    if mine_only.is_empty() && added.is_empty() {
+        println!("rows:    identical ({} rows)", mine.len());
+        return Ok(());
+    }
+    println!("rows only in yours ({}):", mine_only.len());
+    for name in &mine_only {
+        println!("  {name}");
+    }
+    println!("rows only in the shipped table ({}):", added.len());
+    for name in &added {
+        println!("  {name}");
+    }
+    // The one interpretive sentence the marker earns: it is what tells a
+    // base older than the shipped table from an edit against a current one.
+    // Three facts, never folded: no marker means the copy predates
+    // versioning itself; an older marker names both numbers; equal or
+    // newer means the rows above are the operator's own edits.
+    match (mine_version, shipped_version) {
+        (Some(mine), Some(shipped)) if mine.0 >= shipped.0 => {
+            println!("— same table version or newer: the differences above are your edits against the shipped rows");
+        }
+        (Some(mine), Some(shipped)) => println!(
+            "— yours is table-version {}, the shipped table is {}: the shipped-only rows are what the harness added since, and every call they name asks until you take the row; yours-only rows are your own",
+            mine.0, shipped.0
+        ),
+        _ => println!(
+            "— your copy predates table versioning: the shipped-only rows are what the harness added, and every call they name asks until you take the row; yours-only rows are your own"
+        ),
+    }
+    Ok(())
+}
+
+/// The marker as a reader reads it, including the honest nothing: an
+/// unversioned copy is not a broken one, it is an older one.
+fn marker_line(version: Option<(u64, String)>) -> String {
+    match version {
+        Some((n, date)) if date.is_empty() => format!("table-version {n}"),
+        Some((n, date)) => format!("table-version {n} ({date})"),
+        None => "no version marker (the copy predates table versioning)".into(),
+    }
+}
+
+pub(crate) fn default_model(cfg: &config::Config) -> String {
     if cfg.claude_cli.is_some() {
         "sonnet".into()
     } else {
@@ -1460,7 +1823,7 @@ fn open_or_create(
 /// carries, unless it does not exist on this machine — the birth cwd of a
 /// session projected from elsewhere would fail every spawn. The launch
 /// directory stands in, stated on stderr, and `--cwd` still overrides.
-fn launch_cwd(logged: PathBuf) -> PathBuf {
+pub(crate) fn launch_cwd(logged: PathBuf) -> PathBuf {
     if logged.is_dir() {
         return logged;
     }
@@ -1504,15 +1867,33 @@ fn command_bundle(cfg: &config::Config) -> anyhow::Result<Option<String>> {
         .map(|b| b.name.clone()))
 }
 
+/// What one launch is into: where it runs, on what model, over what
+/// provider — and, for the workflow door alone, beside which plugin's
+/// tools register. One named thing, so a call site says what it sets
+/// instead of holding a positional tail only one caller fills.
+pub(crate) struct Launch {
+    pub cwd: PathBuf,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub plugin: Option<PathBuf>,
+}
+
 async fn build(
     cfg: &config::Config,
     mut session: Session,
-    cwd: PathBuf,
-    model: Option<&str>,
-    provider_override: Option<&str>,
     user: Arc<dyn UserIo>,
     yolo: bool,
+    launch: Launch,
 ) -> anyhow::Result<Runtime> {
+    let Launch {
+        cwd,
+        model,
+        provider: provider_override,
+        plugin,
+    } = launch;
+    let model = model.as_deref();
+    let provider_override = provider_override.as_deref();
+    let plugin = plugin.as_deref();
     // The tools' host first, so its Rune context can build on another
     // thread while this one builds the catalog; see the Tui arm.
     //
@@ -1681,6 +2062,16 @@ async fn build(
         // means publishing it a moment later.
         p.update(|m| m.model = key.clone());
     }
+    // The one-shot model call rides the catalog this session resolved: the
+    // host is handed the finished catalog plus the launch key, which is the
+    // default a call without a `model` answers on, and the output cap the
+    // operator configured. Attached before `register_builtins`, which asks
+    // the host whether the `ask_model` tool exists at all.
+    host.attach_completion(eidolon_rune::host::Completion {
+        catalog: catalog.clone(),
+        default_model: key.clone(),
+        max_tokens: cfg.max_tokens,
+    });
     if let Some(k) = claim.filter(|k| k.fresh) {
         // Per-session key attribution, journaled where the turns it
         // attributes live: which lane of which pool this conversation's
@@ -1716,9 +2107,34 @@ async fn build(
             if let Some(note) = note {
                 eprintln!("[policy] table: {note}");
             }
-            (Arc::new(policy), true)
+            // The store the policy loaded composes in front of its table is
+            // the one this session reads and writes: to the host, so the
+            // endpoint's grant check sees the same rows the gate does, and
+            // through the loaded policy, so a write's composed check is a
+            // real compile of exactly what would run.
+            let policy = Arc::new(policy);
+            if let Some(permits) = policy.permits() {
+                let for_writes = policy.clone();
+                permits.attach_checker(Arc::new(move |src| for_writes.recompose(src)));
+                host.attach_permits(permits.clone());
+            }
+            (policy as Arc<dyn PolicyHook>, true)
         }
-        None => (Arc::new(AllowAll), false),
+        None => {
+            // No gate — but the grant half is the endpoint's law, not the
+            // classifier's, so the store still exists and still writes:
+            // through a composed check against whatever table would load.
+            let permits =
+                Arc::new(eidolon_rune::permits::Permits::from_policy_path(&cfg.policy_path()));
+            let table = std::fs::read_to_string(cfg.policy_path())
+                .unwrap_or_else(|_| eidolon_rune::policy::DEFAULT_POLICY.to_string());
+            let check_host = host.clone();
+            permits.attach_checker(Arc::new(move |src| {
+                eidolon_rune::permits::check_composed(src, &table, &check_host)
+            }));
+            host.attach_permits(permits);
+            (Arc::new(AllowAll), false)
+        }
     };
 
     // The blanket yes, under the judge and over the table. Installed
@@ -1735,6 +2151,10 @@ async fn build(
         if switch.armed() {
             eprintln!("[policy] yolo: every question is answered yes; refusals still refuse");
         }
+        // The host sees the same switch the hook does: the endpoint's
+        // credential ask-once is a question, and yolo's answer to it is
+        // the operator's, given in advance.
+        host.attach_yolo(switch.clone());
         (
             Arc::new(eidolon_core::yolo::Yolo::new(policy, switch.clone())),
             Some(switch),
@@ -1797,8 +2217,28 @@ async fn build(
         &host,
         &cfg.tools_dir(),
     ));
+    // Then the plugins' tools, namespaced by their directories: after the
+    // operator's own (user wins on a collision), never over a built-in. A
+    // refused contribution is a line, not a silence. The read is the same
+    // one the tools directory gets, at the same point in the build — a
+    // plugins directory that is not there costs nothing.
+    notes.extend(eidolon_rune::register_plugins(
+        &mut reg,
+        &host,
+        &cfg.plugins_dir(),
+    ));
     for note in notes {
         eprintln!("[tool] {note}");
+    }
+    // The workflow door's plugin tools, after the operator's: a name
+    // already taken is the door refusing, because a plugin never shadows
+    // anything — the operator's directory keeps the override power.
+    if let Some(dir) = plugin {
+        // The plugin's name from the path the operator gave, never from
+        // wherever that path resolves to: one name for the pin, the gate's
+        // question, the audit line and the vouch rows.
+        let name = workflow::plugin_name(dir)?;
+        workflow::register_plugin_tools(&mut reg, &host, dir, &name)?;
     }
     reg.register(Arc::new(ChoicesUser::new(user.clone())));
     // The park: `wait_for` arms a condition against the registry the loop
@@ -1898,6 +2338,13 @@ async fn build(
         // against, and this is the only place they can be seen.
         dispatcher.observe(channel.clone());
     }
+    // The asking pair's advertisement: the registry's changes land in this
+    // session's registration, where every peer's `peers` read finds them.
+    // A question shows exactly while an asking seam holds it — nothing
+    // before, nothing after.
+    if let Some(swarm) = &swarm {
+        dispatcher.set_question_board(swarm.question_board());
+    }
 
     let agent = Agent::with_backend(
         backend,
@@ -1996,6 +2443,7 @@ async fn build(
     };
     Ok(Runtime {
         agent,
+        host,
         bus,
         catalog,
         cwd,
@@ -2034,6 +2482,7 @@ fn door_send(
     from: Option<String>,
     wake: bool,
     no_wake: bool,
+    operator: bool,
     cwd: Option<PathBuf>,
     to: String,
     text: Vec<String>,
@@ -2066,7 +2515,8 @@ fn door_send(
             from,
             &to,
             &text,
-            wake
+            wake,
+            operator
         )?
     );
     Ok(())
@@ -2381,6 +2831,18 @@ async fn cancel_on_signals(cancel: CancellationToken) {
 }
 
 async fn drive(rt: &mut Runtime, said: Option<Said>) -> anyhow::Result<()> {
+    // The branch may end parked: the wait a session died holding is
+    // re-armed before any turn of this process begins — after the build's
+    // `set_vantage`, before the unsettled continuation below — because a
+    // re-armed park belongs to no turn, and the next `begin_turn` retires
+    // it exactly per the existing turn-scoping semantics.
+    if let Some(note) = rt
+        .agent
+        .rearm_from_branch(eidolon_core::wait::DEFAULT_TIMEOUT, eidolon_core::wait::MAX_TIMEOUT)
+        .await?
+    {
+        eprintln!("[wait] {note}");
+    }
     let cancel = CancellationToken::new();
     {
         let cancel = cancel.clone();
@@ -2457,14 +2919,44 @@ async fn answer_the_door(
     // session that is parked. A park's `wake` level says which mail may start
     // a turn — level 0 for none, level 1 for mail marked to wake (the
     // ordinary rule), level 2 for any — and mail it refuses waits in the
-    // branch for the next turn rather than being dropped.
+    // branch for the next turn rather than being dropped. The facts travel
+    // with the message — waking is the sender's mark, operator the override
+    // — and retirement ORs them, because a park any single message would end
+    // is ended. Same fold as the TUI's `collect`.
+    let mut waking = false;
+    let mut operator = false;
     let asked: Vec<String> = messages
         .iter()
-        .filter(|m| rt.agent.parks().admits(m.wake))
+        .filter(|m| {
+            let keep = rt.agent.parks().admits(eidolon_core::wait::Delivery {
+                waking: m.wake,
+                operator: m.operator,
+            });
+            if keep {
+                waking |= m.wake;
+                operator |= m.operator;
+            }
+            keep
+        })
         .map(|m| m.from.clone())
         .collect();
     if asked.is_empty() {
         return false;
+    }
+    // Mail the park's own level admits ends that park — the level is how
+    // much mail may end the wait, said at arm time — so it is retired here,
+    // with the message that ended it in the line, rather than swept by the
+    // turn's `begin_turn` as merely overtaken.
+    for retired in rt
+        .agent
+        .parks()
+        .retire_for_mail(eidolon_core::wait::Delivery { waking, operator })
+    {
+        eprintln!(
+            "[the wait ended: {} — ended by a message from {}]",
+            retired.condition,
+            asked.join(", ")
+        );
     }
     eprintln!("[answering {}]", asked.join(", "));
     let t = CancellationToken::new();
@@ -2474,6 +2966,16 @@ async fn answer_the_door(
     match out {
         Ok(o) => report(rt, &o),
         Err(e) => eprintln!("\n[error] {e:#}"),
+    }
+    // What is left here is what the turn swept: a park whose level refused
+    // this very mail, overtaken by the turn it did not buy. Said out loud,
+    // because a session that does not know its park is gone will arm a second
+    // one, or believe it is still waiting: the one slot is free again.
+    for retired in rt.agent.parks().take_retired() {
+        eprintln!(
+            "[the wait ended: {} — a turn started while it was armed]",
+            retired.condition
+        );
     }
     // The turn that just settled may itself have been the boundary.
     close_if_quiesced(rt).await
@@ -2768,6 +3270,15 @@ async fn repl(rt: &mut Runtime, cfg: &config::Config) -> anyhow::Result<()> {
                         for m in rt.catalog.models() {
                             eprintln!("  {:<36} {}", m.key, m.name);
                         }
+                        // The floor says it is a floor — the same marker
+                        // the `models` command and the picker carry, since
+                        // a provider whose floor is zero rows otherwise
+                        // vanishes from this list without a word.
+                        for name in rt.catalog.listings_fell_back() {
+                            eprintln!(
+                                "  [no listing for {name} — nothing cached; `models --live` fetches]"
+                            );
+                        }
                     } else {
                         match rt.catalog.backend_for(arg, None, &rt.cwd, &cfg_scratch()) {
                             Ok((backend, key, claim)) => {
@@ -3012,7 +3523,7 @@ async fn repl(rt: &mut Runtime, cfg: &config::Config) -> anyhow::Result<()> {
                     }
                     Some(_) => eprintln!("[:{other} is not wired in chat yet; the TUI has it]"),
                     None => {
-                        let near: Vec<String> = eidolon_tui::command::matches(other)
+                        let near: Vec<String> = eidolon_tui::command::suggestions(other)
                             .iter()
                             .take(3)
                             .map(|c| format!(":{}", c.name))

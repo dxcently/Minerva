@@ -43,6 +43,10 @@ pub struct Verdict {
     /// still free to change.
     #[serde(default)]
     pub conflicts: Vec<serde_json::Value>,
+    /// The classifier's own risk counters. `None` is **unknown, not zero** —
+    /// the harness keeps that distinction everywhere — so it never refuses.
+    #[serde(default)]
+    pub risk: Option<Risk>,
     /// Text in the command that no slot claimed — a second instruction, a
     /// remark, a question. Non-null means **do not dispatch**: executing the
     /// first clause while silently dropping the rest is the failure mode this
@@ -50,6 +54,31 @@ pub struct Verdict {
     /// left over"; the gate treats them the same.)
     #[serde(default)]
     pub trailing_editorial_text: Option<String>,
+}
+
+/// The one classifier risk counter this channel gates on.
+///
+/// Typed where [`Verdict::conflicts`] is not, and deliberately so: a refusal
+/// compares an integer, so the integer has to be pinned to a type, while a
+/// conflict is only ever asked whether the list is empty. Modelling the whole
+/// measured risk object instead would pin four nullable fields
+/// (`bio_assignment_disagreements`, `min_assignment_margin`,
+/// `min_bio_claim_margin`) that nothing here reads, and the binary is still free
+/// to change them. `#[serde(default)]` keeps older logs and the synthetic
+/// corpora — which carry `"risk": null` — decoding.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct Risk {
+    /// Arguments the tagger found on the line and no slot claimed. Non-zero
+    /// means **do not dispatch**: a second instruction with its own argument is
+    /// real leftover work, and executing the first clause while dropping it is
+    /// the failure this counter exists to prevent.
+    ///
+    /// Disjoint from [`Verdict::trailing_editorial_text`], which needs the model
+    /// to have explicitly tagged a `TRAIL` span. A clause like
+    /// `and also delete the note $b` opens an unclaimed hole and tags nothing,
+    /// so it is invisible there and counted here.
+    #[serde(default)]
+    pub unclaimed_arguments: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

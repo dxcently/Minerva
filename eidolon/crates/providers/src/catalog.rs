@@ -26,6 +26,34 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("ollama", include_str!("../builtin/ollama.rn")),
 ];
 
+/// The built-in names a `providers_dir` shadows with a script that defines
+/// its own `models()` — the set [`Catalog::load_builtins_except`] skips
+/// discovery for.
+///
+/// Each candidate file is read once, as text, and asked
+/// [`crate::script::source_defines_models`]; nothing is compiled here, and a file that is
+/// not readable simply does not shadow — the ordinary load will report it
+/// if it is genuinely broken. A name with no built-in behind it (`fau`, on
+/// this machine's directory) never enters the set: there is nothing to
+/// skip.
+pub fn shadowed_builtins(dir: &Path) -> std::collections::BTreeSet<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Default::default();
+    };
+    let mut shadowed = std::collections::BTreeSet::new();
+    for p in rd.filter_map(Result::ok).map(|e| e.path()) {
+        if p.extension().is_some_and(|x| x == "rn")
+            && let Some(name) = p.file_stem().map(|s| s.to_string_lossy().into_owned())
+            && BUILTINS.iter().any(|(b, _)| *b == name)
+            && let Ok(src) = std::fs::read_to_string(&p)
+            && crate::script::source_defines_models(&src)
+        {
+            shadowed.insert(name);
+        }
+    }
+    shadowed
+}
+
 pub struct ProviderEntry {
     pub def: ProviderDef,
     pub provider: Arc<dyn Provider>,
@@ -91,6 +119,13 @@ impl CatalogModel {
 
 pub enum Resolved {
     Mock,
+    /// The mock that answers text on its first turn — selected only by
+    /// naming the model `mock-text`, and otherwise the plain mock's twin:
+    /// no network, no quota, no price. It exists because the compounding
+    /// shape — one call's reply becoming the next call's history — is the
+    /// workload the interpreter's `ask_model` exists for, and the plain
+    /// mock's first-turn-is-a-tool-call shape is load-bearing elsewhere.
+    MockText,
     ClaudeCli {
         model: Option<String>,
         binary: Option<String>,
@@ -142,6 +177,15 @@ pub struct Catalog {
     /// and the catalog is shared — the same reason the dispatcher owns
     /// the working directory rather than every tool holding a copy.
     weights: std::sync::RwLock<std::collections::BTreeMap<String, i64>>,
+    /// Built-ins whose listing was deliberately not run at load — a user
+    /// script shadows the name and defines its own `models()`, so the
+    /// built-in's discovery was a parse whose result the replacement would
+    /// have discarded. The set is what keeps a `[[providers]]` patch from
+    /// quietly paying the parse back through
+    /// [`ProviderScript::rediscover_models`]: the patch lands on the
+    /// built-in, and the same replacement discards the patched definition
+    /// too. See [`load_builtins_except`](Self::load_builtins_except).
+    discovery_skipped: std::collections::BTreeSet<String>,
     pub load_errors: Vec<String>,
 }
 
@@ -256,6 +300,7 @@ impl Catalog {
             anyhow::bail!("no provider named `{}` to patch", patch.name);
         };
         let lists_models = patch.models.is_some();
+        let name = patch.name.clone();
         let entry = &self.providers[i];
         let mut def = entry.def.patched(patch);
         // The hooks run over the definition as patched: `http_get` takes
@@ -263,10 +308,20 @@ impl Catalog {
         // and a hook reading the account has to read the account the patch
         // pointed at.
         let script = entry.script.as_ref().map(|s| {
-            if !lists_models {
-                def = s.rediscover_models(def.clone());
+            // A built-in whose discovery the shadow rule skipped has no
+            // parse to pay back here either: the patch lands on it, and
+            // the user script that shadows it discards the patched
+            // definition whole.
+            let mut fell_back = s.listing_fell_back();
+            if !lists_models && !self.discovery_skipped.contains(&name) {
+                let (d, ran_fell_back) = s.rediscover_models(def.clone());
+                def = d;
+                // A run replaces the outcome rather than ORing it: a
+                // rediscovery that succeeded has made the listing fresh,
+                // and a floor's marker must not outlive the floor.
+                fell_back = ran_fell_back;
             }
-            Arc::new(s.with_def(def.clone()))
+            Arc::new(s.with_def(def.clone()).with_listing_fell_back(fell_back))
         });
         let was = entry.source.clone();
         let provider: Arc<dyn Provider> = Arc::new(HttpProvider::with_store(
@@ -301,9 +356,50 @@ impl Catalog {
     /// key — only unpacked for reading, under `~/.config/eidolon/system/
     /// providers/` (`eidolon-cli`'s `system` module).
     pub fn load_builtins(&mut self) {
+        self.load_builtins_except(&std::collections::BTreeSet::new());
+    }
+
+    /// Load the built-ins, except that a name in `shadowed` has its
+    /// discovery left unrun.
+    ///
+    /// The ruling this implements: a user script in `providers_dir` under
+    /// a built-in's name, defining its own `models()`, makes the built-in's
+    /// discovery a parse whose result cannot reach the surface —
+    /// [`add_def`](Self::add_def) replaces the entry whole, keeping no
+    /// trace of the definition it replaced, so the discovered rows die in
+    /// the replacement regardless. The built-in is still **loaded** —
+    /// compiled, `provider()` run, declared rows and costs in place —
+    /// because a `[[providers]]` table naming it patches *it*, inheriting
+    /// those fields, and a patch must not pay the parse back through
+    /// rediscovery either; the names land in `discovery_skipped` for
+    /// exactly that. A shadowing script *without* its own `models()` never
+    /// reaches this path: the built-in's discovery is then the only
+    /// discovery, and it runs.
+    ///
+    /// `shadowed` comes from [`shadowed_builtins`], whose probe is textual
+    /// and can only err toward claiming a `models()` that is not there —
+    /// and that error is priced and harmless, by the same replacement
+    /// argument as the rule itself.
+    pub fn load_builtins_except(&mut self, shadowed: &std::collections::BTreeSet<String>) {
         for (name, src) in BUILTINS {
-            match ProviderScript::load_with_fetch(name, src, self.store.clone(), self.fetch) {
-                Ok((def, script)) => self.add_def(def, Some(script), "built-in"),
+            let skipped = shadowed.contains(*name);
+            let loaded = if skipped {
+                ProviderScript::load_with_fetch_without_discovery(
+                    name,
+                    src,
+                    self.store.clone(),
+                    self.fetch,
+                )
+            } else {
+                ProviderScript::load_with_fetch(name, src, self.store.clone(), self.fetch)
+            };
+            match loaded {
+                Ok((def, script)) => {
+                    if skipped {
+                        self.discovery_skipped.insert(name.to_string());
+                    }
+                    self.add_def(def, Some(script), "built-in");
+                }
                 Err(e) => self
                     .load_errors
                     .push(format!("built-in provider `{name}`: {e:#}")),
@@ -508,6 +604,22 @@ impl Catalog {
         out
     }
 
+    /// The providers whose listing is the declared floor because its fetch
+    /// found nothing — a launch with no cached copy, a `--live` listing
+    /// whose gateway could not be reached. The surfaces that draw a
+    /// listing name these: nine declared rows read as "that is all there
+    /// is", and a provider whose floor is zero rows vanishes without a
+    /// word. The knowledge is the loader's own — see
+    /// [`ProviderScript::listing_fell_back`] — never a guess from a row
+    /// count, and a patch that re-runs discovery replaces it.
+    pub fn listings_fell_back(&self) -> Vec<String> {
+        self.providers
+            .iter()
+            .filter(|p| p.script.as_ref().is_some_and(|s| s.listing_fell_back()))
+            .map(|p| p.def.name.clone())
+            .collect()
+    }
+
     /// Resolve a model string: `mock`, `provider:id`, or a bare id.
     ///
     /// A pooled provider resolves onto a *claimed* lane here — see
@@ -544,6 +656,9 @@ impl Catalog {
         let spec = spec.trim();
         if provider_override == Some("mock") || spec == "mock" {
             return Ok(Resolved::Mock);
+        }
+        if spec == "mock-text" {
+            return Ok(Resolved::MockText);
         }
         let (provider, id) = match provider_override {
             Some(p) => (Some(p.to_string()), spec.to_string()),
@@ -708,6 +823,11 @@ impl Catalog {
     ) -> anyhow::Result<(Backend, String, Option<ClaimedKey>)> {
         Ok(match self.resolve(spec, provider_override)? {
             Resolved::Mock => (Backend::Provider(mock()), "mock".into(), None),
+            Resolved::MockText => (
+                Backend::Provider(mock_text()),
+                "mock-text".into(),
+                None,
+            ),
             Resolved::ClaudeCli {
                 model,
                 binary,
@@ -757,7 +877,7 @@ pub fn mock() -> Arc<dyn Provider> {
         ScriptedProvider::tool(
             "mock_2",
             "grep",
-            serde_json::json!({ "pattern": "fn main", "max": 3 }),
+            serde_json::json!({ "pattern": "fn main", "limit": 3 }),
         ),
         ScriptedProvider::text(
             "Mock provider: I ran `ls` and a grep through the dispatcher. Pick a real model with :model, or space m.",
@@ -765,9 +885,47 @@ pub fn mock() -> Arc<dyn Provider> {
     ])
 }
 
+/// The mock that answers text on its first turn: one scripted turn, one
+/// plain reply — the compounding shape a workflow's `ask_model` chain
+/// makes, with no network and no third turn to walk to. Reached only by
+/// naming the model `mock-text`; the plain [`mock`] is untouched, and its
+/// first-turn-is-a-tool-call shape is what other tests lean on. Its key
+/// prices like the plain mock's: nothing — the record carries what was
+/// measured and the lookup is honestly absent.
+pub fn mock_text() -> Arc<dyn Provider> {
+    use eidolon_core::testing::ScriptedProvider;
+    ScriptedProvider::new(vec![ScriptedProvider::text(
+        "Mock text provider: one plain answer, so a thread has something true to remember.",
+    )])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The second mock key resolves to its own variant and its own journal
+    /// key; the plain mock is byte-for-byte what it was — same spec, same
+    /// variant, same journal key — because other tests lean on its shape.
+    #[test]
+    fn mock_text_is_a_second_key_and_the_plain_mock_is_untouched() {
+        let c = Catalog::new();
+        assert!(matches!(
+            c.resolve("mock-text", None).unwrap(),
+            Resolved::MockText
+        ));
+        assert!(matches!(c.resolve("mock", None).unwrap(), Resolved::Mock));
+        let dir = std::env::temp_dir();
+        let (_, key, _) = c
+            .backend_for("mock-text", None, &dir, &dir)
+            .unwrap();
+        assert_eq!(key, "mock-text", "the spend's key names what answered");
+        let (_, key, _) = c.backend_for("mock", None, &dir, &dir).unwrap();
+        assert_eq!(key, "mock");
+        // And neither prices: the record carries the usage, the lookup is
+        // honestly absent, unpriced is never zero.
+        assert!(c.cost("mock-text").is_none());
+        assert!(c.cost("mock").is_none());
+    }
 
     fn cat() -> Catalog {
         let mut c = Catalog::new().with_claude(Some(ClaudeCliEntry {
@@ -1219,6 +1377,120 @@ token_file = "/x""#
     /// (primed between the two, so the test never touches the network). A
     /// patch that lists models itself is an answer, and no discovery runs to
     /// un-answer it.
+    /// The shadow rule, decision half: only a file under a *built-in's*
+    /// name that declares its own `models()` shadows. A name with no
+    /// built-in behind it shadows nothing, and a same-name script without
+    /// a `models()` leaves the built-in's discovery as the only discovery
+    /// — which then must run. A comment that mentions the definition does
+    /// not answer for one.
+    #[test]
+    fn only_a_builtin_named_file_with_its_own_models_shadows() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("openrouter.rn"),
+            "pub fn provider() { #{ name: \"openrouter\" } }\npub fn models() { [] }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fau.rn"),
+            "pub fn provider() { #{ name: \"fau\" } }\npub fn models() { [] }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("zai.rn"),
+            "pub fn provider() { #{ name: \"zai\" } }\n// pub fn models() { [] }\n",
+        )
+        .unwrap();
+        let shadowed = shadowed_builtins(dir.path());
+        assert_eq!(
+            shadowed,
+            std::collections::BTreeSet::from(["openrouter".to_string()]),
+            "the built-in named and models-defining file, and nothing else"
+        );
+        // An absent directory shadows nothing, and starts nothing.
+        assert!(shadowed_builtins(Path::new("/nonexistent-providers-dir")).is_empty());
+    }
+
+    /// The shadow rule, load half, against the real built-in: loaded with
+    /// the name skipped, the built-in stands whole — declared rows, wire,
+    /// endpoint, hook — with only the discovery left unrun, and a user
+    /// script under the same name then replaces it whole. Nothing of the
+    /// built-in's discovery could have survived that replacement, which is
+    /// what makes the skipped parse pure waste rather than a cut corner.
+    #[test]
+    fn a_shadowed_builtin_stands_loaded_without_its_discovery() {
+        let mut c = Catalog::new();
+        let shadowed: std::collections::BTreeSet<String> =
+            ["openrouter".to_string()].into();
+        c.load_builtins_except(&shadowed);
+        let e = c
+            .providers()
+            .iter()
+            .find(|p| p.def.name == "openrouter")
+            .expect("the built-in is still loaded");
+        assert_eq!(e.source, "built-in");
+        // The shipped openrouter declares no rows — discovery was its only
+        // source — and the skip leaves that honest floor exactly as it is.
+        // What must stand is everything a patch inherits, and the patch
+        // itself: the built-in is loaded to be patched, not merely present.
+        assert_eq!(e.def.base_url, "https://openrouter.ai/api/v1");
+        assert!(e.def.models.is_empty(), "the declared floor, unchanged");
+        let script = e.script.as_ref().expect("the hooks survive");
+        assert!(
+            script.has_models_hook(),
+            "the listing hook is still there; only its run was skipped"
+        );
+        let patch: toml::Value = r#"name = "openrouter"
+token_file = "/run/secrets/openrouter""#
+            .parse()
+            .unwrap();
+        c.patch(crate::def::ProviderPatch::from_toml(&patch).unwrap(), "config.toml")
+            .unwrap();
+        let patched = c
+            .providers()
+            .iter()
+            .find(|p| p.def.name == "openrouter")
+            .unwrap();
+        assert_eq!(
+            patched.def.token_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/openrouter")),
+            "the patch lands on the loaded built-in"
+        );
+        assert_eq!(
+            patched.def.base_url,
+            "https://openrouter.ai/api/v1",
+            "inherited from the built-in, discovery or no discovery"
+        );
+
+        // And the replacement is whole, as it always was: the user script's
+        // definition, its discovery, and no trace of the built-in's.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("openrouter.rn"),
+            r#"
+pub fn provider() { #{ name: "openrouter", wire: "openai", base_url: "http://user.example/v1",
+    models: [ #{ id: "user-declared" } ] } }
+pub fn models() { [ #{ id: "user-discovered" } ] }
+"#,
+        )
+        .unwrap();
+        c.load_scripts(dir.path());
+        let e = c
+            .providers()
+            .iter()
+            .find(|p| p.def.name == "openrouter")
+            .unwrap();
+        let ids: Vec<&str> = e.def.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["user-declared", "user-discovered"], "{ids:?}");
+        assert_eq!(e.def.base_url, "http://user.example/v1");
+        assert!(e.source.ends_with("openrouter.rn"));
+        assert!(
+            c.load_errors.is_empty(),
+            "the skipped built-in loaded cleanly: {:?}",
+            c.load_errors
+        );
+    }
+
     #[test]
     fn a_patch_rediscovers_the_models_the_new_credential_serves() {
         let url = "http://127.0.0.1:1/models";
@@ -1294,6 +1566,101 @@ models = ["from-patch-*"]"#
             let _ = std::fs::remove_file(p);
         }
         let _ = std::fs::remove_file(&token);
+    }
+
+    /// The degraded-listing marker, catalog half: an entry whose discovery
+    /// fetch failed is named by [`Catalog::listings_fell_back`], a script
+    /// that never fetches never is, and a patch that re-runs discovery
+    /// *replaces* the outcome — a successful re-fetch clears the marker, a
+    /// failed one keeps it — while a patch that answers "which models"
+    /// itself leaves the load-time answer standing.
+    #[test]
+    fn a_degraded_listing_is_named_and_a_refetch_replaces_the_marker() {
+        let src = r#"
+pub fn provider() {
+    #{ name: "fbx-cat", wire: "openai", base_url: "http://127.0.0.1:1",
+       token: "t", models: [ #{ id: "floor-row" } ] }
+}
+pub fn models() {
+    match eidolon::http_get("/models") {
+        Ok(b) => match json::from_string(b) { Ok(v) => v, Err(_) => [] },
+        Err(_) => [],
+    }
+}
+"#;
+        let url = "http://127.0.0.1:1/models";
+
+        // Discovery failed at load: the catalog names the provider, and a
+        // declared-only script beside it goes unnamed.
+        let (def, script) =
+            ProviderScript::load_with_fetch("fbx-cat", src, None, crate::script::Fetch::Cached)
+                .unwrap();
+        let (plain_def, plain) = ProviderScript::load(
+            "fbx-plain",
+            r#"pub fn provider() { #{ name: "fbx-plain", wire: "openai", base_url: "http://x", models: [ #{ id: "d" } ] } }
+pub fn models() { [ #{ id: "no-fetch-here" } ] }"#,
+        )
+        .unwrap();
+        let mut c = Catalog::new();
+        c.add_def(def, Some(script), "test");
+        c.add_def(plain_def, Some(plain), "test");
+        assert_eq!(
+            c.listings_fell_back(),
+            ["fbx-cat"],
+            "the failed fetch is named; a models() that never fetches is not a fallback"
+        );
+
+        // A patch that re-runs discovery over a primed listing replaces
+        // the outcome: the marker clears, because what stands now is a
+        // fetched answer, not the floor.
+        crate::script::test_cache::prime("fbx-cat", url, r#"[{ "id": "discovered" }]"#);
+        let cleanup = crate::script::test_cache::path_of("fbx-cat", url);
+        let toml: toml::Value = r#"name = "fbx-cat"
+token = "patched""#
+            .parse()
+        .unwrap();
+        c.patch(crate::def::ProviderPatch::from_toml(&toml).unwrap(), "config.toml")
+            .unwrap();
+        assert!(
+            c.listings_fell_back().is_empty(),
+            "a successful re-fetch clears the marker: {:?}",
+            c.listings_fell_back()
+        );
+
+        // And a failed re-fetch keeps it: a patch over a dead endpoint is
+        // still a floor.
+        let (def, script) =
+            ProviderScript::load_with_fetch("fbx-cat2", src.replace("fbx-cat", "fbx-cat2").as_str(), None, crate::script::Fetch::Cached)
+                .unwrap();
+        c.add_def(def, Some(script), "test");
+        let toml: toml::Value = r#"name = "fbx-cat2"
+token = "patched""#
+            .parse()
+            .unwrap();
+        c.patch(crate::def::ProviderPatch::from_toml(&toml).unwrap(), "config.toml")
+            .unwrap();
+        assert_eq!(c.listings_fell_back(), ["fbx-cat2"]);
+
+        // A patch that carries models itself runs no discovery, so the
+        // load-time answer stands, marker and all.
+        let (def, script) =
+            ProviderScript::load_with_fetch("fbx-cat3", src.replace("fbx-cat", "fbx-cat3").as_str(), None, crate::script::Fetch::Cached)
+                .unwrap();
+        c.add_def(def, Some(script), "test");
+        let toml: toml::Value = r#"name = "fbx-cat3"
+models = ["from-patch"]"#
+            .parse()
+            .unwrap();
+        c.patch(crate::def::ProviderPatch::from_toml(&toml).unwrap(), "config.toml")
+            .unwrap();
+        assert!(
+            c.listings_fell_back().contains(&"fbx-cat3".to_string()),
+            "no discovery ran, so the load-time fallback still says so"
+        );
+
+        if let Some(p) = cleanup {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     /// Weights order the listing and nothing else: an exact key beats a

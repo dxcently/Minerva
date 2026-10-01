@@ -138,7 +138,7 @@ impl Page {
         s.push_str(self.text.trim_end());
         if self.truncated {
             s.push_str(
-                "\n[content truncated; ask for a larger `max`, or fetch a more specific URL]",
+                "\n[content truncated; ask for a larger `limit`, or fetch a more specific URL]",
             );
         }
         if s.is_empty() {

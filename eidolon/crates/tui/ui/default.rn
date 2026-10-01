@@ -238,10 +238,27 @@ pub fn view(s) {
         // paragraph written with `S-ret` — and a box pinned at one row
         // hides all but the row the caret is on.
         grow(3, 12, prompt(titled(s))),
+        panels(s),
         fixed(1, status(left(s), right(s))),
         menu(),
         dialog(),
     ])
+}
+
+// The plugins' panels between the prompt and the status line: the named
+// region the frame gives a payload to draw in. Move or delete this node
+// in your own `view` and the plugins lose their slot — the frame is
+// yours, a panel is a guest in it. `s.plugins` names only the payloads
+// that compiled, so a broken plugin takes no row at all. Three rows per
+// plugin, not one: a panel draws as a titled box, and a box wants its
+// top border, its content row and its bottom border — a one-row slot
+// renders the title alone and the payload's answer has nowhere to land.
+pub fn panels(s) {
+    let rows = [];
+    for p in s.plugins {
+        rows.push(fixed(3, #{ kind: "plugin_panel", plugin: p }))
+    }
+    fixed(rows.len() * 3, column(rows))
 }
 
 // --------------------------------------------------------------- the start screen
@@ -338,6 +355,7 @@ pub fn modes() {
         // and take their keys from the tables of the same names below.
         "confirm":  style("ASK?", "yellow"),
         "choose":   style("CHOOSE", "yellow"),
+        "note":     style("NOTE", "yellow"),
         "pick":     style("PICK", "yellow"),
         "ask":      style("ASK", "yellow"),
         // A page of text (`:help`, `:context`, `:tree`, `:messages`):
@@ -641,23 +659,37 @@ pub fn keymap() {
         // hard-wired in Rust — which is what lets the popup promise what
         // `tab` does on the search line, and lets you rebind `n`.
         "search": search_keys(),
+        // Both dialogs are lists: the answers, then `+ note` and `chat
+        // about it`. `j`/`k` move, `ret` takes the row under the arrow,
+        // which starts on the first answer.
         "confirm": #{
-            "y": cmd("submit", "allow"),
-            "ret": cmd("submit", "allow"),
+            "up": cmd("move_line_up", "previous"),
+            "down": cmd("move_line_down", "next"),
+            "k": cmd("move_line_up", "previous"),
+            "j": cmd("move_line_down", "next"),
+            "ret": cmd("submit", "take the arrowed row"),
+            "y": cmd("dialog_allow", "allow"),
             "n": cmd("dialog_deny", "deny"),
+            "tab": cmd("dialog_note", "add a note"),
+            "c": cmd("dialog_chat", "deny and chat about it"),
             "esc": cmd("cancel", "dismiss"),
         },
-        // The question dialog is a picker of a different shape: the
-        // options are paragraphs, `j`/`k` move, a digit picks its option
-        // outright, and `ret` takes the one under the arrow.
+        // A digit picks its option outright.
         "choose": #{
             "up": cmd("move_line_up", "previous"),
             "down": cmd("move_line_down", "next"),
             "k": cmd("move_line_up", "previous"),
             "j": cmd("move_line_down", "next"),
-            "ret": cmd("submit", "choose"),
+            "ret": cmd("submit", "take the arrowed row"),
+            "tab": cmd("dialog_note", "add a note"),
+            "c": cmd("dialog_chat", "dismiss and chat about it"),
             "esc": cmd("cancel", "dismiss"),
         },
+        // tab or `+ note` opens a note: keys are text, ret keeps it for the answer, esc drops it.
+        "note": line_keys(#{
+            "ret": cmd("submit", "keep the note"),
+            "esc": cmd("cancel", "drop it"),
+        }),
         "pick": pick_keys(),
         "ask": ask_keys(),
         "page": page_keys(),
@@ -990,12 +1022,15 @@ fn normal_keys() {
         "u": cmd("undo", "undo"),
         "U": cmd("redo", "redo"),
 
-        // The transcript. j/k here rather than in the prompt: see above.
-        // `K` is Helix's hover key — more detail about what is in front of
-        // you — so it steps the tool traffic up: folded runs, every call,
-        // then uncapped output, and back.
-        "j": cmd("scroll_line_down", "down a line"),
-        "k": cmd("scroll_line_up", "up a line"),
+        // `j`/`k` are the prompt's line motions — the same commands the
+        // arrows carry, not a second vocabulary where the hands say move
+        // and the vim keys scroll. The transcript keeps its scrolling on
+        // the shifted and alt pairs in `shared()`. `K` is Helix's hover
+        // key — more detail about what is in front of you — so it steps
+        // the tool traffic up: folded runs, every call, then uncapped
+        // output, and back.
+        "j": cmd("move_line_down", "line down"),
+        "k": cmd("move_line_up", "line up"),
         // Helix has `K` on hover — more about the thing in front of you
         // — and here the thing in front of you is the transcript. It
         // used to step the *global* detail knob, which answered "show
@@ -1293,10 +1328,14 @@ fn insert_keys() {
         "right": cmd("move_char_right", "right"),
         "home": cmd("goto_line_start", "line start"),
         "end": cmd("goto_line_end_newline", "past line end"),
-        // Up/down walk the history here; the prompt's own line motion is
-        // in normal mode, where a multi-line draft is edited anyway.
-        "up": cmd("history_prev", "previous message"),
-        "down": cmd("history_next", "next message"),
+        // The arrows walk the rows the composer draws — in a long message
+        // that is the motion the hands ask for, and it is the same motion
+        // `j`/`k` carry in normal mode. History keeps readline's own pair
+        // below and nothing else: an accidental recall used to replace the
+        // draft outright, and lines are walked far more often than the
+        // past is (ruling 2026-09-29).
+        "up": cmd("move_line_up", "line up"),
+        "down": cmd("move_line_down", "line down"),
         "C-p": cmd("history_prev", "previous message"),
         "C-n": cmd("history_next", "next message"),
         // Mid-burst undo boundary: `C-s` closes the run, so what is typed

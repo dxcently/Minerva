@@ -180,6 +180,27 @@ pub enum Event {
         usage: Usage,
         calls: u32,
     },
+    /// One tool-less model call's spend, published by the completion path
+    /// as it journals [`crate::session::RecordKind::ModelSpend`]. A live
+    /// consumer summing spend from [`Event::TurnSettled`] alone would
+    /// miss every `ask_model` call and print a partial total as if it
+    /// were the bill — the same invariant that puts the record in
+    /// `Session::usage` puts the event on the bus in the same commit.
+    ModelSpend {
+        key: String,
+        call_id: String,
+        usage: Usage,
+    },
+    /// One `api_request` a script made, published as the host fn journals
+    /// [`crate::session::RecordKind::ApiRequest`] — the same reason
+    /// [`Event::ModelSpend`] exists: a live consumer counting from the
+    /// turns alone would miss script egress and print a partial total as
+    /// if it were the whole. Counted only when the consumer is a
+    /// plugin's; every request carries the string that says.
+    ApiRequest {
+        consumer: String,
+        service: String,
+    },
     Error(String),
     /// The follow-up queue changed length: a message was queued for after
     /// the turn, or one was taken to run. `waiting` is what is left.

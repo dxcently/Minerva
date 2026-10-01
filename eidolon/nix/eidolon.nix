@@ -7,6 +7,7 @@
 # dependency), the build reassembles the layout Cargo already expects: both
 # trees are copied side by side and the build runs from `eidolon/`.
 { lib
+, pkgs
 , stdenv
 , rustPlatform
 , harnoxSrc
@@ -50,10 +51,18 @@ rustPlatform.buildRustPackage {
 
   # Rustls throughout — no openssl, and nothing else links a system library.
   buildInputs = [ ];
-  nativeBuildInputs = [ ];
+  # `git`, native because it is a program the check phase *runs*: the
+  # install/update tests build their fixtures by shelling out to it, and the
+  # sandbox has no PATH to find it on its own.
+  nativeBuildInputs = [ pkgs.git ];
 
-  # The crash-resume and loop tests are hermetic (`--provider mock`), so they
-  # run here; nothing in the suite reaches the network.
+  # The suite runs here under `--provider mock`: it reaches no network. That
+  # is network-free, not environment-free — the one thing it may reach for
+  # outside the source tree is the `git` binary, provided above. A test that
+  # reaches for any other ambient binary, or for the operator's global
+  # config, is the thing to refuse, not to provision: a check that is green
+  # only where the author's machine happens to have the tool is a check
+  # that hides its own breakage.
   doCheck = true;
 
   meta = {

@@ -332,6 +332,15 @@ pub enum StopReason {
     /// back as an ordinary result buys nothing but the same question
     /// again. Appended after `Waiting` for the reason `Waiting` states.
     Dismissed,
+    /// The harness ended the turn by its own per-turn iteration cap —
+    /// model calls, not tokens (`MaxTokens` is the endpoint's) — before
+    /// the model settled. Like `Waiting` and `Dismissed`, no wire value
+    /// produces it and no endpoint can report it: it is the harness's
+    /// own settle, and it is the honest ending for a turn that was
+    /// stopped rather than one that finished — the spend on the branch
+    /// is real, and the log now says why it has no settle beside it.
+    /// Appended after `Dismissed` for the reason `Waiting` states.
+    IterationLimit,
 }
 
 /// Token accounting for one model call. Additive: sum per turn, per session.

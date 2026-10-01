@@ -3,7 +3,7 @@
 //!
 //! Everything the user touches is Rune (vault, *Extension model*,
 //! 2026-09-03). The built-in tools under `builtin/` are scripts on the
-//! same contract as a user-authored skill; the only thing that
+//! same contract as a user-authored tool; the only thing that
 //! distinguishes them is that they ship inside the binary. Six of them
 //! are on every session; `search` arrives with a search key, the way the
 //! vault's arrive with a vault. There is no
@@ -43,13 +43,26 @@
 //!
 //! Registered in [`host`]: `fs_read`, `fs_write`, `fs_edit`, `shell`,
 //! `exec`, `grep`, `web_fetch`, `web_search`, `api_request`, `cwd`, `ask_user`,
-//! `choices_user`, and —
-//! when a vault is configured — `mneme_rpc` (plus `mneme_call`, the raw
-//! primitive the vault built-in wraps). The first
+//! `choices_user`, and `mneme_rpc` (plus `mneme_call`, the raw primitive the
+//! vault built-in wraps — both registered unconditionally and answered at
+//! call time, so a session with no vault says so when one is called rather
+//! than failing a script's compile; what gates on the vault is only whether
+//! the built-in tool is registered). The first
 //! six are the Rust engine primitives from `eidolon-tools`. `ask_user`,
 //! `choices_user` and `mneme_rpc` route back through the
 //! dispatcher, so a script asking a question or reaching the vault is a tool
 //! call like any other — policy sees it and the log journals it.
+//!
+//! `tool_call(name, input)` is the generic form of those, and the door a
+//! plugin workflow drives (vault, *The Plugin System (design)*,
+//! §Workflows): a script names any registered tool and its input, and the
+//! call is classified and journaled with `CallOrigin::Script` — the same
+//! gate, the same log, never a second execution path. Nesting is bounded by
+//! [`MAX_SCRIPT_DISPATCH_DEPTH`], which names the chain in its error.
+//! `tool_call_as(name, input, id)` is the same door with the caller naming
+//! the call: a workflow step journals its request under `w<run>-<index>`
+//! before dispatching, and the resumed run dispatches under that id, so the
+//! chokepoint's replay check answers from the log instead of re-firing.
 //!
 //! `web_search` is registered on every host and answers a *call* at call time:
 //! the key is the session's, and a session assembled without one is refused
@@ -91,8 +104,12 @@
 //! startup rather than 25, and a call no longer rebuilds anything.
 
 pub mod host;
+pub mod permits;
+pub mod plugins;
 pub mod policy;
 pub mod script;
+pub mod store;
+pub mod workflow;
 pub mod endpoint;
 
 use std::sync::Arc;
@@ -101,6 +118,8 @@ use eidolon_core::tool::{Tool, ToolRegistry};
 
 pub use host::Host;
 pub use script::ScriptTool;
+pub use store::Store;
+pub use workflow::{RunOutcome, Workflow};
 
 /// The six built-in scripts, embedded so they ship in lockstep with the
 /// primitives they wrap.
@@ -115,7 +134,9 @@ pub const BUILTINS: &[(&str, &str)] = &[
 
 /// The vault built-in: Mneme's whole surface as one tool instead of 27
 /// registered functions (vault decision 2026-09-03). Registered only when
-/// the host has a configured vault.
+/// the host has a configured vault; the primitives beneath it
+/// (`eidolon::mneme_call`/`mneme_rpc`) are registered everywhere and answer
+/// the absence at call time.
 ///
 /// It was two until 2026-09-14: `mneme_dispatch`, the natural-language
 /// sibling, was first deferred and then cut outright once the vault command
@@ -126,13 +147,15 @@ pub const BUILTINS: &[(&str, &str)] = &[
 /// tool in the binary wraps it.
 pub const MNEME_BUILTINS: &[(&str, &str)] = &[("mneme_rpc", include_str!("../builtin/mneme_rpc.rn"))];
 
-/// The swarm built-ins: seeing the other sessions, and speaking to one.
-/// Registered only when this session is registered among its peers — a
-/// lone harness would otherwise carry two tools whose only honest answer
-/// is that there is nobody there, and pay for them in the system prompt.
+/// The swarm built-ins: seeing the other sessions, speaking to one, and
+/// answering a question one has asked. Registered only when this session
+/// is registered among its peers — a lone harness would otherwise carry
+/// tools whose only honest answer is that there is nobody there, and pay
+/// for them in the system prompt.
 pub const SWARM_BUILTINS: &[(&str, &str)] = &[
     ("peers", include_str!("../builtin/peers.rn")),
     ("send", include_str!("../builtin/send.rn")),
+    ("answer", include_str!("../builtin/answer.rn")),
 ];
 
 /// The search built-in, registered only on a session that was assembled with
@@ -141,6 +164,15 @@ pub const SWARM_BUILTINS: &[(&str, &str)] = &[
 /// address policy are not the script's to name: the primitive takes neither
 /// from a script.
 pub const SEARCH_BUILTINS: &[(&str, &str)] = &[("search", include_str!("../builtin/search.rn"))];
+
+/// The model-call built-in, registered only on a session that was assembled
+/// with a completion path ([`Host::has_completion`]) — the catalog *is* the
+/// capability, and a session with none has nothing to ask. The tool is
+/// `script_only`: a workflow drives it, and a model is never offered it.
+/// The endpoint, the key and the output cap are not the script's to name —
+/// the primitive takes none of them from a script.
+pub const MODEL_BUILTINS: &[(&str, &str)] =
+    &[("ask_model", include_str!("../builtin/ask_model.rn"))];
 
 /// Whether `name` is one of the tools that ship in the binary — any of the
 /// three lists, enabled or not. A file of that name in the tools directory
@@ -151,6 +183,7 @@ pub fn is_builtin(name: &str) -> bool {
         .chain(MNEME_BUILTINS)
         .chain(SWARM_BUILTINS)
         .chain(SEARCH_BUILTINS)
+        .chain(MODEL_BUILTINS)
         .any(|(n, _)| *n == name)
 }
 
@@ -230,6 +263,137 @@ pub fn register_dir(
     notes
 }
 
+/// Adopt a directory of installed plugins' tools: every installed
+/// plugin's `tools/*.rn` becomes a tool called `<name>_<stem>`, attributed
+/// to `<name>`. Enumeration rides [`crate::plugins::discover`], so the
+/// same rules that list a plugin rule its adoption: a directory outside
+/// the namespace grammar, without a compiling `plugin.rn`, or with a
+/// manifest that disagrees with its directory is one broken entry —
+/// reported, and its tools are not adopted.
+///
+/// The layout is authoritative for *what exists* — a plugin with no
+/// `tools/` simply contributes none — and the tool files themselves are
+/// read the same way [`register_dir`] reads them, at the same point in
+/// session build, after the operator's own tools (**user wins** on a
+/// collision) and never over a built-in, whose name is not shadowable at
+/// all. The manifest's `approval` and `claims` gate nothing here, by
+/// ruling: adoption believes the directory's contents, and an effect is
+/// gated by the one table like any other caller's.
+///
+/// Returns one line per thing worth saying, as [`register_dir`] does: a
+/// broken plugin and why, a tool this session refuses (a built-in's name,
+/// a name already taken, a stem the namespace cannot carry), a script that
+/// failed to compile. One refused tool skips that tool, not the plugin,
+/// and one broken plugin skips nothing else — the operator still reads why
+/// on stderr. A missing plugins directory is nothing to say.
+pub fn register_plugins(
+    registry: &mut ToolRegistry,
+    host: &Arc<Host>,
+    plugins_dir: &std::path::Path,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let plugins = match crate::plugins::discover(plugins_dir) {
+        Ok(plugins) => plugins,
+        // A directory that is there and cannot be read is said out loud —
+        // it is the one case where "no plugins" would be a lie.
+        Err(e) => return vec![format!("{}: {e:#}", plugins_dir.display())],
+    };
+    // The record consult, before anything is compiled: a plugin the
+    // operator disabled is present and listed but not adopted — its
+    // tools join no session, and nothing of it is revoked, so
+    // re-enabling asks nobody again. The read fails open (an unreadable
+    // record enables), and the skip is silent by ruling — the listing is
+    // where the decision is visible, not a stderr line every session
+    // would repeat. (crate::store, *Plugin Packaging (spec)*.)
+    let record = crate::store::Store::load(plugins_dir).ok();
+    let enabled = |name: &str| record.as_ref().is_none_or(|s| s.enabled(name));
+    for entry in plugins {
+        let dir = match entry {
+            crate::plugins::Plugin::Installed { dir, ref manifest }
+                if enabled(&manifest.name) =>
+            {
+                dir
+            }
+            crate::plugins::Plugin::Installed { .. } => continue,
+            crate::plugins::Plugin::Broken { dir, reason } => {
+                notes.push(format!("{}: not adopted — {reason}", dir.display()));
+                continue;
+            }
+        };
+        let plugin = dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tools = dir.join("tools");
+        let Ok(files) = std::fs::read_dir(&tools) else {
+            // A plugin with no tools payload — workflows only, say — is
+            // ordinary and not worth a line.
+            continue;
+        };
+        let mut paths: Vec<std::path::PathBuf> = files
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rn"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let name = format!("{plugin}_{stem}");
+            // Both halves of the name answer to the same grammar the
+            // plugin's own does — the joined name is a tool a model calls
+            // and a log line greps.
+            if !crate::plugins::valid_name(&stem) {
+                notes.push(format!(
+                    "{}: `{stem}` cannot carry the plugin's namespace; `{name}` is not adopted",
+                    path.display()
+                ));
+                continue;
+            }
+            // A built-in's source *is* the file at its name, which is why
+            // the user's directory skips those stems rather than refusing:
+            // a plugin's file does not have that excuse, so its
+            // contribution is refused and the refusal names both the plugin
+            // and the name it tried to take.
+            if is_builtin(&name) {
+                notes.push(format!(
+                    "{}: plugin `{plugin}` may not take `{name}` — a built-in's name is never shadowed",
+                    path.display()
+                ));
+                continue;
+            }
+            let src = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    notes.push(format!("{}: {e}", path.display()));
+                    continue;
+                }
+            };
+            // Compiled under its namespaced name, so a diagnostic names the
+            // tool the session would have had, and attributed to the plugin
+            // the directory names — the tag the gate's question and the
+            // audit lines carry.
+            match ScriptTool::compile(&name, &src, host.clone()) {
+                Ok(mut tool) => {
+                    tool.attribute(&name, &plugin);
+                    if registry.get(&name).is_some() {
+                        notes.push(format!(
+                            "{}: plugin `{plugin}` may not take `{name}` — the operator's tool (or an earlier plugin's) keeps it",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                    registry.register(Arc::new(tool));
+                }
+                Err(e) => notes.push(format!("{}: {e:#}", path.display())),
+            }
+        }
+    }
+    notes
+}
+
 /// Compile every built-in the host enables and register it, each from its
 /// copy in `dir` when there is one and from the binary otherwise. Returns
 /// a line per copy that could not be used — unreadable, or a compile
@@ -249,6 +413,9 @@ pub fn register_builtins(
     }
     if host.has_search() {
         all.extend(SEARCH_BUILTINS.iter());
+    }
+    if host.has_completion() {
+        all.extend(MODEL_BUILTINS.iter());
     }
     let mut notes = Vec::new();
     for (name, shipped) in all {
@@ -366,6 +533,61 @@ mod tests {
         assert!(is_builtin("peers") && is_builtin("mneme_rpc") && !is_builtin("hello"));
     }
 
+    /// One word for how much comes back. The four built-ins whose output the
+    /// caller can bound all name the knob `limit` (standardized 2026-09-29:
+    /// they had shipped `limit`, `max`, `max` and `count` — four words and
+    /// three units for one idea, which is also why the dispatcher's spill
+    /// exemption has to read the older spellings). This pin is about the
+    /// surface rather than the rule: the exemption would keep working if a
+    /// name drifted back, and what would come back with it is a model
+    /// relearning the same knob three times.
+    #[test]
+    fn the_output_bounding_built_ins_name_the_knob_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::new(dir.path().to_path_buf());
+        let _ = host.compiler();
+        host.attach_search_key("test-key");
+        let mut reg = ToolRegistry::new();
+        register_builtins(&mut reg, &host, dir.path()).unwrap();
+        for name in ["read", "grep", "fetch", "search"] {
+            let manifest = reg.get(name).unwrap_or_else(|| panic!("{name}")).manifest().clone();
+            let props = &manifest.input_schema["properties"];
+            assert_eq!(
+                props["limit"]["type"], "integer",
+                "`{name}` bounds its output with `limit`: {}",
+                manifest.input_schema
+            );
+            for older in ["max", "count"] {
+                assert!(
+                    props.get(older).is_none(),
+                    "`{name}` kept the older spelling `{older}`: {}",
+                    manifest.input_schema
+                );
+            }
+        }
+    }
+
+    /// The dispatcher's spill exemption reads the call's own `limit`
+    /// (`eidolon_core::dispatch::named_read_length`), so the built-in
+    /// `read` has to keep naming its read length exactly that. A rename
+    /// here is a silent return of the spill chain: the receipt tells the
+    /// model to page with `read` (offset/limit), the page is spilled
+    /// again, and the answer is a pointer to a second file.
+    #[test]
+    fn the_built_in_read_declares_the_limit_the_spill_exemption_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::new(dir.path().to_path_buf());
+        let mut reg = ToolRegistry::new();
+        register_builtins(&mut reg, &host, dir.path()).unwrap();
+        let manifest = reg.get("read").unwrap().manifest().clone();
+        let limit = &manifest.input_schema["properties"]["limit"];
+        assert_eq!(
+            limit["type"], "integer",
+            "`read` still takes a top-level `limit`: {}",
+            manifest.input_schema
+        );
+    }
+
     /// The swarm tools exist exactly when the session is registered among
     /// its peers. A lone harness should not carry two tools whose only
     /// honest answer is that there is nobody there — and it pays for a
@@ -418,6 +640,72 @@ mod tests {
                 .iter()
                 .any(|v| v == "to")
         );
+        assert!(
+            send.input_schema["properties"].get("operator").is_none(),
+            "the send tool must not grow an `operator` parameter"
+        );
+    }
+
+    /// The override is not a tool's to claim: the send tool's schema has
+    /// no `operator`, and a model-fabricated one in the arguments is
+    /// ignored rather than honoured — the envelope that lands says
+    /// nothing of the operator. This is the pin that keeps a level-0
+    /// park deaf to peers only: the operator's flag is their CLI act's
+    /// to set, and nobody else reaches it.
+    #[tokio::test]
+    async fn a_fabricated_operator_field_in_the_send_tool_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let host = Host::new(dir.path().to_path_buf());
+        // Two sessions: the sender holds the tool, the recipient holds
+        // the inbox — a session's own roster is every OTHER session by
+        // construction, so nobody sends to themselves here.
+        let sender = eidolon_swarm::Presence::register(
+            &run,
+            &dir.path().join("sender.eid"),
+            dir.path(),
+            "mock",
+            "sender",
+        )
+        .unwrap();
+        let recipient = eidolon_swarm::Presence::register(
+            &run,
+            &dir.path().join("receiver.eid"),
+            dir.path(),
+            "mock",
+            "receiver",
+        )
+        .unwrap();
+        let to = recipient.id().to_string();
+        let inbox = recipient.inbox_dir();
+        let _ = host.compiler();
+        host.attach_swarm(sender);
+        let mut reg = ToolRegistry::new();
+        register_builtins(&mut reg, &host, dir.path()).unwrap();
+        let send = reg.get("send").expect("registered").clone();
+        let out = send
+            .call(
+                serde_json::json!({
+                    "to": to,
+                    "text": "fabricated override",
+                    "operator": true,
+                }),
+                eidolon_core::tool::CallContext {
+                    cwd: dir.path().to_path_buf(),
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                    call_id: "test".into(),
+                },
+            )
+            .await
+            .expect("the tool call itself succeeds");
+        assert!(!out.is_error, "{}", out.content);
+        let mail = eidolon_swarm::inbox::drain(&inbox);
+        assert_eq!(mail.len(), 1);
+        assert!(
+            !mail[0].operator,
+            "a fabricated operator field must arrive unmarked: {mail:?}"
+        );
+        assert!(mail[0].wake, "and the ordinary direct-message defaults hold");
     }
 
     /// The search tool exists exactly when the session was assembled with a

@@ -5,11 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-harnox = { workspace = true, features = ["policy", "secrets"] }
+harnox = { workspace = true, features = ["policy", "secrets", "llm"] }
 eidolon-core.workspace = true
 eidolon-tools.workspace = true
 eidolon-remote.workspace = true
 eidolon-swarm.workspace = true
+# The model call: the catalog a one-shot completion resolves, streams and
+# prices through, injected into the host the way the vault and the secret
+# store are — tools have no model reach of their own.
+eidolon-providers.workspace = true
 # The search key is held the way the secret store hands it out: in a value
 # that wipes itself when the session is done with it (as `eidolon-providers`
 # holds a provider token).
@@ -17,6 +21,13 @@ zeroize = "1"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The plugin record (`plugins.toml`): what the operator has decided about
+# each installed plugin, read by adoption and the ui merge, rewritten by
+# the verbs.
+toml.workspace = true
+# The pin's content hash: the workflow source set, lib files included, so a
+# resume refuses a program that is not the one the run was started under.
+sha2 = "0.10"
 tokio.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true

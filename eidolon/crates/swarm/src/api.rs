@@ -5,7 +5,7 @@
 //! belong somewhere they can be read and tested. Both functions return the
 //! string the model sees.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 
 use crate::inbox::Envelope;
 use crate::presence::{Delivery, Peer, Presence};
@@ -70,13 +70,69 @@ fn row(q: &Peer) -> String {
     } else {
         format!("\"{}\"", one_line(&q.meta.title))
     };
-    format!(
+    let mut out = format!(
         "  {}  {}  {}  {}  {doing}\n",
         q.meta.id,
         tilde(&q.meta.cwd.display().to_string()),
         q.meta.model,
         if q.meta.busy { "busy" } else { "idle" },
+    );
+    // The asking pair's advertisement: a question is here exactly while
+    // the asking session's seam holds it, so this line is both the
+    // invitation and its expiry. `text` is the short form; the answer
+    // names the session and the question's id.
+    for question in &q.questions {
+        out.push_str(&format!(
+            "      asking ({}) `{}` — {}  (answer with the `answer` tool)\n",
+            question.kind,
+            question.id,
+            one_line(&question.text)
+        ));
+    }
+    out
+}
+
+/// Carry a peer's answer to a question another session has outstanding —
+/// the answering half of the asking pair. This goes over the asking
+/// session's door rather than its inbox on purpose: the reply says what
+/// became of the answer, so an answer that lost a race, aimed at a
+/// question already gone, or aimed at a gate question the operator alone
+/// may settle, is *told* to the sender instead of landing unread in a
+/// mailbox.
+///
+/// A session does not answer its own question: the question this session
+/// is blocked on is refused here, because the door credits answers to the
+/// session that sent them and its own would be a loop wearing a name.
+pub fn answer(p: &Presence, to: &str, id: &str, text: &str) -> Result<String> {
+    if to == p.id() {
+        anyhow::bail!(
+            "a session does not answer its own question — `{}` is this session's id, and its \
+own door refuses its answer; a question of yours is yours to wait out or to answer as \
+the resume door delivers one",
+            to
+        );
+    }
+    if text.trim().is_empty() {
+        anyhow::bail!("an answer needs something in it");
+    }
+    let Some(peer) = p.find(to) else {
+        anyhow::bail!("{}", unknown_name(p.peers(), to));
+    };
+    let reply = crate::socket::request(
+        &peer.socket(),
+        &serde_json::json!({ "op": "answer", "id": id, "text": text, "peer": p.id() }),
     )
+    .with_context(|| format!("the door of `{}` did not answer", peer.meta.id))?;
+    match reply.get("ok").and_then(serde_json::Value::as_bool) {
+        Some(true) => Ok(format!("delivered to {}", peer.meta.id)),
+        _ => anyhow::bail!(
+            "{}",
+            reply
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the answer was refused without a reason")
+        ),
+    }
 }
 
 /// Send `text` to one peer, or to every session on this project.
@@ -159,6 +215,7 @@ pub fn send_external(
     to: &str,
     text: &str,
     wake: Option<bool>,
+    operator: bool,
 ) -> Result<String> {
     if text.trim().is_empty() {
         anyhow::bail!("a message needs something in it");
@@ -183,19 +240,25 @@ pub fn send_external(
         if members.is_empty() {
             anyhow::bail!("no session is working on this project, so there is nobody on the channel");
         }
-        let env = Envelope::new(from, &cwd.display().to_string(), text)
+        let mut env = Envelope::new(from, &cwd.display().to_string(), text)
             .on_channel(&key.display().to_string())
             .external()
             .waking(wake.unwrap_or(false));
+        if operator {
+            env.operator = true;
+        }
         return Ok(deliver_all(&members, &env));
     }
 
     let Some(peer) = crate::presence::find_in(&peers, to) else {
         anyhow::bail!("{}", unknown_name(peers, to));
     };
-    let env = Envelope::new(from, &cwd.display().to_string(), text)
+    let mut env = Envelope::new(from, &cwd.display().to_string(), text)
         .external()
         .waking(wake.unwrap_or(true));
+    if operator {
+        env.operator = true;
+    }
     Ok(match peer.deliver(&env)? {
         Delivery::Delivered => format!("delivered to {}", peer.meta.id),
         Delivery::Queued => format!(
@@ -351,6 +414,19 @@ mod tests {
         p
     }
 
+    /// An envelope written before the flag existed — no `operator` key at
+    /// all — reads as false: history is unmarked, never retroactively the
+    /// operator's word.
+    #[test]
+    fn an_envelope_without_the_field_reads_as_unmarked() {
+        let env: crate::inbox::Envelope = serde_json::from_str(
+            r#"{ "from": "a", "from_cwd": "/x", "text": "hi", "wake": true, "external": true, "ts_ms": 0 }"#,
+        )
+        .unwrap();
+        assert!(!env.operator);
+        assert!(env.external, "the one flag it carries is still read");
+    }
+
     #[tokio::test]
     async fn an_outside_sender_reaches_a_session_and_is_marked_external() {
         let tmp = tempfile::tempdir().unwrap();
@@ -361,7 +437,7 @@ mod tests {
 
         let out = tokio::task::spawn_blocking({
             let (root, cwd, to) = (root.clone(), cwd.clone(), a.id().to_string());
-            move || send_external(&root, &cwd, "aoide", &to, "rebase finished", None)
+            move || send_external(&root, &cwd, "aoide", &to, "rebase finished", None, false)
         })
         .await
         .unwrap()
@@ -372,11 +448,26 @@ mod tests {
         assert_eq!(mail[0].from, "aoide");
         assert!(mail[0].external, "the recipient must frame it as a tool's");
         assert!(mail[0].wake, "a direct message still wakes by default");
+        assert!(!mail[0].operator, "external is not operator: the two flags are different senders");
+
+        // The operator's own act marks the envelope, and the mark
+        // survives the file.
+        tokio::task::spawn_blocking({
+            let (root, cwd, to) = (root.clone(), cwd.clone(), a.id().to_string());
+            move || send_external(&root, &cwd, "noah", &to, "come back", None, true)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let mail = crate::inbox::drain(&a.inbox_dir());
+        assert_eq!(mail.len(), 1);
+        assert!(mail[0].operator, "the operator's flag rides the envelope");
+        assert!(mail[0].external, "the operator's path is the external path");
 
         // A unique prefix is enough, as for a session's own `send`.
         tokio::task::spawn_blocking({
             let (root, cwd, to) = (root.clone(), cwd.clone(), a.id()[..6].to_string());
-            move || send_external(&root, &cwd, "aoide", &to, "again", Some(false))
+            move || send_external(&root, &cwd, "aoide", &to, "again", Some(false), false)
         })
         .await
         .unwrap()
@@ -387,7 +478,7 @@ mod tests {
 
         let e = tokio::task::spawn_blocking({
             let (root, cwd) = (root.clone(), cwd.clone());
-            move || send_external(&root, &cwd, "aoide", "eidolon-nope", "hi", None)
+            move || send_external(&root, &cwd, "aoide", "eidolon-nope", "hi", None, false)
         })
         .await
         .unwrap()
@@ -408,7 +499,7 @@ mod tests {
 
         let out = tokio::task::spawn_blocking({
             let (root, cwd) = (root.clone(), cwd.clone());
-            move || send_external(&root, &cwd, "aoide", CHANNEL, "heads up", None)
+            move || send_external(&root, &cwd, "aoide", CHANNEL, "heads up", None, false)
         })
         .await
         .unwrap()

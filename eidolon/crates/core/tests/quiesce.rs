@@ -69,6 +69,9 @@ fn harness(dir: &std::path::Path, provider: Arc<ScriptedProvider>) -> Harness {
             prompt: None,
             render: None,
             deferred: false,
+            script_only: false,
+            plugin: None,
+            source_hash: None,
         },
         entered: entered.clone(),
         release: release.clone(),
@@ -102,6 +105,91 @@ fn harness(dir: &std::path::Path, provider: Arc<ScriptedProvider>) -> Harness {
 /// Is this record the quiesce marker?
 fn is_marker(kind: &RecordKind) -> bool {
     matches!(kind, RecordKind::Note { text } if text.contains("quiesced for projection"))
+}
+
+/// The `state` op's words, in the order a peer meets them: one word per
+/// state a wait can distinguish, most specific first. The two absent-reply
+/// words (`quiesced` past the exit, `gone`) are the journal's and the empty
+/// socket's to tell — a session that answers is neither.
+#[tokio::test]
+async fn the_state_op_names_what_a_wait_can_distinguish() {
+    use eidolon_core::wait::{Answer, Arm, Condition, Spec, Term, Vantage, Wake};
+
+    /// Answers no and says nothing: enough to keep a park armed, never
+    /// enough to fire it inside the test's window.
+    struct Never;
+
+    #[async_trait::async_trait]
+    impl Vantage for Never {
+        fn cadence(&self, _: &Condition) -> Duration {
+            Duration::from_secs(3600)
+        }
+        async fn ask(&self, _: &Term) -> Answer {
+            Answer::No
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(vec![
+        ScriptedProvider::tool("t1", "gate", json!({})),
+        ScriptedProvider::text("done"),
+    ]);
+    let h = harness(dir.path(), provider.clone());
+    h.agent.parks().set_vantage(Arc::new(Never));
+
+    let (ring, _ring_rx) = tokio::sync::mpsc::unbounded_channel();
+    let word = |h: &Harness, ring: &tokio::sync::mpsc::UnboundedSender<()>| {
+        doorbell::answer(h.agent.as_ref(), &json!({ "op": "state" }), ring).unwrap()["state"]
+            .clone()
+    };
+
+    // Fresh: nothing in flight, nothing armed, nothing asked.
+    assert_eq!(word(&h, &ring), "idle");
+
+    // A park armed: the session itself is waiting on something else.
+    let armed = h
+        .agent
+        .parks()
+        .arm(Spec {
+            call_id: "call-1".into(),
+            condition: Condition::parse(&json!({ "peer_idle": "eidolon-x" })).unwrap(),
+            wake: Wake::Any,
+            timeout: Duration::from_secs(60),
+            epoch: h.agent.parks().begin_turn(),
+            note: None,
+        })
+        .await;
+    assert!(matches!(armed, Arm::Armed(_)), "{armed:?}");
+    assert_eq!(word(&h, &ring), "waiting");
+
+    // A turn in flight outranks the arithmetic below it. The park from the
+    // last leg retires at the turn's `begin_turn` — the stale-park rule —
+    // which is why `busy` is asked about on its own merits here.
+    let turn = {
+        let agent = h.agent.clone();
+        tokio::spawn(async move {
+            agent
+                .run_turn(vec![ContentBlock::text("go")], CancellationToken::new())
+                .await
+        })
+    };
+    h.entered.notified().await;
+    assert!(h.agent.turn_in_flight());
+    assert_eq!(word(&h, &ring), "busy");
+
+    // Asked to settle with the boundary not reached: the ask is noted, the
+    // word says so, and the tool call is untouched.
+    assert!(h.agent.request_quiesce("cannataxis"));
+    assert_eq!(word(&h, &ring), "quiescing");
+
+    // The boundary arrives, the marker lands, and the word changes one
+    // last time — the state a projection reader looks for.
+    h.release.notify_one();
+    turn.await.unwrap().unwrap();
+    quiesce::quiesce_wait(&h.agent, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(word(&h, &ring), "quiesced");
 }
 
 #[tokio::test]
@@ -380,6 +468,7 @@ async fn a_driver_turns_quiesce_outranks_a_waking_message() {
             text: "rebased onto master".into(),
             wake: true,
             external: false,
+            operator: false,
         },
     ]))));
     assert!(h.agent.request_quiesce("cannataxis"));

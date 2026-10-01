@@ -122,7 +122,7 @@
 //! yet (vault: `Tool-Starved Models Confabulate Calls and Their Results`) —
 //! and the number is how the discipline is measured rather than assumed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
@@ -194,7 +194,7 @@ pub const CODE_FENCE: &str = "```";
 /// interface: the parameter is a line of prose, so the description *is* the
 /// grammar, and it is the model's only statement of what the channel covers
 /// and what to do when it declines.
-pub const DESCRIPTION: &str = r#"vault commands — plain imperative one-liners, dispatched locally, no tool call needed. Covered (reads): read a note, search, backlinks, similar notes, index, list notes/trash/versions/handles, orphan & dead-link checks, semantic queries, embed text, skill bodies, conventions. Covered (writes): append to a note, create a note, replace text in a note, replace a section body, move, rename, delete a note, restore a note or a version. A write's text payload goes in a fenced block, never inline: leave the payload hole bare (`$a`), then a line `!!a`, the exact bytes with their newlines and quotes, then a line `!!`. A write whose payload is left inline is refused, and a delete is confirmed by the channel. Rules: one command per line; literal values inline, quoted when multi-word (read note "Groceries List"); no pronouns ('merge it' → 'merge pr 42'); don't pad with politeness. If a command comes back undispatched, use RPC as normal — fallback is expected, not an error. Anything else still goes through RPC."#;
+pub const DESCRIPTION: &str = r#"vault commands — plain imperative one-liners, dispatched locally, no tool call needed. Covered (reads): read a note, search, backlinks, similar notes, index, list notes/trash/versions/handles, orphan & dead-link checks, semantic queries, embed text, skill bodies, conventions. Covered (writes): append to a note, create a note, replace text in a note, replace a section body, move, rename, delete a note, restore a note or a version. A write's text payload goes in a fenced block, never inline: leave the payload hole bare (`$a`), then a line `!!a`, the exact bytes with their newlines and quotes, then a line `!!`. A write whose payload is left inline is refused, and a delete is confirmed by the channel. Rules: one instruction per line — a second request in the same line is not carried out, so send each as its own command; literal values inline, quoted when multi-word (read note "Groceries List"); no pronouns ('merge it' → 'merge pr 42'); don't pad with politeness. If a command comes back undispatched, use RPC as normal — fallback is expected, not an error. Anything else still goes through RPC."#;
 
 /// The teaching the model reads when the **inline** seam is armed — the
 /// marker convention and the turn discipline, then [`DESCRIPTION`] verbatim.
@@ -233,6 +233,57 @@ nothing else may follow them. Every command in one message runs, in order.\n\n\
 struct Command {
     text: String,
     blocks: BTreeMap<char, String>,
+    /// A shape in which the block the model wrote is *not* the block it meant,
+    /// so the bytes in `blocks` are not the payload. See [`PayloadDefect`].
+    defect: Option<PayloadDefect>,
+}
+
+/// A payload fence that cannot be read as the payload, and why.
+///
+/// These are refusals rather than repairs, and deliberately so: an escape is a
+/// thing the model must *remember*, and a forgotten escape is exactly the
+/// silent failure this removes. So the two shapes are refused whole — the
+/// command, the blocks and all — and the model is told the route out, which is
+/// the RPC path, where a payload is an argument rather than a fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadDefect {
+    /// The body contains a line that is exactly [`FENCE`], so the block closed
+    /// early and what followed parsed as prose. Carrying the part before it
+    /// would write a **prefix** of the payload and pass it off as the whole —
+    /// the one failure "carried, never inferred" exists to prevent.
+    InteriorTerminator,
+    /// One hole was fenced twice. `BTreeMap::insert` would have kept the second
+    /// block and dropped the first with no word, and the gate — seeing one
+    /// block for one hole — would have passed it. Choosing between two
+    /// payloads is the guess this gate refuses.
+    DuplicateFence,
+}
+
+impl PayloadDefect {
+    /// The one sentence the model reads, naming the way out. The grammar has
+    /// no escape by ruling, so this is where the route out lives: a body that
+    /// genuinely needs a line shaped like the terminator goes through
+    /// `mneme_rpc`, where the payload is an argument and no fence is involved.
+    /// The wire spelling, for the harvest record: one token per shape, so the
+    /// log can count a duplicate fence separately from an interior terminator
+    /// instead of reporting one refusal for both.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PayloadDefect::InteriorTerminator => "interior_terminator",
+            PayloadDefect::DuplicateFence => "duplicate_fence",
+        }
+    }
+
+    pub fn as_advice(self) -> &'static str {
+        match self {
+            PayloadDefect::InteriorTerminator => {
+                "a line that is exactly `!!` inside a payload closes the block, so the rest would not be written — there is no escape for it by design; use `mneme_rpc` for a write whose text contains such a line"
+            }
+            PayloadDefect::DuplicateFence => {
+                "one hole was fenced twice, so the channel cannot tell which payload you meant — fence each hole once, or use `mneme_rpc`"
+            }
+        }
+    }
 }
 
 /// The commands one assistant message marks, and how many characters of it
@@ -306,6 +357,12 @@ fn marked_block(block: &str) -> (Vec<Command>, usize) {
     let mut open: Option<(usize, char, Vec<String>)> = None;
     // Inside a code block every line is prose — see [`CODE_FENCE`].
     let mut in_code = false;
+    // The command whose block closed most recently, and whether an ordinary
+    // line of prose has been read since. Together they are the trace of a
+    // truncated block — see the fence branch. Cleared by any command, fence or
+    // code block, so only the lines straight after a close are in scope.
+    let mut just_closed: Option<usize> = None;
+    let mut prose_since_close = false;
     for line in block.split_inclusive('\n') {
         let end = start + line.len();
         let body = line.strip_suffix('\n').unwrap_or(line);
@@ -318,8 +375,26 @@ fn marked_block(block: &str) -> (Vec<Command>, usize) {
                 // replaces the bytes it was handed, and one the model did not
                 // type is not one of them.
                 if let Some(cmd) = commands.get_mut(owner) {
-                    cmd.blocks.insert(letter, lines.join("\n"));
+                    // First-wins: a hole fenced twice keeps the **first** block
+                    // and drops the second, so which payload was lost is a
+                    // decision with a name rather than an accident of insertion
+                    // order — and the command is marked unreadable, so the gate
+                    // refuses it either way ([`PayloadDefect::DuplicateFence`]).
+                    // `insert` alone would keep the *second* and say nothing,
+                    // which is the whole finding.
+                    match cmd.blocks.entry(letter) {
+                        Entry::Occupied(_) => {
+                            cmd.defect.get_or_insert(PayloadDefect::DuplicateFence);
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(lines.join("\n"));
+                        }
+                    }
                 }
+                // The block ended at a terminator line, and only the lines
+                // after it can still turn out to have been inside it.
+                just_closed = Some(owner);
+                prose_since_close = false;
                 after = block[end..].chars().count();
             } else {
                 lines.push(body.to_string());
@@ -329,14 +404,17 @@ fn marked_block(block: &str) -> (Vec<Command>, usize) {
             // A payload block is the one thing that outranks this: a fence
             // written inside the bytes is bytes, and the branch above has it.
             in_code = !in_code;
+            just_closed = None;
         } else if in_code {
             // Prose, whatever it looks like.
+            prose_since_close = true;
         } else if let Some(rest) = body.strip_prefix(MARKER) {
             let command = rest.trim();
             if !command.is_empty() {
-                commands.push(Command { text: command.to_string(), blocks: BTreeMap::new() });
+                commands.push(Command { text: command.to_string(), blocks: BTreeMap::new(), defect: None });
                 // Past the terminating newline: a last line that ends the
                 // block is not "text after the last command".
+                just_closed = None;
                 after = block[end..].chars().count();
             }
         } else if let Some(rest) = body.strip_prefix(FENCE) {
@@ -349,8 +427,36 @@ fn marked_block(block: &str) -> (Vec<Command>, usize) {
             if let (None, Some(letter), Some(owner)) =
                 (letters.next(), hole, commands.len().checked_sub(1))
             {
+                just_closed = None;
                 open = Some((owner, letter, Vec::new()));
+            } else if letter.is_none() {
+                // A bare `!!` with nothing open. Usually prose — the teaching
+                // text says so, and a model may write one anywhere. It is also
+                // what a *truncated* block leaves behind: a body holding a
+                // terminator-shaped line closed early, the rest of that body
+                // became prose, and the closer the model meant arrives here with
+                // no block left to close.
+                //
+                // So the trace is: a block closed, then **prose** — the rest of
+                // the body — and then a `!!`. A `!!` on the line right after a
+                // closer is not that: nothing was stranded, so it stays prose
+                // and the block it follows keeps its bytes.
+                if let (true, Some(owner)) = (prose_since_close, just_closed.take())
+                    && let Some(cmd) = commands.get_mut(owner)
+                {
+                    // Withdraw the payload rather than shorten it: a prefix of
+                    // what the model wrote is not its payload.
+                    cmd.blocks.clear();
+                    cmd.defect.get_or_insert(PayloadDefect::InteriorTerminator);
+                }
             }
+        } else if just_closed.is_some() {
+            // An ordinary line of text straight after a close. Nothing here is
+            // marked or fenced, so it is prose — and prose is exactly what the
+            // rest of a body looks like once a terminator-shaped line has closed
+            // its block early. Whether that happened is decided by the `!!` that
+            // may follow; this only records that there is something in between.
+            prose_since_close = true;
         }
         start = end;
     }
@@ -388,6 +494,12 @@ pub enum Gate {
     NotReadShaped,
     /// There was text in the line no slot claimed — a second instruction.
     Editorial,
+    /// The tagger found an argument on the line that no slot claimed — a
+    /// second instruction with its own argument. Disjoint from [`Gate::Editorial`],
+    /// which needs the model to have tagged a `TRAIL` span: a clause like
+    /// `and also delete the note $b` opens an unclaimed hole and tags nothing, so
+    /// it reaches the gate here and nowhere else.
+    UnclaimedArguments,
     /// A write, and its payload was not *carried*: the hole held inferred words,
     /// or was missing altogether. Not dispatched — the bytes of a write are the
     /// one thing here the tagger is not allowed to guess.
@@ -398,6 +510,13 @@ pub enum Gate {
     /// A payload block the command did not declare — a fence on a read, an extra
     /// block, or a letter nothing asked for.
     BlockOrphan,
+    /// A payload block the scanner could not read as the payload the model
+    /// meant, and refused rather than guessed: a body containing a line shaped
+    /// like the terminator, which closed the block early, or one hole fenced
+    /// twice. Not dispatched, and no bytes handed on either way — carrying the
+    /// prefix or the survivor of a duplicate fence is the guess this channel
+    /// will not make. See [`PayloadDefect`].
+    PayloadShape,
     /// A command, but short of an argument Mneme requires. Not dispatched: the
     /// model gets a count instead of a guaranteed error.
     MissingSlots,
@@ -411,9 +530,11 @@ impl Gate {
             Gate::Conflict => "conflict",
             Gate::NotReadShaped => "not_read_shaped",
             Gate::Editorial => "editorial",
+            Gate::UnclaimedArguments => "unclaimed_arguments",
             Gate::PayloadUndeclared => "payload_undeclared",
             Gate::PayloadUnbound => "payload_unbound",
             Gate::BlockOrphan => "block_orphan",
+            Gate::PayloadShape => "payload_shape",
             Gate::MissingSlots => "missing_slots",
         }
     }
@@ -426,6 +547,9 @@ pub struct Decision {
     /// `Some` exactly when the gate is [`Gate::Pass`]: the Mneme function and
     /// the arguments, already reconciled with the RPC vocabulary.
     pub call: Option<(String, Map<String, Value>)>,
+    /// Which unreadable shape stopped a [`Gate::PayloadShape`], so the refusal
+    /// names its own cause and the route out. `None` for every other gate.
+    pub defect: Option<PayloadDefect>,
 }
 
 /// One intent this channel may run: Mneme's function, the arguments it cannot
@@ -560,7 +684,7 @@ fn hole_letter(value: &str) -> Option<char> {
 /// (`append "he said \"…\""` binds `content` to `he said \`) is the same failure
 /// arriving by a different road.
 pub fn gate(v: &Verdict, blocks: &BTreeMap<char, String>) -> Decision {
-    let refuse = |gate| Decision { gate, call: None };
+    let refuse = |gate| Decision { gate, call: None, defect: None };
     if !v.accepted() {
         return refuse(Gate::Abstain);
     }
@@ -575,6 +699,20 @@ pub fn gate(v: &Verdict, blocks: &BTreeMap<char, String>) -> Decision {
         .is_some_and(|t| !t.trim().is_empty())
     {
         return refuse(Gate::Editorial);
+    }
+    // Read alongside the editorial check above and deliberately beside it: both
+    // answer "did the line carry more work than this call does?", from two
+    // disjoint signals. `trailing_editorial_text` needs the model to have tagged
+    // a TRAIL span; the counter is raised by the tagger noticing an argument no
+    // slot claimed. Neither implies the other, so both are consulted and each
+    // names its own cause. Measured across 98 verdicts (the 47 real corpus rows
+    // and 51 probes) no utterance carried a politeness or constraint tail here,
+    // so the test is the bare counter and no threshold — a "thanks" or "if you
+    // can" leaves no argument to go unclaimed. This is not a general
+    // second-request detector either: a follow-on clause naming no bindable
+    // argument raises neither signal and still passes.
+    if v.risk.as_ref().is_some_and(|r| r.unclaimed_arguments > 0) {
+        return refuse(Gate::UnclaimedArguments);
     }
     let mut slots = v.slots.clone();
     if payloads.is_empty() {
@@ -620,7 +758,28 @@ pub fn gate(v: &Verdict, blocks: &BTreeMap<char, String>) -> Decision {
     Decision {
         gate: Gate::Pass,
         call: Some((function, args)),
+        defect: None,
     }
+}
+
+/// The gate, with the scanner's verdict on the fences in front of it.
+///
+/// A command whose block the scanner could not read as the payload is refused
+/// here, ahead of the classifier's own reading of the line: the question is
+/// whether the bytes are the ones the model wrote, and that does not depend on
+/// what the command was or whether the verdict would have passed. Keeping it
+/// here rather than inside [`gate`] leaves that function a pure function of a
+/// verdict and a block map, which is what the corpus and the 116 gate cases
+/// measure.
+fn gate_command(
+    v: &Verdict,
+    blocks: &BTreeMap<char, String>,
+    defect: Option<PayloadDefect>,
+) -> Decision {
+    if let Some(defect) = defect {
+        return Decision { gate: Gate::PayloadShape, call: None, defect: Some(defect) };
+    }
+    gate(v, blocks)
 }
 
 /// `vv` as a registered tool. See the module docs.
@@ -648,7 +807,7 @@ impl VaultCommands {
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "One plain imperative vault command, e.g. `read the note Groceries`. A write's payload is not inline: leave its hole bare (`$a`), then a line `!!a`, the bytes exactly as they should be written, then a line `!!`.",
+                            "description": "One plain instruction per command — a second request in the same line is not carried out, so send each one as its own command. A write's payload is not inline: leave its hole bare (`$a`), then a line `!!a`, the bytes exactly as they should be written, then a line `!!`.",
                         }
                     },
                     "required": ["command"]
@@ -663,6 +822,9 @@ impl VaultCommands {
                 prompt: None,
                 render: None,
                 deferred: false,
+                script_only: false,
+                plugin: None,
+                source_hash: None,
             },
             palette,
             bundle: bundle.into(),
@@ -720,7 +882,7 @@ impl VaultCommands {
         trailing: Option<usize>,
         cancel: &CancellationToken,
     ) -> String {
-        let Command { text, blocks } = command;
+        let Command { text, blocks, defect } = command;
         let Some(d) = self.dispatcher() else {
             return ToolOutput::error("vv has no dispatcher attached yet").content;
         };
@@ -735,6 +897,7 @@ impl VaultCommands {
                     trailing_chars: trailing,
                     verdict: VerdictRecord::unknown(),
                     gate: Gate::Abstain.as_str(),
+                    payload_defect: None,
                     executed: false,
                     result_status: None,
                     error_shape: None,
@@ -743,7 +906,7 @@ impl VaultCommands {
                 return undispatched(Gate::Abstain);
             }
         };
-        let decision = gate(&verdict, &blocks);
+        let decision = gate_command(&verdict, &blocks, defect);
         let Some((function, args)) = decision.call else {
             self.harvest(CommandRecord {
                 ts: now_ms(),
@@ -752,12 +915,16 @@ impl VaultCommands {
                 trailing_chars: trailing,
                 verdict: VerdictRecord::of(&verdict),
                 gate: decision.gate.as_str(),
+                payload_defect: decision.defect.map(PayloadDefect::as_str),
                 executed: false,
                 result_status: None,
                 error_shape: None,
             })
             .await;
-            return undispatched(decision.gate);
+            return match decision.defect {
+                Some(defect) => unshapeable(defect),
+                None => undispatched(decision.gate),
+            };
         };
         let call = mneme_call(&function, args.clone(), CallOrigin::Script, &self.bundle);
         let out = d.dispatch(call, cancel.child_token()).await;
@@ -770,6 +937,7 @@ impl VaultCommands {
             trailing_chars: trailing,
             verdict: VerdictRecord::of(&verdict),
             gate: decision.gate.as_str(),
+            payload_defect: decision.defect.map(PayloadDefect::as_str),
             executed: true,
             result_status: Some(status),
             error_shape: shape,
@@ -900,6 +1068,20 @@ fn undispatched(gate: Gate) -> String {
     )
 }
 
+/// The refusal line for a payload whose fences the scanner could not read.
+///
+/// It says which shape it was and where those bytes go instead, because the
+/// grammar offers no escape for either: a model that only sees `payload_shape`
+/// would try the same fence again, and a model told the route writes through
+/// `mneme_rpc` rather than re-attempting the fence it just got wrong.
+fn unshapeable(defect: PayloadDefect) -> String {
+    format!(
+        "[vv] undispatched (reason: {}) — {} Fallback is expected, not an error.",
+        Gate::PayloadShape.as_str(),
+        defect.as_advice()
+    )
+}
+
 /// What the model reads when the gate passed: the call that actually ran (its
 /// *RPC* names, not the corpus's — a line that showed `note=` for a call that
 /// sent `title=` would be the wrong half of the reconciliation) and the whole
@@ -966,6 +1148,12 @@ struct VerdictRecord {
     conflicts: Option<Vec<Value>>,
     slots: Option<BTreeMap<String, Value>>,
     trailing_editorial_text: Option<String>,
+    /// The counter a [`Gate::UnclaimedArguments`] refusal was decided on, so the
+    /// harvest record names its own measured cause rather than carrying a gate
+    /// label with nothing beside it. Absent when the verdict carried no risk —
+    /// unknown, not zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    risk_unclaimed_arguments: Option<usize>,
 }
 
 impl VerdictRecord {
@@ -978,6 +1166,7 @@ impl VerdictRecord {
             conflicts: Some(v.conflicts.clone()),
             slots: Some(v.slots.clone()),
             trailing_editorial_text: v.trailing_editorial_text.clone(),
+            risk_unclaimed_arguments: v.risk.as_ref().map(|r| r.unclaimed_arguments),
         }
     }
 
@@ -990,6 +1179,7 @@ impl VerdictRecord {
             conflicts: None,
             slots: None,
             trailing_editorial_text: None,
+            risk_unclaimed_arguments: None,
         }
     }
 }
@@ -1012,6 +1202,16 @@ struct CommandRecord {
     trailing_chars: Option<usize>,
     verdict: VerdictRecord,
     gate: &'static str,
+    /// Which unreadable payload fence stopped a [`Gate::PayloadShape`], so the
+    /// log tells a duplicate fence from an interior terminator rather than
+    /// counting one refusal for two different mistakes. `None` for every other
+    /// gate, and for a command that never reached one.
+    ///
+    /// Skipped when absent, not written as null: this field is additive, and a
+    /// record that never had a payload defect should read exactly as it did
+    /// before the field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_defect: Option<&'static str>,
     executed: bool,
     result_status: Option<&'static str>,
     error_shape: Option<&'static str>,
@@ -1056,6 +1256,7 @@ fn append(path: &Path, record: &impl Serialize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatcher::Risk;
 
     /// `gate` over a command that carried no payload blocks — every read, and
     /// the refusal cases that never reach a fence.
@@ -1251,6 +1452,51 @@ mod tests {
             ..with_slots("read_note", &[("note", "Groceries")])
         };
         assert_eq!(g(&blank).gate, Gate::Pass);
+        // An argument on the line that no slot claimed: the second instruction
+        // the T01 shape carries (`read the note $a and also delete the note $b`).
+        // It leaves *no* trailing editorial text, so nothing above can see it.
+        let unclaimed = Verdict {
+            risk: Some(Risk { unclaimed_arguments: 1 }),
+            ..with_slots("read_note", &[("note", "Y")])
+        };
+        assert_eq!(g(&unclaimed).gate, Gate::UnclaimedArguments);
+        assert!(g(&unclaimed).call.is_none());
+        // Counted, not boolean: two unclaimed arguments refuse exactly as one
+        // does, and the rule reads the number rather than its presence.
+        let two = Verdict {
+            risk: Some(Risk { unclaimed_arguments: 2 }),
+            ..with_slots("read_note", &[("note", "Y")])
+        };
+        assert_eq!(g(&two).gate, Gate::UnclaimedArguments);
+        // A risk object that measured nothing is not a refusal, and a verdict
+        // that carried no risk at all is *unknown*, not zero — both pass.
+        assert_eq!(
+            g(&Verdict { risk: Some(Risk::default()), ..with_slots("read_note", &[("note", "Groceries")]) }).gate,
+            Gate::Pass
+        );
+        assert_eq!(
+            g(&with_slots("read_note", &[("note", "Groceries")])).gate,
+            Gate::Pass
+        );
+        // The politeness tails measured at zero across the corpus: "thanks" and
+        // "if you can" leave no argument behind, so a bare counter does not
+        // refuse a well-formed read.
+        for tail in ["thanks", "please", "now", "if you can", "for me"] {
+            let polite = Verdict {
+                risk: Some(Risk { unclaimed_arguments: 0 }),
+                ..with_slots("read_note", &[("note", "Groceries")])
+            };
+            assert_eq!(g(&polite).gate, Gate::Pass, "{tail}");
+        }
+        // The two signals are disjoint, so each keeps its own gate label: a
+        // verdict carrying both is refused for the trailing text, which is
+        // checked first and was already there.
+        let both = Verdict {
+            trailing_editorial_text: Some("and let me know".into()),
+            risk: Some(Risk { unclaimed_arguments: 1 }),
+            ..with_slots("read_note", &[("note", "Y")])
+        };
+        assert_eq!(g(&both).gate, Gate::Editorial);
         // A read short of an argument Mneme requires: not dispatched, so the
         // model gets a count instead of a guaranteed error.
         assert_eq!(g(&with_slots("read_note", &[])).gate, Gate::MissingSlots);
@@ -1286,6 +1532,38 @@ mod tests {
         let line = r#"{"accept":true,"candidates":[],"conflicts":[],"delex":"what sits between $a and $b","intent":"semantic_centroid","intent_prob":0.95,"margin":0.9,"slots":{"refs":["Token Savings","Project Envelope"]},"threshold":0.39,"trailing_editorial_text":null,"utterance":"what sits between \"Token Savings\" and \"Project Envelope\""}"#;
         let verdict: Verdict = serde_json::from_str(line).expect("a list-slot verdict decodes");
         assert_eq!(g(&verdict).gate, Gate::Pass);
+    }
+
+    /// The three `risk` shapes a verdict line can arrive in, all of them real:
+    /// the key absent (older logs and the literal verdict lines above), the key
+    /// present and null (the synthetic corpora and R01/H06), and the object the
+    /// binary actually prints. Only the last one can refuse, and it refuses on
+    /// the number alone — the four nullable fields beside it are not modelled,
+    /// and a verdict carrying them must still decode.
+    #[test]
+    fn the_risk_field_decodes_in_every_shape_the_wire_sends() {
+        let read = r#""utterance":"read the note \"X\" and also delete the note \"Y\"","delex":"read the note $a and also delete the note $b","intent":"read_note","intent_prob":0.86,"margin":0.8,"threshold":null,"accept":true,"slots":{"note":"Y"},"conflicts":[],"trailing_editorial_text":null"#;
+        // Absent entirely.
+        let absent: Verdict =
+            serde_json::from_str(&format!("{{{read}}}")).expect("a verdict with no risk key decodes");
+        assert_eq!(absent.risk, None);
+        assert_eq!(g(&absent).gate, Gate::Pass);
+        // Present and null — unknown, not zero.
+        let null: Verdict =
+            serde_json::from_str(&format!(r#"{{{read},"risk":null}}"#)).expect("a null risk decodes");
+        assert_eq!(null.risk, None);
+        assert_eq!(g(&null).gate, Gate::Pass);
+        // The measured object, all five keys, four of them nullable.
+        let full = format!(
+            r#"{{{read},"risk":{{"argument_occurrences":2,"bio_assignment_disagreements":null,"min_assignment_margin":null,"min_bio_claim_margin":0.998,"unclaimed_arguments":1}}}}"#
+        );
+        let counted: Verdict = serde_json::from_str(&full).expect("the measured risk object decodes");
+        assert_eq!(counted.risk, Some(Risk { unclaimed_arguments: 1 }));
+        assert_eq!(g(&counted).gate, Gate::UnclaimedArguments);
+        // Same object, counter zero: decoded, and not a refusal.
+        let clean = full.replace("\"unclaimed_arguments\":1", "\"unclaimed_arguments\":0");
+        let zeroed: Verdict = serde_json::from_str(&clean).expect("a zeroed risk decodes");
+        assert_eq!(g(&zeroed).gate, Gate::Pass);
     }
 
     /// The type of an argument is the wire's, not the coercion's: Mneme's
@@ -1329,6 +1607,68 @@ mod tests {
         assert_eq!(failed, "[vv] embed_text text=\"hi\" → error: failed to deserialize parameters: missing field `text`");
         // An empty answer is still a line.
         assert_eq!(executed_line("check_orphans", &Map::new(), &ToolOutput::ok("")), "[vv] check_orphans → ok: ");
+    }
+
+    /// The harvest record distinguishes the two payload refusals. `gate` alone
+    #[test]
+    /// The harvest record carries the number a counted refusal was decided on,
+    /// and omits it when the verdict carried no risk.
+    fn the_harvest_record_carries_the_counted_refusals_own_cause() {
+        let record = |v: &Verdict| {
+            serde_json::to_value(VerdictRecord::of(v)).expect("verdict record serialises")
+        };
+        // A refusal decided on the counter says which count, so a record read
+        // back names its measured cause rather than a bare gate label.
+        let refused = record(&Verdict {
+            risk: Some(Risk { unclaimed_arguments: 2 }),
+            ..with_slots("read_note", &[("note", "Y")])
+        });
+        assert_eq!(refused["risk_unclaimed_arguments"], 2);
+        // A verdict that carried no risk omits the field entirely rather than
+        // claiming zero — absent is unknown, not zero, on the wire as well.
+        let unknown = record(&with_slots("read_note", &[("note", "Groceries")]));
+        assert!(unknown.get("risk_unclaimed_arguments").is_none(), "{unknown}");
+        // A measured zero is kept: it is a measurement, and it is what a record
+        // for a `pass` should say.
+        let clean = record(&Verdict {
+            risk: Some(Risk { unclaimed_arguments: 0 }),
+            ..with_slots("read_note", &[("note", "Groceries")])
+        });
+        assert_eq!(clean["risk_unclaimed_arguments"], 0);
+        // A verdict that never arrived carries nothing at all.
+        let none = serde_json::to_value(VerdictRecord::unknown()).expect("unknown record serialises");
+        assert!(none.get("risk_unclaimed_arguments").is_none(), "{none}");
+    }
+
+    /// The harvest record distinguishes the two payload refusals. `gate` alone
+    #[test]
+    fn the_harvest_record_carries_which_payload_shape_stopped_it() {
+        let record = |defect: Option<PayloadDefect>| {
+            serde_json::to_value(CommandRecord {
+                ts: 0,
+                session_id: "s".into(),
+                command: "append $a to N".into(),
+                trailing_chars: None,
+                verdict: VerdictRecord::unknown(),
+                gate: Gate::PayloadShape.as_str(),
+                payload_defect: defect.map(PayloadDefect::as_str),
+                executed: false,
+                result_status: None,
+                error_shape: None,
+            })
+            .expect("record serialises")
+        };
+        let duplicate = record(Some(PayloadDefect::DuplicateFence));
+        let interior = record(Some(PayloadDefect::InteriorTerminator));
+        assert_eq!(duplicate["gate"], "payload_shape");
+        assert_eq!(interior["gate"], "payload_shape");
+        assert_eq!(duplicate["payload_defect"], "duplicate_fence");
+        assert_eq!(interior["payload_defect"], "interior_terminator");
+        assert_ne!(duplicate["payload_defect"], interior["payload_defect"]);
+        // A command refused for anything else names no shape, and the field is
+        // absent rather than null so the record reads the same as before this
+        // one existed.
+        assert!(record(None).get("payload_defect").is_none());
     }
 
     #[test]
@@ -1556,6 +1896,718 @@ mod tests {
         assert_eq!(commands[0].blocks[&'a'], "bytes");
     }
 
+    // ---------------------------------------------------------------------
+    // Fence-scanner corpus.
+    //
+    // What follows measures the `!!a` scanner itself — `marked`, `marked_block`
+    // and `tool_command` — and nothing downstream of it. The gate is measured
+    // above; here the question is narrower and is the one the doctrine names:
+    // the bytes a write's payload is given must have been *carried*, byte for
+    // byte, from a declared hole and a supplied block, and never inferred,
+    // never escaped and never silently cut short.
+    //
+    // The four properties, read off this file's own claims rather than off
+    // taste:
+    //
+    // 1. **Byte-exact carriage.** The block equals the fenced bytes, interior
+    //    marker-looking lines included. The one documented exception is the
+    //    closing fence's own newline: "with no trailing newline of its own"
+    //    (`marked_block`). Line endings arrive normalised to `\n`, also
+    //    documented, so a CRLF reply cannot write `\r`.
+    // 2. **No silent truncation.** A body that cannot be carried whole must
+    //    yield no block at all, so the gate refuses it, and must never yield
+    //    a prefix of what the model wrote.
+    // 3. **Refusal labels are right**: an undeclared letter, a hole declared
+    //    twice, and an unterminated fence each land where the gate says.
+    // 4. **No inference.** A block is sourced from the fence and nowhere else —
+    //    not from the command line, not from the delex form.
+    //
+    // These are measurements. A red case here is a finding for the owner of
+    // the policy, not a thing to patch in the parser; where a case is red it
+    // is left `#[ignore]`d with the counterexample written down next to it.
+
+    /// One block's payload, or `None` when the scanner supplied none — which
+    /// is what the gate sees as an unbound hole, not as empty bytes.
+    fn block(commands: &[Command], letter: char) -> Option<&str> {
+        commands[0].blocks.get(&letter).map(String::as_str)
+    }
+
+    /// Property 1: what was fenced is what is carried.
+    #[test]
+    fn fenced_bytes_arrive_unchanged() {
+        // The interior shapes a model actually writes into a note: another
+        // fence, a line that only looks like the marker, backticks, and a `$a`
+        // that must reach the note as two ordinary characters.
+        let body = "```\n!!x\n$a\n`!!`\n!!!\nend";
+        let (commands, _) = marked_block(&format!("! append $a to the note \"N\"\n!!a\n{body}\n!!\n"));
+        assert_eq!(block(&commands, 'a'), Some(body), "interior lines are content");
+
+        // Blank first line, blank interior line, and a blank last line: the
+        // first two are bytes, the last is the closing fence's own newline and
+        // is not one of them.
+        let (commands, _) = marked_block("! append $a to N\n!!a\n\nfirst\n\n!!\n");
+        assert_eq!(block(&commands, 'a'), Some("\nfirst\n"));
+
+        // Whitespace-only and whitespace-bearing payloads are bytes too; the
+        // payload is not trimmed, escaped or re-indented anywhere on the way.
+        for body in ["   ", "\t \t", "  leading and trailing  ", "a\r b"] {
+            let (commands, _) = marked_block(&format!("! append $a to N\n!!a\n{body}\n!!\n"));
+            assert_eq!(block(&commands, 'a'), Some(body), "{body:?}");
+        }
+
+        // An empty fence is an empty payload, which is distinguishable from a
+        // missing one — and the gate is what tells them apart.
+        let (commands, _) = marked_block("! append $a to N\n!!a\n!!\n");
+        assert_eq!(block(&commands, 'a'), Some(""));
+
+        // The tool seam carries the same bytes the interceptor does.
+        let command = tool_command("append $a to the note \"N\"\n!!a\n```\n!!x\n$a\n!!\n").expect("one command");
+        assert_eq!(command.blocks[&'a'], "```\n!!x\n$a");
+    }
+
+    /// Property 1 at size: a payload big enough that any prefix-only carry,
+    /// any per-line cap or any off-by-one would show.
+    #[test]
+    fn a_large_payload_is_carried_whole() {
+        let body: String = (0..50_000).map(|i| format!("line {i} !!x $a\n")).collect();
+        let carried = body.trim_end_matches('\n').to_string();
+        let (commands, trailing) = marked_block(&format!("! append $a to N\n!!a\n{body}!!\n"));
+        assert_eq!(block(&commands, 'a').map(str::len), Some(carried.len()), "byte count");
+        assert_eq!(block(&commands, 'a'), Some(carried.as_str()), "every line, in order");
+        assert_eq!(trailing, 0, "the block is part of its command");
+    }
+
+    /// Property 1 with CRLF throughout, on every line the scanner reads: the
+    /// command, the fences and the body. The file's claim is that line endings
+    /// arrive normalised, so a CRLF-authored reply cannot write `\r` into a
+    /// note — the carriage return is removed and nothing else is.
+    #[test]
+    fn a_crlf_reply_is_normalised_and_nothing_else_is() {
+        let (commands, _) = marked_block("! append $a to N\r\n!!a\r\none\r\ntwo\r\n!!\r\n");
+        assert_eq!(texts(&commands), ["append $a to N"]);
+        assert_eq!(block(&commands, 'a'), Some("one\ntwo"));
+        // A bare `\r` mid-line is content, not an ending.
+        let (commands, _) = marked_block("! append $a to N\r\n!!a\r\na\rb\r\n!!\r\n");
+        assert_eq!(block(&commands, 'a'), Some("a\rb"));
+    }
+
+    /// Property 2: an unterminated fence supplies no bytes rather than the
+    /// ones it had so far, and an opener no command can bind to supplies none
+    /// either. Both land on the refusal the gate names.
+    #[test]
+    fn an_uncarryable_fence_yields_no_bytes_rather_than_a_prefix() {
+        let v = with_slots("append_to_note", &[("note", "N"), ("content", "$a")]);
+        // `!!a` at end of input, with and without a body under it.
+        for unterminated in ["! append $a to N\n!!a", "! append $a to N\n!!a\n", "! append $a to N\n!!a\nbytes\n"] {
+            let (commands, _) = marked_block(unterminated);
+            assert!(commands[0].blocks.is_empty(), "{unterminated:?}");
+            assert_eq!(gate(&v, &commands[0].blocks).gate, Gate::PayloadUnbound, "{unterminated:?}");
+        }
+        // An opener with no command above it marks nothing at all.
+        assert!(marked_block("!!a\nbytes\n!!\n").0.is_empty());
+        // A fence for a read is carried by the scanner and refused by the gate.
+        let (commands, _) = marked_block("! read the note N\n!!a\nbytes\n!!\n");
+        assert_eq!(block(&commands, 'a'), Some("bytes"));
+        let read = with_slots("read_note", &[("note", "N")]);
+        assert_eq!(gate(&read, &commands[0].blocks).gate, Gate::BlockOrphan);
+    }
+
+    /// Property 3: the three refusals the gate's own labels name.
+    #[test]
+    fn the_three_payload_refusals_are_labelled() {
+        let v = with_slots("append_to_note", &[("note", "N"), ("content", "$a")]);
+        // A fence for a letter the command never declared: the block exists and
+        // the hole does not, so there are no bytes *for it* — unbound, not
+        // orphaned, and not a payload.
+        let (commands, _) = marked_block("! append $a to N\n!!b\nbytes\n!!\n");
+        assert_eq!(block(&commands, 'a'), None, "a wrong letter does not fill the hole");
+        assert_eq!(gate(&v, &commands[0].blocks).gate, Gate::PayloadUnbound);
+        // A hole declared twice on one line cannot be two payloads.
+        let twice = with_slots("edit_note", &[("note", "N"), ("target", "$a"), ("content", "$a")]);
+        assert_eq!(
+            gate(&twice, &blocks(&[('a', "old")])).gate,
+            Gate::PayloadUnbound,
+            "one hole, two payloads"
+        );
+        // An unterminated fence: named above, asserted here for the label.
+        let (commands, _) = marked_block("! append $a to N\n!!a\nbytes\n");
+        assert_eq!(gate(&v, &commands[0].blocks).gate, Gate::PayloadUnbound);
+
+        // A letter the grammar never described opens nothing, so the hole is
+        // unbound rather than bound to something the channel invented.
+        for letter in ["!!-", "!! a b", "!!ab", "!!", "!!\t"] {
+            let (commands, _) = marked_block(&format!("! append $a to N\n{letter}\nbytes\n!!\n"));
+            assert!(commands[0].blocks.is_empty(), "{letter:?}");
+            assert_eq!(gate(&v, &commands[0].blocks).gate, Gate::PayloadUnbound, "{letter:?}");
+        }
+        // `!! a` *is* a shape the parser opens, because the fence line is
+        // trimmed; the model was never taught it, and the bytes still come
+        // from the block rather than from anywhere else.
+        let (commands, _) = marked_block("! append $a to N\n!! a\nbytes\n!!\n");
+        assert_eq!(block(&commands, 'a'), Some("bytes"));
+    }
+
+    /// Property 3, continued: which letters the scanner will open a hole for.
+    /// `hole_letter` accepts a bare `$` plus one ASCII alphanumeric, so an
+    /// uppercase letter and a digit are holes the grammar has, and both the
+    /// fence and the hole are case-sensitive and position-matched.
+    #[test]
+    fn fence_letters_follow_the_holes_the_gate_accepts() {
+        let v = with_slots("append_to_note", &[("note", "N"), ("content", "$A")]);
+        let (commands, _) = marked_block("! append $a to N\n!!A\nbytes\n!!\n");
+        assert_eq!(block(&commands, 'A'), Some("bytes"));
+        assert_eq!(gate(&v, &commands[0].blocks).gate, Gate::Pass);
+        // The same shape with the case the model did not write does not fill
+        // it: `!!a` against `$A` is unbound, not a case-folded match.
+        let (commands, _) = marked_block("! append $a to N\n!!a\nbytes\n!!\n");
+        assert_eq!(gate(&v, &commands[0].blocks).gate, Gate::PayloadUnbound);
+
+        // A digit is as good a letter as a letter.
+        let v = with_slots("edit_note", &[("note", "N"), ("target", "$1"), ("content", "$2")]);
+        let (commands, _) = marked_block("! replace $2 with $1 in N\n!!2\nnew\n!!\n!!1\nold\n!!\n");
+        assert_eq!(block(&commands, '1'), Some("old"));
+        assert_eq!(block(&commands, '2'), Some("new"));
+        assert_eq!(gate(&v, &commands[0].blocks).gate, Gate::Pass);
+    }
+
+    /// The marker question, stated as a test: a fence is line-initial like the
+    /// command marker is. An indented `!!a` is prose, so it opens nothing and
+    /// the hole is unbound — it is not a fence with stray whitespace.
+    #[test]
+    fn fences_are_line_initial_too() {
+        let v = with_slots("append_to_note", &[("note", "N"), ("content", "$a")]);
+        for indented in [" !!a", "\t!!a", "  !!a"] {
+            let (commands, _) = marked_block(&format!("! append $a to N\n{indented}\nbytes\n!!\n"));
+            assert!(commands[0].blocks.is_empty(), "{indented:?}");
+            assert_eq!(gate(&v, &commands[0].blocks).gate, Gate::PayloadUnbound, "{indented:?}");
+        }
+        // The closing fence is line-initial by the same rule: `!! ` with a
+        // trailing space does not close, so the body runs to end of input and
+        // carries nothing.
+        let (commands, _) = marked_block("! append $a to N\n!!a\nbytes\n!! \n");
+        assert!(commands[0].blocks.is_empty(), "a spaced terminator is content");
+    }
+
+    /// The interleave, measured: a `!!b` line inside an `!!a` body is bytes —
+    /// only a line that is exactly `!!` closes. So the block carries
+    /// `before\n!!b\nmiddle` and the model cannot smuggle a second block out by
+    /// writing one inside the first.
+    ///
+    /// The `!!` line in the same body is a different matter and is the
+    /// truncation finding: see
+    /// `an_interior_terminator_must_not_yield_a_prefix_of_the_payload`.
+    #[test]
+    fn an_interleaved_fence_is_bytes_not_a_block() {
+        let (commands, _) = marked_block("! replace $b with $a in N\n!!a\nbefore\n!!b\nmiddle\n!!\n");
+        assert_eq!(block(&commands, 'a'), Some("before\n!!b\nmiddle"));
+        assert_eq!(block(&commands, 'b'), None, "no second block was opened");
+        // Both holes named, one block supplied: the second is unbound.
+        let v = with_slots("edit_note", &[("note", "N"), ("target", "$b"), ("content", "$a")]);
+        assert_eq!(gate(&v, &commands[0].blocks).gate, Gate::PayloadUnbound);
+
+        // A whole second fence, written after the first, binds by its letter —
+        // this is the shape the two-block case above already covers.
+        let (commands, _) = marked_block("! replace $b with $a in N\n!!b\nold\n!!\n!!a\nnew\n!!\n");
+        assert_eq!(block(&commands, 'a'), Some("new"));
+        assert_eq!(block(&commands, 'b'), Some("old"));
+    }
+
+    /// A block binds to the command *above* it, so a fence written after a
+    /// second command belongs to that one and not the first.
+    #[test]
+    fn a_fence_binds_to_the_command_above_it() {
+        let (commands, _) =
+            marked_block("! append $a to N\n!!a\nfirst payload\n!!\n! append $a to M\n!!a\nsecond payload\n!!\n");
+        assert_eq!(texts(&commands), ["append $a to N", "append $a to M"]);
+        // Each block binds to the command above it, so two commands keep two
+        // payloads even when both fences name the same letter.
+        let (commands, _) =
+            marked_block("! append $a to N\n!!a\nfirst payload\n!!\n! append $a to M\n!!a\nsecond payload\n!!\n");
+        assert_eq!(texts(&commands), ["append $a to N", "append $a to M"]);
+        assert_eq!(commands[0].blocks[&'a'], "first payload", "bound to the command it follows");
+        assert_eq!(commands[1].blocks[&'a'], "second payload");
+        // A fence written after two commands binds to the last of them, and
+        // leaves the earlier one with no payload.
+        let (commands, _) = marked_block("! append $a to N\n! append $a to M\n!!a\nbytes\n!!\n");
+        assert!(commands[0].blocks.is_empty(), "no fence followed this one");
+        assert_eq!(commands[1].blocks[&'a'], "bytes", "it bound to the last command");
+    }
+
+    /// Property 4: a payload comes from a block or from nothing. The command
+    /// line's own words are never a payload, and a hole the model left inline
+    /// is refused rather than read off the utterance.
+    #[test]
+    fn a_payload_is_never_sourced_from_the_command_line() {
+        let v = with_slots("append_to_note", &[("note", "N"), ("content", "$a")]);
+        // The words a tagger would happily call the payload, inline. The hole
+        // is still declared (`$a` in the slot) and no fence supplied bytes, so
+        // the label is `unbound`; `undeclared` is the neighbouring case where
+        // the slot never held a bare `$a` at all.
+        let (commands, _) = marked_block("! append buy milk to the note \"N\"\n");
+        assert!(commands[0].blocks.is_empty());
+        assert_eq!(gate(&v, &commands[0].blocks).gate, Gate::PayloadUnbound);
+        let inline = with_slots("append_to_note", &[("note", "N"), ("content", "buy milk")]);
+        assert_eq!(gate(&inline, &commands[0].blocks).gate, Gate::PayloadUndeclared);
+
+        // A block's bytes go in whole, and nothing of the line leaks into them.
+        let (commands, _) = marked_block("! append buy milk to the note \"N\"\n!!a\nbuy milk\n!!\n");
+        assert_eq!(block(&commands, 'a'), Some("buy milk"));
+        assert_eq!(
+            gate(&v, &commands[0].blocks).call.expect("pass").1["content"],
+            json!("buy milk")
+        );
+
+        // The tool seam does not infer either: no fence, no bytes, whatever the
+        // parameter says after the hole.
+        let command = tool_command("append $a and then some prose to the note \"N\"").expect("one command");
+        assert!(command.blocks.is_empty());
+        assert_eq!(gate(&v, &command.blocks).gate, Gate::PayloadUnbound);
+    }
+
+    /// Finding 1, now ruled and closed: **refuse, do not choose.**
+    ///
+    /// Before: `marked_block` bound a block with `BTreeMap::insert`, so a second
+    /// fence for a letter already bound **overwrote the first silently** — the
+    /// model wrote two payloads, one hole was declared, the gate saw one block
+    /// for one letter and passed, and the first payload was dropped with no
+    /// word. Counterexample, byte-exact:
+    ///
+    /// ```text
+    /// ! append $a to the note "N"
+    /// !!a
+    /// first payload
+    /// !!
+    /// !!a
+    /// second payload
+    /// !!
+    /// ```
+    ///
+    /// Now the scanner marks the command [`PayloadDefect::DuplicateFence`],
+    /// keeps the *first* block so which one was dropped is a decision with a
+    /// name, and the gate refuses before the classifier's verdict is consulted.
+    #[test]
+    fn a_repeated_fence_letter_is_refused_rather_than_last_one_wins() {
+        let v = with_slots("append_to_note", &[("note", "N"), ("content", "$a")]);
+        let (commands, _) = marked_block("! append $a to N\n!!a\nfirst payload\n!!\n!!a\nsecond payload\n!!\n");
+        let decision = gate_command(&v, &commands[0].blocks, commands[0].defect);
+        assert_eq!(decision.gate, Gate::PayloadShape);
+        assert_eq!(decision.defect, Some(PayloadDefect::DuplicateFence));
+        assert_eq!(decision.call, None, "no call is authorised");
+        // First-wins, in the map itself and not only in the refusal: the first
+        // block stands and the second is dropped. This was the disagreement the
+        // coordinator caught — `insert` replaced, so the map held the *second*
+        // while the comment said the first — and the test is what holds them
+        // together now.
+        assert_eq!(
+            commands[0].blocks[&'a'],
+            "first payload",
+            "the first block stands; anything reading `blocks` sees the same bytes the comment names"
+        );
+        assert_eq!(PayloadDefect::DuplicateFence.as_str(), "duplicate_fence");
+        // The refusal names the shape and the route out.
+        let line = unshapeable(PayloadDefect::DuplicateFence);
+        assert!(line.contains("(reason: payload_shape)"), "{line}");
+        assert!(line.contains("fenced twice"), "{line}");
+        assert!(line.contains("mneme_rpc"), "{line}");
+
+        // Two commands, each fencing the same hole once, is not a duplicate: a
+        // block binds to the command above it, and both payloads are carried.
+        let (commands, _) = marked_block(
+            "! append $a to N\n!!a\nfirst payload\n!!\n! append $a to M\n!!a\nsecond payload\n!!\n",
+        );
+        assert_eq!(commands[0].defect, None);
+        assert_eq!(commands[1].defect, None);
+        assert_eq!(commands[0].blocks[&'a'], "first payload");
+        assert_eq!(commands[1].blocks[&'a'], "second payload");
+    }
+
+    /// Finding 2, now ruled and closed, and the sharper of the two: **refuse the
+    /// whole command; never carry a prefix.**
+    ///
+    /// Before: a line that is exactly `!!` inside a body *is* the terminator —
+    /// the parser compares the whole line and there was no escape the model was
+    /// ever taught — so the block closed early, everything after it parsed as
+    /// prose, and the closer the model meant arrived with no block left to
+    /// close. The gate was handed one block for one hole and passed it, so the
+    /// write carried a prefix of the payload, silently. Counterexample,
+    /// byte-exact:
+    ///
+    /// ```text
+    /// ! append $a to the note "N"
+    /// !!a
+    /// first half
+    /// !!
+    /// second half
+    /// !!
+    /// ```
+    ///
+    /// Carried, before: `first half`. Intended: `first half\n!!\nsecond half`.
+    ///
+    /// The trace of that is a bare `!!` with nothing open, directly after
+    /// another `!!` — and that is the whole of the detection, because it is the
+    /// only shape a truncated block leaves. The scanner withdraws the payload
+    /// and marks the command; the gate refuses it. No escape was added, by
+    /// ruling: a body that genuinely needs such a line goes through
+    /// `mneme_rpc`, and the refusal says so.
+    #[test]
+    fn an_interior_terminator_is_refused_rather_than_truncated() {
+        let v = with_slots("append_to_note", &[("note", "N"), ("content", "$a")]);
+        let intended = "first half\n!!\nsecond half";
+        let (commands, _) = marked_block(&format!("! append $a to N\n!!a\n{intended}\n!!\n"));
+        let decision = gate_command(&v, &commands[0].blocks, commands[0].defect);
+        assert_eq!(decision.gate, Gate::PayloadShape);
+        assert_eq!(decision.defect, Some(PayloadDefect::InteriorTerminator));
+        assert_eq!(decision.call, None, "no call is authorised");
+        // The bytes are withdrawn, not shortened: no prefix survives to be
+        // mistaken for the payload.
+        assert!(commands[0].blocks.is_empty(), "a prefix of the payload was carried");
+        // The refusal names the shape, says there is no escape by design, and
+        // names the route out.
+        let line = unshapeable(PayloadDefect::InteriorTerminator);
+        assert!(line.contains("(reason: payload_shape)"), "{line}");
+        assert!(line.contains("no escape for it by design"), "{line}");
+        assert!(line.contains("mneme_rpc"), "{line}");
+
+        // The three lines that must *not* trip it, because each is a shape the
+        // model is taught or a legitimate block end.
+        for carried in [
+            // An ordinary write, ending at its own closer.
+            ("! append $a to N\n!!a\nfirst half\nsecond half\n!!\n", Some("first half\nsecond half")),
+            // A `!!`-shaped line that is not the terminator is content.
+            ("! append $a to N\n!!a\n!!x\nbytes\n!!\n", Some("!!x\nbytes")),
+            // Two payloads, each closed by its own terminator.
+            ("! replace $b with $a in N\n!!a\nnew\n!!\n!!b\nold\n!!\n", Some("new")),
+            // A terminator with trailing whitespace is content, so this block
+            // never closes and carries nothing — as it always did.
+            ("! append $a to N\n!!a\nbytes\n!! \n", None),
+        ] {
+            let (commands, _) = marked_block(carried.0);
+            assert_eq!(commands[0].defect, None, "{:?}", carried.0);
+            assert_eq!(
+                commands[0].blocks.get(&'a').map(String::as_str),
+                carried.1,
+                "{:?}",
+                carried.0
+            );
+        }
+    }
+
+    /// The guard on the rule above: a `!!` that is not the trace of a truncated
+    /// block stays prose, and takes no payload with it.
+    ///
+    /// The detection is positional — "a block closed and only prose followed" —
+    /// so the cases that must survive are the ones where a `!!` line arrives
+    /// with no such block behind it. A model writing the grammar in prose, a
+    /// stray terminator between two commands, and a terminator quoted in a
+    /// read: none is a truncated payload, and none may be turned into one.
+    /// The search behind the bound in `an_interior_terminator_is_refused_rather_than_truncated`.
+    ///
+    /// `#[ignore]`d because it is a measurement, not an assertion: it enumerates
+    /// the alphabet that matters and *reports* what still slips through. Run it
+    /// with `cargo test -p eidolon-verba -- --ignored search_for_a_carried_prefix`.
+    ///
+    /// The alphabet is every line shape the scanner gives a meaning to: the
+    /// terminator, a fence opener for the declared hole, a fence opener for
+    /// another letter, a blank line, ordinary prose, a code fence, and a
+    /// marker. Bodies are every sequence of up to five of those, so the search
+    /// is exhaustive over the shapes rather than a sample of them, and each is
+    /// run through the real [`marked_block`] and the real [`gate`].
+    ///
+    /// What counts as a hit: the model wrote one payload between one pair of
+    /// fences, and what the gate would pass is a **strict prefix** of it. That
+    /// is the doctrine failing — bytes reaching a call that are not the bytes
+    /// the model wrote — and it is not the same thing as a refusal or an
+    /// unbound hole, which are the channel working.
+    #[test]
+    #[ignore = "MEASUREMENT: enumerates the fence alphabet and reports residual prefix carriage"]
+    fn search_for_a_carried_prefix_over_the_fence_alphabet() {
+        /// One line shape. `p` is ordinary prose, so the search is not all
+        /// special lines — a body of pure markers is not a thing models write,
+        /// and a rate measured over only those would not mean much.
+        const ALPHABET: &[&str] = &["!!", "!!a", "!!b", "", "p", "```", "! p"];
+        let v = with_slots("append_to_note", &[("note", "N"), ("content", "$a")]);
+        let mut tried = 0usize;
+        let mut hits: Vec<(String, String)> = Vec::new();
+        // Bodies of every shape, classified by what separates the early close
+        // from the closer the model meant. `none` — nothing between the two
+        // `!!` lines — is the class my fix does not catch, and it is the one
+        // worth bounding precisely.
+        let mut by_shape: BTreeMap<&'static str, (usize, Option<String>)> = BTreeMap::new();
+        // Every body of up to five lines, each line from the alphabet.
+        for len in 0..=5usize {
+            let mut counter = vec![0usize; len];
+            loop {
+                let body: Vec<&str> = counter.iter().map(|i| ALPHABET[*i]).collect();
+                let payload = body.join("\n");
+                let message = format!("! append $a to N\n!!a\n{payload}\n!!\n");
+                tried += 1;
+                let (commands, _) = marked_block(&message);
+                if commands.is_empty() {
+                    // Not a command at all: nothing to carry, nothing to pass.
+                } else {
+                    let decision = gate_command(&v, &commands[0].blocks, commands[0].defect);
+                    if let Some((_, args)) = decision.call {
+                        let carried = args["content"].as_str().unwrap_or_default().to_string();
+                        // A strict prefix of what the model wrote.
+                        if carried.len() < payload.len() && payload.starts_with(&carried) {
+                            // Classify by what the remainder held, since that is
+                            // what decides whether the trace survives. A body
+                            // that closes early and holds only ordinary lines
+                            // afterwards is the class the fix catches; one that
+                            // holds a line the scanner *re-arms* on — a fence
+                            // opener, a marker, a code fence — is not.
+                            let remainder: Vec<&str> =
+                                body.iter().skip_while(|l| **l != FENCE).skip(1).copied().collect();
+                            let rearming: Option<&str> = remainder
+                                .iter()
+                                .find(|l| {
+                                    l.starts_with(FENCE) || l.starts_with(MARKER) || l.starts_with(CODE_FENCE)
+                                })
+                                .copied();
+                            let shape: &'static str = match (remainder.is_empty(), rearming) {
+                                (true, _) => "no_remainder",
+                                (false, Some(tok)) if tok.starts_with(FENCE) && tok.len() > 2 => "remainder_fence_opener",
+                                (false, Some(tok)) if tok.starts_with(FENCE) => "remainder_bare_fence",
+                                (false, Some(_)) if remainder.iter().any(|l| l.starts_with(MARKER)) => {
+                                    "remainder_marker"
+                                }
+                                (false, Some(_)) => "remainder_code_fence",
+                                (false, None) => "remainder_prose_only",
+                            };
+                            let entry = by_shape.entry(shape).or_insert((0, None));
+                            entry.0 += 1;
+                            if entry.1.is_none() {
+                                entry.1 = Some(payload.clone());
+                            }
+                            hits.push((payload, carried));
+                        }
+                    }
+                }
+                // Odometer over the alphabet.
+                let mut i = 0;
+                loop {
+                    if i == len {
+                        break;
+                    }
+                    counter[i] += 1;
+                    if counter[i] < ALPHABET.len() {
+                        break;
+                    }
+                    counter[i] = 0;
+                    i += 1;
+                }
+                if i == len {
+                    break;
+                }
+            }
+        }
+        let report = |hits: &[(String, String)], by_shape: &BTreeMap<&'static str, (usize, Option<String>)>| {
+            let mut s = format!("{} bodies tried, {} carried a strict prefix and passed\n", tried, hits.len());
+            for (shape, (n, smallest)) in by_shape {
+                s.push_str(&format!("  shape {shape}: {n}"));
+                if let Some(small) = smallest {
+                    s.push_str(&format!(", smallest body {small:?}"));
+                }
+                s.push('\n');
+            }
+            for (payload, carried) in hits.iter().take(10) {
+                s.push_str(&format!("  payload {payload:?} carried {carried:?}\n"));
+            }
+            s
+        };
+        let summary = report(&hits, &by_shape);
+        // The bound, stated as a shape and not a count: every residual in the
+        // classes above is a body whose **first** line is the terminator, or a
+        // body with nothing after the terminator but a line the scanner gives
+        // no meaning to. The prose-only class — the one a model writing a real
+        // note hits — is empty, and the fence-opener class is empty too, which
+        // is the class this search was written to look for. Both are pinned
+        // green below, and the exact residual is
+        // `a_body_that_opens_with_the_terminator_is_a_truncation_undetected`.
+        assert!(tried > 10_000, "the search must actually have searched: {tried}");
+
+        for absent in ["remainder_prose_only", "remainder_fence_opener"] {
+            assert_eq!(
+                by_shape.get(absent).map(|(n, _)| *n).unwrap_or(0),
+                0,
+                "{absent} must carry no prefix: a hit here is a regression"
+            );
+        }
+        println!("{summary}");
+    }
+
+    /// The class my note predicted and the search cleared: a remainder holding
+    /// a **fence opener**. It is refused, and the mechanism is not the one I
+    /// guessed.
+    ///
+    /// The opener does re-arm a block, so the closer the model meant does close
+    /// that one — but a block opened where the model wrote no command is then
+    /// bound to the command *above* it, and a second block for a letter already
+    /// bound is [`PayloadDefect::DuplicateFence`], or a block for a letter
+    /// nothing asked for is `BlockOrphan`. Either way no payload is carried.
+    ///
+    /// ```text
+    /// ! append $a to the note "N"
+    /// !!a
+    /// first half
+    /// !!
+    /// second half
+    /// !!a
+    /// !!
+    /// ```
+    ///
+    /// This is here because the report for this slice named it as an unfuzzed
+    /// limit and it turned out to be closed already. The test says so, so the
+    /// claim cannot outlive the measurement that corrected it.
+    #[test]
+    fn a_terminator_whose_remainder_holds_a_fence_opener_is_refused() {
+        let v = with_slots("append_to_note", &[("note", "N"), ("content", "$a")]);
+        let (commands, _) = marked_block("! append $a to N\n!!a\nfirst half\n!!\nsecond half\n!!a\n!!\n");
+        let decision = gate_command(&v, &commands[0].blocks, commands[0].defect);
+        assert_ne!(decision.gate, Gate::Pass, "a prefix of the payload was carried as the payload");
+        assert_eq!(decision.defect, Some(PayloadDefect::DuplicateFence));
+        // A block for a letter nothing asked for is refused too.
+        let (commands, _) = marked_block("! append $a to N\n!!a\nfirst half\n!!\nsecond half\n!!b\n!!\n");
+        assert_eq!(gate_command(&v, &commands[0].blocks, commands[0].defect).gate, Gate::BlockOrphan);
+    }
+
+    /// The residual that is real, bounded rather than fixed, with the search's
+    /// numbers on it.
+    ///
+    /// **5549 of 19608 enumerated bodies carry a strict prefix and pass.** The
+    /// classes are narrow and all of them are the same shape, which is *not*
+    /// the one the earlier report guessed: every residual body contains a
+    /// terminator as its **first** line, or has nothing after the early close
+    /// that the scanner gives a meaning to.
+    ///
+    /// The smallest, byte-exact — a body that opens with the terminator:
+    ///
+    /// ```text
+    /// ! append $a to the note "N"
+    /// !!a
+    /// !!
+    /// !!
+    /// ```
+    ///
+    /// Carried: `""` — an **empty** payload, not a shortened one. The block
+    /// closed on its first line and the model's closer closed nothing, so the
+    /// gate saw one block for one hole and passed an empty string as the
+    /// content. The same at every length: `!!\np` carries `""`, `!!\n! p` carries
+    /// `""`, `p\n!!` carries `p`.
+    ///
+    /// **The bound, and why it is here rather than fixed.** The two classes
+    /// that matter are empty, and pinned above: prose after an early close is
+    /// caught, and a fence opener after one is refused. What is left needs a
+    /// body whose first line is a bare `!!` — the model opened a payload and
+    /// immediately wrote its own terminator. Distinguishing "empty payload" from
+    /// "payload truncated to nothing" is not available here: both arrive as a
+    /// block that is the empty string, and the channel has no second reading of
+    /// the message to consult. A rule that refused on it would also refuse a
+    /// deliberate empty payload — `!!a\n!!\n` is the taught spelling of "write
+    /// nothing", asserted green in `fenced_bytes_arrive_unchanged` — and that
+    /// write is legitimate. So this stays bounded with its exact bytes, and the
+    /// severity is what it is worth: an empty or shortened payload where the
+    /// model meant a longer one, refused nowhere because the grammar has one
+    /// spelling and it is this one.
+    #[test]
+    #[ignore = "BOUNDED: a body opening with the terminator carries an empty payload where one was meant"]
+    fn a_body_that_opens_with_the_terminator_is_a_truncation_undetected() {
+        let v = with_slots("append_to_note", &[("note", "N"), ("content", "$a")]);
+        for (message, carried) in [
+            // Opens with the terminator: an empty payload where one was meant.
+            ("! append $a to N\n!!a\n!!\n!!\n", ""),
+            // Prose stranded by the early close is **caught** — this class is
+            // empty in the search, and the case is here so the two tests cannot
+            // disagree about it.
+            ("! append $a to N\n!!a\n!!\np\n!!\n", ""),
+            // A body whose second line closes it, nothing after but a closer.
+            ("! append $a to N\n!!a\np\n!!\n!!\n", "p"),
+        ] {
+            let (commands, _) = marked_block(message);
+            let decision = gate_command(&v, &commands[0].blocks, commands[0].defect);
+            if message.contains("!!\np\n!!") {
+                // The one case here the fix does catch: prose after an early
+                // close is the trace, and it is refused.
+                assert_eq!(decision.gate, Gate::PayloadShape, "{message:?}");
+                assert_eq!(decision.defect, Some(PayloadDefect::InteriorTerminator));
+                continue;
+            }
+            assert_eq!(
+                decision.gate,
+                Gate::Pass,
+                "this is the residual: the model wrote {message:?} and the gate passed it"
+            );
+            let (function, args) = decision.call.expect("pass");
+            assert_eq!(args["content"], json!(carried));
+            assert_eq!(function, "append_to_note");
+        }
+        // And the deliberate empty payload is the same shape, which is exactly
+        // why the two cannot be told apart and why this is bounded and not
+        // fixed: refusing on it would refuse a legitimate write.
+        let (commands, _) = marked_block("! append $a to N\n!!a\n!!\n");
+        assert_eq!(commands[0].blocks[&'a'], "");
+        assert_eq!(commands[0].defect, None, "an empty payload is a payload");
+    }
+
+    #[test]
+    fn a_stray_terminator_is_not_a_truncated_payload() {
+        // The teaching text itself, quoted in the answer — as the description
+        // writes it. Nothing is marked, and nothing is refused.
+        let teaching = "the shape is: a line `!!a`, the bytes, then a line `!!`.";
+        assert!(marked_block(teaching).0.is_empty(), "{teaching}");
+
+        // A stray terminator between two commands, each with its own block. The
+        // second command is unaffected and both payloads are carried.
+        let (commands, _) = marked_block(
+            "! append $a to N\n!!a\nfirst\n!!\n!!\n! append $a to M\n!!a\nsecond\n!!\n",
+        );
+        assert_eq!(texts(&commands), ["append $a to N", "append $a to M"]);
+        assert_eq!(commands[0].defect, None, "the stray `!!` is not the first block's trace");
+        assert_eq!(commands[0].blocks[&'a'], "first");
+        assert_eq!(commands[1].defect, None);
+        assert_eq!(commands[1].blocks[&'a'], "second");
+
+        // Prose after a closed block, then a `!!` line the model wrote as text:
+        // still prose. Only a *second* `!!`, closing a block that is already
+        // closed, is the trace.
+        let (commands, _) = marked_block("! append $a to N\n!!a\nbytes\n!!\njust a line of prose\n");
+        assert_eq!(commands[0].defect, None);
+        assert_eq!(commands[0].blocks[&'a'], "bytes");
+    }
+
+    /// A model that writes its own fence is the third path, and this is what
+    /// the code-fence rule buys: a grammar example fenced as prose is not an
+    /// instruction, and a payload fence *inside* a code block is still read,
+    /// because a block outranks the code fence. Both halves of that are
+    /// asserted here because both are byte claims, not refusals.
+    #[test]
+    fn a_model_may_write_the_grammar_and_not_mean_it() {
+        let reply = "the shape is:\n\n```\n! append $a to the note \"N\"\n!!a\nthe bytes\n!!\n```\n";
+        assert!(marked_block(reply).0.is_empty(), "an example is prose");
+        // The same shape un-fenced is a write, with those bytes.
+        let (commands, _) = marked_block("! append $a to the note \"N\"\n!!a\nthe bytes\n!!\n");
+        assert_eq!(block(&commands, 'a'), Some("the bytes"));
+        // A payload block is not enough on its own: the command above it still
+        // has to be a command, so a fence inside a code block outranks the code
+        // fence but does not rescue a command that was prose.
+        let (commands, _) = marked_block("```\n! append $a to N\n!!a\nbytes\n!!\n");
+        assert!(commands.is_empty(), "{commands:?}");
+        // Opened outside the code fence, it carries its bytes; the code fence
+        // ahead of it is untouched by the block.
+        let (commands, _) = marked_block("```\n! append $a to N\n```\n! append $a to N\n!!a\nbytes\n!!\n");
+        assert_eq!(block(&commands, 'a'), Some("bytes"));
+    }
+
+    /// The tool seam's own edge: a parameter is one command, so a second
+    /// marked line inside it is not a second command and its fence binds to
+    /// the first. The parameter is a parameter, not a message.
+    #[test]
+    fn the_tool_parameter_takes_the_first_command_and_its_fences() {
+        let command = tool_command("append $a to N\n!!a\nbytes\n! read the note A\n!!\n").expect("one command");
+        assert_eq!(command.text, "append $a to N");
+        assert_eq!(command.blocks[&'a'], "bytes\n! read the note A", "the fence closed where the model closed it");
+    }
+
     /// The `vv` tool's parameter is the same grammar without the marker, and a
     /// write through it carries its payload the same way.
     #[test]
@@ -1603,9 +2655,12 @@ mod tests {
         assert!(v.accepted());
         // Additive fields are the binary's business: they decode as nothing and
         // serialise as nothing, so a verdict this side has never heard of is
-        // still just a verdict.
+        // still just a verdict. `route` is that case; `risk` stopped being one
+        // when the gate began to refuse on it, and now round-trips as the null
+        // it arrived as rather than being dropped.
         let round: Value = serde_json::to_value(&v).unwrap();
-        assert!(round.get("route").is_none() && round.get("risk").is_none(), "{round}");
+        assert!(round.get("route").is_none(), "{round}");
+        assert_eq!(round.get("risk"), Some(&Value::Null), "{round}");
 
         // Supplied: the fence's bytes are the payload, byte for byte.
         let payload = "the exact bytes\nwith a \"quote\", a \\ backslash,\nand a tab\ttoo";
@@ -1838,6 +2893,9 @@ mod integration {
                     prompt: None,
                     render: None,
                     deferred: false,
+                    script_only: false,
+                    plugin: None,
+                    source_hash: None,
                 },
                 reply,
                 seen: Mutex::new(Vec::new()),

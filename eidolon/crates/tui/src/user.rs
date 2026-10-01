@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use eidolon_core::user::{Choice, UserIo};
+use eidolon_core::user::{Choice, Consent, Reply, UserIo};
 
 use crate::app::{DialogRequest, UiMsg};
 use crate::state::DialogKind;
@@ -25,7 +25,7 @@ impl TuiUser {
         prompt: &str,
         options: Vec<Choice>,
         cancel: &CancellationToken,
-    ) -> Option<String> {
+    ) -> Option<Reply> {
         let (reply, rx) = oneshot::channel();
         let req = DialogRequest {
             kind,
@@ -50,16 +50,18 @@ impl UserIo for TuiUser {
         prompt: &str,
         options: &[Choice],
         cancel: &CancellationToken,
-    ) -> Option<String> {
+    ) -> Option<Reply> {
         self.request(DialogKind::Choose, prompt, options.to_vec(), cancel)
             .await
     }
-    async fn confirm(&self, prompt: &str, cancel: &CancellationToken) -> bool {
-        matches!(
-            self.request(DialogKind::Confirm, prompt, Vec::new(), cancel)
-                .await
-                .as_deref(),
-            Some("yes")
-        )
+    async fn confirm(&self, prompt: &str, cancel: &CancellationToken) -> Consent {
+        self.request(DialogKind::Confirm, prompt, Vec::new(), cancel).await.into()
+    }
+    async fn respond(&self, prompt: &str, cancel: &CancellationToken) -> Option<String> {
+        // The text hop's answer is its field: a `Reply` with no note, since
+        // the words said *are* the answer.
+        self.request(DialogKind::Respond, prompt, Vec::new(), cancel)
+            .await
+            .map(|r| r.label)
     }
 }

@@ -20,7 +20,7 @@ use eidolon_core::event::Event;
 use eidolon_core::message::ContentBlock;
 use eidolon_core::session::{Record, RecordKind, Session};
 use eidolon_core::tool::CallOrigin;
-use eidolon_core::user::Choice;
+use eidolon_core::user::{Choice, Reply, Words, WordsRefused};
 
 use crate::command::{self, Run};
 use crate::edit::{Buffer, Mode};
@@ -39,6 +39,11 @@ pub enum UiMsg {
     /// the bus — because ticks are the polling made visible, and the log
     /// keeps the arm and the fire.
     ParkTicked(Vec<eidolon_core::wait::ParkTick>),
+    /// Mail the park's own level admitted retired it: the wait block
+    /// comes to rest naming the message that ended it. Never journaled —
+    /// the message itself is the log fact, and the log-last rule is what
+    /// a resumed session reads.
+    WaitRetired { call_id: String, by: String },
     VaultNote { id: u64, result: Result<crate::vault::Note, String> },
     Bus(Event),
     Dialog(DialogRequest),
@@ -64,6 +69,13 @@ pub enum UiMsg {
     /// A word for the status line: what a command came to. The driver's
     /// [`UiState::info`], and as passing. See [`crate::state::Notice`].
     Info(String),
+    /// A live source's fetch came back: the reading, or the fact that it
+    /// failed. View data — the call itself is in the log.
+    SourceFetched { plugin: String, name: String, ok: bool, content: String },
+    /// Which of one load's declared sources may fetch, the driver's
+    /// answer to `Cmd::CheckSources`: vouched or not, and whose plugin
+    /// the verb is when it is not — the trust command names it.
+    SourceVouch { facts: Vec<(String, String, bool, String)> },
     /// A line for the transcript: something that happened to the
     /// conversation, which the log will say again on resume. The
     /// driver's [`UiState::note`], and as rare.
@@ -139,7 +151,7 @@ pub struct DialogRequest {
     pub kind: DialogKind,
     pub prompt: String,
     pub options: Vec<Choice>,
-    pub reply: tokio::sync::oneshot::Sender<Option<String>>,
+    pub reply: tokio::sync::oneshot::Sender<Option<Reply>>,
 }
 
 /// UI → core.
@@ -165,6 +177,15 @@ pub enum Cmd {
     /// with none: the driver refreshes after every turn on its own, so
     /// this is for the reading that went stale while nothing ran.
     Quota,
+    /// Which of one load's declared live sources may fetch. The driver
+    /// holds the registry's manifests and the operator's permission
+    /// store; the UI holds only the declarations and the facts.
+    CheckSources { decls: Vec<(String, String, String)> },
+    /// Fetch one declared source: a tool call through the chokepoint
+    /// with `CallOrigin::Script` — gated, journaled and plugin-tagged
+    /// like any other call, because nothing fetches with a mechanism of
+    /// its own. The UI says when; this says go.
+    FetchSource { plugin: String, name: String, tool: String, args: serde_json::Value },
     Quit,
 }
 
@@ -230,6 +251,18 @@ pub struct TuiOptions {
     /// Where that source lives, so `reload_ui` can read it again. `None`
     /// makes a reload recompile whatever was first loaded.
     pub ui_script_path: Option<PathBuf>,
+    /// Where the installed plugins live, for their `ui/*.rn` payloads —
+    /// the tables they contribute between the defaults and the
+    /// operator's script, and the panels the default view places.
+    /// `None` — the tests' usual — means the frame runs without.
+    pub plugins_dir: Option<PathBuf>,
+    /// The operator's policy file, for its sibling permission store: the
+    /// may-fetch check a live source must pass before its verb is ever
+    /// dispatched. The same file the gate's store reads — two handles on
+    /// one file, each refresh-on-read, so they cannot disagree.
+    /// `None` — the tests' usual — makes every source draw as not
+    /// vouched.
+    pub policy_path: Option<PathBuf>,
     /// The model catalog, for `model` and its picker.
     pub catalog: Option<Arc<eidolon_providers::Catalog>>,
     /// Working directory and scratch dir, for building a swapped-in backend.
@@ -266,6 +299,41 @@ pub struct TuiOptions {
     pub launcher: crate::launch::Launcher,
 }
 
+/// Seed the state's catalog tables from the catalog: the status line's
+/// context windows, the rates a settling turn is priced at, the model keys
+/// `:model` completes against, and the provider keys `:login` could reach.
+/// Four walks over definitions already in memory — no provider is asked
+/// anything, so the first frame waits on nothing for them.
+///
+/// Once is enough rather than merely all there is: the catalog's
+/// definitions are fixed for the life of a session. Nothing mutates a
+/// running catalog — every loader and patch runs in the launch's
+/// `config::catalog()`, the only in-session change is the operator's
+/// weight table, and none of these tables read weights — so what is
+/// seeded here is every model the catalog can answer for, an adopted
+/// log's model looked up in it like any other. A model that arrives after
+/// the launch arrives with a launch: the listing's refresh heals the
+/// cache file the next catalog build reads. Should a path ever mutate a
+/// running catalog's definitions, this is the function to call again —
+/// the seed test pins its coverage so that day fails a test, not a status
+/// line.
+fn seed_catalog_tables(st: &mut UiState, catalog: Option<&eidolon_providers::Catalog>) {
+    st.windows = catalog.map(|c| c.windows()).unwrap_or_default();
+    st.costs = catalog.map(|c| c.costs()).unwrap_or_default();
+    st.model_keys = catalog
+        .map(|c| c.models().into_iter().map(|m| (m.key, m.name)).collect())
+        .unwrap_or_default();
+    st.provider_keys = catalog
+        .map(|c| {
+            c.providers()
+                .iter()
+                .filter(|p| p.def.token_secret.is_some())
+                .map(|p| p.def.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+}
+
 /// Run the TUI to completion. The caller has already built the agent with
 /// a [`crate::TuiUser`] made from `ui_tx` (so `choices_user` reaches us).
 pub async fn run(
@@ -284,38 +352,10 @@ pub async fn run(
             s.path().display().to_string(),
             String::new(),
         );
-        // The status line's denominator. Read here because this is the
-        // last place that holds both the catalog and the state, and it is
-        // a walk over definitions already in memory — no provider is
-        // asked anything, so the first frame waits on nothing for it.
-        st.windows = opts
-            .catalog
-            .as_ref()
-            .map(|c| c.windows())
-            .unwrap_or_default();
-        // And the rates, on the same arrangement, so a settling turn can
-        // be priced at the rates of the model it ran on.
-        st.costs = opts.catalog.as_ref().map(|c| c.costs()).unwrap_or_default();
-        // And the keys themselves, for what `:model` completes against.
-        // The same walk, over the same definitions already in memory:
-        // nothing is asked of a provider here either.
-        st.model_keys = opts
-            .catalog
-            .as_ref()
-            .map(|c| c.models().into_iter().map(|m| (m.key, m.name)).collect())
-            .unwrap_or_default();
-        // And every provider `:login` could reach, the same walk again.
-        st.provider_keys = opts
-            .catalog
-            .as_ref()
-            .map(|c| {
-                c.providers()
-                    .iter()
-                    .filter(|p| p.def.token_secret.is_some())
-                    .map(|p| p.def.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // The plugins' payloads compile inside `load_ui`, with the ui
+        // script; the state only needs to know where they live.
+        st.plugins_dir = opts.plugins_dir.clone();
+        seed_catalog_tables(&mut st, opts.catalog.as_deref());
         st.sessions_dir = opts.sessions_dir.clone();
         st.pins = s.pins();
         st.seed(&s.branch());
@@ -392,6 +432,7 @@ pub async fn run(
         cwd: opts.cwd,
         scratch: opts.scratch,
         sessions_dir: opts.sessions_dir,
+        permits: opts.policy_path.as_ref().map(|p| eidolon_rune::permits::Permits::from_policy_path(p)),
         palette: opts.palette,
         swarm: opts.swarm,
     };
@@ -414,6 +455,11 @@ struct DriverCtx {
     scratch: std::path::PathBuf,
     sessions_dir: std::path::PathBuf,
     swarm: Option<Arc<eidolon_swarm::Presence>>,
+    /// The operator's permission store, for the live sources' may-fetch
+    /// check. The same file the gate's store reads; refresh-on-read, so
+    /// two handles cannot disagree. `None` — the tests' usual — refuses
+    /// every source.
+    permits: Option<eidolon_rune::permits::Permits>,
 }
 
 /// The async side. Turns run as tasks so `Cancel` can land mid-turn; a
@@ -478,6 +524,18 @@ async fn driver(
     // it. Off the driver on a thread of its own, so the prompt is up
     // while the account answers.
     refresh_quota(&agent, &ui_tx, &ctx);
+
+    // The branch may end parked: the wait a session died holding is
+    // re-armed before any turn of this process begins — after the build's
+    // `set_vantage`, before the unsettled continuation below — because a
+    // re-armed park belongs to no turn, and the next `begin_turn` retires
+    // it exactly per the existing turn-scoping semantics.
+    if let Some(note) = agent
+        .rearm_from_branch(eidolon_core::wait::DEFAULT_TIMEOUT, eidolon_core::wait::MAX_TIMEOUT)
+        .await?
+    {
+        let _ = ui_tx.send(UiMsg::Info(note));
+    }
 
     // Finish an unsettled turn from a crash before accepting input — and
     // only one that is unfinished: a branch that already ends on the
@@ -583,6 +641,20 @@ async fn driver(
                             ));
                         } else {
                             turn = Some(start_turn(&agent, said.blocks()));
+                            // The operator's own submit retires any park
+                            // the turn interrupted: read them out so the
+                            // wait blocks come to rest saying so, the same
+                            // report the mail twin sends. Mail retires on
+                            // delivery, never here, so this cannot swallow
+                            // one of that twin's — and `by: "you"` is true
+                            // the same way a peer's name is: your message
+                            // is the one that ended it.
+                            for retired in agent.parks().take_retired() {
+                                let _ = ui_tx.send(UiMsg::WaitRetired {
+                                    call_id: retired.call_id,
+                                    by: "you".into(),
+                                });
+                            }
                         }
                     }
                     Cmd::Cancel => {
@@ -655,6 +727,52 @@ async fn driver(
                         let tx = ui_tx.clone();
                         tokio::spawn(async move {
                             let _ = tx.send(crate::vault::fetch_message(source, id, target, from).await);
+                        });
+                    }
+                    Cmd::CheckSources { decls } => {
+                        let facts = decls
+                            .into_iter()
+                            .map(|(plugin, name, tool)| {
+                                let manifest = agent
+                                    .dispatcher()
+                                    .registry()
+                                    .get(&tool)
+                                    .map(|t| t.manifest().clone());
+                                let vouched = manifest
+                                    .as_ref()
+                                    .zip(ctx.permits.as_ref())
+                                    .and_then(|(m, p)| {
+                                        p.vouched(&tool).and_then(|row| row.covers(m).then_some(()))
+                                    })
+                                    .is_some();
+                                // The trust command names the plugin
+                                // whose verb it is — the manifest's,
+                                // when a source reached across plugins.
+                                let whose = manifest
+                                    .and_then(|m| m.plugin)
+                                    .unwrap_or_else(|| plugin.clone());
+                                (plugin, name, vouched, whose)
+                            })
+                            .collect();
+                        let _ = ui_tx.send(UiMsg::SourceVouch { facts });
+                    }
+                    Cmd::FetchSource { plugin, name, tool, args } => {
+                        let dispatcher = agent.dispatcher().clone();
+                        let tx = ui_tx.clone();
+                        let call = eidolon_core::tool::ToolCall {
+                            id: format!("src-{plugin}-{name}-{}", crate::usage::now_ms()),
+                            name: tool.clone(),
+                            input: args,
+                            origin: eidolon_core::tool::CallOrigin::Script,
+                        };
+                        tokio::spawn(async move {
+                            let out = dispatcher.dispatch(call, CancellationToken::new()).await;
+                            let _ = tx.send(UiMsg::SourceFetched {
+                                plugin,
+                                name,
+                                ok: !out.is_error,
+                                content: out.content,
+                            });
                         });
                     }
                     Cmd::Quota => refresh_quota(&agent, &ui_tx, &ctx),
@@ -810,15 +928,44 @@ async fn collect(
     // Each message is drawn by the `PeerMessage` event this publishes, so
     // nothing is silently swallowed even when nothing is woken.
     let messages = agent.drain_peers().await;
+    // The facts travel with the message: waking is the sender's mark,
+    // operator the override — and retirement ORs them, because a park
+    // any single message would end is ended.
+    let mut waking = false;
+    let mut operator = false;
     let asked: Vec<String> = messages
         .into_iter()
-        .filter(|m| agent.parks().admits(m.wake))
+        .filter(|m| {
+            let keep = agent.parks().admits(eidolon_core::wait::Delivery {
+                waking: m.wake,
+                operator: m.operator,
+            });
+            if keep {
+                waking |= m.wake;
+                operator |= m.operator;
+            }
+            keep
+        })
         .map(|m| m.from)
         .collect();
     if asked.is_empty() {
         return None;
     }
-    let _ = ui_tx.send(UiMsg::Note(format!("answering {}", asked.join(", "))));
+    // Mail the park's own level admits ends that park — the level is how
+    // much mail may end the wait, said at arm time — and the block comes
+    // to rest saying which message ended it, instead of ticking on over
+    // a wait that is over.
+    let by = asked.join(", ");
+    for retired in agent.parks().retire_for_mail(eidolon_core::wait::Delivery {
+        waking,
+        operator,
+    }) {
+        let _ = ui_tx.send(UiMsg::WaitRetired {
+            call_id: retired.call_id,
+            by: by.clone(),
+        });
+    }
+    let _ = ui_tx.send(UiMsg::Note(format!("answering {}", by)));
     Some(start_continue(agent))
 }
 
@@ -876,6 +1023,16 @@ async fn command(
                 return Some(UiMsg::Info("no model catalog configured".into()));
             };
             if arg.is_empty() {
+                // A provider whose discovery fell back to its declared
+                // floor is named in the title, not on a row: a floor of
+                // zero rows has no row to annotate, and the operator must
+                // see why openrouter — say — is missing from the list.
+                let fell = catalog.listings_fell_back();
+                let title = if fell.is_empty() {
+                    "model".to_string()
+                } else {
+                    format!("model — declared floor only: {}", fell.join(", "))
+                };
                 let items = catalog
                     .models()
                     .into_iter()
@@ -887,7 +1044,7 @@ async fn command(
                     })
                     .collect();
                 UiMsg::Pick {
-                    title: "model".into(),
+                    title,
                     items,
                     pick: PickAction::Run("model".into()),
                     current: Some(agent.model_key()),
@@ -1592,6 +1749,7 @@ fn context_report_lines(r: &eidolon_core::agent::ContextReport, limit: Option<u6
 /// Walk branches together rather than interleaving them in append order.
 /// Linear runs keep one lane; only a fork adds indentation.
 fn tree_report(nodes: &[eidolon_core::TreeNode<'_>]) -> crate::vault::Tree {
+    use eidolon_core::session::RecordKind;
     let by_id: std::collections::HashMap<_, _> = nodes.iter().map(|n| (n.record.id, n)).collect();
     let forks = nodes.iter().filter(|n| n.children.len() > 1).count();
     let head = nodes.iter().find(|n| n.is_head).map(|n| format!("#{}", n.record.id)).unwrap_or_else(|| "none".into());
@@ -1599,12 +1757,43 @@ fn tree_report(nodes: &[eidolon_core::TreeNode<'_>]) -> crate::vault::Tree {
     let mut stack: Vec<_> = nodes.iter().rev().filter(|n| n.record.parent.is_none_or(|p| !by_id.contains_key(&p)))
         .map(|n| (n.record.id, String::new(), String::new())).collect();
     let mut records = std::collections::BTreeMap::new();
+    // A run fold gathers by lineage as the walk passes each record: the
+    // start line keyed by the run's id, then every step, budget, ending
+    // and `w<run>-` satellite that names it — in draw order, so a run
+    // resumed across a fork still gathers whole.
+    let mut runs: std::collections::BTreeMap<u64, (usize, usize, Option<&'static str>)> = Default::default();
+    let mut members: std::collections::BTreeMap<u64, Vec<usize>> = Default::default();
     let mut source_line = out.lines().count() + 1;
     while let Some((id, prefix, edge)) = stack.pop() {
         let Some(n) = by_id.get(&id) else { continue; };
         let mark = if n.is_head { "●" } else if n.on_branch { "◆" } else { "○" };
         let suffix = if n.is_head { "  ← HEAD" } else { "" };
         records.insert(source_line, n.record.clone());
+        match &n.record.kind {
+            RecordKind::WorkflowStart { .. } => {
+                runs.insert(n.record.id, (source_line, 0, None));
+            }
+            RecordKind::WorkflowStep { run, .. } => {
+                members.entry(*run).or_default().push(source_line);
+                if let Some((_, steps, _)) = runs.get_mut(run) {
+                    *steps += 1;
+                }
+            }
+            RecordKind::WorkflowEnd { run, status } => {
+                members.entry(*run).or_default().push(source_line);
+                if let Some((_, _, word)) = runs.get_mut(run) {
+                    *word = Some(run_status_word(*status));
+                }
+            }
+            RecordKind::WorkflowBudget { run, .. } => {
+                members.entry(*run).or_default().push(source_line);
+            }
+            kind => {
+                if let Some(run) = step_run(kind) {
+                    members.entry(run).or_default().push(source_line);
+                }
+            }
+        }
         source_line += 1;
         out.push_str(&format!("  {prefix}{edge}{mark} #{:<4} {}{suffix}\n", id, record_line(n.record).replace(['\n', '\r'], " ")));
         let next = if edge == "├─" { format!("{prefix}│ ") } else if edge == "└─" { format!("{prefix}  ") } else { prefix };
@@ -1614,7 +1803,45 @@ fn tree_report(nodes: &[eidolon_core::TreeNode<'_>]) -> crate::vault::Tree {
         }
     }
     if nodes.is_empty() { out.push_str("  No records yet.\n"); }
-    crate::vault::Tree { body: out, records }
+    let mut tree_runs = std::collections::BTreeMap::new();
+    let mut folds = std::collections::BTreeMap::new();
+    for (id, (line, steps, status)) in runs {
+        let mut lines = vec![line];
+        if let Some(rest) = members.remove(&id) {
+            lines.extend(rest);
+        }
+        lines.sort_unstable();
+        for hidden in &lines[1..] {
+            folds.insert(*hidden, line);
+        }
+        tree_runs.insert(line, crate::vault::TreeRun { lines, steps, status });
+    }
+    crate::vault::Tree { body: out, records, runs: tree_runs, folds }
+}
+
+/// The run a record served, when it ran under a step's deterministic
+/// `w<run>-<index>` call id — the join the record itself declines to
+/// carry a field for (`ModelSpend`'s doc says why: the step already
+/// names both). Anything else — a model's `tool_use` id, an operator's
+/// minted one, a bare word — parses as no run and draws as itself.
+fn step_run(kind: &eidolon_core::session::RecordKind) -> Option<u64> {
+    let id = match kind {
+        eidolon_core::session::RecordKind::ToolResult { tool_use_id, .. }
+        | eidolon_core::session::RecordKind::PolicyVerdict { tool_use_id, .. } => tool_use_id,
+        eidolon_core::session::RecordKind::ModelSpend { call_id, .. } => call_id,
+        _ => return None,
+    };
+    id.strip_prefix('w')?.split('-').next()?.parse().ok()
+}
+
+/// The one word a run's ending draws — here and in `record_line`.
+fn run_status_word(status: eidolon_core::workflow::RunStatus) -> &'static str {
+    use eidolon_core::workflow::RunStatus;
+    match status {
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Parked => "parked on a question",
+    }
 }
 
 /// Characters, short. A separate spelling from `usage::human` on purpose:
@@ -1666,6 +1893,9 @@ fn record_line(r: &eidolon_core::session::Record) -> String {
         },
         AskUser { prompt, .. } => format!("ask {}", short(prompt)),
         Cancelled => "cancelled".into(),
+        // The row the record exists for: the wire's own sentence, redacted
+        // at the write and shown as it was journaled.
+        TurnFailed { error } => format!("failed: {}", short(error)),
         TurnSpend { usage, calls } => {
             use eidolon_core::UsageExt;
             format!(
@@ -1674,6 +1904,17 @@ fn record_line(r: &eidolon_core::session::Record) -> String {
                 usage.output_tokens,
                 if *calls == 1 { "" } else { "s" }
             )
+        }
+        ModelSpend { key, usage, .. } => {
+            use eidolon_core::UsageExt;
+            format!(
+                "model call on {key}: {} in {} out",
+                usage.total_input(),
+                usage.output_tokens
+            )
+        }
+        ApiRequest { consumer, service } => {
+            format!("api request: {consumer} → {service}")
         }
         ModelChanged { model } => format!("model → {model}"),
         Compacted {
@@ -1717,10 +1958,116 @@ fn record_line(r: &eidolon_core::session::Record) -> String {
             Some(first) => format!("answers {}: {}", lines.len(), short(first)),
             None => "answers".to_string(),
         },
+        // A run's own records. The trace is where a workflow run is visible
+        // at all: the transcript holds none of them (whether a run's steps
+        // belong in the conversation is still open on the design note, and
+        // the safe half of an open question draws nothing), so this line and
+        // the log are the two places an operator can see one.
+        WorkflowStart {
+            plugin,
+            workflow,
+            version,
+            hash,
+            ..
+        } => format!("workflow {plugin}/{workflow} {version} @{}", short(hash)),
+        WorkflowStep {
+            run,
+            index,
+            tool,
+            ..
+        } => format!("workflow #{run} step {index}: {tool}"),
+        WorkflowEnd { run, status } => {
+            format!("workflow #{run} {}", run_status_word(*status))
+        }
+        WorkflowBudget {
+            run,
+            steps,
+            spend_micros,
+        } => {
+            let what = match (steps, spend_micros) {
+                (Some(s), Some(m)) => format!("{s} steps, ${:.4}", *m as f64 / 1e6),
+                (Some(s), None) => format!("{s} steps"),
+                (None, Some(m)) => format!("${:.4}", *m as f64 / 1e6),
+                (None, None) => "nothing".into(),
+            };
+            format!("workflow #{run} budget: {what}")
+        }
+        PeerAnswer { call_id, peer } => {
+            format!("answered by peer `{peer}`: {call_id}")
+        }
+        OperatorMessage { .. } => {
+            "a word from the operator".to_string()
+        }
     }
 }
 
 // ---------------------------------------------------------------- UI thread
+
+/// One declared source, checked against its shape: a non-empty tool
+/// name, an object of fixed args, and a cadence of at least one second
+/// — the floor the harness may lengthen and never shorten.
+fn parse_source_decl(name: &str, spec: &serde_json::Value) -> Option<crate::state::SourceDecl> {
+    let obj = spec.as_object()?;
+    let tool = obj.get("tool")?.as_str()?.to_string();
+    if tool.is_empty() {
+        return None;
+    }
+    let args = obj.get("args").cloned().unwrap_or(serde_json::json!({}));
+    if !args.is_object() {
+        return None;
+    }
+    let every = obj.get("every")?.as_u64()?.max(1);
+    Some(crate::state::SourceDecl {
+        name: name.to_string(),
+        tool,
+        args,
+        every,
+    })
+}
+
+/// After each load, ask the driver which declared sources may fetch:
+/// the registry's manifests and the operator's permission store are the
+/// driver's to read, and the answer comes back as
+/// [`UiMsg::SourceVouch`] — the UI holds the declarations and the
+/// facts, never the gate.
+fn ask_source_vouches(state: &UiState, cmd_tx: &mpsc::UnboundedSender<Cmd>) {
+    if state.source_decls.is_empty() {
+        return;
+    }
+    let decls = state
+        .source_decls
+        .iter()
+        .map(|(p, d)| (p.clone(), d.name.clone(), d.tool.clone()))
+        .collect();
+    let _ = cmd_tx.send(Cmd::CheckSources { decls });
+}
+
+/// The plugins whose panel slots a tree places — the drawn-panel set
+/// the live sources' beat works from, scanned where the tree is built,
+/// so a plugin whose panel is not on screen is not fetched for.
+fn plugin_panels_in(tree: &serde_json::Value) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut stack = vec![tree];
+    while let Some(n) = stack.pop() {
+        match n {
+            serde_json::Value::Object(o) => {
+                if o.get("kind").and_then(serde_json::Value::as_str) == Some("plugin_panel")
+                    && let Some(p) = o.get("plugin").and_then(serde_json::Value::as_str)
+                    && !found.iter().any(|f| f == p)
+                {
+                    found.push(p.to_string());
+                }
+                for v in o.values() {
+                    stack.push(v);
+                }
+            }
+            serde_json::Value::Array(a) => stack.extend(a.iter()),
+            _ => {}
+        }
+    }
+    found
+}
+
 
 /// Compile a script and read its tables — keymap, modes, theme — into
 /// place. Every failure is a line in the transcript and a fallback to
@@ -1740,6 +2087,70 @@ fn load_ui(state: &mut UiState, src: &str) -> (Option<UiScript>, Keys) {
         }
     };
     eidolon_core::boot::mark("ui compiled");
+    // The plugins' ui payloads, compiled between the built-in defaults
+    // and the operator's script: default < plugin < user, the precedence
+    // every table below applies. A payload that does not compile is a
+    // notice naming the plugin and nothing on screen — the frame never
+    // depends on a third party's file, and `reload_ui` re-reads these
+    // beside the operator's own.
+    state.plugin_uis = Vec::new();
+    state.plugin_commands = Vec::new();
+    let mut plugin_keymaps: Vec<(String, serde_json::Value)> = Vec::new();
+    if let Some(dir) = state.plugins_dir.clone() {
+        for source in crate::script::plugin_ui_sources(&dir) {
+            match source {
+                Ok((plugin, stem, src)) => match UiScript::compile(&src) {
+                    Ok(s) => {
+                        if let Ok(k) = s.keymap() {
+                            plugin_keymaps.push((plugin.clone(), k));
+                        }
+                        state.plugin_uis.push(crate::script::PluginUi { plugin, script: s });
+                    }
+                    Err(e) => state.info(format!(
+                        "plugin {plugin}: ui/{stem}.rn failed to compile; it contributes nothing: {e:#}"
+                    )),
+                },
+                Err(line) => state.info(line),
+            }
+        }
+    }
+    // The payloads' live-source declarations, read once per load the way
+    // the tables are: fixed args and a cadence, what and how often,
+    // never how. A malformed entry is a notice naming the plugin and the
+    // source, skipped — the P2 collision discipline — and so is a name
+    // another plugin already declared, which would make the snapshot's
+    // flat `sources.<name>` a lie about whose reading it carries.
+    state.source_decls = Vec::new();
+    state.source_state.clear();
+    state.fetching = 0;
+    let declared: Vec<(String, Option<anyhow::Result<serde_json::Value>>)> = state
+        .plugin_uis
+        .iter()
+        .map(|ui| (ui.plugin.clone(), ui.script.sources()))
+        .collect();
+    for (plugin, sources) in declared {
+        let Some(Ok(decls)) = sources else { continue };
+        let Some(map) = decls.as_object() else {
+            state.info(format!("plugin {plugin}: sources() is not a map of names; it contributes no sources"));
+            continue;
+        };
+        for (name, spec) in map {
+            match parse_source_decl(name, spec) {
+                Some(d) => {
+                    if state.source_decls.iter().any(|(_, e)| e.name == d.name) {
+                        state.info(format!(
+                            "plugin {plugin}: source {name} declared by an earlier plugin too; skipped — the snapshot's sources.{name} would not say whose reading it carries",
+                        ));
+                        continue;
+                    }
+                    state.source_decls.push((plugin.clone(), d));
+                }
+                None => state.info(format!(
+                    "plugin {plugin}: source {name} is not {{ tool, args, every }}; skipped",
+                )),
+            }
+        }
+    }
     // The keymap is read once: it is pure data, and a `Vm` per keystroke
     // would be both wasteful and unable to remember a half-typed chord.
     let mut keymap = match script.as_ref().map(|s| s.keymap()) {
@@ -1776,7 +2187,7 @@ fn load_ui(state: &mut UiState, src: &str) -> (Option<UiScript>, Keys) {
         )
     {
         let mut filled = mine;
-        for name in ["search", "trace", "confirm", "choose", "pick", "page", "vault"] {
+        for name in ["search", "trace", "confirm", "choose", "note", "pick", "page", "vault"] {
             if !filled.contains_key(name)
                 && let Some(t) = defaults.get(name)
             {
@@ -1784,6 +2195,52 @@ fn load_ui(state: &mut UiState, src: &str) -> (Option<UiScript>, Keys) {
             }
         }
         keymap = serde_json::Value::Object(filled);
+    }
+    // The plugins' keymap rows, under one rule: keys never shadow. A row
+    // lands where the mode is new or the key is free; a key the built-in
+    // layout or the operator's script already binds is a refusal naming
+    // both bindings, and the plugin's row is the one dropped — the
+    // tool-name rule, one surface over.
+    for (plugin, rows) in &plugin_keymaps {
+        let Some(add) = rows.as_object() else {
+            state.info(format!("plugin {plugin}: keymap() must return an object of mode → table"));
+            continue;
+        };
+        let Some(merged) = keymap.as_object().cloned() else {
+            continue;
+        };
+        let mut merged = merged;
+        for (mode, table) in add {
+            let Some(table) = table.as_object() else {
+                continue;
+            };
+            match merged.get(mode).and_then(|v| v.as_object()) {
+                None => {
+                    merged.insert(mode.clone(), serde_json::Value::Object(table.clone()));
+                }
+                Some(slot) => {
+                    let mut slot = slot.clone();
+                    let mut refused = 0;
+                    for (key, row) in table {
+                        match slot.get(key) {
+                            Some(held) => {
+                                state.info(format!(
+                                    "plugin {plugin}: keymap {mode} {key} already binds {held}; the plugin's {row} is refused — keys never shadow"
+                                ));
+                                refused += 1;
+                            }
+                            None => {
+                                slot.insert(key.clone(), row.clone());
+                            }
+                        }
+                    }
+                    if refused < table.len() {
+                        merged.insert(mode.clone(), serde_json::Value::Object(slot));
+                    }
+                }
+            }
+        }
+        keymap = serde_json::Value::Object(merged);
     }
     // The script's own commands, checked before the keymap is, since a
     // binding may name one. A built-in's name is refused rather than
@@ -1816,16 +2273,62 @@ fn load_ui(state: &mut UiState, src: &str) -> (Option<UiScript>, Keys) {
             None => {}
         }
     }
+    // The plugins' commands, the same rules one surface over: a
+    // built-in's name is refused, so is a name the operator's script
+    // declared or another plugin took, and a row whose function the
+    // payload does not define is refused rather than left to fail on the
+    // keystroke. A plugin command submits the way a person typing does —
+    // it never runs anything itself.
+    for p in state.plugin_uis.clone() {
+        match p.script.commands() {
+            Some(Ok(v)) => match v.as_object() {
+                Some(rows) => {
+                    for (name, row) in rows {
+                        match crate::command::Scripted::parse(name, row) {
+                            Ok(c) if command::lookup(&c.name).is_some() => {
+                                state.info(format!(
+                                    "plugin {} commands(): `{}` is a built-in and cannot be redefined",
+                                    p.plugin, c.name
+                                ));
+                            }
+                            Ok(c)
+                                if state.script_commands.iter().any(|x| x.name == c.name)
+                                    || state.plugin_commands.iter().any(|(pl, x)| {
+                                        x.name == c.name && *pl != p.plugin
+                                    }) =>
+                            {
+                                state.info(format!(
+                                    "plugin {} commands(): `{}` is already a command, and a command is never shadowed",
+                                    p.plugin, c.name
+                                ));
+                            }
+                            Ok(c) if !p.script.has(&c.run) => {
+                                state.info(format!(
+                                    "plugin {} commands(): `{}` names a function `{}` the payload does not define",
+                                    p.plugin, c.name, c.run
+                                ));
+                            }
+                            Ok(c) => state.plugin_commands.push((p.plugin.clone(), c)),
+                            Err(e) => state.info(format!("plugin {} commands(): {e:#}", p.plugin)),
+                        }
+                    }
+                }
+                None => state.info(format!(
+                    "plugin {} commands() must return an object of name → row",
+                    p.plugin
+                )),
+            },
+            Some(Err(e)) => state.info(format!("plugin {} commands() failed: {e:#}", p.plugin)),
+            None => {}
+        }
+    }
     // A binding may only name a command the registry — or the script —
     // defines. Saying so at startup rather than on the keystroke that
     // finds it is the point of having one table: a typo in a hand-written
     // `ui.rn` is a line in the transcript, not a key that silently does
     // nothing.
-    let extra: Vec<String> = state
-        .script_commands
-        .iter()
-        .map(|c| c.name.clone())
-        .collect();
+    let extra: Vec<String> =
+        state.scripted_commands().iter().map(|c| c.name.clone()).collect();
     let unknown = crate::keys::unknown_commands(&keymap, &extra);
     if !unknown.is_empty() {
         state.info(format!(
@@ -1838,7 +2341,25 @@ fn load_ui(state: &mut UiState, src: &str) -> (Option<UiScript>, Keys) {
     // The mode table, laid over the default script's so a user's need
     // only say what it changes. A script that says nothing gets the
     // default's outright.
-    let base = crate::script::default_modes();
+    let mut base = crate::script::default_modes();
+    // Each payload's rows laid over the defaults before the operator's:
+    // a plugin's row beats the default's and only the default's. A
+    // payload whose table does not compile contributes no modes and
+    // costs a notice.
+    for p in state.plugin_uis.clone() {
+        if let Some(Ok(v)) = p.script.modes() {
+            base = match crate::modes::ModeTable::from_value(&v, &base) {
+                Ok(t) => t,
+                Err(e) => {
+                    state.info(format!(
+                        "plugin {} modes() is not usable; it contributes no modes: {e:#}",
+                        p.plugin
+                    ));
+                    base
+                }
+            };
+        }
+    }
     state.modes = match script.as_ref().and_then(|s| s.modes()) {
         Some(Ok(v)) => match crate::modes::ModeTable::from_value(&v, &base) {
             Ok(t) => t,
@@ -1858,7 +2379,23 @@ fn load_ui(state: &mut UiState, src: &str) -> (Option<UiScript>, Keys) {
         None => base,
     };
     // The theme, the same way.
-    let base = crate::script::default_theme();
+    // The theme, the same layering: defaults, then each payload's rows,
+    // then the operator's.
+    let mut base = crate::script::default_theme();
+    for p in state.plugin_uis.clone() {
+        if let Some(Ok(v)) = p.script.theme() {
+            base = match crate::theme::Theme::from_value(&v, &base) {
+                Ok((t, _)) => t,
+                Err(e) => {
+                    state.info(format!(
+                        "plugin {} theme() is not usable; it contributes no theme: {e:#}",
+                        p.plugin
+                    ));
+                    base
+                }
+            };
+        }
+    }
     state.theme = match script.as_ref().and_then(|s| s.theme()) {
         Some(Ok(v)) => match crate::theme::Theme::from_value(&v, &base) {
             Ok((t, unknown)) => {
@@ -1887,7 +2424,23 @@ fn load_ui(state: &mut UiState, src: &str) -> (Option<UiScript>, Keys) {
     };
     // The labels, the same way: what tools are called, with the wire
     // name for anything the script says nothing about.
-    let base = crate::script::default_labels();
+    // The labels, the same layering: what tools are called, with the
+    // wire name for anything no source says anything about.
+    let mut base = crate::script::default_labels();
+    for p in state.plugin_uis.clone() {
+        if let Some(Ok(v)) = p.script.labels() {
+            base = match crate::labels::Labels::from_value(&v, &base) {
+                Ok(t) => t,
+                Err(e) => {
+                    state.info(format!(
+                        "plugin {} labels() is not usable; it contributes no labels: {e:#}",
+                        p.plugin
+                    ));
+                    base
+                }
+            };
+        }
+    }
     state.labels = match script.as_ref().and_then(|s| s.labels()) {
         Some(Ok(v)) => match crate::labels::Labels::from_value(&v, &base) {
             Ok(t) => t,
@@ -1908,7 +2461,17 @@ fn load_ui(state: &mut UiState, src: &str) -> (Option<UiScript>, Keys) {
     };
     // The wait tags, the same way: a kind core does not watch is a
     // warning, not a row.
-    let base = crate::labels::builtin_wait_tags();
+    let mut base = crate::labels::builtin_wait_tags();
+    // `wait_tags()` is free — labels only — so the payload layer says
+    // nothing here beyond the fold itself.
+    for p in state.plugin_uis.clone() {
+        if let Some(Ok(v)) = p.script.wait_tags() {
+            base = match crate::labels::WaitTags::from_value(&v, &base) {
+                Ok((t, _)) => t,
+                Err(_) => base,
+            };
+        }
+    }
     state.wait_tags = match script.as_ref().and_then(|s| s.wait_tags()) {
         Some(Ok(v)) => match crate::labels::WaitTags::from_value(&v, &base) {
             Ok((t, unknown)) => {
@@ -2005,6 +2568,7 @@ fn ui_loop(
     script_path: Option<PathBuf>,
 ) {
     let (mut script, mut keys) = load_ui(&mut state, &script_src);
+    ask_source_vouches(&state, &cmd_tx);
     eidolon_core::boot::mark("ui tables");
     let mut terminal = ratatui::init();
     // The frames paint their own caret; this one is shown again on the way out.
@@ -2054,6 +2618,24 @@ fn ui_loop(
     let mut frame: Vec<Vec<String>> = Vec::new();
 
     while !state.quit {
+        // The live sources' beat, before the drain: a due fetch fires
+        // here — off the draw path, only for a panel the frame draws,
+        // never stacked, capped across plugins. The dispatch is the
+        // driver's; the UI only says when.
+        for (plugin, d) in state.due_sources(crate::usage::now_ms()) {
+            // Due means a vouched entry exists for it; the mark is what
+            // makes skip-never-stack true under concurrency.
+            if let Some(st) = state.source_state.get_mut(&(plugin.clone(), d.name.clone())) {
+                st.in_flight = true;
+                state.fetching += 1;
+                let _ = cmd_tx.send(Cmd::FetchSource {
+                    plugin,
+                    name: d.name,
+                    tool: d.tool,
+                    args: d.args,
+                });
+            }
+        }
         // Drain the core.
         while let Ok(msg) = rx.try_recv() {
             apply(&mut state, msg);
@@ -2081,6 +2663,13 @@ fn ui_loop(
             dirty = true;
         }
         if state.expire_notice() {
+            dirty = true;
+        }
+        if let Some(d) = &mut state.dialog
+            && d.steady.is_some()
+            && !d.steadying()
+        {
+            d.steady = None;
             dirty = true;
         }
         if (state.working || state.waiting())
@@ -2116,7 +2705,11 @@ fn ui_loop(
                         None
                     }
                 })
-                .unwrap_or_else(fallback_tree);
+                .unwrap_or_else(|| fallback_tree(&state));
+            // What the frame will draw: the drawn-panel set the live
+            // sources' beat works from. A panel not placed this frame
+            // means its plugin's sources are not fetched.
+            state.panels_drawn = plugin_panels_in(&tree);
             let mut r = Renderer::new(&state);
             let mut screen = None;
             if let Ok(done) = terminal.draw(|f| r.draw(f, &tree)) {
@@ -2148,8 +2741,16 @@ fn ui_loop(
             let rect = r.transcript_rect;
             let images = std::mem::take(&mut r.images);
             let link_hits = std::mem::take(&mut r.link_hits);
+            let prompt_width = r.prompt_width;
             // The renderer borrows the state; painting writes to it.
             drop(r);
+            // The wrap width the prompt's rows were just drawn at: the
+            // prompt's vertical motion walks those rows, and the renderer
+            // — a read-only view — could only report the width, not
+            // record it.
+            if let Some(w) = prompt_width {
+                state.prompt.set_wrap_width(w);
+            }
             if let Some(screen) = screen {
                 state.screen = screen;
             }
@@ -2178,9 +2779,14 @@ fn ui_loop(
         // Wait for one event, then drain what is already queued before
         // drawing: a drag is a burst, and a frame per event fell behind it.
         let mut wait = Duration::from_millis(33);
+        let mut events = Vec::new();
         while event::poll(wait).unwrap_or(false) {
             wait = Duration::ZERO;
-            match event::read() {
+            events.push(event::read());
+        }
+        state.burst = burst(&events);
+        for event in events {
+            match event {
                 Ok(TermEvent::Key(k)) if k.kind != KeyEventKind::Release => {
                     state.selection = None;
                     handle_key(&mut state, &mut keys, script.as_ref(), &cmd_tx, k);
@@ -2189,6 +2795,7 @@ fn ui_loop(
                     if std::mem::take(&mut state.reload) {
                         let src = reload_source(&mut state, script_path.as_deref(), &script_src);
                         (script, keys) = load_ui(&mut state, &src);
+                        ask_source_vouches(&state, &cmd_tx);
                         if state.script_error.is_none() {
                             state.info("ui reloaded: layout, keymap, modes and theme");
                         }
@@ -2273,24 +2880,7 @@ fn ui_loop(
                 // search line owned the keyboard — and a pasted answer
                 // then reappeared in the next message.
                 Ok(TermEvent::Paste(s)) => {
-                    // A `Pick`'s field is a filter and a minibuffer is a
-                    // pattern, a command or an utterance: all one line
-                    // by nature, so a pasted newline is flattened rather
-                    // than left to submit something. Only the prompt
-                    // takes a paste whole.
-                    match &mut state.dialog {
-                        Some(d) => {
-                            d.input.insert(&s.replace('\n', " "));
-                            if d.kind == DialogKind::Pick {
-                                d.selected = d.visible().first().copied().unwrap_or(0);
-                            }
-                        }
-                        None if state.mini.is_some() => {
-                            target(&mut state).insert(&s.replace('\n', " "));
-                            sync_search(&mut state);
-                        }
-                        None => state.prompt.insert(&s),
-                    }
+                    paste(&mut state, &s);
                     dirty = true;
                 }
                 _ => {}
@@ -2308,21 +2898,90 @@ fn ui_loop(
     let _ = cmd_tx.send(Cmd::Quit);
 }
 
-fn fallback_tree() -> serde_json::Value {
-    serde_json::json!({ "kind": "column", "children": [
-        { "size": "fill", "child": { "kind": "panel", "title": " eidolon ", "child": { "kind": "transcript" } } },
-        { "size": "grow:3:12", "child": { "kind": "prompt" } },
-        { "size": 1, "child": { "kind": "status", "left": "built-in layout", "right": "" } },
-        { "kind": "dialog" }
-    ]})
+/// The built-in default view — what draws when no operator script says
+/// otherwise, or the operator's `view` failed. An enabled plugin whose
+/// payload defines a `plugin_panel` gets a slot in a fixed band above
+/// the status line, one titled panel per plugin in load order; the
+/// measure algebra answers only for the prompt, so the band is fixed
+/// and taller content clips. That is the default's guess, not a rule:
+/// the operator moves or deletes the node in their own `view` like any
+/// other. No panel-bearing plugin, no band — the frame is exactly what
+/// it always was.
+fn fallback_tree(state: &UiState) -> serde_json::Value {
+    let slots: Vec<serde_json::Value> = state
+        .plugin_uis
+        .iter()
+        .filter(|p| p.script.has("plugin_panel"))
+        .map(|p| serde_json::json!({ "kind": "plugin_panel", "plugin": p.plugin }))
+        .collect();
+    let mut children = vec![
+        serde_json::json!({ "size": "fill", "child": { "kind": "panel", "title": " eidolon ", "child": { "kind": "transcript" } } }),
+        serde_json::json!({ "size": "grow:3:12", "child": { "kind": "prompt" } }),
+    ];
+    if !slots.is_empty() {
+        children.push(serde_json::json!({ "size": 6, "child": { "kind": "column", "children": slots } }));
+    }
+    children.push(serde_json::json!({ "size": 1, "child": { "kind": "status", "left": "built-in layout", "right": "" } }));
+    children.push(serde_json::json!({ "kind": "dialog" }));
+    serde_json::json!({ "kind": "column", "children": children })
 }
 
 fn apply(state: &mut UiState, msg: UiMsg) {
     match msg {
+        UiMsg::SourceVouch { facts } => {
+            for (plugin, name, vouched, whose) in facts {
+                let st = state.source_state.entry((plugin.clone(), name.clone())).or_default();
+                if vouched {
+                    // A re-trust heals: the next load's vouched fact
+                    // clears a standing refusal, and the beat fetches.
+                    if st.why == crate::state::SourceWhy::NotVouched {
+                        st.why = crate::state::SourceWhy::Never;
+                    }
+                    continue;
+                }
+                let said = st.why != crate::state::SourceWhy::NotVouched;
+                st.why = crate::state::SourceWhy::NotVouched;
+                if !said {
+                    continue;
+                }
+                let tool = state
+                    .source_decls
+                    .iter()
+                    .find(|(p, d)| *p == plugin && d.name == name)
+                    .map(|(_, d)| d.tool.clone())
+                    .unwrap_or_default();
+                state.info(format!(
+                    "plugin {plugin}: source {name} will not be fetched — {tool} is not vouched; run `plugins trust {whose} {tool}`"
+                ));
+            }
+        }
+        UiMsg::SourceFetched { plugin, name, ok, content } => {
+            state.fetching = state.fetching.saturating_sub(1);
+            if let Some(st) = state.source_state.get_mut(&(plugin, name)) {
+                st.in_flight = false;
+                if ok {
+                    // A reading lands: the fact replaces whatever stood —
+                    // a source that healed from a failure draws fresh.
+                    st.value = Some(content);
+                    st.at = Some(crate::usage::now_ms());
+                    if st.why == crate::state::SourceWhy::NotVouched {
+                        st.why = crate::state::SourceWhy::Never;
+                    }
+                } else {
+                    // Failed keeps the last good reading and its `at`:
+                    // the panel draws the age of it, never a guess that
+                    // the number is current.
+                    st.why = crate::state::SourceWhy::Failed;
+                }
+            }
+        }
         UiMsg::ParkTicked(ticks) => {
             for tick in ticks {
                 state.wait_tick(tick);
             }
+        }
+        UiMsg::WaitRetired { call_id, by } => {
+            state.wait_settled(&call_id, &format!("ended by a message from {by}"));
         }
         UiMsg::Bus(ev) => match ev {
             Event::MessageStart => {
@@ -2479,7 +3138,7 @@ fn apply(state: &mut UiState, msg: UiMsg) {
                 // striking.
                 state.remember(state.msg_start.min(state.transcript.len()), record);
             }
-            // A call the harness makes *inside* another call — a skill
+            // A call the harness makes *inside* another call — a tool
             // script's `eidolon::*`, or the vault channel's resolved
             // `mneme_rpc` — is not the model's tool traffic, and it is not
             // on the branch as a call at all: only an operator's dispatch
@@ -2654,6 +3313,17 @@ fn apply(state: &mut UiState, msg: UiMsg) {
                     );
                 }
             }
+            // One tool-less call's spend, published as the record lands:
+            // priced at the key it names, so the live totals move with
+            // the log's and neither can print a partial total as the bill.
+            Event::ModelSpend { key, usage, .. } => {
+                state.model_spend(&key, &usage, crate::usage::now_ms());
+            }
+            // A script's api_request: counted for the usage page when a
+            // plugin's — nothing drawn, egress is not conversation.
+            Event::ApiRequest { consumer, .. } => {
+                state.ledger.api_request(&consumer);
+            }
             Event::Error(e) => state.note_alert(format!("error: {e}")),
             // Journaled before it was published, and only ever at a turn
             // boundary — so pushing it at the end of the transcript is
@@ -2671,23 +3341,17 @@ fn apply(state: &mut UiState, msg: UiMsg) {
                     text,
                 });
             }
-            // Why this session woke. A line of its own rather than a peer's
-            // entry, because it is neither the operator speaking nor a
-            // colleague: the harness answering a condition the session
-            // asked to be woken by.
+            // Why this session woke. The wait block the call drew comes to
+            // rest — rows stay as the last tick drew them, so the leaf
+            // that fired stays checked, and the outcome's own words name
+            // it. There is no separate woke line: the block is the
+            // rendering, in both its states.
             Event::TriggerFired {
-                condition,
                 outcome,
                 call_id,
                 ..
             } => {
                 finish_streaming(state);
-                state.transcript.push(Entry::Woke {
-                    condition,
-                    outcome: outcome.clone(),
-                });
-                // The block comes to rest: rows stay as the last tick drew
-                // them, so the leaf that fired stays checked on screen.
                 state.wait_settled(&call_id, &outcome);
                 state.working = false;
             }
@@ -2721,6 +3385,8 @@ fn apply(state: &mut UiState, msg: UiMsg) {
             state.jump = None;
             state.vault.pending = None;
             if state.vault.current.is_none() && state.vault.tree.is_none() { crate::vault::close(state); }
+            let typing = state.keyed_at.is_some_and(|t| t.elapsed() < TYPING)
+                || (state.prompt.mode.typing() && !state.prompt.text().is_empty());
             state.dialog = Some(Dialog {
                 kind: req.kind,
                 prompt: req.prompt,
@@ -2737,6 +3403,8 @@ fn apply(state: &mut UiState, msg: UiMsg) {
                 pick: None,
                 body: String::new(),
                 masked: false,
+                noting: false,
+                steady: typing.then(|| std::time::Instant::now() + STEADY),
             });
         }
         UiMsg::Pick {
@@ -2859,6 +3527,8 @@ fn open_pick(
         pick: Some(pick),
         body: String::new(),
         masked: false,
+        noting: false,
+        steady: None,
     });
 }
 
@@ -2882,6 +3552,8 @@ fn open_ask(state: &mut UiState, title: String, masked: bool, run: String, key: 
         pick: Some(PickAction::Run(run)),
         body: String::new(),
         masked,
+        noting: false,
+        steady: None,
     });
 }
 
@@ -2919,6 +3591,8 @@ pub(crate) fn open_page(state: &mut UiState, title: String, text: String) {
         pick: None,
         body: text,
         masked: false,
+        noting: false,
+        steady: None,
     });
 }
 
@@ -2945,6 +3619,14 @@ fn handle_key(
     cmd_tx: &mpsc::UnboundedSender<Cmd>,
     k: ratatui::crossterm::event::KeyEvent,
 ) {
+    let now = std::time::Instant::now();
+    state.keyed_at = Some(now);
+    if let Some(d) = &mut state.dialog
+        && matches!(d.kind, DialogKind::Confirm | DialogKind::Choose)
+        && (state.burst || d.steadying())
+    {
+        d.steady = d.steady.max(Some(now + STEADY));
+    }
     // A set of letter tags owns the keyboard for the one or two presses
     // it lasts. It has to: every letter on it is a tag, including the
     // ones that are also commands, which is the same reason `f` holds
@@ -3014,8 +3696,8 @@ fn handle_key(
     sync_search(state);
 }
 
-/// The buffer the keyboard is aimed at: the [minibuffer](crate::state::Mini)
-/// while one is up, the prompt otherwise.
+/// The buffer the keyboard is aimed at: a dialog's open note field, the
+/// [minibuffer](crate::state::Mini) while one is up, the prompt otherwise.
 ///
 /// Every motion, every verb and every change goes through this, which is
 /// what makes a `:` line, a pattern and a dispatch utterance edit
@@ -3024,9 +3706,10 @@ fn handle_key(
 /// is also the whole of the routing: nothing else in this module needs
 /// to know which line is in front.
 fn target(state: &mut UiState) -> &mut Buffer {
-    match &mut state.mini {
-        Some(m) => &mut m.input,
-        None => &mut state.prompt,
+    match (&mut state.dialog, &mut state.mini) {
+        (Some(d), _) if d.noting => &mut d.input,
+        (_, Some(m)) => &mut m.input,
+        _ => &mut state.prompt,
     }
 }
 
@@ -3179,6 +3862,28 @@ fn refresh_search(state: &UiState, search: &mut Search, from: Option<usize>) {
         }).collect();
         search.refresh(&entries, "", from);
     } else { search.refresh(&state.transcript, state.prompt.text(), from); }
+}
+
+/// A `Pick`'s field is a filter and a minibuffer is a pattern, a command
+/// or an utterance: all one line by nature, so a pasted newline is
+/// flattened rather than left to submit something. Only the prompt takes
+/// a paste whole. A confirm or a question takes one only into an open
+/// note: anywhere else it would become a note on the next answer.
+fn paste(state: &mut UiState, s: &str) {
+    match &mut state.dialog {
+        Some(d) if d.noting || matches!(d.kind, DialogKind::Pick | DialogKind::Ask) => {
+            d.input.insert(&s.replace('\r', "").replace('\n', " "));
+            if d.kind == DialogKind::Pick {
+                d.selected = d.visible().first().copied().unwrap_or(0);
+            }
+        }
+        Some(_) => {}
+        None if state.mini.is_some() => {
+            target(state).insert(&s.replace('\n', " "));
+            sync_search(state);
+        }
+        None => state.prompt.insert(s),
+    }
 }
 
 /// Keep the live search's pattern in step with the line being typed.
@@ -3529,7 +4234,7 @@ fn tag_hits(state: &mut UiState) {
 /// kind (`confirm`, `choose`, `pick`). Returns whether `name`
 /// meant something here. A dialog used to own the keyboard outright,
 /// which kept it out of the which-key popup and out of a user's reach;
-/// now `y` is `submit` and `n` is `dialog_deny` in a table like any
+/// now `y` is `dialog_allow` and `n` is `dialog_deny` in a table like any
 /// other, and the popup can say so.
 fn dialog_exec(
     state: &mut UiState,
@@ -3660,19 +4365,83 @@ fn dialog_exec(
         }
         return true;
     }
-    let answer: Option<Option<String>> = match (&d.kind, name) {
+    if d.noting {
+        match (name, Words::new(d.input.text())) {
+            ("cancel", _) => {
+                d.input = Dialog::field();
+                d.noting = false;
+            }
+            ("submit", Err(why)) if why != WordsRefused::Blank => state.info(format!("that {why}")),
+            ("submit", _) => d.noting = false,
+            // Everything else is the field's own editing, on `target`.
+            _ => return false,
+        }
+        return true;
+    }
+    if d.steadying() && STEADIED.contains(&name) {
+        return true;
+    }
+    // The rows are the answers, then `+ note`, then `chat about it` — for
+    // the kinds whose answer is a row. The park's text hop answers with its
+    // field instead, so its `submit` is the text and nothing else: an empty
+    // row list would otherwise read as `answers` and turn its enter into
+    // `+ note`.
+    let answers = d.answers().len();
+    let rows = d.kind != DialogKind::Respond;
+    let name = match name {
+        "submit" if rows && d.selected == answers => "dialog_note",
+        "submit" if rows && d.selected > answers => "dialog_chat",
+        _ => name,
+    };
+    let answer: Option<Option<Reply>> = match (&d.kind, name) {
         (_, "cancel") => Some(None),
-        (DialogKind::Confirm, "submit") => Some(Some("yes".into())),
-        (DialogKind::Confirm, "dialog_deny") => Some(Some("no".into())),
-        (DialogKind::Choose, "move_line_up" | "scroll_line_up") => {
+        (_, "dialog_note") => {
+            d.noting = true;
+            None
+        }
+        (_, "dialog_chat") => return chat_about(state, cmd_tx),
+        (_, "move_line_up" | "scroll_line_up") => {
             d.selected = d.selected.saturating_sub(1);
             None
         }
-        (DialogKind::Choose, "move_line_down" | "scroll_line_down") => {
-            d.selected = (d.selected + 1).min(d.options.len().saturating_sub(1));
+        (_, "move_line_down" | "scroll_line_down") => {
+            d.selected = (d.selected + 1).min(answers + 1);
             None
         }
-        (DialogKind::Choose, "submit") => Some(d.options.get(d.selected).map(|o| o.0.clone())),
+        (DialogKind::Confirm, "dialog_allow") => Some(Some(d.picked("yes".into()))),
+        (DialogKind::Confirm, "dialog_deny") => Some(Some(d.picked("no".into()))),
+        // The park's text hop: the same field editor the ask box drives,
+        // submitted through the request's reply like a choose. Empty is
+        // not an answer — it dismisses, and the run parks.
+        (DialogKind::Respond, "submit") => {
+            let text = d.input.text().trim().to_string();
+            Some(if text.is_empty() { None } else { Some(Reply::picked(text)) })
+        }
+        (DialogKind::Respond, "delete_char_backward") => {
+            d.input.delete_char_backward();
+            None
+        }
+        (DialogKind::Respond, "delete_char_forward") => {
+            d.input.delete_char_forward();
+            None
+        }
+        (DialogKind::Respond, "move_char_left") => {
+            d.input.move_char_left();
+            None
+        }
+        (DialogKind::Respond, "move_char_right") => {
+            d.input.move_char_right();
+            None
+        }
+        (DialogKind::Respond, "goto_line_start" | "goto_first_nonwhitespace") => {
+            d.input.goto_line_start();
+            None
+        }
+        (DialogKind::Respond, "goto_line_end" | "goto_line_end_newline") => {
+            d.input.goto_line_end_newline();
+            None
+        }
+        (_, "submit") => Some(d.answers().get(d.selected).map(|l| d.picked(l.to_string()))),
         _ => return false,
     };
     if let Some(a) = answer {
@@ -3684,10 +4453,61 @@ fn dialog_exec(
     true
 }
 
+/// A confirm or a question opening within `TYPING` of the last key is
+/// steadying: it takes nothing until `STEADY` passes with no key at it.
+/// A burst, keys no hand types together, steadies it the same way.
+const STEADY: Duration = Duration::from_millis(300);
+const TYPING: Duration = Duration::from_millis(1000);
+const STEADIED: &[&str] = &[
+    "submit", "dialog_allow", "dialog_deny", "dialog_chat", "dialog_note", "cancel",
+    "move_line_up", "move_line_down", "scroll_line_up", "scroll_line_down",
+];
+
+/// More than one key read in one drain is a paste to a terminal without
+/// bracketed paste, or keys typed ahead of a slow frame: neither is an answer.
+fn burst(events: &[std::io::Result<TermEvent>]) -> bool {
+    events.iter().filter(|e| matches!(e, Ok(TermEvent::Key(k)) if k.kind != KeyEventKind::Release)).count() > 1
+}
+
+/// `chat about it`: decline the ask (a confirm is denied with its note, a
+/// question dismissed), cancel the turn as `esc` does, and hand the prompt
+/// back in insert with the ask's first line as context for the operator's
+/// words, after a question's kept note, which the dismissal cannot carry.
+fn chat_about(state: &mut UiState, cmd_tx: &mpsc::UnboundedSender<Cmd>) -> bool {
+    let Some(mut d) = state.dialog.take() else { return false };
+    let declined = (d.kind == DialogKind::Confirm).then(|| d.picked("no".into()));
+    let note = match &declined {
+        Some(_) => String::new(),
+        None => Words::new(d.input.text()).map(|w| w.as_str().to_string()).unwrap_or_default(),
+    };
+    if let Some(reply) = d.reply.take() {
+        let _ = reply.send(declined);
+    }
+    if state.working {
+        let _ = cmd_tx.send(Cmd::Cancel);
+    }
+    close_mini(state, false);
+    let mut text = state.prompt.text().to_string();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    state.prompt.set_text(&format!("{text}> {}: {note}", d.summary()));
+    state.prompt.enter(Mode::insert());
+    true
+}
+
 /// A character typed at a dialog: into its field for the kinds that have
-/// one, a numbered choice for `choose`, nothing for a confirm box.
+/// one and for an open note, a numbered choice for `choose`, nothing for
+/// a confirm box.
 fn dialog_literal(state: &mut UiState, text: &str) {
     let Some(d) = &mut state.dialog else { return };
+    if !d.noting && d.kind == DialogKind::Choose && d.steadying() {
+        return;
+    }
+    if d.noting {
+        d.input.insert(text);
+        return;
+    }
     match d.kind {
         // Typing re-aims at the best match rather than keeping whatever
         // row was under the highlight. The list is ranked now
@@ -3703,13 +4523,16 @@ fn dialog_literal(state: &mut UiState, text: &str) {
         // Nothing to re-rank: one field, and it holds only what was typed
         // into it.
         DialogKind::Ask => d.input.insert(text),
+        // The park's field: the same one field, holding only what was
+        // typed — nothing to re-rank, nothing to hide.
+        DialogKind::Respond => d.input.insert(text),
         DialogKind::Choose => {
             let Some(i) = text.chars().next().and_then(|c| c.to_digit(10)) else {
                 return;
             };
             let i = i as usize;
             if i >= 1 && i <= d.options.len() {
-                let answer = d.options[i - 1].0.clone();
+                let answer = d.picked(d.options[i - 1].0.clone());
                 if let Some(reply) = d.reply.take() {
                     let _ = reply.send(Some(answer));
                 }
@@ -4691,7 +5514,30 @@ fn exec(
                     "command `{other}` needs the script, which did not compile"
                 )),
             },
-            None => state.info(format!("no such command: {other}")),
+            None => match state
+                .plugin_commands
+                .iter()
+                .find(|(_, c)| c.name == other)
+                .map(|(p, c)| (p.clone(), c.run.clone()))
+            {
+                Some((plugin, run)) => {
+                    match state
+                        .plugin_uis
+                        .iter()
+                        .find(|p| p.plugin == plugin)
+                        .map(|p| p.script.run_command(&run, state.snapshot(), arg))
+                    {
+                        Some(Ok(action)) => {
+                            act(state, script, cmd_tx, action);
+                        }
+                        Some(Err(e)) => state.info(format!("command `{other}` failed: {e:#}")),
+                        None => state.info(format!(
+                            "command `{other}` needs its plugin, which did not compile"
+                        )),
+                    }
+                }
+                None => state.info(format!("no such command: {other}")),
+            },
         },
     }
 }
@@ -4699,9 +5545,10 @@ fn exec(
 /// `:help`: every mode's bindings from the keymap as loaded, then the
 /// vocabulary. The canonical three modes first, the rest in name order.
 fn help_text(state: &UiState) -> String {
+    let commands = state.scripted_commands();
     let mut out = String::from("── Key reference ──\n\n  Live keymap · :reload_ui re-reads ui.rn\n  Bindings grouped by mode; commands follow below.\n");
     let Some(tables) = state.keymap.as_object() else {
-        return out + &command::reference_in(&state.script_commands);
+        return out + &command::reference_in(state, &commands);
     };
     let mut names: Vec<&String> = tables.keys().collect();
     let rank = |n: &str| {
@@ -4724,7 +5571,7 @@ fn help_text(state: &UiState) -> String {
     }
     out.push_str("\n── Command vocabulary ──\n");
     // Keep the registry authoritative, adding only visual section boundaries.
-    for line in command::reference_in(&state.script_commands).lines() {
+    for line in command::reference_in(state, &commands).lines() {
         if !line.is_empty() && !line.starts_with(' ') {
             out.push_str(&format!("── {line} ──\n"));
         } else {
@@ -4922,6 +5769,53 @@ mod tests {
     use super::*;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    /// The seed covers the whole catalog, and leaves out exactly what the
+    /// definitions leave out: a row without a context has no window, a row
+    /// without rates has no cost, a provider without a secret is no
+    /// `:login` target. The point is the precondition, not a behaviour —
+    /// nothing mutates a running catalog's definitions, so this is the
+    /// check that fails if one ever lands and the seed is not re-run, and
+    /// it reads only public catalog API and the crate's own seed function.
+    #[test]
+    fn the_seed_covers_every_model_the_catalog_answers_for() {
+        let mut c = eidolon_providers::Catalog::new();
+        for (name, src) in [
+            (
+                "seed-a",
+                r#"pub fn provider() { #{ name: "seed-a", wire: "openai", base_url: "http://a",
+   token_secret: "s", models: [ #{ id: "big", context: 1000, cost: #{ input: 1.0, output: 2.0 } }, #{ id: "bare" } ] } }"#,
+            ),
+            (
+                "seed-b",
+                r#"pub fn provider() { #{ name: "seed-b", wire: "openai", base_url: "http://b",
+   models: [ #{ id: "only", context: 2000 } ] } }"#,
+            ),
+        ] {
+            let (def, script) = eidolon_providers::ProviderScript::load(name, src).unwrap();
+            c.add_def(def, Some(script), "test");
+        }
+        let mut st = UiState::new("seed-a:big".into(), "/tmp/s.eid".into(), "/".into());
+        super::seed_catalog_tables(&mut st, Some(&c));
+        assert_eq!(st.windows.get("seed-a:big"), Some(&1000));
+        assert_eq!(st.windows.get("seed-b:only"), Some(&2000));
+        assert!(
+            !st.windows.contains_key("seed-a:bare"),
+            "a row that declares no context is the nobody-said case"
+        );
+        assert!(st.costs.contains_key("seed-a:big"));
+        assert!(
+            !st.costs.contains_key("seed-b:only"),
+            "a row that declares no rates is unpriced, not free"
+        );
+        for key in ["seed-a:big", "seed-a:bare", "seed-b:only"] {
+            assert!(
+                st.model_keys.iter().any(|(k, _)| k == key),
+                "{key} completes against :model"
+            );
+        }
+        assert_eq!(st.provider_keys, ["seed-a"], "only a token_secret makes a :login target");
+    }
+
     #[test]
     fn trace_links_open_a_note_follow_another_and_return_to_the_untouched_draft() {
         let mut r = Rig::new();
@@ -5118,6 +6012,293 @@ mod tests {
         r.press("esc");
         assert_eq!(r.state.mode_name(), "vault");
         assert_eq!(r.state.vault.current.as_ref().unwrap().path, "Note.md");
+    }
+
+    /// A dialog opening on a keyboard that has been quiet for a while.
+    fn asked(r: &mut Rig, kind: DialogKind, options: &[&str]) -> tokio::sync::oneshot::Receiver<Option<Reply>> {
+        r.state.keyed_at = None;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let options = options.iter().map(|l| Choice { label: l.to_string(), description: None }).collect();
+        apply(&mut r.state, UiMsg::Dialog(DialogRequest { kind, prompt: "well?".into(), options, reply: tx }));
+        rx
+    }
+
+    #[test]
+    fn a_confirm_answered_without_a_note_sends_the_bare_answer() {
+        let mut r = Rig::new();
+        let mut rx = asked(&mut r, DialogKind::Confirm, &[]);
+        r.press("y");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply::picked("yes")));
+    }
+
+    #[test]
+    fn a_note_typed_on_a_confirm_rides_the_answer_that_follows() {
+        let mut r = Rig::new();
+        let mut rx = asked(&mut r, DialogKind::Confirm, &[]);
+        r.press("tab");
+        assert_eq!(r.state.mode_name(), "note");
+        r.typed("not on main, you know why").press("ret");
+        assert_eq!(r.state.mode_name(), "confirm", "ret keeps the note and hands the keys back");
+        r.press("n");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Some(Reply { label: "no".into(), operator_note: Some(Words::new("not on main, you know why").unwrap()) })
+        );
+    }
+
+    #[test]
+    fn esc_in_the_note_drops_it() {
+        let mut r = Rig::new();
+        let mut rx = asked(&mut r, DialogKind::Choose, &["a", "b"]);
+        r.press("tab").typed("never mind").press("esc");
+        assert_eq!(r.state.mode_name(), "choose");
+        r.typed("2");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply::picked("b")));
+    }
+
+    #[test]
+    fn an_over_long_note_is_refused_by_name_and_the_field_stays_open() {
+        let mut r = Rig::new();
+        let _rx = asked(&mut r, DialogKind::Confirm, &[]);
+        r.press("tab");
+        paste(&mut r.state, &"x".repeat(eidolon_core::user::MAX_WORDS_BYTES + 1));
+        r.press("ret");
+        assert_eq!(r.state.mode_name(), "note");
+        assert!(r.state.notice.as_ref().unwrap().text.contains("is over"));
+    }
+
+    #[test]
+    fn a_paste_on_a_confirm_lands_only_in_an_open_note() {
+        let mut r = Rig::new();
+        let mut rx = asked(&mut r, DialogKind::Confirm, &[]);
+        paste(&mut r.state, "stray");
+        assert_eq!(r.state.dialog.as_ref().unwrap().input.text(), "", "no field open, no paste");
+        r.press("tab");
+        paste(&mut r.state, "only\r\nthis once");
+        r.press("ret y");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Some(Reply { label: "yes".into(), operator_note: Some(Words::new("only this once").unwrap()) })
+        );
+        assert_eq!(r.text(), "", "and the prompt never saw it");
+    }
+
+    #[test]
+    fn the_readline_keys_in_a_note_edit_the_note_and_not_the_message() {
+        let mut r = Rig::new();
+        r.write("the message").press("esc");
+        let _rx = asked(&mut r, DialogKind::Confirm, &[]);
+        r.press("tab").typed("not on main");
+        r.press("C-w");
+        assert_eq!(r.state.dialog.as_ref().unwrap().input.text(), "not on ");
+        r.press("C-u");
+        assert_eq!(r.state.dialog.as_ref().unwrap().input.text(), "");
+        assert_eq!(r.text(), "the message");
+    }
+
+    fn selected(r: &Rig) -> usize {
+        r.state.dialog.as_ref().unwrap().selected
+    }
+
+    #[test]
+    fn a_confirm_is_a_list_that_starts_on_yes_and_clamps_at_both_ends() {
+        let mut r = Rig::new();
+        let mut rx = asked(&mut r, DialogKind::Confirm, &[]);
+        assert_eq!(selected(&r), 0);
+        r.press("k up");
+        assert_eq!(selected(&r), 0);
+        r.press("j down j j j");
+        assert_eq!(selected(&r), 3, "yes, no, + note, chat about it");
+        r.press("k up k");
+        assert_eq!(selected(&r), 0);
+        r.press("ret");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply::picked("yes")));
+
+        let mut rx = asked(&mut r, DialogKind::Choose, &["a", "b"]);
+        r.press("j j j j");
+        assert_eq!(selected(&r), 3, "a, b, + note, chat about it");
+        r.typed("3");
+        assert!(r.state.dialog.is_some(), "a digit picks options only");
+        r.press("k k ret");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply::picked("b")));
+    }
+
+    #[test]
+    fn ret_takes_whichever_row_is_arrowed() {
+        let mut r = Rig::new();
+        let mut rx = asked(&mut r, DialogKind::Confirm, &[]);
+        r.press("j ret");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply::picked("no")));
+        let mut rx = asked(&mut r, DialogKind::Confirm, &[]);
+        r.press("j j ret");
+        assert_eq!(r.state.mode_name(), "note", "+ note opens the field as tab does");
+        r.typed("once").press("ret");
+        assert_eq!(r.state.mode_name(), "confirm");
+        assert!(rx.try_recv().is_err(), "the note row answers nothing");
+        r.press("k k ret");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply { label: "yes".into(), operator_note: Some(Words::new("once").unwrap()) }));
+        let mut rx = asked(&mut r, DialogKind::Choose, &["a", "b"]);
+        r.press("j j ret").typed("why").press("ret").typed("1");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply { label: "a".into(), operator_note: Some(Words::new("why").unwrap()) }));
+        let mut rx = asked(&mut r, DialogKind::Confirm, &[]);
+        r.press("j j j ret");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply::picked("no")), "chat about it denies");
+        assert!(r.state.dialog.is_none());
+
+        let mut r = Rig::new();
+        let mut rx = asked(&mut r, DialogKind::Choose, &["a", "b"]);
+        r.press("j j j ret");
+        assert_eq!(rx.try_recv().unwrap(), None, "chat about it dismisses a question");
+    }
+
+    #[test]
+    fn chat_about_it_declines_cancels_the_turn_and_leaves_the_ask_in_the_prompt() {
+        let mut r = Rig::new();
+        r.state.working = true;
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let prompt = "\nbash — rm -rf build is destructive. Run it?\nthe command in full".into();
+        apply(&mut r.state, UiMsg::Dialog(DialogRequest { kind: DialogKind::Confirm, prompt, options: Vec::new(), reply: tx }));
+        r.press("tab").typed("not that dir").press("ret c");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply { label: "no".into(), operator_note: Some(Words::new("not that dir").unwrap()) }));
+        assert_eq!(r.cmds(), vec!["Cancel"]);
+        assert!(r.state.dialog.is_none());
+        assert_eq!(r.state.mode_name(), "insert");
+        assert_eq!(r.text(), "> bash — rm -rf build is destructive. Run it?: ");
+        r.typed("use the other one");
+        assert_eq!(r.text(), "> bash — rm -rf build is destructive. Run it?: use the other one");
+
+        let mut r = Rig::new();
+        r.state.prompt.insert("draft");
+        let mut rx = asked(&mut r, DialogKind::Choose, &["a", "b"]);
+        r.press("c");
+        assert_eq!(rx.try_recv().unwrap(), None);
+        assert!(r.cmds().is_empty(), "no turn in flight, nothing to cancel");
+        assert_eq!(r.text(), "draft\n> well?: ");
+    }
+
+    #[test]
+    fn chat_about_a_question_keeps_its_note_and_clears_the_line_in_front() {
+        let mut r = Rig::new();
+        r.press(":").typed("hel");
+        assert!(r.state.mini.is_some());
+        r.state.keyed_at = None;
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let options = vec![Choice { label: "a".into(), description: None }];
+        let prompt = "\u{1b}[1mpick\tone".into();
+        apply(&mut r.state, UiMsg::Dialog(DialogRequest { kind: DialogKind::Choose, prompt, options, reply: tx }));
+        r.press("tab").typed("neither, really").press("ret c");
+        assert_eq!(rx.try_recv().unwrap(), None, "a dismissal carries no note");
+        assert!(r.state.mini.is_none());
+        assert_eq!(r.state.mode_name(), "insert");
+        assert_eq!(r.text(), "> [1mpickone: neither, really");
+    }
+
+    /// Far enough ahead that no test runs past it; as a last key, "just now".
+    fn later() -> std::time::Instant {
+        std::time::Instant::now() + Duration::from_secs(3600)
+    }
+
+    /// A dialog opening on whatever the keyboard last did.
+    fn opened(r: &mut Rig, kind: DialogKind, options: &[&str]) -> tokio::sync::oneshot::Receiver<Option<Reply>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let options = options.iter().map(|l| Choice { label: l.to_string(), description: None }).collect();
+        apply(&mut r.state, UiMsg::Dialog(DialogRequest { kind, prompt: "well?".into(), options, reply: tx }));
+        rx
+    }
+
+    fn hold(r: &mut Rig) {
+        r.state.dialog.as_mut().unwrap().steady = Some(later());
+    }
+
+    #[test]
+    fn a_dialog_opening_under_typing_takes_no_key_until_it_steadies() {
+        let mut r = Rig::new();
+        r.write("half a thought");
+        r.state.keyed_at = Some(later());
+        let mut rx = opened(&mut r, DialogKind::Confirm, &[]);
+        assert!(r.state.dialog.as_ref().unwrap().steady.is_some());
+        hold(&mut r);
+        r.press("y ret n c esc j down tab");
+        assert!(rx.try_recv().is_err());
+        let d = r.state.dialog.as_ref().unwrap();
+        assert_eq!((d.selected, d.noting), (0, false), "nor moves, nor opens a note");
+        r.state.dialog.as_mut().unwrap().steady = None;
+        r.press("y");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply::picked("yes")));
+        assert_eq!(r.text(), "half a thought");
+        assert_eq!(r.state.mode_name(), "insert");
+
+        r.state.keyed_at = Some(later());
+        let mut rx = opened(&mut r, DialogKind::Choose, &["a", "b"]);
+        hold(&mut r);
+        r.typed("2");
+        assert!(rx.try_recv().is_err(), "a digit is an answer too");
+        r.state.dialog.as_mut().unwrap().steady = None;
+        r.typed("2");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply::picked("b")));
+    }
+
+    #[test]
+    fn a_key_at_a_steadying_dialog_holds_it_and_a_steady_one_is_not_held() {
+        let mut r = Rig::new();
+        let mut rx = asked(&mut r, DialogKind::Confirm, &[]);
+        r.press("j");
+        assert!(r.state.dialog.as_ref().unwrap().steady.is_none());
+        let soon = std::time::Instant::now() + STEADY / 2;
+        r.state.dialog.as_mut().unwrap().steady = Some(soon);
+        r.press("n");
+        assert!(rx.try_recv().is_err());
+        assert!(r.state.dialog.as_ref().unwrap().steady.unwrap() > soon, "typing on pushes it out");
+    }
+
+    #[test]
+    fn a_key_that_answers_one_dialog_counts_against_the_next() {
+        let mut r = Rig::new();
+        let mut rx = asked(&mut r, DialogKind::Confirm, &[]);
+        let before = std::time::Instant::now();
+        r.press("y");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply::picked("yes")));
+        assert!(r.state.keyed_at.is_some_and(|t| t >= before));
+        r.state.keyed_at = Some(later());
+        let _rx = opened(&mut r, DialogKind::Confirm, &[]);
+        assert!(r.state.dialog.as_ref().unwrap().steady.is_some());
+    }
+
+    #[test]
+    fn a_dialog_opening_on_a_quiet_prompt_answers_at_once() {
+        let long_ago = || std::time::Instant::now().checked_sub(Duration::from_secs(2));
+        let mut r = Rig::new();
+        r.write("draft").press("esc");
+        r.state.keyed_at = long_ago();
+        let mut rx = opened(&mut r, DialogKind::Confirm, &[]);
+        r.press("y");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply::picked("yes")));
+        // A draft still in insert is hands on the prompt, however long ago the last key.
+        r.press("i");
+        r.state.keyed_at = long_ago();
+        let _rx = opened(&mut r, DialogKind::Confirm, &[]);
+        assert!(r.state.dialog.as_ref().unwrap().steady.is_some());
+    }
+
+    #[test]
+    fn a_burst_is_keys_read_together_and_cannot_answer_a_dialog() {
+        use ratatui::crossterm::event::MouseEvent;
+        let key = |kind| Ok(TermEvent::Key(KeyEvent::new_with_kind(KeyCode::Char('y'), KeyModifiers::NONE, kind)));
+        let moved = || Ok(TermEvent::Mouse(MouseEvent { kind: MouseEventKind::Moved, column: 0, row: 0, modifiers: KeyModifiers::NONE }));
+        assert!(!burst(&[key(KeyEventKind::Press), moved(), moved(), key(KeyEventKind::Release)]), "one key and a mouse");
+        assert!(burst(&[key(KeyEventKind::Press), key(KeyEventKind::Release), key(KeyEventKind::Press)]));
+
+        let mut r = Rig::new();
+        let mut rx = asked(&mut r, DialogKind::Confirm, &[]);
+        r.state.burst = true;
+        r.press("y");
+        assert!(rx.try_recv().is_err());
+        assert!(r.state.dialog.as_ref().unwrap().steady.is_some(), "the burst steadies it");
+        r.state.burst = false;
+        r.state.dialog.as_mut().unwrap().steady = None;
+        r.press("n");
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply::picked("no")));
+        assert_eq!(r.text(), "");
     }
 
     /// A UI thread's worth of state, without a terminal or a driver.
@@ -5375,15 +6556,20 @@ mod tests {
         assert_eq!(r.cmds(), vec![r#"Command { name: "model", arg: "" }"#]);
     }
 
+    /// `j`/`k` are the prompt's line motions (ruling 2026-09-29), so they
+    /// move the caret and touch no scroll; the transcript's scroll keeps
+    /// its own keys beside them.
     #[test]
-    fn jk_scroll_the_transcript_and_leave_the_prompt_alone() {
+    fn jk_move_the_prompt_and_touch_no_scroll() {
         let mut r = Rig::new();
-        r.write("draft").press("esc");
-        r.press("k k k j");
-        assert_eq!(r.state.scroll_up, 2);
-        assert_eq!(r.text(), "draft");
-        r.press("g b");
-        assert_eq!(r.state.scroll_up, 0);
+        r.write("one").press("S-ret").typed("two").press("esc");
+        r.state.scroll_up = 2;
+        r.press("k");
+        assert!(r.state.prompt.range.head < 7, "k moves the prompt's caret");
+        assert_eq!(r.state.scroll_up, 2, "and no scroll moved with it");
+        assert_eq!(r.text(), "one\ntwo");
+        r.press("A-up");
+        assert_eq!(r.state.scroll_up, 12, "the scroll keys are still bound beside it"); // view_height 20
     }
 
     #[test]
@@ -5449,7 +6635,7 @@ mod tests {
     fn the_operators_hand_spends_the_anchor() {
         let mut r = Rig::new();
         r.state.scroll_anchor = Some((3, 0));
-        r.press("esc k");
+        r.press("esc A-up");
         assert_eq!(
             r.state.scroll_anchor, None,
             "a scroll key must spend the anchor"
@@ -5560,6 +6746,8 @@ mod tests {
             pick: None,
             body: String::new(),
             masked: false,
+            noting: false,
+            steady: None,
         });
         // `d` would delete a selection; here it is just a key the confirm
         // box ignores, and the prompt behind it is untouched.
@@ -5602,6 +6790,8 @@ mod tests {
             pick: None,
             body: String::new(),
             masked: false,
+            noting: false,
+            steady: None,
         });
         r.press("n");
         assert!(
@@ -5610,7 +6800,7 @@ mod tests {
         );
         r.press("x");
         assert!(r.state.dialog.is_none());
-        assert_eq!(rx.try_recv().unwrap(), Some("no".into()));
+        assert_eq!(rx.try_recv().unwrap(), Some(Reply::picked("no")));
         // And the search line: its `esc` is the same `cancel` the prompt
         // has, resolved from the `search` table.
         r.seeded(&["alpha", "beta"]).press("/").typed("beta");
@@ -5701,8 +6891,19 @@ mod tests {
             .state
             .menu
             .clone()
-            .expect("a bare colon offers everything");
-        assert_eq!(m.items.len(), crate::command::COMMANDS.len());
+            .expect("a bare colon offers everything that works here");
+        assert_eq!(
+            m.items.len(),
+            crate::command::COMMANDS
+                .iter()
+                .filter(|c| c.available(&r.state))
+                .count(),
+            "the bare colon lists the vocabulary of where we are"
+        );
+        assert!(
+            !m.items.iter().any(|(k, _)| k == "link_open"),
+            "not tracing, no page: the reading vocabulary is not offered"
+        );
         assert!(
             m.items
                 .iter()
@@ -5957,7 +7158,13 @@ mod tests {
             .menu
             .clone()
             .expect("a bare colon offers the whole vocabulary");
-        assert_eq!(all.items.len(), crate::command::COMMANDS.len());
+        assert_eq!(
+            all.items.len(),
+            crate::command::COMMANDS
+                .iter()
+                .filter(|c| c.available(&r.state))
+                .count()
+        );
         assert_eq!(all.selected, Some(0));
         r.typed("comp");
         let m = r.state.menu.clone().expect("still suggesting");
@@ -6273,6 +7480,7 @@ mod tests {
             palette: None,
             sessions_dir: tmp.path().to_path_buf(),
             swarm: None,
+            permits: None,
         };
 
         let msg = adopt(&agent, &ctx, Session::open(&second).unwrap())
@@ -6360,6 +7568,7 @@ mod tests {
             palette: None,
             sessions_dir: tmp.path().to_path_buf(),
             swarm: None,
+            permits: None,
         };
 
         let msg = adopt(&agent, &ctx, Session::open(&second).unwrap())
@@ -6428,6 +7637,7 @@ mod tests {
             palette: None,
             sessions_dir: tmp.path().to_path_buf(),
             swarm: None,
+            permits: None,
         };
 
         // The shipped file is reopened the way a venue receives it: as a
@@ -6511,6 +7721,7 @@ mod tests {
             palette: None,
             sessions_dir: logs.clone(),
             swarm: None,
+            permits: None,
         };
 
         // The directory does not exist yet, as it will not on a first run.
@@ -6817,6 +8028,102 @@ mod tests {
         );
     }
 
+    /// The ruling's table half (2026-09-29): in insert the arrows move the
+    /// prompt's caret and history keeps readline's pair; in normal `j`/`k`
+    /// are the same motions and not transcript scroll; and the picker's
+    /// `j`/`k` list walking is exactly what it was — the dialogs match the
+    /// command names before the prompt's buffer ever sees them.
+    #[test]
+    fn arrows_and_jk_move_the_prompt_caret_and_the_picker_keeps_its_list() {
+        let mut r = Rig::new();
+        r.write("one").press("S-ret").typed("two");
+        let at = r.state.prompt.range.head;
+        r.press("up");
+        assert_ne!(r.state.prompt.range.head, at, "up moves the caret in insert");
+        assert_eq!(r.text(), "one\ntwo", "and nothing was recalled to do it");
+        r.press("down");
+        assert_eq!(r.state.prompt.range.head, at, "down comes back");
+        r.press("esc k");
+        assert_ne!(r.state.prompt.range.head, at, "k is the same motion in normal");
+        r.press("j");
+        assert_eq!(r.state.prompt.range.head, at, "and j back");
+
+        // The question dialog: `j`/`k` walk its list, exactly as they did
+        // — the dialog matches the command names before the prompt's
+        // buffer ever sees them.
+        r.state.dialog = Some(Dialog {
+            kind: DialogKind::Choose,
+            prompt: "test".into(),
+            options: vec![
+                ("a".into(), None),
+                ("b".into(), None),
+                ("c".into(), None),
+            ],
+            keys: Vec::new(),
+            weights: Vec::new(),
+            selected: 0,
+            input: Dialog::field(),
+            reply: None,
+            noting: false,
+            pick: None,
+            body: String::new(),
+            masked: false,
+            steady: None,
+        });
+        r.press("j");
+        assert_eq!(
+            r.state.dialog.as_ref().unwrap().selected, 1,
+            "the chooser's j walks its list"
+        );
+        r.press("k");
+        assert_eq!(r.state.dialog.as_ref().unwrap().selected, 0, "and k walks it back");
+    }
+
+    /// The ruling's substance (2026-09-29): a long unsplit message wraps,
+    /// and the motion keys walk the rows it is drawn in — insert's arrows
+    /// and normal's `j`/`k` alike. The width is what a draw records on the
+    /// buffer; these tests never draw, so they record it the same way the
+    /// frame does. In normal mode the block cursor's range carries the +1
+    /// the widened head shows.
+    #[test]
+    fn the_motion_keys_walk_the_wrapped_rows_of_a_long_line() {
+        let mut r = Rig::new();
+        r.write("0123456789abcdefghij");
+        r.state.prompt.set_wrap_width(8);
+        assert_eq!(r.state.prompt.range.head, 20);
+        r.press("up");
+        assert_eq!(r.state.prompt.range.head, 12, "up one drawn row, column kept: the caret sat past the last char, col 4"); // row 1
+        r.press("esc j");
+        assert_eq!(r.state.prompt.range.head, 20, "normal's j is the same walk, back to the end");
+        r.press("k");
+        assert_eq!(r.state.prompt.range.head, 13, "and k back onto row 1 — caret 12, block cursor and all");
+    }
+
+    /// The recall defect the ruling names, end to end (2026-09-29): a
+    /// walk back from a half-written message stashes the draft, the walk
+    /// forward past the newest entry hands it back, and the replacement
+    /// is an undo step — `u` after a recall puts the draft back too.
+    #[test]
+    fn a_recall_stashes_the_draft_and_hands_it_back() {
+        let mut r = Rig::new();
+        r.write("half a thought");
+        r.state.prompt.history = vec!["older".into(), "newer".into()];
+        r.press("C-p C-p");
+        assert_eq!(r.text(), "older", "the walk went back through the history");
+        r.press("C-n");
+        assert_eq!(r.text(), "newer", "the newest entry, still not the draft");
+        r.press("C-n");
+        assert_eq!(r.text(), "half a thought", "past the newest, the draft comes back");
+        // The recall left the mode the draft was typed in, so the undo is
+        // readline's own pair first: esc, then u.
+        r.press("C-p esc u");
+        assert_eq!(
+            r.text(),
+            "half a thought",
+            "the recall is an undo step: u alone restores the draft"
+        );
+    }
+
     #[test]
     fn context_page_is_a_footprint_dashboard_not_a_replay() {
         use eidolon_core::agent::{ContextBlock, ContextReport};
@@ -6866,6 +8173,105 @@ mod tests {
         assert_eq!(text.matches("← HEAD").count(), 1);
         assert!(text.find("#3").unwrap() < text.find("#4").unwrap());
         assert!(tree_report(&[]).body.contains("No records yet."));
+    }
+
+    /// A run folds under its start line: closed, the page draws the
+    /// summary and none of the run; `ret` (trace's `l`) opens it;
+    /// `backspace` (trace's `h`) closes it again with the cursor back
+    /// on the summary; `tab` hops only what is drawn. The records are
+    /// journaled into a real session file and read back from it, which
+    /// is the resumed session's exact shape — the page is always built
+    /// from the log, so a run already in the log folds the same. The
+    /// fold is a view: the body keeps every line, and the records a
+    /// step's `w<run>-<index>` id gathered hide with the run while a
+    /// note the run merely happened beside stays drawn.
+    #[test]
+    fn a_workflow_run_folds_under_its_start_and_opens_on_demand() {
+        use eidolon_core::session::{RecordKind, Session};
+        use eidolon_core::workflow::{RunPin, RunStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("s.eid");
+        let mut s = Session::create(&path, "mock", tmp.path(), None).unwrap();
+        let run = s
+            .start_workflow(RunPin {
+                plugin: "browser".into(),
+                workflow: "page_walk".into(),
+                version: "1".into(),
+                hash: "ab".into(),
+                args: serde_json::json!({}).into(),
+            })
+            .unwrap();
+        s.workflow_step(run, 0, &format!("w{run}-0"), "write", serde_json::json!({}).into()).unwrap();
+        s.append(RecordKind::ToolResult { tool_use_id: format!("w{run}-0"), content: "wrote".into(), is_error: false }).unwrap();
+        s.workflow_step(run, 1, &format!("w{run}-1"), "browser_read", serde_json::json!({}).into()).unwrap();
+        s.append(RecordKind::ToolResult { tool_use_id: format!("w{run}-1"), content: "page one".into(), is_error: false }).unwrap();
+        s.end_workflow(run, RunStatus::Completed).unwrap();
+        s.append(RecordKind::Note { text: "beside the run".into() }).unwrap();
+        drop(s);
+        // Reopened: the page the resumed session draws, from records only.
+        let tree = tree_report(&Session::open(&path).unwrap().tree());
+        let line_of = |want: &dyn Fn(&RecordKind) -> bool| {
+            tree.records
+                .iter()
+                .find(|(_, r)| want(&r.kind))
+                .map(|(l, _)| *l)
+                .unwrap()
+        };
+        let start = line_of(&|k| matches!(k, RecordKind::WorkflowStart { .. }));
+        let step = line_of(&|k| matches!(k, RecordKind::WorkflowStep { .. }));
+        let result = line_of(&|k| matches!(k, RecordKind::ToolResult { .. }));
+        let ended = line_of(&|k| matches!(k, RecordKind::WorkflowEnd { .. }));
+        let note = line_of(&|k| matches!(k, RecordKind::Note { .. }));
+        let note_id = tree.records[&note].id;
+        assert!(tree.body.contains("step 0"), "the body keeps every line: {:?}", tree.body);
+
+        let mut r = Rig::new();
+        // Wide enough that the summary line does not wrap: the fold's
+        // subject is what is drawn, not where the columns break it.
+        r.state.transcript_rect = ratatui::layout::Rect::new(0, 0, 120, 16);
+        apply(&mut r.state, UiMsg::Tree(tree));
+        let drawn = |state: &UiState, source: usize| {
+            let doc = crate::vault::document(state);
+            let rows: Vec<String> = doc
+                .source_lines
+                .iter()
+                .zip(&doc.lines)
+                .filter(|(l, _)| **l == source)
+                .map(|(_, line)| line.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect();
+            (!rows.is_empty()).then(|| rows.join("\n"))
+        };
+        // Closed: the summary names the run, and none of it is drawn.
+        let summary = drawn(&r.state, start).unwrap();
+        assert!(summary.contains("page_walk"), "{summary}");
+        assert!(summary.contains("2 steps · completed"), "{summary}");
+        for hidden in [step, result, ended] {
+            assert!(drawn(&r.state, hidden).is_none(), "line {hidden} drew folded");
+        }
+        assert!(drawn(&r.state, note).is_some(), "a record beside the run is not the run's");
+        // Opened: the whole group draws, the line reads as itself.
+        crate::vault::trace_goto(&mut r.state, start);
+        r.press("ret");
+        assert!(r.state.vault.tree_opened.contains(&start), "{:?}", r.state.vault.tree_opened);
+        for shown in [step, result, ended] {
+            assert!(drawn(&r.state, shown).is_some(), "line {shown} stayed folded");
+        }
+        assert!(!drawn(&r.state, start).unwrap().contains("steps"), "opened, the line is its own");
+        // `h` from inside the group closes it and puts the cursor back.
+        crate::vault::trace_goto(&mut r.state, step);
+        r.press("backspace");
+        assert!(!r.state.vault.tree_opened.contains(&start));
+        assert_eq!(r.state.vault.trace.at, start);
+        assert!(drawn(&r.state, step).is_none());
+        // And the walk never lands in a closed fold: three tabs from the
+        // top visit the session start, the summary and the note.
+        crate::vault::trace_goto(&mut r.state, 0);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            r.press("tab");
+            seen.push(crate::vault::tree_record(&r.state).unwrap().id);
+        }
+        assert_eq!(seen, vec![0, run, note_id], "hidden records are off the walk: {seen:?}");
     }
 
     #[test]
@@ -9060,5 +10466,432 @@ mod tests {
             resumed.transcript.iter().map(Entry::text).collect::<Vec<_>>(),
             "and the whole frame is the frame a resume draws"
         );
+    }
+}
+
+#[cfg(test)]
+mod plugin_tests {
+    use super::*;
+
+    /// One installed plugin under a scratch plugins directory: a
+    /// manifest and one ui payload, the layout discovery reads.
+    fn plugin(root: &std::path::Path, name: &str, payload: &str) -> std::path::PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("ui")).unwrap();
+        std::fs::write(
+            dir.join("plugin.rn"),
+            format!("pub fn manifest() {{ #{{ name: \"{name}\", description: \"test plugin\" }} }}"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("ui").join("main.rn"), payload).unwrap();
+        dir
+    }
+
+    /// Precedence both ways: a plugin's row beats the default's and
+    /// only the default's, and the user's row beats the plugin's.
+    #[test]
+    fn plugin_tables_lay_between_the_defaults_and_the_users() {
+        let root = tempfile::tempdir().unwrap();
+        plugin(
+            root.path(),
+            "modes",
+            "pub fn modes() { #{ normal: #{ kind: \"normal\", label: \"PLUGIN\" }, insert: #{ kind: \"insert\", label: \"PLUGIN-INSERT\" } } }",
+        );
+        let mut state = UiState::new("m".into(), "/tmp/s.eid".into(), "/".into());
+        state.plugins_dir = Some(root.path().to_path_buf());
+        let user = "pub fn view(s) { #{ kind: \"empty\" } }\npub fn keymap() { #{} }\npub fn on_submit(s, t) { send(t) }\npub fn modes() { #{ normal: #{ kind: \"normal\", label: \"USER\" } } }";
+        let (script, _) = load_ui(&mut state, user);
+        assert!(script.is_some());
+        assert!(state.script_error.is_none(), "{:?}", state.notices);
+        assert_eq!(state.modes.style("normal").label, "USER");
+        assert_eq!(state.modes.style("insert").label, "PLUGIN-INSERT");
+        assert_eq!(
+            state.modes.style("select").label,
+            crate::script::default_modes().style("select").label
+        );
+    }
+
+    /// Enabled, the payload loads and the snapshot names it; disabled,
+    /// the same directory contributes nothing — present on disk, listed
+    /// by `eidolon plugins`, but adopted by no surface. Re-enabling is
+    /// the next load, which is why disabling revokes nothing.
+    #[test]
+    fn a_disabled_plugin_still_stands_on_disk_but_loads_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let plugins = root.path().join("plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        plugin(&plugins, "modes", "pub fn modes() { #{ } }");
+        let mut state = UiState::new("m".into(), "/tmp/s.eid".into(), "/".into());
+        state.plugins_dir = Some(plugins.clone());
+        load_ui(&mut state, crate::DEFAULT_UI);
+        assert_eq!(state.plugin_names(), vec!["modes".to_string()]);
+
+        std::fs::write(
+            eidolon_rune::store::Store::beside(&plugins),
+            "[plugins.modes]\nenabled = false\n",
+        )
+        .unwrap();
+        load_ui(&mut state, crate::DEFAULT_UI);
+        assert!(state.plugin_uis.is_empty());
+        assert!(state.snapshot()["plugins"].as_array().unwrap().is_empty());
+
+        std::fs::write(eidolon_rune::store::Store::beside(&plugins), "").unwrap();
+        load_ui(&mut state, crate::DEFAULT_UI);
+        assert_eq!(state.plugin_names(), vec!["modes".to_string()]);
+    }
+
+    /// Keys never shadow: a plugin's row on a key the frame already
+    /// binds is refused naming both bindings; a row on a mode of the
+    /// plugin's own lands whole.
+    #[test]
+    fn a_plugin_keymap_row_on_a_bound_key_is_refused_naming_both() {
+        let root = tempfile::tempdir().unwrap();
+        plugin(
+            root.path(),
+            "keys",
+            "pub fn keymap() { #{ normal: #{ \"esc\": \"reload_ui\" }, zplug: #{ x: \"reload_ui\" } } }",
+        );
+        let mut state = UiState::new("m".into(), "/tmp/s.eid".into(), "/".into());
+        state.plugins_dir = Some(root.path().to_path_buf());
+        load_ui(&mut state, crate::DEFAULT_UI);
+        let said = state
+            .notices
+            .iter()
+            .map(|(_, n)| n.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(said.contains("esc"), "{said}");
+        assert!(said.contains("reload_ui"), "{said}");
+        assert!(said.contains("already binds"), "{said}");
+        // The new mode landed whole; the refused key changed nothing.
+        assert!(state.keymap["zplug"].get("x").is_some());
+        let normal = state.keymap["normal"].as_object().unwrap();
+        assert_ne!(normal.get("esc").and_then(|v| v.as_str()), Some("reload_ui"));
+    }
+
+    /// A broken payload is a notice naming the plugin and nothing on
+    /// screen — and a later load picks the payload up once it compiles,
+    /// which is `reload_ui`'s re-read of the plugins' directory.
+    #[test]
+    fn a_broken_plugin_contributes_a_line_and_nothing_else() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("broken/ui")).unwrap();
+        std::fs::write(root.path().join("broken/plugin.rn"), "pub fn manifest() { #{ ").unwrap();
+        let mut state = UiState::new("m".into(), "/tmp/s.eid".into(), "/".into());
+        state.plugins_dir = Some(root.path().to_path_buf());
+        let (script, _) = load_ui(&mut state, crate::DEFAULT_UI);
+        assert!(script.is_some(), "the frame still draws");
+        assert!(state.plugin_uis.is_empty());
+        assert!(
+            state.notices.iter().any(|(_, n)| n.contains("plugin broken")),
+            "{:?}",
+            state.notices
+        );
+        // The same load again, the payload now compiling: the plugin is
+        // in, the way a reload re-reads the directory.
+        plugin(root.path(), "broken", "pub fn modes() { #{ } }");
+        load_ui(&mut state, crate::DEFAULT_UI);
+        assert_eq!(state.plugin_uis.len(), 1);
+        assert_eq!(state.plugin_uis[0].plugin, "broken");
+    }
+
+    /// The rows of one drawn frame, top row first.
+    fn glyphs(state: &UiState, tree: serde_json::Value, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let mut r = Renderer::new(state);
+        terminal.draw(|f| r.draw(f, &tree)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The default view places an enabled plugin's panel in a band
+    /// above the status line, and a frame with no panel-bearing plugin
+    /// reserves no band at all — the layout is what it always was.
+    /// Disabled never reaches here: `plugin_uis` only ever holds the
+    /// enabled, which the disabled-plugin test pins at load.
+    #[test]
+    fn the_default_view_places_an_enabled_plugins_panel_above_the_status_line() {
+        let mut state = UiState::new("m".into(), "/tmp/s.eid".into(), "/".into());
+        assert!(
+            !fallback_tree(&state).to_string().contains("plugin_panel"),
+            "no plugin, no band: {:?}",
+            fallback_tree(&state)
+        );
+        state.plugin_uis.push(crate::script::PluginUi {
+            plugin: "pinger".into(),
+            script: crate::script::UiScript::compile(
+                "pub fn plugin_panel(s) { #{ kind: \"text\", content: \"hello from pinger\" } }",
+            )
+            .unwrap(),
+        });
+        let tree = fallback_tree(&state);
+        assert!(tree.to_string().contains("plugin_panel"), "{tree}");
+        let glyphs = glyphs(&state, tree, 40, 14);
+        let panel = glyphs
+            .iter()
+            .position(|l| l.contains("hello from pinger"))
+            .expect("the panel drew");
+        let status = glyphs
+            .iter()
+            .position(|l| l.contains("built-in layout"))
+            .expect("the status line drew");
+        assert!(panel < status, "panel above status: {glyphs:?}");
+    }
+
+    /// A payload carrying tables or commands only reserves nothing: a
+    /// slot that names it would draw as nothing, so the default view
+    /// never builds one — the band appears for a panel, not for a
+    /// plugin.
+    #[test]
+    fn a_plugin_without_a_panel_reserves_no_band() {
+        let mut state = UiState::new("m".into(), "/tmp/s.eid".into(), "/".into());
+        state.plugin_uis.push(crate::script::PluginUi {
+            plugin: "tables".into(),
+            script: crate::script::UiScript::compile("pub fn modes() { #{ } }").unwrap(),
+        });
+        let tree = fallback_tree(&state);
+        assert!(!tree.to_string().contains("plugin_panel"), "{tree}");
+        assert_eq!(tree["children"].as_array().unwrap().len(), 4);
+    }
+
+    /// The test the live-sources shape owes and cannot fake: a panel
+    /// whose snapshot holds a stale reading draws the **age**, never the
+    /// value, and a `why: "not vouched"` source draws its reason naming
+    /// the verb. The fixture payload encodes the drawing rule the spec
+    /// teaches — stale as an age, a refusal as its reason — and the
+    /// assertions are on the drawn frame, so a snapshot that made those
+    /// two states indistinguishable would fail this on the screen and
+    /// not in a structure.
+    #[test]
+    fn a_stale_source_draws_its_age_and_a_not_vouched_one_draws_its_reason() {
+        let panel = r#"
+            pub fn plugin_panel(s) {
+                let src = s.sources["status"];
+                if src.stale { return #{ kind: "text", content: `stale · read ${src.age}s ago` }; }
+                if src.why == "not vouched" { return #{ kind: "text", content: `${src.tool}: ${src.why}` }; }
+                #{ kind: "text", content: `live: ${src.value}` }
+            }
+        "#;
+        let decl = crate::state::SourceDecl {
+            name: "status".into(),
+            tool: "browser_state".into(),
+            args: serde_json::json!({}),
+            every: 5,
+        };
+        let mk = |why: crate::state::SourceWhy, value: Option<&str>, age_ms: u64| {
+            let mut state = UiState::new("m".into(), "/tmp/s.eid".into(), "/".into());
+            state.plugin_uis.push(crate::script::PluginUi {
+                plugin: "watcher".into(),
+                script: crate::script::UiScript::compile(panel).unwrap(),
+            });
+            state.source_decls.push(("watcher".into(), decl.clone()));
+            state.source_state.insert(
+                ("watcher".into(), "status".into()),
+                crate::state::SourceState {
+                    value: value.map(String::from),
+                    at: (age_ms > 0).then(|| crate::usage::now_ms() - age_ms),
+                    why,
+                    in_flight: false,
+                },
+            );
+            state
+        };
+        // Stale: the reading is good but older than the cadence — the
+        // frame draws how old it is, and the old value is nowhere on it.
+        let state = mk(crate::state::SourceWhy::Never, Some("OLD READING"), 42_000);
+        let rows = glyphs(&state, fallback_tree(&state), 60, 14);
+        let screen = rows.join("\n");
+        assert!(screen.contains("stale · read 42s ago"), "{screen}");
+        assert!(!screen.contains("OLD READING"), "the stale value drew as if current: {screen}");
+        // Not vouched: nothing to draw but the reason, and the reason
+        // names the verb.
+        let state = mk(crate::state::SourceWhy::NotVouched, None, 0);
+        let rows = glyphs(&state, fallback_tree(&state), 60, 14);
+        let screen = rows.join("\n");
+        assert!(screen.contains("browser_state: not vouched"), "{screen}");
+        // Fresh: the value draws as itself, no age in front of it.
+        let state = mk(crate::state::SourceWhy::Never, Some("just read"), 500);
+        let rows = glyphs(&state, fallback_tree(&state), 60, 14);
+        let screen = rows.join("\n");
+        assert!(screen.contains("live: just read"), "{screen}");
+        assert!(!screen.contains("stale"), "{screen}");
+    }
+
+    /// The scheduler's whole rule, on `due_sources`: nothing is due
+    /// while its panel's plugin is not drawn; a drawn, never-fetched
+    /// source is due at once; one in flight is skipped, never stacked;
+    /// one not vouched is never due, no cadence, no retry; and a
+    /// reading inside its cadence is not due again.
+    #[test]
+    fn a_source_is_due_only_while_its_panel_is_drawn_and_never_stacked() {
+        use crate::state::{SourceState, SourceWhy};
+        let mut state = UiState::new("m".into(), "/tmp/s.eid".into(), "/".into());
+        let decl = |name: &str| crate::state::SourceDecl {
+            name: name.into(),
+            tool: format!("tool_{name}"),
+            args: serde_json::json!({}),
+            every: 5,
+        };
+        state.source_decls = vec![
+            ("watcher".into(), decl("status")),
+            ("watcher".into(), decl("second")),
+            ("other".into(), decl("third")),
+        ];
+        let now = crate::usage::now_ms();
+        // No facts yet — the may-fetch answers have not landed: nothing
+        // is due, whatever the cadence and the drawn panels say.
+        assert!(state.due_sources(now).is_empty());
+        state.panels_drawn = vec!["watcher".into(), "other".into()];
+        // Vouched answers land for all three; the undrawn plugin's
+        // source is still not due, the drawn ones are.
+        for (plugin, name) in [
+            ("watcher", "status"),
+            ("watcher", "second"),
+            ("other", "third"),
+        ] {
+            state.source_state.insert((plugin.into(), name.into()), SourceState {
+                value: None, at: None, why: SourceWhy::Never, in_flight: false,
+            });
+        }
+        let due = state.due_sources(now);
+        assert_eq!(due.len(), 3, "watcher carries two sources, other one: {due:?}");
+        // In flight: skipped, never stacked.
+        state.source_state.insert(("watcher".into(), "status".into()), SourceState {
+            value: None, at: None, why: SourceWhy::Never, in_flight: true,
+        });
+        let due = state.due_sources(now);
+        assert!(due.iter().all(|(_, d)| d.name != "status"), "{due:?}");
+        // Not vouched: never due.
+        state.source_state.insert(("watcher".into(), "second".into()), SourceState {
+            value: None, at: None, why: SourceWhy::NotVouched, in_flight: false,
+        });
+        let due = state.due_sources(now);
+        assert!(due.iter().all(|(_, d)| d.name != "second"), "{due:?}");
+        // Stale cadence: a reading older than `every` is due again.
+        state.source_state.insert(("other".into(), "third".into()), SourceState {
+            value: Some("old".into()), at: Some(now - 6_000), why: SourceWhy::Never, in_flight: false,
+        });
+        let due = state.due_sources(now);
+        assert!(due.iter().any(|(_, d)| d.name == "third"), "{due:?}");
+        // A reading inside its cadence is not.
+        state.source_state.get_mut(&("other".into(), "third".into())).unwrap().at = Some(now - 1_000);
+        let due = state.due_sources(now);
+        assert!(due.iter().all(|(_, d)| d.name != "third"), "{due:?}");
+    }
+
+    /// The facts land where the drawing reads them: a vouch answer marks
+    /// the refused source and the notice names the verb and the trust
+    /// command; a re-trust clears the refusal; a reading stamps `at`; a
+    /// failure keeps the last good value and marks `failed`; and a
+    /// source in flight with nothing yet is absent from the snapshot
+    /// rather than blocking it.
+    #[test]
+    fn source_facts_land_and_the_notice_names_the_verb() {
+        use crate::state::{SourceState, SourceWhy};
+        let mut state = UiState::new("m".into(), "/tmp/s.eid".into(), "/".into());
+        state.source_decls.push((
+            "watcher".into(),
+            crate::state::SourceDecl {
+                name: "status".into(),
+                tool: "browser_state".into(),
+                args: serde_json::json!({}),
+                every: 5,
+            },
+        ));
+        apply(
+            &mut state,
+            UiMsg::SourceVouch {
+                facts: vec![("watcher".into(), "status".into(), false, "browser".into())],
+            },
+        );
+        assert_eq!(
+            state.source_state[&("watcher".into(), "status".into())].why,
+            SourceWhy::NotVouched
+        );
+        let said = state.notices.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>().join("\n");
+        assert!(said.contains("browser_state"), "{said}");
+        assert!(said.contains("plugins trust browser browser_state"), "{said}");
+        // Vouched at last: the refusal clears, the beat may fetch.
+        apply(
+            &mut state,
+            UiMsg::SourceVouch {
+                facts: vec![("watcher".into(), "status".into(), true, "browser".into())],
+            },
+        );
+        assert_eq!(
+            state.source_state[&("watcher".into(), "status".into())].why,
+            SourceWhy::Never
+        );
+        // A reading lands, then a failure: the value and its `at` survive
+        // the failure, and the `why` says which is which.
+        apply(
+            &mut state,
+            UiMsg::SourceFetched {
+                plugin: "watcher".into(),
+                name: "status".into(),
+                ok: true,
+                content: "the page state".into(),
+            },
+        );
+        let st = &state.source_state[&("watcher".into(), "status".into())];
+        assert_eq!(st.value.as_deref(), Some("the page state"));
+        assert!(st.at.is_some());
+        apply(
+            &mut state,
+            UiMsg::SourceFetched {
+                plugin: "watcher".into(),
+                name: "status".into(),
+                ok: false,
+                content: "the tool failed".into(),
+            },
+        );
+        let st = &state.source_state[&("watcher".into(), "status".into())];
+        assert_eq!(st.value.as_deref(), Some("the page state"), "a failure lost the last good reading");
+        assert_eq!(st.why, SourceWhy::Failed);
+        assert_eq!(state.source_snapshot()["status"]["why"].as_str(), Some("failed"));
+        // In flight with nothing yet: absent, not blocking.
+        state.source_decls.push((
+            "watcher".into(),
+            crate::state::SourceDecl {
+                name: "second".into(),
+                tool: "other_tool".into(),
+                args: serde_json::json!({}),
+                every: 5,
+            },
+        ));
+        state.source_state.insert(
+            ("watcher".into(), "second".into()),
+            SourceState { value: None, at: None, why: SourceWhy::Never, in_flight: true },
+        );
+        assert!(state.source_snapshot().get("second").is_none());
+    }
+
+    /// The declaration shape: a name, a tool, fixed args, a cadence with
+    /// a one-second floor — and anything else is a notice and a skip,
+    /// the way a broken manifest is.
+    #[test]
+    fn source_declarations_parse_strictly_and_floor_their_cadence() {
+        let good = serde_json::json!({ "tool": "browser_state", "args": { "x": 1 }, "every": 0 });
+        let d = parse_source_decl("status", &good).unwrap();
+        assert_eq!(d.tool, "browser_state");
+        assert_eq!(d.every, 1, "the floor is one second, whatever was declared");
+        assert_eq!(d.args["x"], 1);
+        for bad in [
+            serde_json::json!({ "args": {}, "every": 5 }),
+            serde_json::json!({ "tool": "", "args": {}, "every": 5 }),
+            serde_json::json!({ "tool": "t", "args": 3, "every": 5 }),
+            serde_json::json!({ "tool": "t", "args": {} }),
+            serde_json::json!({ "tool": "t", "args": {}, "every": "soon" }),
+        ] {
+            assert!(parse_source_decl("status", &bad).is_none(), "{bad}");
+        }
     }
 }

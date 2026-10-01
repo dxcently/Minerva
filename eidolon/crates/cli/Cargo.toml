@@ -32,7 +32,9 @@ percent-encoding = "2.3"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-# The version stamp on the unpacked system files (`system.rs`).
+# The version stamp on the unpacked system files (`system.rs`), and the
+# file hashes an install records and an update compares.
+sha2 = "0.10"
 crc32fast.workspace = true
 
 [dev-dependencies]

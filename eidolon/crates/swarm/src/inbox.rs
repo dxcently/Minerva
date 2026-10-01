@@ -37,6 +37,16 @@ pub struct Envelope {
     /// reads as `false`: those were peers.
     #[serde(default)]
     pub external: bool,
+    /// Whether this is the operator speaking, delivered through the
+    /// override path — `eidolon send --operator`, their own CLI act. The
+    /// one sender a parked session cannot be deaf to: every wake level
+    /// admits it, `Nothing` included, and the recipient's model is told
+    /// it is the operator and not a tool or a colleague. Absent on every
+    /// envelope written before the flag existed, which reads as `false`.
+    /// A peer session cannot set it: the send tool has no such parameter,
+    /// and this field is written by the operator's own hand alone.
+    #[serde(default)]
+    pub operator: bool,
     pub ts_ms: u64,
 }
 
@@ -49,6 +59,7 @@ impl Envelope {
             text: text.to_string(),
             wake: false,
             external: false,
+            operator: false,
             ts_ms: crate::now_ms(),
         }
     }

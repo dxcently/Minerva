@@ -78,6 +78,20 @@ pub enum Wire {
     TurnBudget { record: u64, calls_left: u32 },
     CommandResults { record: u64, lines: Vec<String> },
     Cancelled { usage: Usage, calls: u32 },
+    /// One tool-less model call's spend, priced by the reader off `key`.
+    /// Present in both projections — live and replayed — because a
+    /// browser consumer summing spend from the settles alone would print
+    /// a partial total as the bill.
+    ModelSpend {
+        key: String,
+        call_id: String,
+        usage: Usage,
+    },
+    /// A script's `api_request`, journaled at the attempt — present in
+    /// both projections, live and replayed, for the same reason
+    /// `ModelSpend` is: a browser consumer that loaded the backlog and
+    /// then went live must not miss egress the ledger counts.
+    ApiRequest { consumer: String, service: String },
     Error { text: String },
     Queued { waiting: usize },
     Quiesced { record: u64, destination: String },
@@ -154,6 +168,10 @@ pub enum Stop {
     Waiting,
     /// The operator left a question unanswered; likewise not `Other`.
     Dismissed,
+    /// The harness's own per-turn iteration cap ended the turn without a
+    /// model settle; likewise a decision, and the most expensive way a
+    /// turn can finish.
+    IterationLimit,
 }
 
 impl From<&StopReason> for Stop {
@@ -168,6 +186,7 @@ impl From<&StopReason> for Stop {
             StopReason::Other => Stop::Other,
             StopReason::Waiting => Stop::Waiting,
             StopReason::Dismissed => Stop::Dismissed,
+            StopReason::IterationLimit => Stop::IterationLimit,
         }
     }
 }
@@ -335,6 +354,19 @@ pub fn project(event: &Event) -> Option<Wire> {
             usage: usage.into(),
             calls: *calls,
         },
+        Event::ModelSpend {
+            key,
+            call_id,
+            usage,
+        } => Wire::ModelSpend {
+            key: key.clone(),
+            call_id: call_id.clone(),
+            usage: usage.into(),
+        },
+        Event::ApiRequest { consumer, service } => Wire::ApiRequest {
+            consumer: consumer.clone(),
+            service: service.clone(),
+        },
         Event::Error(text) => Wire::Error { text: text.clone() },
         Event::Queued { waiting } => Wire::Queued { waiting: *waiting },
         Event::Quiesced { record, destination } => Wire::Quiesced {
@@ -433,6 +465,24 @@ pub fn replay(records: &[&Record]) -> Vec<Wire> {
                 usage: Usage::default(),
                 calls: 0,
             }),
+            // Replay must carry the spend the live stream carried, or a
+            // consumer that loads the backlog and then goes live sums two
+            // different sessions.
+            RecordKind::ModelSpend {
+                key,
+                call_id,
+                usage,
+            } => out.push(Wire::ModelSpend {
+                key: key.clone(),
+                call_id: call_id.clone(),
+                usage: usage.into(),
+            }),
+            RecordKind::ApiRequest { consumer, service } => {
+                out.push(Wire::ApiRequest {
+                    consumer: consumer.clone(),
+                    service: service.clone(),
+                });
+            }
             RecordKind::ContextSize { tokens } => out.push(Wire::ContextSize { tokens: *tokens }),
             // No `quiesced`: its marker is a skipped `Note`, so it arrives only live.
             RecordKind::ExternalMessage { from, channel, text } => out.push(Wire::PeerMessage {
@@ -748,6 +798,74 @@ mod tests {
             serde_json::json!({
                 "type": "trigger-fired", "record": 8, "condition": "the build log says green",
                 "outcome": "it fired", "call_id": "tu1",
+            })
+        );
+    }
+
+    /// The spend the live stream carried is the spend the backlog replays —
+    /// the property the replay arm's own comment claims: a consumer that
+    /// loads the log and then goes live would otherwise sum two different
+    /// sessions.
+    #[test]
+    fn model_spend_replays_what_the_live_stream_carried() {
+        let usage = CoreUsage {
+            input_tokens: 12,
+            output_tokens: 34,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 6,
+        };
+        let live = project(&Event::ModelSpend {
+            key: "bash.00".into(),
+            call_id: "w7-3".into(),
+            usage,
+        })
+        .unwrap();
+        let record = Record {
+            id: 29,
+            parent: None,
+            ts_ms: 0,
+            kind: RecordKind::ModelSpend {
+                key: "bash.00".into(),
+                call_id: "w7-3".into(),
+                usage,
+            },
+        };
+        let replayed = replay(&[&record]).into_iter().next().expect("the replay projects the record");
+        assert_eq!(wire_json(&replayed), wire_json(&live));
+        assert_eq!(
+            wire_json(&live),
+            serde_json::json!({
+                "type": "model-spend", "key": "bash.00", "call_id": "w7-3",
+                "usage": {"input_tokens": 12, "output_tokens": 34, "cache_creation_input_tokens": 5, "cache_read_input_tokens": 6},
+            })
+        );
+    }
+
+    #[test]
+    fn api_request_replays_what_the_live_stream_carried() {
+        let live = project(&Event::ApiRequest {
+            consumer: "plugin:browser".into(),
+            service: "api.example.com".into(),
+        })
+        .unwrap();
+        let record = Record {
+            id: 30,
+            parent: None,
+            ts_ms: 0,
+            kind: RecordKind::ApiRequest {
+                consumer: "plugin:browser".into(),
+                service: "api.example.com".into(),
+            },
+        };
+        let replayed = replay(&[&record])
+            .into_iter()
+            .next()
+            .expect("the replay projects the record");
+        assert_eq!(wire_json(&replayed), wire_json(&live));
+        assert_eq!(
+            wire_json(&live),
+            serde_json::json!({
+                "type": "api-request", "consumer": "plugin:browser", "service": "api.example.com",
             })
         );
     }

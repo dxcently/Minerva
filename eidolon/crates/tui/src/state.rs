@@ -5,6 +5,7 @@ use eidolon_core::UsageExt;
 use std::time::{Duration, Instant};
 
 use eidolon_core::session::{Record, RecordId, RecordKind};
+use eidolon_core::user::{Reply, Words};
 
 /// How much of the transcript's tool traffic is drawn.
 ///
@@ -146,19 +147,6 @@ pub enum Entry {
         channel: bool,
         text: String,
     },
-    /// A park resolving: this session was woken by a condition it asked
-    /// `wait_for` to watch, and this is the harness saying so — neither
-    /// the operator speaking nor a colleague, and not a quiet note about
-    /// the conversation either. It is the third way a turn starts, beside
-    /// the operator and a peer's message, so like a peer's message it is
-    /// drawn as its own kind and seeded from its own record; a resumed
-    /// session sees the wake that started the turn it resumes into.
-    Woke {
-        /// The condition in words, as the model wrote it.
-        condition: String,
-        /// What became of it — `it fired`, `the deadline arrived first`.
-        outcome: String,
-    },
     /// One line the model **marked** in its own prose, as the call it
     /// became, with the harness's answer as its output.
     ///
@@ -254,12 +242,6 @@ impl Entry {
                 }
                 out
             }
-            // The same line the transcript draws: a wake is a fact about
-            // this conversation's turn order, and a yank of it should
-            // read as one.
-            Entry::Woke { condition, outcome } => {
-                format!("woke: {outcome} — waiting on {condition}")
-            }
             // The label and not the bytes: a search for `screenshot`
             // should find the picture, and a yank of it should paste
             // something a person can read rather than four megabytes of
@@ -292,7 +274,6 @@ impl Entry {
             Entry::Settle { .. } => "note",
             Entry::Alert(_) => "alert",
             Entry::Peer { .. } => "peer",
-            Entry::Woke { .. } => "wake",
             Entry::Ask { .. } => "ask",
             Entry::Image(_) => "image",
         }
@@ -309,11 +290,18 @@ impl Entry {
     /// work that happened — and neither is thinking still arriving. An
     /// [`Ask`](Entry::Ask) has no waiting state to exclude: it is built
     /// from the answers, so it exists only once the call has come back.
+    /// Nor is a question put to the operator: its choices stay on screen,
+    /// on a line of their own, for an answer given in the next prompt.
     pub fn clustered(&self) -> bool {
         // Every settled call folds the same way — reads, searches, shells,
         // and edits alike — and `space o` opens them again. Finding the
         // calls that changed something is trace's job, not a fold rule:
         // an exclusion nobody could see read as randomness.
+        if let Entry::Tool { name, .. } = self
+            && is_question(name)
+        {
+            return false;
+        }
         matches!(
             self,
             Entry::Thinking {
@@ -325,6 +313,11 @@ impl Entry {
             } | Entry::Ask { .. }
         )
     }
+}
+
+/// `choices_user`, under its own name or a bridge's prefix (`mcp__eidolon__choices_user`).
+pub fn is_question(tool: &str) -> bool {
+    tool.rsplit("__").next() == Some("choices_user")
 }
 
 /// **The minibuffer**: the one-line modes, written on the prompt's own
@@ -479,6 +472,12 @@ pub enum DialogKind {
     /// typed. Not a [`Pick`](Self::Pick): there is nothing to choose
     /// among, only something to type once and never see again.
     Ask,
+    /// The park's text hop: a run is blocked on a person, the question is
+    /// what a workflow's `park()` asked, and the typed answer is
+    /// journaled under the park's own id — the same record a resume's
+    /// `--answer` writes. Not [`Ask`](Self::Ask): that one feeds a
+    /// command, and answers nothing.
+    Respond,
 }
 
 /// What enter does to the key behind the highlighted row. Every picker in
@@ -508,6 +507,9 @@ pub enum PickAction {
     Edit(String),
 }
 
+pub const NOTE_ROW: &str = "+ note";
+pub const CHAT_ROW: &str = "chat about it";
+
 pub struct Dialog {
     pub kind: DialogKind,
     pub prompt: String,
@@ -529,7 +531,11 @@ pub struct Dialog {
     /// where its lines are. The same reasoning made the [`Mini`] one,
     /// and there is now no other kind of field in the harness.
     pub input: crate::edit::Buffer,
-    pub reply: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+    pub reply: Option<tokio::sync::oneshot::Sender<Option<Reply>>>,
+    /// For `Confirm` and `Choose`: `input` is taking typed keys as a note
+    /// rather than the dialog taking them as answers. Closed, a note stays
+    /// in `input` and rides whichever answer comes next.
+    pub noting: bool,
     /// For `Pick`: what enter does with the chosen key.
     pub pick: Option<PickAction>,
     /// For `Page`: the text. Wrapped when drawn, so a page reads the
@@ -539,6 +545,9 @@ pub struct Dialog {
     /// itself. `false` everywhere else — a filter or a page has nothing
     /// to hide.
     pub masked: bool,
+    /// For `Confirm` and `Choose`: until when an answering key is refused,
+    /// because the dialog opened under hands that were typing.
+    pub steady: Option<Instant>,
 }
 
 impl Dialog {
@@ -549,6 +558,40 @@ impl Dialog {
         let mut b = crate::edit::Buffer::default();
         b.enter(crate::edit::Mode::insert());
         b
+    }
+
+    /// A confirm's or a question's answers, in row order. [`NOTE_ROW`] and
+    /// [`CHAT_ROW`] come below them and answer nothing themselves.
+    pub fn answers(&self) -> Vec<&str> {
+        match self.kind {
+            DialogKind::Confirm => vec!["yes", "no"],
+            _ => self.options.iter().map(|o| o.0.as_str()).collect(),
+        }
+    }
+
+    /// The prompt's first line, the context `chat about it` leaves in the prompt.
+    pub fn summary(&self) -> String {
+        let line = self.prompt.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        let mut line: String = line.chars().filter(|c| !c.is_control()).collect();
+        if let Some((at, _)) = line.char_indices().nth(80) {
+            line.truncate(at);
+            line.push('…');
+        }
+        line
+    }
+
+    pub fn steadying(&self) -> bool {
+        self.steady.is_some_and(|t| Instant::now() < t)
+    }
+
+    /// `label` as a [`Reply`], carrying the note in the field if there is one;
+    /// the field was checked when it closed.
+    pub fn picked(&self, label: String) -> Reply {
+        // `.ok()` would silently drop an invalid note, but it cannot here: the
+        // note field refuses to close on invalid input (its keymap gates it),
+        // so by the time a pick is read the text is already a valid `Words`.
+        let operator_note = Words::new(self.input.text()).ok();
+        Reply { label, operator_note }
     }
 
     /// Option indices matching the filter text, best first — all of them
@@ -904,6 +947,12 @@ pub fn thinking_of(m: &eidolon_core::message::Message) -> String {
 /// the driver for a fresh one.
 pub const QUOTA_STALE_MS: u64 = 60_000;
 
+/// How many source fetches may be in flight at once, across all
+/// plugins. A payload may declare fifty sources; fifty concurrent
+/// requests beside the draw loop are the harness's business, and the
+/// harness says four.
+pub const MAX_SOURCE_FETCHES: usize = 4;
+
 /// The live state of one `wait_for` — the checklist the transcript draws
 /// while a park is armed. **View state, deliberately journaled nowhere**:
 /// the log keeps the arm (the call and its result) and the fire (the
@@ -925,6 +974,11 @@ pub struct WaitView {
     /// Set when the fire arrives: the outcome's own words, and how long
     /// the wait had been armed when it did.
     pub settled: Option<WaitOutcome>,
+    /// Set at seed time when this wait is neither resolved nor the last
+    /// thing on the branch — a state the one-wait invariant makes
+    /// unproducible live, and which means the session died mid-wait. The
+    /// block says so instead of ticking on like an active wait.
+    pub stale: bool,
 }
 
 /// How a wait came to rest.
@@ -932,6 +986,68 @@ pub struct WaitView {
 pub struct WaitOutcome {
     pub words: String,
     pub waited_s: Option<u64>,
+}
+
+/// One live source a payload declares: a name for the snapshot, a
+/// (vouched) tool, fixed arguments, and a cadence floor in seconds —
+/// what to fetch and how often, never how. The harness lengthens
+/// `every` if it must; it never shortens it, and never goes under one
+/// second.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceDecl {
+    pub name: String,
+    pub tool: String,
+    pub args: serde_json::Value,
+    pub every: u64,
+}
+
+/// Why a source may have nothing to draw. Three stored facts; the
+/// fourth — **stale** — is computed at snapshot time from `at` against
+/// the cadence, because it is about the age of a good reading and not
+/// about the last attempt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceWhy {
+    /// Armed and vouched, and no fetch has landed yet.
+    #[default]
+    Never,
+    /// The verb is not vouched: never fetched, by the rule that keeps a
+    /// timer from becoming a way to raise an Ask with nobody at the
+    /// keyboard.
+    NotVouched,
+    /// The last fetch came back an error. A reading a source had before
+    /// the failure is kept — the panel draws the age of it, never a
+    /// guess that it is current.
+    Failed,
+}
+
+impl SourceWhy {
+    /// The word the snapshot carries. `stale` wins when it computes:
+    /// the reading is good but old, which is the fact a panel most
+    /// needs to tell apart from a failure.
+    pub fn word(self, stale: bool) -> &'static str {
+        if stale {
+            "stale"
+        } else {
+            match self {
+                SourceWhy::Never => "never fetched",
+                SourceWhy::NotVouched => "not vouched",
+                SourceWhy::Failed => "failed",
+            }
+        }
+    }
+}
+
+/// What the harness holds about one declared source. `at` is the
+/// millisecond the good reading landed; a failed or stale source keeps
+/// its last good `value` and `at` beside the `why`, so a panel can draw
+/// the age instead of pretending the number is current.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceState {
+    pub value: Option<String>,
+    pub at: Option<u64>,
+    pub why: SourceWhy,
+    /// A fetch is out for this source: skipped, never stacked.
+    pub in_flight: bool,
 }
 
 pub struct UiState {
@@ -1146,6 +1262,12 @@ pub struct UiState {
     pub selection: Option<Selection>,
     /// When the selection last reached the clipboard, for the status line.
     pub copied_at: Option<Instant>,
+    /// When the last key was read — set on *every* key, by intent: a key
+    /// that answered the previous dialog counts as recent typing against the
+    /// next one, so a dialog does not take a key meant for the prompt (or a
+    /// held key) as an answer.
+    pub keyed_at: Option<Instant>,
+    pub burst: bool,
     /// The word on the status line, while there is one. See [`Notice`].
     pub notice: Option<Notice>,
     /// Every notice said so far, oldest first, for `:messages`.
@@ -1188,6 +1310,38 @@ pub struct UiState {
     /// The script's `commands()`, validated: bound, completed, listed and
     /// run beside the built-ins.
     pub script_commands: Vec<crate::command::Scripted>,
+    /// The plugins' compiled ui payloads — the panel renderer's scripts
+    /// and the plugin commands' home. A payload that did not compile is
+    /// absent from here and named in a notice; the frame never waits on
+    /// one, and `reload_ui` rebuilds this beside everything else.
+    pub plugin_uis: Vec<crate::script::PluginUi>,
+    /// The plugins' commands: whose payload answers and the parsed row,
+    /// so execution reaches the right script. Parsed beside the
+    /// operator's own in `load_ui`, under the same refusals.
+    pub plugin_commands: Vec<(String, crate::command::Scripted)>,
+    /// Where the installed plugins live, so `load_ui` re-reads their
+    /// payloads with the ui script. `None` — the tests' usual — means
+    /// the frame runs without plugins at all.
+    pub plugins_dir: Option<std::path::PathBuf>,
+    /// The plugins' live-source declarations, `(plugin, declaration)` in
+    /// load order. Read once per load beside the payloads; the fetch
+    /// scheduler works from this, never from a per-frame script call.
+    pub source_decls: Vec<(String, SourceDecl)>,
+    /// What each declared source has: its last good reading, when, and
+    /// why a panel may be looking at nothing. Keyed `(plugin, name)` —
+    /// the snapshot's `sources.<name>` is the declared name, and a name
+    /// two plugins both declared is refused at load, so the flat key is
+    /// unambiguous.
+    pub source_state: std::collections::BTreeMap<(String, String), SourceState>,
+    /// How many source fetches are in flight, across all plugins — the
+    /// harness's concurrency cap works from this count, not per plugin.
+    pub fetching: usize,
+    /// The plugins whose panel slots the current frame draws. The scan
+    /// of the tree, done where the tree is built — the one fact the
+    /// "fetched only while a panel that reads it is drawn" rule needs,
+    /// and the reason a headless session never fetches: no frame, no
+    /// scan, no fetch.
+    pub panels_drawn: Vec<String>,
     /// The keymap as loaded, for `help` — the resolver owns the live copy.
     pub keymap: serde_json::Value,
     /// `[terminal]`: what the `T` chords open another window with.
@@ -1325,12 +1479,14 @@ impl UiState {
     /// row in the script's `modes()`.
     pub fn mode_name(&self) -> &str {
         match &self.dialog {
+            Some(Dialog { noting: true, .. }) => "note",
             Some(d) => match d.kind {
                 DialogKind::Confirm => "confirm",
                 DialogKind::Choose => "choose",
                 DialogKind::Pick => "pick",
                 DialogKind::Page => "page",
                 DialogKind::Ask => "ask",
+                DialogKind::Respond => "respond",
             },
             None => match &self.mini {
                 Some(m) => m.kind.as_str(),
@@ -1394,6 +1550,8 @@ impl UiState {
             opened: Vec::new(),
             selection: None,
             copied_at: None,
+            keyed_at: None,
+            burst: false,
             notice: None,
             notices: Vec::new(),
             screen: (80, 24),
@@ -1409,6 +1567,13 @@ impl UiState {
             reload: false,
             edit_draft: false,
             script_commands: Vec::new(),
+            plugin_uis: Vec::new(),
+            plugin_commands: Vec::new(),
+            plugins_dir: None,
+            source_decls: Vec::new(),
+            source_state: Default::default(),
+            fetching: 0,
+            panels_drawn: Vec::new(),
             keymap: serde_json::Value::Null,
             // Empty is "nothing was configured", and the scan that
             // answers it happens on the first `T` rather than here: see
@@ -1430,9 +1595,19 @@ impl UiState {
 
     /// The window the model in play declares, if it declares one.
     ///
-    /// `None` is "nobody said" and not "no room": a gateway's discovered
-    /// model list carries no such number, so most keys are absent, and
-    /// the honest thing to draw for them is the count alone.
+    /// `None` is "nobody said" and not "no room": a row that declares no
+    /// window — Claude CLI's, a provider script that left `context` out —
+    /// has no number, and the honest thing to draw for it is the count
+    /// alone. A gateway row that does declare one is in the table like any
+    /// other. The table is seeded once at startup from the catalog, and
+    /// once is enough rather than merely all there is: the catalog's
+    /// definitions are fixed for the life of a session — only the
+    /// operator's weight table moves under it, and a window is not a
+    /// weight — so every model the catalog can answer for is in here, an
+    /// adopted log's model looked up in it like any other. A model that
+    /// arrives after the launch arrives with a launch: the listing's
+    /// refresh heals the cache file the next catalog build reads, and
+    /// until then the count alone is the honest draw.
     pub fn context_limit(&self) -> Option<u64> {
         self.windows.get(&self.model).copied()
     }
@@ -1476,6 +1651,28 @@ impl UiState {
                 text: settle_line(self.tools_run, timing, usage.output_tokens),
             });
         }
+    }
+
+    /// Count one tool-less model call: the tokens always, the dollars at
+    /// the rates of *the key the record carries* — not the model in
+    /// play, which a call may have overridden — and a ledger row either
+    /// way. Live and on resume alike, like [`UiState::settled`]: the
+    /// status line, the page and the log cannot be allowed to disagree
+    /// about what a session spent, and a call the totals skipped would
+    /// make the status line's figure a partial one.
+    pub fn model_spend(
+        &mut self,
+        key: &str,
+        usage: &eidolon_core::Usage,
+        ts_ms: u64,
+    ) {
+        self.usage_in += usage.total_input();
+        self.usage_out += usage.output_tokens;
+        let cost = self.costs.get(key).map(|c| c.price(usage));
+        if let Some(cost) = cost {
+            self.spend += cost;
+        }
+        self.ledger.model_call(key, *usage, cost, ts_ms);
     }
 
     /// The quota reading, when it is about the model in play's provider.
@@ -1598,7 +1795,10 @@ impl UiState {
         // carry it: `TurnPace` is written immediately before its
         // `TurnSettled`, and the ledger wants both at once.
         let mut pending_pace: Option<eidolon_core::usage::TurnTiming> = None;
-        for r in branch {
+        // The last `wait_for` call the branch armed, and where it sits —
+        // the one-wait invariant's reading of a replayed log.
+        let mut wait_armed_at: Option<(String, usize)> = None;
+        for (i, r) in branch.iter().enumerate() {
             // Where this record's entries begin, so they can be claimed
             // for it below. A resumed session gets the same entry→record
             // map the live path builds, which is what lets the trace
@@ -1665,6 +1865,12 @@ impl UiState {
                     utterance,
                 } => {
                     self.ledger.began(r.ts_ms);
+                    // The one-wait invariant, read off the log: the last
+                    // `wait_for` call is the only one that can still be
+                    // armed, and only while nothing follows it.
+                    if name == "wait_for" {
+                        wait_armed_at = Some((tool_use_id.clone(), i));
+                    }
                     if let Some(u) = utterance
                         .as_deref()
                         .map(str::trim)
@@ -1805,6 +2011,18 @@ impl UiState {
                 RecordKind::TurnSpend { usage, .. } => {
                     self.settled(usage, eidolon_core::StopReason::Cancelled, None, r.ts_ms)
                 }
+                // One tool-less call's spend, priced at *its* key's rates
+                // — which the record carries, because the model in play
+                // when it ran is not necessarily the one the call asked
+                // for. Priced here or marked unpriced; never folded into
+                // a turn, and never summed as free.
+                RecordKind::ModelSpend { key, usage, .. } => {
+                    self.model_spend(key, usage, r.ts_ms)
+                }
+                // A script's api_request: counted when a plugin's, so the
+                // usage page can say what it cannot price. Drawn nowhere —
+                // a plugin's egress is not conversation.
+                RecordKind::ApiRequest { consumer, .. } => self.ledger.api_request(consumer),
                 RecordKind::Cancelled => {
                     self.transcript.push(Entry::Info("cancelled".into()));
                     self.ledger.cancelled();
@@ -1825,15 +2043,42 @@ impl UiState {
                 // same line the live event drew. It used to draw nothing
                 // at all here, which made a resumed session miss the
                 // very thing that started its last turn.
-                RecordKind::TriggerFired {
-                    condition, outcome, ..
-                } => self.transcript.push(Entry::Woke {
-                    condition: condition.clone(),
-                    outcome: outcome.clone(),
-                }),
+                // The fire settles the block the call drew — the outcome's
+                // own words name the leaf that decided — and no separate
+                // woke line rides beside it: the block is the rendering,
+                // in both its states.
+                RecordKind::TriggerFired { call_id, outcome, .. } => {
+                    self.wait_settled(call_id, outcome)
+                }
+                // A workflow run's own records — the pin, its steps, its
+                // ending — draw **nothing** here, and that is a decision
+                // rather than an omission. The model is not told them:
+                // `Session::messages_after` leaves them out, because what a
+                // caller learns is the report the driving call returns and
+                // not the forty steps that produced it. Drawing them on the
+                // transcript would show the operator a conversation the
+                // model never had. The trace draws them (`record_line`), the
+                // log keeps them, and whether a run belongs on the
+                // transcript at all is still open on the design note — this
+                // is the arm that changes the day it is ruled.
+                RecordKind::WorkflowStart { .. }
+                | RecordKind::WorkflowStep { .. }
+                | RecordKind::WorkflowEnd { .. } => {}
                 _ => {}
             }
             self.remember(from, r.id);
+        }
+        // An armed wait that is not the last thing on the branch is a
+        // state the one-wait invariant makes unproducible live: reaching
+        // it in a log means the session died mid-wait. Mark it, and the
+        // block says the log cannot say how it ended instead of ticking
+        // on like an active wait.
+        if let Some((call_id, pos)) = &wait_armed_at
+            && *pos + 1 != branch.len()
+            && let Some(view) = self.waits.get_mut(call_id)
+            && view.settled.is_none()
+        {
+            view.stale = true;
         }
         // Nothing is in flight in a log that has been read to the end.
         self.msg_start = self.transcript.len();
@@ -1933,6 +2178,7 @@ impl UiState {
     /// from this and the call's own input, never the other way round.
     pub fn wait_armed(&mut self, call_id: &str, deadline_s: u64) {
         let view = self.waits.entry(call_id.to_string()).or_insert(WaitView {
+            stale: false,
             rows: Vec::new(),
             armed_at: std::time::Instant::now(),
             deadline_s,
@@ -1947,6 +2193,7 @@ impl UiState {
         self.waits
             .entry(tick.call_id)
             .or_insert(WaitView {
+                stale: false,
                 rows: Vec::new(),
                 armed_at: std::time::Instant::now(),
                 deadline_s: 0,
@@ -1959,6 +2206,7 @@ impl UiState {
     /// one that fired stays checked on screen.
     pub fn wait_settled(&mut self, call_id: &str, words: &str) {
         let view = self.waits.entry(call_id.to_string()).or_insert(WaitView {
+            stale: false,
             rows: Vec::new(),
             armed_at: std::time::Instant::now(),
             deadline_s: 0,
@@ -2044,6 +2292,108 @@ impl UiState {
 
     /// What the script sees. Small on purpose: the transcript stays on the
     /// Rust side and is placed, not passed.
+    /// The plugins present in the snapshot's `plugins` list: each name
+    /// once, in load order. One per plugin, not per ui file — a panel
+    /// slot is a plugin's, whatever its payload's file layout.
+    pub fn plugin_names(&self) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        for p in &self.plugin_uis {
+            if !seen.contains(&p.plugin) {
+                seen.push(p.plugin.clone());
+            }
+        }
+        seen
+    }
+
+    /// The `sources` half of the snapshot: one entry per declared source
+    /// the harness holds a fact about — `value`, `at`, `age` (seconds),
+    /// `stale`, `why`, and the verb, so a panel can name the tool a
+    /// reason is about. Nothing is computed here but ages: no fetch, no
+    /// wait — a source in flight with nothing yet to show is absent, and
+    /// the frame does not block on it.
+    pub fn source_snapshot(&self) -> serde_json::Value {
+        let now = crate::usage::now_ms();
+        let mut map = serde_json::Map::new();
+        for (plugin, d) in &self.source_decls {
+            let Some(st) = self.source_state.get(&(plugin.clone(), d.name.clone())) else {
+                continue;
+            };
+            if st.value.is_none() && st.in_flight {
+                continue;
+            }
+            let age_s = st.at.map_or(0, |at| now.saturating_sub(at) / 1000);
+            let stale = st
+                .at
+                .is_some_and(|at| now.saturating_sub(at) > d.every.saturating_mul(1000));
+            map.insert(
+                d.name.clone(),
+                serde_json::json!({
+                    "value": st.value,
+                    "at": st.at,
+                    "age": age_s,
+                    "stale": stale,
+                    "why": st.why.word(stale),
+                    "tool": d.tool,
+                    "every": d.every,
+                }),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// The fetch scheduler's beat, called once per loop turn — never on
+    /// the draw path. A source is due when its panel's plugin is drawn
+    /// (the rule that keeps a headless session from fetching at all),
+    /// its cadence has elapsed, and nothing for it is in flight; the
+    /// harness caps concurrent fetches across all plugins. The caller
+    /// owns the actual dispatch — this only says which sources are due.
+    pub fn due_sources(&self, now: u64) -> Vec<(String, SourceDecl)> {
+        if self.fetching >= MAX_SOURCE_FETCHES {
+            return Vec::new();
+        }
+        let mut due = Vec::new();
+        for (plugin, d) in &self.source_decls {
+            if !self.panels_drawn.iter().any(|p| p == plugin) {
+                continue;
+            }
+            if self.fetching + due.len() >= MAX_SOURCE_FETCHES {
+                break;
+            }
+            let Some(st) = self.source_state.get(&(plugin.clone(), d.name.clone())) else {
+                // No fact yet: the may-fetch answer has not landed for
+                // this load. Absent from the snapshot and never due —
+                // fetching before the vouch check would be exactly the
+                // timer-raised refusal the rule exists to prevent.
+                continue;
+            };
+            if st.in_flight {
+                continue;
+            }
+            // A not-vouched source is never fetched — no cadence, no
+            // retry: the fact is the answer until the operator trusts
+            // the verb and a reload re-asks.
+            if st.why == crate::state::SourceWhy::NotVouched {
+                continue;
+            }
+            let due_at = st.at.map_or(0, |at| at.saturating_add(d.every.saturating_mul(1000)));
+            if now >= due_at {
+                due.push((plugin.clone(), d.clone()));
+            }
+        }
+        due
+    }
+
+    /// The script's commands with the plugins' beside them, in load
+    /// order — what completion, the reference and the keymap's
+    /// known-command check present as callable.
+    pub fn scripted_commands(&self) -> Vec<crate::command::Scripted> {
+        self.script_commands
+            .iter()
+            .chain(self.plugin_commands.iter().map(|(_, c)| c))
+            .cloned()
+            .collect()
+    }
+
     pub fn snapshot(&self) -> serde_json::Value {
         let name = std::path::Path::new(&self.session_path)
             .file_stem()
@@ -2083,6 +2433,16 @@ impl UiState {
             // value it needs to tell apart: nothing priced yet.
             "spend": if self.spend > 0.0 { eidolon_core::usage::dollars(self.spend) } else { String::new() },
             "tools_run": self.tools_run,
+            // The plugins whose ui payloads compiled: the only names a
+            // frame's own view may place panels for. Absent from here is
+            // how a broken payload vanishes instead of erroring on
+            // screen — the snapshot offers no plugin it cannot draw.
+            "plugins": self.plugin_names(),
+            // The live sources' facts, what a panel reads to draw a
+            // value, an age, or a reason. Always present — an empty map
+            // when no source has a fact — so a panel never has to guess
+            // whether the key exists, only whether its name does.
+            "sources": self.source_snapshot(),
             "last_tool": self.last_tool,
             "dialog": self.dialog.is_some(),
             "following": self.scroll_up == 0,
@@ -2329,6 +2689,22 @@ mod tests {
                 stop_reason: StopReason::MaxTokens,
                 usage,
             },
+            // One tool-less call, priced at its own key's rates; the model
+            // in play at that point is `other:m`, which prices nothing —
+            // the row must take its rates from the record, not from the
+            // session.
+            RecordKind::ModelSpend {
+                key: "m".into(),
+                call_id: "w1-0".into(),
+                usage,
+            },
+            // And one on a key the catalog prices nowhere: unpriced, said
+            // so, never zero.
+            RecordKind::ModelSpend {
+                key: "nobody:m".into(),
+                call_id: "w1-1".into(),
+                usage,
+            },
         ] {
             s.append(k).unwrap();
         }
@@ -2382,11 +2758,39 @@ mod tests {
         // ledger's own.
         assert_eq!(l.total().total_input(), st.usage_in);
         assert_eq!(l.total().output_tokens, st.usage_out);
-        assert_eq!(l.spend(), Some((st.spend, 1)));
+        // Both directions, priced and unpriced: the priced model call's
+        // dollars are in the sum — priced from the key the *record*
+        // carries (the model in play at that point was `other:m`, which
+        // prices nothing) — and the unpriced call is counted as unknown
+        // rather than summed as free. One priced turn, one priced call,
+        // at the same rates.
+        let call_price = (1_000.0 * 1.0 + 200.0 * 2.0 + 9_000.0 * 0.1) / 1e6;
+        assert_eq!(l.spend(), Some(st.spend), "one accumulator");
+        assert_eq!(l.unpriced(), (1, 1), "one unpriced turn, one unpriced call");
+        assert!(
+            (st.spend - (price + call_price)).abs() < 1e-12,
+            "one priced turn plus one priced call: {}",
+            st.spend
+        );
+        assert_eq!(l.model_calls.len(), 2);
+        assert_eq!(l.model_calls[0].model, "m");
+        assert!(
+            l.model_calls[0].cost.is_some_and(|c| (c - call_price).abs() < 1e-12),
+            "{:?}",
+            l.model_calls[0].cost
+        );
+        assert_eq!(l.model_calls[1].model, "nobody:m");
+        assert_eq!(l.model_calls[1].cost, None);
         let page = st.usage_page();
         assert!(page.contains("2 turns"), "{page}");
         assert!(page.contains("interrupted 1 time"), "{page}");
         assert!(page.contains("1 turn unpriced (on other:m)"), "{page}");
+        // The unpriced call is said, naming the key it could not be
+        // priced on — never a $0.00 standing in for what is not known.
+        assert!(
+            page.contains("1 model call unpriced (on nobody:m)"),
+            "{page}"
+        );
     }
 
     fn seeded(kinds: Vec<RecordKind>) -> UiState {
@@ -2398,6 +2802,33 @@ mod tests {
         let mut st = UiState::new("m".into(), "s".into(), "/".into());
         st.seed(&s.branch());
         st
+    }
+
+    #[test]
+    fn plugin_api_requests_count_and_the_operators_own_do_not() {
+        let st = seeded(vec![
+            RecordKind::ApiRequest {
+                consumer: "plugin:browser".into(),
+                service: "api.example.com".into(),
+            },
+            RecordKind::ApiRequest {
+                consumer: "reader".into(),
+                service: "r.jina.ai".into(),
+            },
+            RecordKind::ApiRequest {
+                consumer: "plugin:browser".into(),
+                service: "api.example.com".into(),
+            },
+        ]);
+        assert_eq!(
+            st.ledger.plugin_requests, 2,
+            "the plugin-tagged ones, and only them"
+        );
+        // A session of nothing but plugin calls still says what it cannot
+        // price — never a $0.00, never a silent omission.
+        let page = st.usage_page();
+        assert!(page.contains("2 plugin requests"), "{page}");
+        assert!(page.contains("unpriced"), "{page}");
     }
 
     /// A tool line on screen belongs to its **result**, not to the message
@@ -2930,7 +3361,7 @@ mod tests {
     ///
     /// A script-originated call is exactly that: the harness's own work
     /// inside another call — the vault channel's resolved `mneme_rpc`, a
-    /// skill script's `eidolon::*` — and no record describes it, because
+    /// tool script's `eidolon::*` — and no record describes it, because
     /// only an operator's dispatch writes a call record. Its result still
     /// arrives, and pairing it by order would write it under the `vv` line
     /// that asked for it *and* leave that line's own result with no open

@@ -232,6 +232,7 @@ async fn a_session_that_is_not_answering_is_queued_rather_than_failed() {
             let peer = eidolon_swarm::presence::Peer {
                 meta: b.meta(),
                 dir: b.dir().to_path_buf(),
+                questions: Vec::new(),
             };
             let report = a.deliver(&peer, &a.envelope("are you there?")).unwrap();
             assert_eq!(bid, peer.meta.id);

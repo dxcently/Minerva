@@ -210,6 +210,23 @@ pub struct Buffer {
     /// Whether that run began by replacing a selection, which is how `.`
     /// knows to replace rather than type.
     run_replaced: bool,
+    /// The width the composer last wrapped this buffer at, when it wraps
+    /// it at all. Draw records it — the prompt's render pass, the one
+    /// place that knows — so vertical motion walks the rows the operator
+    /// sees rather than a second opinion about them. `None` where nothing
+    /// wraps: a one-line field is drawn one row per hard line.
+    wrap_width: Option<usize>,
+    /// The column the last vertical motion wanted, held across rows the
+    /// way vim holds it: through a row too short to honour it, and back
+    /// out the other side. Anything that moves the caret some other way
+    /// drops it.
+    desired_col: Option<usize>,
+    /// The half-written message a recall swept aside, handed back when
+    /// the walk passes the newest entry. A recall that destroyed the
+    /// draft outright — replaced whole, no undo step, and `clear()` past
+    /// the end — is why an accidental `up` used to cost the operator a
+    /// long message.
+    draft: Option<String>,
 }
 
 impl Default for Buffer {
@@ -228,6 +245,9 @@ impl Default for Buffer {
             run: String::new(),
             last_insert: String::new(),
             run_replaced: false,
+            wrap_width: None,
+            desired_col: None,
+            draft: None,
         }
     }
 }
@@ -293,6 +313,7 @@ impl Buffer {
 
     /// Replace the char range `a..b` with `s`, leaving the range on it.
     fn splice(&mut self, a: usize, b: usize, s: &str) {
+        self.desired_col = None;
         let (ba, bb) = (self.byte_of(a), self.byte_of(b));
         self.text.replace_range(ba..bb, s);
         let grown = s.chars().count();
@@ -372,6 +393,7 @@ impl Buffer {
     /// fiddly part is keeping the anchor on the right side of the char it
     /// was covering when the head crosses it.
     fn put_cursor(&mut self, pos: usize) {
+        self.desired_col = None;
         let n = self.len();
         let r = self.range;
         let anchor = if r.head >= r.anchor && pos < r.anchor {
@@ -393,6 +415,7 @@ impl Buffer {
 
     /// A motion that lands on a single position: reselect it, or extend.
     fn set_cursor(&mut self, pos: usize) {
+        self.desired_col = None;
         if self.mode.kind == Kind::Select {
             self.put_cursor(pos);
         } else {
@@ -404,6 +427,7 @@ impl Buffer {
 
     /// A motion that sweeps a range: take it whole, or extend to its head.
     fn set_range(&mut self, r: Range) {
+        self.desired_col = None;
         if self.mode.kind == Kind::Select {
             self.put_cursor(r.cursor());
         } else {
@@ -423,24 +447,93 @@ impl Buffer {
         self.set_cursor((c + 1).min(self.len()));
     }
 
+    /// One drawn row up. On a buffer the composer wraps — the prompt,
+    /// whose width the render pass records on the buffer — a row is a
+    /// *visual* row, and the caret keeps its column across them the way
+    /// vim walks: through a row too short to honour it, and back out the
+    /// other side. A hard newline is a boundary, not the unit. Where no
+    /// width is known the buffer is drawn one row per hard line, and the
+    /// same walk runs over those. The list dialogs match these commands
+    /// before the prompt's buffer is consulted, so their rows are their
+    /// rows and were never this walk's business.
     pub fn move_line_up(&mut self) {
-        let col = self.column();
-        let ls = self.line_start(self.range.cursor());
-        if ls == 0 {
-            return self.set_cursor(0);
+        match self.wrap_width {
+            Some(w) => self.move_visual_up(w),
+            None => {
+                let col = self.column();
+                let ls = self.line_start(self.range.cursor());
+                if ls == 0 {
+                    return self.set_cursor(0);
+                }
+                let prev = self.line_start(ls - 1);
+                self.set_cursor((prev + col).min(ls - 1));
+            }
         }
-        let prev = self.line_start(ls - 1);
-        self.set_cursor((prev + col).min(ls - 1));
     }
 
     pub fn move_line_down(&mut self) {
-        let col = self.column();
-        let le = self.line_end(self.range.cursor());
-        if le >= self.len() {
-            return self.set_cursor(self.len());
+        match self.wrap_width {
+            Some(w) => self.move_visual_down(w),
+            None => {
+                let col = self.column();
+                let le = self.line_end(self.range.cursor());
+                if le >= self.len() {
+                    return self.set_cursor(self.len());
+                }
+                let next_end = self.line_end(le + 1);
+                self.set_cursor((le + 1 + col).min(next_end));
+            }
         }
-        let next_end = self.line_end(le + 1);
-        self.set_cursor((le + 1 + col).min(next_end));
+    }
+
+    fn move_visual_up(&mut self, width: usize) {
+        let (row, col, ls, le) = self.visual_rc(width);
+        let want = self.desired_col.unwrap_or(col);
+        let (ls_target, row_target, len_target) = if row > 0 {
+            (ls, row - 1, le - ls)
+        } else if ls == 0 {
+            // The first drawn row of the buffer: the walk's top. The caret
+            // stays where its column put it.
+            return;
+        } else {
+            let pls = self.line_start(ls - 1);
+            (pls, (ls - 1 - pls) / width, ls - 1 - pls)
+        };
+        self.set_cursor(ls_target + visual_offset(row_target, want, len_target, width));
+        self.desired_col = Some(want);
+    }
+
+    fn move_visual_down(&mut self, width: usize) {
+        let (row, col, ls, le) = self.visual_rc(width);
+        let want = self.desired_col.unwrap_or(col);
+        if le >= self.len() && (row + 1) * width > le - ls {
+            // The last drawn row of the buffer: the walk's bottom.
+            return;
+        }
+        let (ls_target, row_target, len_target) = if (row + 1) * width <= le - ls {
+            (ls, row + 1, le - ls)
+        } else {
+            let nls = le + 1;
+            (nls, 0, self.line_end(nls) - nls)
+        };
+        self.set_cursor(ls_target + visual_offset(row_target, want, len_target, width));
+        self.desired_col = Some(want);
+    }
+
+    /// The caret's row, column and hard-line bounds, in the rows the
+    /// composer draws: `width`-char rows inside each hard line, the
+    /// arithmetic of [`crate::render::cursor_rc`], which paints the caret
+    /// by it — so motion and paint cannot disagree about what a row is.
+    fn visual_rc(&self, width: usize) -> (usize, usize, usize, usize) {
+        let c = self.range.cursor();
+        let ls = self.line_start(c);
+        let n = c - ls;
+        (n / width, n % width, ls, self.line_end(c))
+    }
+
+    /// The width the composer's last draw wrapped this buffer at.
+    pub fn set_wrap_width(&mut self, width: usize) {
+        self.wrap_width = Some(width.max(1));
     }
 
     pub fn move_next_word_start(&mut self, long: bool) {
@@ -1050,6 +1143,8 @@ impl Buffer {
     }
 
     pub fn clear(&mut self) {
+        self.desired_col = None;
+        self.draft = None;
         self.text.clear();
         self.range = Range::default();
         self.inserting = false;
@@ -1059,6 +1154,8 @@ impl Buffer {
 
     /// Submit: hand back the text, remember it, and leave an empty buffer.
     pub fn take(&mut self) -> String {
+        self.desired_col = None;
+        self.draft = None; // what was sent supersedes any draft in hiding
         let t = std::mem::take(&mut self.text);
         self.range = Range::default();
         self.undo.clear();
@@ -1077,6 +1174,12 @@ impl Buffer {
         if self.history.is_empty() {
             return;
         }
+        // Leaving a buffer that is not a recalled entry — a draft — is
+        // what a recall must not destroy: the draft goes into hiding and
+        // comes back when the walk runs past the newest entry.
+        if self.history_at.is_none() {
+            self.draft = Some(self.text.clone());
+        }
         let at = match self.history_at {
             None => self.history.len() - 1,
             Some(0) => 0,
@@ -1090,17 +1193,28 @@ impl Buffer {
         let Some(i) = self.history_at else { return };
         if i + 1 >= self.history.len() {
             self.history_at = None;
-            self.clear();
+            // The walk has run past the newest entry: what the operator
+            // was typing when it started comes back, readline's way.
+            match self.draft.take() {
+                Some(d) => self.set(d),
+                None => self.clear(),
+            }
         } else {
             self.history_at = Some(i + 1);
             self.set(self.history[i + 1].clone());
         }
     }
 
+    /// Replace the whole buffer for a recall. `snapshot` makes the
+    /// replacement one undo step — a recall must be as reversible as
+    /// everything else — and the caret lands past the last char, where
+    /// typing continues.
     fn set(&mut self, t: String) {
+        self.desired_col = None;
+        self.inserting = false;
+        self.snapshot();
         self.text = t;
         self.range = Range::point(self.len());
-        self.inserting = false;
         self.line_selected = false;
         self.run.clear();
         self.normalize();
@@ -1111,6 +1225,7 @@ impl Buffer {
     /// [`crate::editor`] — and nothing else should want it: a buffer is
     /// edited in place, or it is a different buffer.
     pub fn set_text(&mut self, s: &str) {
+        self.desired_col = None;
         self.inserting = false;
         self.snapshot();
         self.text = s.to_string();
@@ -1774,6 +1889,21 @@ fn reached(target: Target, prev: char, next: char, long: bool) -> bool {
     }
 }
 
+/// The char offset of `row` at wanted column `want` inside a hard line of
+/// `len` chars wrapped at `width` chars: the row's own start plus the
+/// column, held to the row's extent. A row that is not the line's last
+/// holds exactly `width` chars, so the column stays under it; the last
+/// reachable row reaches the newline position, where an insert sits. The
+/// reachable rows are the arithmetic of `cursor_rc` — an offset `n` of a
+/// line paints at row `n / width` — so a caret on the newline of a line
+/// whose length is an exact multiple of the width sits on the row past
+/// the last drawn one, and this walk puts it back there too.
+fn visual_offset(row: usize, want: usize, len: usize, width: usize) -> usize {
+    let start = row * width;
+    let end = ((row + 1) * width).min(len);
+    start + want.min(end - start)
+}
+
 fn word_move(c: &[char], range: Range, target: Target, long: bool) -> Range {
     let n = c.len();
     let back = target == Target::PrevStart;
@@ -2168,6 +2298,73 @@ mod tests {
         assert_eq!(b.range.cursor(), 2);
     }
 
+    /// The prompt's vertical motion walks the rows the composer draws:
+    /// `width`-char rows inside each hard line, the arithmetic of the
+    /// renderer's `cursor_rc`. Twenty chars at width eight draw three rows
+    /// — eight, eight, four — and the walk moves between them by visual
+    /// row, not by hard line.
+    #[test]
+    fn vertical_motion_walks_the_wrapped_rows() {
+        let mut b = buf("0123456789abcdefghij");
+        b.set_wrap_width(8);
+        b.goto_buffer_end();
+        assert_eq!(b.range.cursor(), 19); // row 2, col 3
+        b.move_line_up();
+        assert_eq!(b.range.cursor(), 11, "up one drawn row, column kept"); // row 1
+        b.move_line_up();
+        assert_eq!(b.range.cursor(), 3, "and again onto the first row"); // row 0
+        b.move_line_up();
+        assert_eq!(b.range.cursor(), 3, "the first drawn row is the walk's top");
+        b.move_line_down();
+        assert_eq!(b.range.cursor(), 11, "and back down, column still kept");
+    }
+
+    /// The caret's column is remembered across rows the way vim holds it:
+    /// a row too short to honour it clamps the caret for as long as the
+    /// caret is there, and the next walk out restores the column wanted.
+    /// Recomputing from wherever the clamp left the caret would walk a
+    /// staircase — three downs and the column is gone for good.
+    #[test]
+    fn the_wanted_column_survives_a_row_too_short_to_honour_it() {
+        let mut b = buf("0123456789abcdefghij");
+        b.set_wrap_width(8);
+        b.set_cursor(13); // row 1, col 5
+        b.move_line_down();
+        assert_eq!(b.range.cursor(), 20, "the last row is four wide; the caret clamps");
+        b.move_line_up();
+        assert_eq!(b.range.cursor(), 13, "and the column wanted comes back, not the clamp");
+    }
+
+    /// A hard newline is a boundary the visual walk crosses: up from the
+    /// first drawn row lands on the last drawn row of the line above, at
+    /// the remembered column, and down comes back the same road.
+    #[test]
+    fn the_visual_walk_crosses_a_hard_newline_by_rows() {
+        let mut b = buf("ab\ncdefghij");
+        b.set_wrap_width(4);
+        b.set_cursor(9); // second hard line, drawn row 1, col 2
+        b.move_line_up();
+        assert_eq!(b.range.cursor(), 5, "the row above within the line, column kept");
+        b.move_line_up();
+        assert_eq!(b.range.cursor(), 2, "the line above's last row, at the newline");
+        b.move_line_down();
+        assert_eq!(b.range.cursor(), 5, "and back onto the rows below");
+        b.move_line_down();
+        assert_eq!(b.range.cursor(), 9);
+    }
+
+    /// Where nothing records a wrap width — a one-line field, a buffer no
+    /// frame has drawn — the walk is the hard-line motion it always was.
+    #[test]
+    fn without_a_wrap_width_the_motions_still_walk_hard_lines() {
+        let mut b = buf("one\ntwo");
+        b.goto_buffer_end();
+        b.move_line_up();
+        assert_eq!(b.range.cursor(), 2, "the column kept, clamped to the line above");
+        b.move_line_down();
+        assert_eq!(b.range.cursor(), 6);
+    }
+
     #[test]
     fn x_takes_the_line_then_grows_by_one_more() {
         let mut b = buf("one\ntwo\nthree");
@@ -2227,6 +2424,32 @@ mod tests {
         assert_eq!(b.text(), "acbd");
         b.undo();
         assert_eq!(b.text(), "abcd");
+    }
+
+    /// A recall must not be able to destroy a draft: the draft is stashed
+    /// when a recall replaces it, handed back when the walk runs past the
+    /// newest entry, and the replacement is one undo step — `u` alone puts
+    /// the draft back. A submit supersedes the draft for good.
+    #[test]
+    fn history_stashes_a_draft_and_hands_it_back() {
+        let mut b = typing("the draft so far");
+        b.history.push("sent".into());
+        b.history_prev();
+        assert_eq!(b.text(), "sent", "the recall replaced the buffer");
+        b.undo();
+        assert_eq!(b.text(), "the draft so far", "`u` alone restores the draft");
+        b.redo();
+        assert_eq!(b.text(), "sent");
+        b.history_next();
+        assert_eq!(
+            b.text(),
+            "the draft so far",
+            "past the newest entry, the draft is handed back"
+        );
+        b.history_prev();
+        b.take();
+        b.history_next();
+        assert_eq!(b.text(), "", "a submit supersedes the draft; none comes back");
     }
 
     #[test]
