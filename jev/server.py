@@ -13,31 +13,26 @@ Both answer in ONE forward pass -- no token-by-token decode -- which is why
 they are fast on this bandwidth-bound box even though it crawls on 27B dense
 models.
 
-THE CONTRACT: this used to fake an OpenAI chat surface so Open WebUI could
-list a "model" that was really a chooser. The decision on record
-(docs/Decisions.md, "jevlike and openjev are tools, not chat models") is that
-a chooser in a chat model list "cannot be used anyway" -- so this is now an
-eidolon extension service instead: `GET /health` (process-up, not
-model-loaded -- see the comment there) and `POST /call` with
-`{"method": "choose"|"entail", "args": {...}}`, gated on a bearer token the
-extension host mints and hands this process in the environment, never on the
-command line and never in a log. Full contract:
-eidolon/docs/extensions.md. The Rune side is `extensions/jev/tools/choose.rn`
-and `tools/entail.rn`, which register as `jev_choose` and `jev_entail`.
+THE CONTRACT: `GET /health` (process-up, not model-loaded -- see the comment
+there) and `POST /call` with `{"method": "choose"|"entail", "args": {...}}`,
+gated on a bearer token read from EIDOLON_SERVICE_TOKEN, on the port in
+EIDOLON_SERVICE_PORT; neither has a default, and the process dies on import
+without them. (This used to fake an OpenAI chat surface for Open WebUI; the
+decision on record, docs/Decisions.md, "jevlike and openjev are tools, not chat
+models", retired that.)
 
-Run only through the extension host -- `eidolon ext start jev`, or
-`eidolon ext enable jev` once and every later session adopts the same
-process (see the "Lifetime: one service per machine" section of the doc
-above). It reads EIDOLON_SERVICE_PORT and EIDOLON_SERVICE_TOKEN from the
-environment the host starts it with; there is no other way in. For a manual
-smoke test set both by hand:
+The eidolon side is the `jev` plugin (eidolon-plugins/jev; tools/choose.rn and
+tools/entail.rn register jev_choose and jev_entail). It expects port 8091 and
+the token file ~/.config/eidolon/jev.token; the operator starts this by hand
+(see the plugin README's Install step 3). Graphs and automation live in that
+plugin (Rune interpreter); the old Python automation.* methods are retired.
+Manual smoke:
 
-    EIDOLON_SERVICE_PORT=8090 EIDOLON_SERVICE_TOKEN=dev python jev/server.py
+    EIDOLON_SERVICE_PORT=8091 EIDOLON_SERVICE_TOKEN=dev python jev/server.py
 """
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import hmac
 import json
 import os
@@ -51,10 +46,6 @@ from fastapi.responses import JSONResponse
 import uvicorn
 
 import _paths
-import automation.graph as automation_graph
-import automation.run as automation_run
-import automation.systemone as automation_systemone
-import automation.warrant as automation_warrant
 
 # --- jevlike -----------------------------------------------------------------
 # Vendored at jev/jevlike (the three modules imported below) with its 169 KB
@@ -71,29 +62,6 @@ JEVLIKE_CKPT = Path(os.getenv("JEVLIKE_CKPT", str(_JEV_DIR / "runs" / "synthetic
 # to the revision those weights were checked against.
 OPENJEV_DIR = Path(os.getenv("OPENJEV_DIR", str(_JEV_DIR.parent / "models" / "openjev")))
 OPENJEV_CODE_DIR = _JEV_DIR / "openjev"
-
-# --- automation (docs/design/automation.md) -----------------------------------
-# Where `automation.start` resolves a graph id (`{"graph": "wiki-hop"}`) to a
-# file -- `extensions/jev/graphs/<id>.json`, the same tree `run.rn` and the
-# two worked-example graphs already live under. `.parent.parent` from this
-# file (`jev/server.py`) is the repo root, matching `extensions/jev/graphs/`
-# sitting beside `jev/` rather than under it.
-GRAPHS_DIR = Path(
-    os.getenv(
-        "JEV_GRAPHS_DIR", str(Path(__file__).resolve().parent.parent / "extensions" / "jev" / "graphs")
-    )
-)
-
-# jevlike's own fixed windows (`ByteCollator`'s `context_tokens`/
-# `option_tokens`) -- confirmed against `runs/synthetic.pt` directly
-# (`torch.load(..., weights_only=False)["config"]`), not read from the
-# checkpoint at request time: that would force `_jevlike()`'s real load (a
-# real, if small, forward-pass-capable model) just to validate a graph's
-# menu/label lengths, which `graph.py`'s lint needs to do before any run
-# starts, `choose` calls included. Overridable for a checkpoint trained with
-# different windows.
-CONTEXT_TOKENS = int(os.getenv("JEV_CONTEXT_TOKENS", "192"))
-OPTION_TOKENS = int(os.getenv("JEV_OPTION_TOKENS", "32"))
 
 # --- the extension contract ---------------------------------------------------
 # Minted by the extension host and handed to this process in the environment
@@ -301,7 +269,7 @@ DECISIONS_LOG = Path(
 
 # `_O_BINARY`/`_lock_file`/`_unlock_file` used to be defined here, an
 # import-time platform branch (`msvcrt` on Windows, `fcntl` on POSIX) that
-# `automation/decisions.py`'s own per-graph log now needs too. Rather than
+# the retired `automation/decisions.py` log also needed. Rather than
 # a second copy of the same platform branch, both modules share one
 # implementation in `_paths.py` -- see its docstring for the full reasoning
 # (in particular the Windows measurement behind why this is load-bearing:
@@ -392,270 +360,9 @@ def _entail(args: dict) -> dict:
     }
 
 
-_ckpt_id_cache: dict[str, str] = {}
-
-
-def _ckpt_id() -> str | None:
-    """A short, content-derived id for whichever checkpoint `_jevlike()`
-    would load, for a decision row's `ckpt` field (section 5: which model
-    version made this pick). Hashes the file's bytes, not its path or
-    mtime, so a checkpoint retrained in place -- same path, new weights --
-    still gets a new id; `None` when the file is not there yet (`_jevlike`
-    already raises a clear, named error for that case on the actual
-    `choose` call this id would be attached to, so this does not duplicate
-    it -- a run can still *start*, and fail at its first real choose, same
-    as a bare `jev_choose` would). Cached after the first successful read:
-    the file does not change under a running process."""
-    if "id" in _ckpt_id_cache:
-        return _ckpt_id_cache["id"]
-    if not JEVLIKE_CKPT.is_file():
-        return None
-    digest = hashlib.sha256(JEVLIKE_CKPT.read_bytes()).hexdigest()[:12]
-    _ckpt_id_cache["id"] = digest
-    return digest
-
-
-# --- automation.* (docs/design/automation.md s2's service-driver contract) ----
-# `_chooser`/`_entailer` are lazy closures, not `_jevlike()`/`_openjev()`
-# called eagerly here: each is only ever invoked from inside a run that
-# actually reaches a choose phase, or an `entails`/`contradicts` guard past
-# whatever deterministic prefix precedes it (automation/guards.py's
-# `first_passing`), so a graph with no NLI guard at all -- and a graph whose
-# NLI guards a given run never reaches -- never pays openjev's ~9 GB load.
-# This is the same lazy shape `_jevlike`/`_openjev` already give `/health`:
-# passing the closure costs nothing; only calling it loads anything. Named
-# functions rather than the inline lambdas `_automation_start` used to carry
-# alone, because every one of the five `automation.*` methods below now
-# needs the same two: `step`/`status`/`answer`/`stop` pass them through to
-# `automation_run`'s own `_lookup` so a run this process has forgotten but a
-# previous one parked can be reconstructed rather than reported lost (see
-# automation/run.py's module docstring) -- a `Run` that is still in `_RUNS`
-# never touches either, so this costs nothing on the common path either.
-# `JEV_CHOOSER` (automation/systemone.py) swaps jevlike for a System One
-# model over HTTP; a bad spec stops the service here rather than at a run.
-_SYSTEMONE = automation_systemone.from_env()
-
-
-def _chooser(context: str, labels: list[str]) -> list[float]:
-    if _SYSTEMONE is not None:
-        return _SYSTEMONE(context, labels)
-    return list(_jevlike()(context, labels))
-
-
-def _entailer(premise: str, hypotheses: list) -> list:
-    return _openjev()(premise, hypotheses)
-
-
-def _automation_lint(args: dict) -> dict:
-    """automation.lint: `jev/automation/graph.py`'s own validator + its
-    five lints (including `_lint_always_spin`, the rule that rejects a
-    transition that can only spin), over the wire -- so the graph editor's
-    LINT button has something to call instead of hitting `unknown method`.
-    S28 (docs/Tasklist.md): the linter already existed; this is wiring,
-    not a second implementation -- "a graph validated by one implementation
-    and executed by another is the drift this project has spent a day on"
-    (docs/Decisions.md).
-
-    Needs neither `_chooser` nor `_entailer`: shape validation and the
-    five lints are pure functions of the document (`graph.py`'s own
-    docstring -- schema validation, then `_lint_targets`/`_lint_choose`/
-    `_lint_always_spin`/etc., none of which ever calls a guard), so this
-    never loads jevlike or openjev, unlike every other `automation.*`
-    method below.
-
-    `graph` is whatever `args["graph"]` holds, hand off unchanged to
-    `graph_mod.load_graph` (`automation/graph.py`), which already accepts
-    three shapes: a `dict` (an inline graph object); a `str` whose first
-    non-whitespace character is `{`/`[` (parsed as the document's own
-    JSON text); or a path string. The middle case is exactly what
-    `crates/web/src/pages/jev.rs`'s `JevHost::lint` sends over HTTP --
-    checked directly against that file rather than assumed: its
-    `args = json!({"graph": json})` has `json: &str` the `<textarea>`'s
-    raw bytes (see that module's own doc, "nothing in this module parses
-    a graph... and that read never round-trips through a serialiser"), so
-    `serde_json::json!` serialises the `&str` as a JSON *string*, never a
-    nested object -- `graph` therefore arrives here holding the document's
-    literal text, not something already parsed. No id-under-graphs_dir
-    case (unlike `automation.start`'s `graph_ref`, via `run.load_graph_ref`):
-    the editor lints whatever text is in the textarea, saved or not, which
-    an id lookup cannot name, and nothing here needs it either.
-
-    Returns `{errors, option_tokens, context_tokens}` -- `errors` empty for
-    a clean graph, everything `GraphError.errors` collected otherwise, each
-    already naming its own JSON path; `option_tokens`/`context_tokens` are
-    this service's loaded windows (`OPTION_TOKENS`/`CONTEXT_TOKENS` above),
-    the same two numbers `graph.py`'s own menu-label lint measures against
-    and `jev.rs`'s `Lint::windows()` draws as rulers -- checked directly
-    against `crates/cli/src/serve_host.rs::parse_lint_answer`, which
-    requires exactly this shape (both windows present as numbers, `errors`
-    present as an array) or falls back to `Lint::Unavailable` naming what
-    it got instead."""
-    graph = args.get("graph")
-    if not graph:
-        raise ValueError("automation.lint needs 'graph' (a graph document: an inline object or its JSON text)")
-    try:
-        automation_graph.load_graph(graph, option_tokens=OPTION_TOKENS, context_tokens=CONTEXT_TOKENS)
-        errors: list[str] = []
-    except automation_graph.GraphError as e:
-        errors = e.errors
-    return {"errors": errors, "option_tokens": OPTION_TOKENS, "context_tokens": CONTEXT_TOKENS}
-
-
-def _automation_start(args: dict) -> dict:
-    graph = args.get("graph")
-    if not graph:
-        raise ValueError("automation.start needs 'graph' (a graph id under extensions/jev/graphs, or an inline graph object)")
-    run_input = args.get("input") or {}
-    return automation_run.start(
-        graph,
-        run_input,
-        graphs_dir=GRAPHS_DIR,
-        chooser=_chooser,
-        entail=_entailer,
-        option_tokens=OPTION_TOKENS,
-        context_tokens=CONTEXT_TOKENS,
-        ckpt_id=None if _SYSTEMONE is not None else _ckpt_id(),
-        warrant=args.get("warrant"),
-    )
-
-
-def _automation_step(args: dict) -> dict:
-    run_id = args.get("run")
-    request_id = args.get("request")
-    if not run_id or not request_id:
-        raise ValueError("automation.step needs 'run' and 'request' (the pending request id automation.start or the last automation.step returned)")
-    return automation_run.step(
-        run_id, request_id, args.get("result") or {},
-        graphs_dir=GRAPHS_DIR, chooser=_chooser, entail=_entailer,
-        option_tokens=OPTION_TOKENS, context_tokens=CONTEXT_TOKENS,
-    )
-
-
-def _automation_status(args: dict) -> dict:
-    run_id = args.get("run")
-    if not run_id:
-        raise ValueError("automation.status needs 'run'")
-    return automation_run.status(
-        run_id, graphs_dir=GRAPHS_DIR, chooser=_chooser, entail=_entailer,
-        option_tokens=OPTION_TOKENS, context_tokens=CONTEXT_TOKENS,
-    )
-
-
-def _automation_answer(args: dict) -> dict:
-    """`automation.answer`: resolves whatever escalation is currently
-    parked on `run` -- see automation/run.py's `Run.answer` for the pick/
-    stop validation rules (an out-of-menu pick is a `ValueError`, surfaced
-    below as the same `{"ok": False, "error": ...}` shape every other
-    method failure already takes, not a partially-applied answer). `run`
-    need not still be in this process's own memory: `automation_run.answer`
-    reconstructs an escalate-suspended run from its persisted snapshot when
-    it is not, transparently to everything below this line. `request`, when
-    the caller gives one, is the escalation payload's own `request` id --
-    passed straight through to `automation_run.answer`, which refuses a
-    stale id (one naming a question this run is no longer parked on)
-    without disturbing the live park. Omitted, this call is exactly what it
-    always was."""
-    run_id = args.get("run")
-    if not run_id:
-        raise ValueError("automation.answer needs 'run'")
-    if "pick" not in args and "stop" not in args:
-        raise ValueError("automation.answer needs one of 'pick' (an option index or label) or 'stop' (a reason)")
-    return automation_run.answer(
-        run_id, pick=args.get("pick"), stop=args.get("stop"), by=args.get("by"), note=args.get("note"),
-        warrant=args.get("warrant"), request=args.get("request"),
-        graphs_dir=GRAPHS_DIR, chooser=_chooser, entail=_entailer,
-        option_tokens=OPTION_TOKENS, context_tokens=CONTEXT_TOKENS,
-    )
-
-
-def _automation_order(args: dict) -> dict:
-    """`automation.order`: queues a standing order on an existing run, for
-    the next chooser call to fold into its context -- see `Run.order` in
-    automation/run.py for the whole contract (the 2000-character text limit,
-    the empty text that clears, the required `id` an idempotent retry
-    repeats, superseding a prior pending order, the finished-run refusal and
-    the separate audit log). Nothing about a live park, warrant or pending
-    request is touched by it, so this is safe to call from an operator
-    looking at a run that is mid-`act` or parked; `run` need not still be in
-    this process's memory, since `automation_run.order` reconstructs an
-    escalate-suspended run from its persisted snapshot exactly as
-    `automation.answer`/`.status` already do. `text` must actually be
-    present: a *missing* `text` is a caller error (it named no order at
-    all), while `text: ""` is the documented clear and is passed through as
-    such."""
-    run_id = args.get("run")
-    if not run_id:
-        raise ValueError("automation.order needs 'run' (the id of a run that already exists)")
-    if "text" not in args:
-        raise ValueError(
-            "automation.order needs 'text' (a string of at most 2000 characters; the empty string clears the "
-            "standing order)"
-        )
-    return automation_run.order(
-        run_id, args.get("text"), args.get("id"),
-        graphs_dir=GRAPHS_DIR, chooser=_chooser, entail=_entailer,
-        option_tokens=OPTION_TOKENS, context_tokens=CONTEXT_TOKENS,
-    )
-
-
-def _automation_stop(args: dict) -> dict:
-    run_id = args.get("run")
-    reason = args.get("reason")
-    if not run_id or not reason:
-        raise ValueError("automation.stop needs 'run' and 'reason'")
-    return automation_run.stop_run(
-        run_id, reason,
-        graphs_dir=GRAPHS_DIR, chooser=_chooser, entail=_entailer,
-        option_tokens=OPTION_TOKENS, context_tokens=CONTEXT_TOKENS,
-    )
-
-
-def _automation_runs(args: dict) -> dict:
-    return automation_run.list_runs()
-
-
-def _automation_warrant(args: dict) -> dict:
-    """automation.warrant: the graph's own canonical block
-    (`meta.jev.warrant`, docs/design/unattended.md section 2) -- what
-    `extensions/jev/tools/warrant.rn`'s `jev_warrant` hands back verbatim,
-    for a caller to pass straight in as `jev_run`'s or `jev_resume`'s own
-    `warrant` argument. Loads the graph exactly as `automation.start` does
-    (an id under `extensions/jev/graphs`, or an inline graph object) but
-    never starts a run and never touches `_chooser`/`_entailer` -- a pure
-    function of the document, the same shape `automation.lint` already is,
-    for the same reason (see that function's own docstring).
-
-    A graph with no `meta.jev.warrant` is not an error in the schema/lint
-    sense -- it is simply a graph that runs attended -- but this method has
-    nothing to answer with for one, so it refuses with `ValueError`, the
-    same `{"ok": False, "error": ...}` shape every other method failure
-    already takes, naming the graph and saying plainly what running it
-    without a warrant means."""
-    graph_ref = args.get("graph")
-    if not graph_ref:
-        raise ValueError(
-            "automation.warrant needs 'graph' (a graph id under extensions/jev/graphs, or an inline graph object)"
-        )
-    graph = automation_run.load_graph_ref(graph_ref, GRAPHS_DIR, OPTION_TOKENS, CONTEXT_TOKENS)
-    block = automation_warrant.canonical(graph)
-    if block is None:
-        ref = automation_warrant._graph_ref(graph)
-        raise ValueError(f"graph {ref} declares no warrant (meta.jev.warrant); it runs attended")
-    return {"warrant": block, "id": automation_warrant.warrant_id(block)}
-
-
 METHODS = {
     "choose": _choose,
     "entail": _entail,
-    "automation.lint": _automation_lint,
-    "automation.start": _automation_start,
-    "automation.step": _automation_step,
-    "automation.status": _automation_status,
-    "automation.answer": _automation_answer,
-    "automation.order": _automation_order,
-    "automation.stop": _automation_stop,
-    "automation.runs": _automation_runs,
-    "automation.warrant": _automation_warrant,
 }
 
 
