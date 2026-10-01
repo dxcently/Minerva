@@ -225,7 +225,7 @@ switch ($Command.ToLower()) {
     'setup' {
         # Binaries (upstream llama.cpp, win-vulkan-x64) and, when asked,
         # weights. Nothing about eidolon: it lives in WSL now, and its own
-        # setup (extensions_dir, providers) is done there.
+        # setup (plugins, providers) is done there.
         Banner
         & $Setup -Tag $Tag -Force:$Force
     }

@@ -9,7 +9,7 @@
 #   AGENT_MODEL  brain (default ollama:glm-5.3)
 #   JEV_CKPT     chooser checkpoint, repo-relative (default jev/runs/jev-base-v0.pt)
 #   JEV_PYTHON   WSL python with torch+fastapi+uvicorn (default /tmp/venvtest/bin/python)
-#   JEV_PORT     loopback port for the chooser (default 8090)
+#   JEV_PORT     loopback port for the chooser (default 8092; 8090 is the browser plugin's service, 8091 the standing jev service)
 #
 # The jev arm starts jev/server.py in WSL for this run only, with a fresh token
 # and its decision log at logs/botforge/RUN_NAME.decisions.jsonl, and stops it
@@ -25,7 +25,7 @@ distro=${WSL_DISTRO:-Ubuntu}
 export AGENT_MODEL=${AGENT_MODEL:-ollama:glm-5.3}
 ckpt=${JEV_CKPT:-jev/runs/jev-base-v0.pt}
 py=${JEV_PYTHON:-/tmp/venvtest/bin/python}
-port=${JEV_PORT:-8090}
+port=${JEV_PORT:-8092}
 task=$repo/logs/agents/$run.task.src.txt
 mkdir -p "$repo/logs/agents" "$repo/logs/botforge"
 [[ -e $task ]] && { echo "run name exists; choose a unique one" >&2; exit 2; }

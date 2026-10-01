@@ -1,5 +1,0 @@
-# Only for running test_server.py -- never installed to serve the extension
-# itself (see requirements.txt for that). Starlette's TestClient on this
-# fastapi/starlette pin needs httpx2 (its successor to the classic httpx
-# package) to exist; without it TestClient raises at import, not at use.
-httpx2==2.13.0
