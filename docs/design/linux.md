@@ -1,5 +1,7 @@
 # Linux, as a flake
 
+> **2026-10-01:** `extensions/` was retired; its successors are the plugins in `eidolon-plugins/` (see VENDORED.md). Paths under `extensions/` below are historical; tag `archive/extensions-2026-10-01` has them.
+
 Status: design (Tasklist A7), 2026-09-19. Nothing here is code, and this
 document creates no flake; it decides what someone else writes. The
 implementation specification is at the end, staged and ordered, with the

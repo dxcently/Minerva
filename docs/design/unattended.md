@@ -1,5 +1,7 @@
 # Unattended
 
+> **2026-10-01:** `extensions/` was retired; its successors are the plugins in `eidolon-plugins/` (see VENDORED.md). Paths under `extensions/` below are historical; tag `archive/extensions-2026-10-01` has them.
+
 What authorizes an unattended graph run, what it cannot authorize, what is
 recorded, and how an operator revokes or bounds it.
 

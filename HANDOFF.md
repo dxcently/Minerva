@@ -22,8 +22,8 @@ Written 2026-09-19. Everything below was measured on the day, not remembered.
 | piece | what it is | where |
 |---|---|---|
 | **Open WebUI** | the face — the chat UI the operator actually uses | `webui/`, runs on `:3000` |
-| **eidolon** | a Rust coding-agent harness, and the **sole extension host** | `eidolon/`, serves `:8085` |
-| **jev** | the tools sidecar — browser automation, graph-driven navigation | `jev/`, `extensions/` |
+| **eidolon** | a Rust coding-agent harness, with a plugin runtime (`eidolon-plugins/`) | `eidolon/`, serves `:8085` |
+| **jev** | the tools sidecar — browser automation, graph-driven navigation | `jev/`, `eidolon-plugins/jev/` |
 
 A local llama.cpp router serves models on `:8080`. Ollama is on `:11434`.
 
@@ -62,7 +62,7 @@ disagreed with a briefing by three.
 So:
 
 - **Claim a component before you edit it.** One agent per directory. `jev/`,
-  `extensions/browser/`, `extensions/jev/`, `eidolon/crates/<name>/`, `bin/`,
+  `eidolon-plugins/` (vendored: change upstream), `eidolon/crates/<name>/`, `bin/`,
   `docs/` are the natural units.
 - **Do not use a git worktree for `bonsai2/` work.** There is no repository.
   Work in place, or back files up by hash first.

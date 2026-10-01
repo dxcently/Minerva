@@ -1,5 +1,7 @@
 # Triage toolkit: a competitor agent on JEV, from a fresh Aeacus image to solved
 
+> **2026-10-01:** `extensions/` was retired; its successors are the plugins in `eidolon-plugins/` (see VENDORED.md). Paths under `extensions/` below are historical; tag `archive/extensions-2026-10-01` has them.
+
 **2026-09-25. Design only: no code, no downloads, no VM started.** Evidence labels follow `triage.md`:
 
 | Label | Meaning |

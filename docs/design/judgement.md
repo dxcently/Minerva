@@ -1,5 +1,7 @@
 # Judgement
 
+> **2026-10-01:** `extensions/` was retired; its successors are the plugins in `eidolon-plugins/` (see VENDORED.md). Paths under `extensions/` below are historical; tag `archive/extensions-2026-10-01` has them.
+
 What catches a decision that is well-formed, authorized, in-bounds,
 confidently made, and wrong.
 

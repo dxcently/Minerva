@@ -6185,3 +6185,7 @@ The four improvement reports held out every fifth fix and two forensics
 questions, and one cross-reference in the key (V39 pointing at V40) still
 leaked. For real scored iteration the whole key is used; rows from the v3
 template are tagged `template=jev-v3`, and V40 no longer counts as held out.
+
+## 2026-10-01 - Minerva runs upstream eidolon's plugins, and extensions/ is retired
+
+The operator chose upstream master with the plugin runtime over keeping the fork's extension host. eidolon `bab3813` and harnox `v0.3.12` are vendored (upstream head has since moved to `24d6bda`). Browser, subagent and jev are vendored from eidolon-plugins `3be1e2b` and installed and trusted in the WSL eidolon. `extensions/` was archived (tag, bundle and tarball in `Minerva-archive/extensions-2026-10-01`; the tag stays local) and then deleted. jev's Python service stays in `jev/`; its `automation.*` path and old-format graphs were retired, and the graphs live only in the jev plugin.

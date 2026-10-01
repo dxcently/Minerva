@@ -1,5 +1,7 @@
 # Host baseline — recorded before any change
 
+> **2026-10-01:** `extensions/` was retired; its successors are the plugins in `eidolon-plugins/` (see VENDORED.md). Paths under `extensions/` below are historical; tag `archive/extensions-2026-10-01` has them.
+
 Recorded by: agent session, unattended host-prep task.
 Purpose: this box is being prepared so the agent's `bash` tool resolves a working
 interpreter. Step 3 of the procedure (`bash` starting to work) looks identical to

@@ -28,6 +28,7 @@ Status is as of 2026-09-26. Anything marked **untested** has not yet been run en
  │                    http://127.0.0.1:8080/v1
  └─ WSL2 (Ubuntu) ── everything else
      ├─ eidolon ........ the agent (Rust)      eidolon/  + harnox/  (vendored)
+     ├─ plugins ........ browser, subagent, jev  eidolon-plugins/  (vendored; installed into eidolon)
      ├─ webui/term ..... the browser face      served by `eidolon web`
      ├─ jev ............ the chooser (Python)  jev/
      └─ aoide .......... the mesh node (Rust)  aoide-core/  (optional)
@@ -217,7 +218,7 @@ eidolon web --bind 127.0.0.1:47811 --ui-dir ~/Minerva/webui/term
 
 Windows can reach WSL's loopback by default. The page moves the token out of the URL once it loads.
 
-`webui/term` is milestone M1. Some features, such as attachments, depend on eidolon web-door changes that are proposed upstream (dxcently's PRs #17 and #18) and not yet merged. Anything that returns 404 is waiting on those. See [`webui/term/README.md`](../webui/term/README.md) for keys and layout.
+`webui/term` is milestone M1. The door's attachment and launch routes it uses are in the vendored eidolon (upstream master). See [`webui/term/README.md`](../webui/term/README.md) for keys and layout.
 
 ---
 
@@ -225,7 +226,7 @@ Windows can reach WSL's loopback by default. The page moves the token out of the
 
 jev scores a menu of options in one pass (`choose`), checks whether one statement follows from another (`entail`), and runs jev automation graphs.
 
-> **Status:** jev runs, and its test suite passes, as a standalone service. It does **not** yet load into eidolon. Upstream eidolon has no extension host; the one `extensions/jev` was written for exists only in the old fork. The fix is to port jev's tools to Rune tool scripts that call the jev service over loopback, which upstream supports (`eidolon::api_request`). That port is open work (see `docs/Tasklist.md`).
+> **Status:** jev loads into eidolon as the `jev` plugin (`eidolon-plugins/jev`): `jev_choose` and `jev_entail` call this service on `127.0.0.1:8091` with the bearer token in `~/.config/eidolon/jev.token`, and the automation graphs run as workflows. Install it, and the `browser` and `subagent` plugins, with `eidolon plugins install dxcently/eidolon-plugins browser subagent jev --ref 3be1e2b378ba0442de2ecf5a2b9625baebadbefc` and then `eidolon plugins trust <name>` for each; each plugin's README (in `eidolon-plugins/<name>/README.md`) has the rest (the browser service, the token grants).
 
 Set it up:
 
@@ -234,6 +235,19 @@ cd ~/Minerva
 python3 -m venv jev/.venv
 jev/.venv/bin/pip install -r jev/requirements.txt    # CPU-only torch, ~1 GB
 jev/.venv/bin/python jev/test_server.py              # 33 tests; `choose` uses the shipped checkpoint
+```
+
+Then, to start the service for the plugin:
+
+```bash
+mkdir -p ~/.config/eidolon && umask 077
+head -c 24 /dev/urandom | base64 > ~/.config/eidolon/jev.token
+for v in jev_choose jev_entail; do
+  eidolon plugins grant $v file:~/.config/eidolon/jev.token
+done
+cd ~/Minerva/jev
+EIDOLON_SERVICE_PORT=8091 EIDOLON_SERVICE_TOKEN="$(cat ~/.config/eidolon/jev.token)" \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv/bin/python -u server.py
 ```
 
 For `entail`, download the openjev weights:

@@ -1,5 +1,7 @@
 # Automation
 
+> **2026-10-01:** `extensions/` was retired; its successors are the plugins in `eidolon-plugins/` (see VENDORED.md). Paths under `extensions/` below are historical; tag `archive/extensions-2026-10-01` has them. The Python `automation.*` path described here was superseded by the Rune workflows in the jev plugin (`eidolon-plugins/jev`); `jev/automation/` is removed.
+
 The statechart, its learned transition function, and the loop that makes the
 transition function better.
 

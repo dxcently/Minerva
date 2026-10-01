@@ -1,5 +1,7 @@
 # Observation
 
+> **2026-10-01:** `extensions/` was retired; its successors are the plugins in `eidolon-plugins/` (see VENDORED.md). Paths under `extensions/` below are historical; tag `archive/extensions-2026-10-01` has them.
+
 What a node observes, what makes an observation untrustworthy, and what
 happens then.
 

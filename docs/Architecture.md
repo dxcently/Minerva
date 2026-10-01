@@ -97,7 +97,7 @@ remote `noah427/harnox`). Crates:
 
 Everything the operator changes is a **Rune 0.14 script**: tools (`tools/*.rn`),
 providers (`providers/*.rn`), the policy leaf table (`policy.rn`), the TUI
-(`ui.rn`), and now extensions (`extensions/<name>/`). Scripts see only `json`
+(`ui.rn`), and plugins (`~/.config/eidolon/plugins/<name>/`). Scripts see only `json`
 and `eidolon` — no `http`, `fs`, `process` — so every effect goes through a
 host primitive, behind the policy gate, into the session log. Built-ins are
 seeded into the user's tools directory so "the file the operator edits is the
@@ -107,30 +107,20 @@ The `hoot` provider (`%APPDATA%\eidolon\providers\hoot.rn`) points eidolon at
 the router: `hoot:Qwen3.8-27B-UD-Q4_K_M`, `hoot:bonsai-8b`,
 `hoot:bonsai-2-27b`.
 
-### The extension host
+### Plugins
 
-Landed 2026-09-18. An extension is a directory under
-`%APPDATA%\eidolon\extensions\` with an `extension.rn` in it: a namespaced
-bundle of Rune tools, optionally served by a long-running process of its own.
+A plugin is a directory under `~/.config/eidolon/plugins/<name>/` with a
+`plugin.rn` manifest. Each `tools/<verb>.rn` becomes the tool `<name>_<verb>`;
+`workflows/*.rn` run with `eidolon workflow run`. A plugin cannot shadow a
+built-in, and the operator's own `tools/*.rn` wins a name collision.
 
-```
-extensions/jev/
-  extension.rn        manifest: name, description, service, tools
-  tools/choose.rn     an ordinary tool script — registers as jev_choose
-  service.py
-```
+Installing does not trust: `eidolon plugins trust` vouches for the verbs,
+credentials are `eidolon plugins grant`, and a declared service is
+`eidolon plugins service approve|start`.
 
-The joint between the two halves is one host primitive,
-`eidolon::service_call(method, args)`. A script names a **method**; the loader
-owns the address, the port and the bearer token, all in Rust. A script cannot
-name a URL — it cannot even name which extension it belongs to, because that is
-bound to the thread the call runs on. Same shape as `search`, same reason.
-
-Services are **machine-scoped**: started once, recorded at
-`<cache>/eidolon/extensions/<name>.json`, adopted by every later session. Two
-chats do not mean two copies of a model in memory.
-
-Full guide: [`eidolon/docs/extensions.md`](../eidolon/docs/extensions.md).
+Minerva's three (browser, subagent, jev) are vendored at `eidolon-plugins/`
+(see `VENDORED.md`). The fork-line extension host this section used to describe
+is gone; its last state is tag `archive/extensions-2026-10-01`.
 
 ### Credentials
 

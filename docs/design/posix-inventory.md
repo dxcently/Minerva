@@ -1,5 +1,7 @@
 # POSIX blocker inventory — bonsai2 (Windows → Linux / Nix flake)
 
+> **2026-10-01:** `extensions/` was retired; its successors are the plugins in `eidolon-plugins/` (see VENDORED.md). Paths under `extensions/` below are historical; tag `archive/extensions-2026-10-01` has them.
+
 Read-only survey. No file in the project was created, modified, or deleted; this
 document is the only file written.
 
