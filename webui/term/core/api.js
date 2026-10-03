@@ -58,3 +58,55 @@ export async function post(sid, route, body) {
     return { status: 0, data: { error: 'network error' } };
   }
 }
+
+// ---------------------------------------------------------------- the hub
+// `minerva perch` serves `/hub/sessions` (list, spawn, and per session
+// resume/stop); a bare `eidolon web --ui-dir` door answers `/hub/...` with a
+// static 404. That difference is how the page tells the two apart. Only
+// `/hub/sessions...` and `/hub/tree?...` paths are built here.
+let hubMode = 'unknown'; // 'unknown' | 'door' | 'perch'
+let hubRows = [];
+export const mode = () => hubMode;
+export const rows = () => hubRows;
+
+// `timeout` (ms) aborts a call the perch never answers: it comes back as status 0, like a
+// network failure. The list poll and the boot probe set it; spawn, resume and stop do not
+// (a door can take ~20 s to come up).
+export const POLL_TIMEOUT_MS = 5000;
+async function hubCall(method, path, body, timeout) {
+  if (typeof path !== 'string' || !(path.startsWith('sessions') || path.startsWith('tree?'))) throw new Error('hub path must start with sessions or tree?');
+  const init = { method, cache: 'no-store', headers: auth() };
+  if (body !== undefined) {
+    init.headers['content-type'] = 'application/json';
+    init.body = JSON.stringify(body);
+  }
+  const ac = timeout ? new AbortController() : null;
+  const timer = ac ? setTimeout(() => ac.abort(), timeout) : 0;
+  if (ac) init.signal = ac.signal;
+  try {
+    const r = await fetch(`/hub/${path}`, init);
+    const t = await r.text();
+    let data = null;
+    if (t) { try { data = JSON.parse(t); } catch { data = { error: t.slice(0, 200) }; } }
+    return { status: r.status, data };
+  } catch (e) {
+    return { status: 0, data: { error: 'network error' } };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+export const hubGet = (path, timeout) => hubCall('GET', path, undefined, timeout);
+export const hubPost = (path, body) => hubCall('POST', path, body);
+// GET /hub/tree?session=<id>&path=<rel> (hub.md section 7): the query is built
+// from parts with encodeURIComponent, never by joining a raw path.
+export const hubTree = (sid, rel) => hubGet(`tree?session=${encodeURIComponent(sid)}&path=${encodeURIComponent(rel || '')}`);
+
+// What serves this page: 'perch' (rows kept for rows()), 'door', 'refused'
+// (the token is wrong: the perch restarted) or 'offline' (nothing answered).
+export async function detect() {
+  const { status, data } = await hubGet('sessions', POLL_TIMEOUT_MS);
+  if (status === 200 && Array.isArray(data)) { hubMode = 'perch'; hubRows = data; return 'perch'; }
+  if (status === 404) { hubMode = 'door'; hubRows = []; return 'door'; }
+  if (status === 401) return 'refused';
+  return 'offline';
+}

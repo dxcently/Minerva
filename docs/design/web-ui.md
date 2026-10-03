@@ -393,7 +393,7 @@ Reconnect check: pending asks arrive before `caught-up` and `hello.pending` equa
 | `rec` | the pane's record: turns, calls, verdicts, budget | replay + live frames | none |
 | `diff` ("changed") | files touched this session, with per-call diffs | derived from `edit`/`write` tool calls in the log (`tool-call-started.input` + `finished.output`) | none; user-origin calls missing until gap 8 |
 | `run` ("running") | open tool calls, subagents, parks | open calls = started without finished; subagents from their tool calls; parks from `wait_for` calls + `trigger-fired` | **park-tick frame** (gap 7) for live samples |
-| `tree` | file tree of the session's `cwd` | **new listing route in the hub**, `GET /s/<id>/tree?path=` | hub route with the door's static-file containment rules (no escape from root, no symlink out, **observed** model: `files.rs:71`); spec in `hub.md` |
+| `tree` | file tree of the session's `cwd` | **new listing route in the hub**, `GET /hub/tree?session=<id>&path=<rel>` | hub route with the door's static-file containment rules (no escape from root, no symlink out, **observed** model: `files.rs:71`); spec in `hub.md` |
 | `graph` | a live turn graph: turn -> calls -> asks -> verdicts | derived from the log in the page | none. jev graphs from the archived line are **out** |
 | (none) | OS process lists | - | **not a panel**; triage stays a model tool (`triage.md`) |
 

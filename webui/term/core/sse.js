@@ -3,10 +3,12 @@
 // one `data:` line of JSON per frame, no `id:`, no `event:` (stream.rs:44-46).
 //
 // Resolves when the stream ends: { status } (200 = it opened and later
-// ended), or rejects on a network error / abort.
+// ended), or { status, data } for a refusal at connect (data: the JSON body,
+// at most 4 KiB read, else null). Rejects on a network error / abort; never
+// on an HTTP status.
 export async function stream(url, headers, onFrame, signal) {
   const r = await fetch(url, { headers, signal, cache: 'no-store' });
-  if (!r.ok || !r.body) return { status: r.status };
+  if (!r.ok || !r.body) return { status: r.status, data: await refusal(r) };
   const reader = r.body.getReader();
   const dec = new TextDecoder();
   let buf = '', cr = false;
@@ -36,4 +38,22 @@ export async function stream(url, headers, onFrame, signal) {
     if (done) break;
   }
   return { status: r.status };
+}
+
+// A refusal's body: at most 4 KiB read, parsed as JSON, else null.
+async function refusal(r) {
+  try {
+    if (!r.body) return null;
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let t = '', n = 0;
+    while (n < 4096) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      n += value.length;
+      t += dec.decode(value, { stream: true });
+    }
+    reader.cancel().catch(() => {});
+    return JSON.parse(t.slice(0, 4096));
+  } catch { return null; }
 }

@@ -6,11 +6,19 @@
 // nodes it changes; streamed text is appended to a live text node, never
 // rebuilt (see Draft).
 import { signal, batch } from './ui.js';
-import { apiUrl, auth, post } from './api.js';
+import { apiUrl, auth, post, hubPost, mode } from './api.js';
 import { stream } from './sse.js';
 import { World, TICK_MS } from './life.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// The wait before the nth consecutive reconnect (n = 0, 1, ...): 250 ms doubled
+// each time up to `cap`, then jittered into its upper half so tabs and panes do
+// not reconnect in step. A connection that held for HEALTHY_MS resets n.
+const HEALTHY_MS = 5000;
+export const backoffMs = (n, cap = 15000) => {
+  const ms = Math.min(cap, 250 * 2 ** Math.min(n, 16));
+  return Math.round(ms / 2 + Math.random() * (ms / 2));
+};
 export const kfmt = (n) => (n >= 10000 ? (n / 1000).toFixed(0) + 'k' : n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
 export const tildify = (p) => String(p || '').replace(/^\/home\/[^/]+(?=\/|$)|^\/root(?=\/|$)/, '~');
 export const MODES = ['yolo', 'accept edits', 'manual', 'auto'];
@@ -28,6 +36,7 @@ export function stateOf(s) {
   const run = s.running.value;
   return run === true ? 'RUN' : run === false ? 'IDLE' : '?';
 }
+const deadText = (exit) => (exit ? `the door exited (${exit})` : 'the door exited');
 const pad = (n) => String(n).padStart(2, '0');
 const DAYS = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
 const MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
@@ -91,14 +100,16 @@ export class Session {
     this.hooks = hooks; // { toast(text, isErr) }
     this.closed = false;
     this.bye = false;
+    this.epoch = 0;        // bumped by resume(): a loop and its stream from an older epoch are superseded
     this.conn = signal('connecting');
     this.banner = signal(null);        // { text, err }
     this.life = new World();
     this.strip = signal(this.life.render());
     this.clock = signal(0);
     this.timer = 0;
-    // The door turned down a note beside an answer (notes arrive with a
-    // pending eidolon PR): later answers go without one.
+    // A door from before eidolon #18 turned down the unknown `note` field
+    // (a 400): later answers go without one. A door with the feature 422s
+    // only a bad note, which does not set this.
     this.noNote = signal(false);
     this.arrived = new Map(); // ask_id -> arrival order, kept across reconnects
     this.picked = new Map();  // ask_id -> the answer recorded and not yet sent, kept across reconnects
@@ -138,6 +149,7 @@ export class Session {
     this.day = null;         // the date of the last row with a known time: a new one draws a day row
     this.partial = null;     // a reply row an `error` cut short, until its assistant-message
     this.seqReplay = [];     // replayed frames, for the overlap window
+    this.stale = false;      // a `context-invalidated` waits for a safe point
     this.win = null;
   }
 
@@ -203,37 +215,139 @@ export class Session {
 
   // ---------------------------------------------------------------- connection
   async run() {
-    let fails = 0;
-    while (!this.closed && !this.bye) {
+    const ep = this.epoch;
+    if (this.looping === ep) return;
+    this.looping = ep;
+    try { await this.loop(ep); } finally { if (this.looping === ep) this.looping = null; }
+  }
+
+  // Whether the session still holds (or is about to open) an event stream:
+  // what the page's connection cap counts. A stopped, kept, dead, gone,
+  // refused or goodbye'd session holds none.
+  holdsStream() {
+    return !this.closed && !['stopped', 'kept', 'dead', 'gone', 'refused', 'goodbye'].includes(this.conn.value);
+  }
+
+  // How a session that will not come back is shown: the connection word, and
+  // a banner that offers `resume` under the perch (the perch never restarts a
+  // door by itself; resuming can start a turn, hub.md section 4).
+  finish(conn, text) {
+    this.setRunning(null);
+    this.live = false;
+    this.conn.value = conn;
+    this.banner.value = { text, resume: conn !== 'gone' && mode() === 'perch' };
+  }
+
+  async loop(ep) {
+    let fails = 0, quick = 0;
+    while (!this.closed && !this.bye && ep === this.epoch) {
       this.conn.value = fails >= 3 ? 'door not answering' : fails ? 'reconnecting' : 'connecting';
       this.gotHello = false;
       this.lagged = false;
+      this.refresh = false;
+      this.ended = null;
+      this.stale = false; // a waiting context-invalidated is moot: this connection replays the log
+      const t0 = performance.now();
       this.abort = new AbortController();
       let res;
       try {
-        res = await stream(apiUrl(this.sid, 'events'), auth(), (f) => batch(() => this.frame(f)), this.abort.signal);
+        // Frames of a connection from a superseded epoch (resume() ran) are dropped.
+        res = await stream(apiUrl(this.sid, 'events'), auth(), (f) => { if (ep === this.epoch) batch(() => this.frame(f)); }, this.abort.signal);
       } catch {
         res = { status: 0 };
       }
-      if (this.closed || this.bye) break;
+      if (this.closed || this.bye || ep !== this.epoch) break;
       // The stream ended with no goodbye (the door died, or it will be
       // reopened): what runs is unknown until a turn-state says, the same `?`
       // as a page that connected mid-turn, never a stale RUN.
       this.setRunning(null);
       if (res.status === 401) {
         this.conn.value = 'refused';
-        this.banner.value = { text: 'the door refused the token. Open Minerva again from the launcher.', err: true };
+        this.banner.value = { text: mode() === 'perch' ? 'the perch refused the token (it restarted?). Run bin/perch-open.sh again.' : 'the door refused the token. Open Minerva again from the launcher.', err: true };
         return;
       }
       this.live = false;
-      if (this.lagged) { fails = 0; continue; }
+      if (mode() === 'perch') {
+        // How the perch says a stream ended (hub.md section 5), and what it
+        // answers at connect when there is no stream to open.
+        const e = this.ended, st = res.data && res.data.state;
+        if (e && e.door === 'stopping') { this.finish('stopped', 'stopped'); return; }
+        if (e && e.door === 'dead') { this.finish('dead', deadText(e.exit)); return; }
+        if (res.status === 409 && st === 'kept') { this.finish('kept', 'kept, not running'); return; }
+        if (res.status === 503 && st === 'dead') { this.finish('dead', deadText(null)); return; }
+        if (res.status === 404) { this.finish('gone', `no session ${this.sid} under this perch`); return; }
+        // `live`, 409 starting|stopping, 502 and anything else: try again
+      }
+      if (this.lagged || this.refresh || (mode() === 'perch' && this.ended && this.ended.door === 'live')) {
+        // A stream that ended on purpose (lagged, a redraw, the door still there):
+        // reconnect after a short jittered wait that doubles while the
+        // connections keep ending quickly; a stream that held resets it.
+        fails = 0;
+        quick = this.gotHello && performance.now() - t0 >= HEALTHY_MS ? 0 : quick + 1;
+        if (quick >= 3) this.conn.value = 'reconnecting';
+        await sleep(backoffMs(Math.max(0, quick - 1)));
+        continue;
+      }
+      quick = 0;
       fails = this.gotHello ? 1 : fails + 1;
       this.conn.value = fails >= 3 ? 'door not answering' : 'reconnecting';
-      await sleep(Math.min(8000, 250 * 2 ** fails));
+      await sleep(backoffMs(fails, 8000));
     }
   }
 
   reconnect() { if (this.abort) this.abort.abort(); }
+
+  // The page keeps no cache beyond its rows, so "shed it and redraw from the
+  // log" is a reconnect: the stream replays the log and `hello` resets the
+  // rows. Done only when no turn is running (the safe point), and without
+  // counting as a failure or showing a banner.
+  redraw() {
+    this.stale = false;
+    this.refresh = true;
+    this.reconnect();
+  }
+
+  // Whether `resume` is on offer: the perch is here, the banner says so, and
+  // no resume is already out.
+  canResume() { const b = this.banner.value; return mode() === 'perch' && !!(b && b.resume) && !this.resuming; }
+
+  // Resume a stopped, dead or kept session (perch only). It can take ~20 s
+  // (a door has to come up) and can start a turn by itself; only ever called
+  // from a click or a key, never automatically.
+  async resume() {
+    if (!this.canResume() || this.closed) return false;
+    if (this.hooks.cap && this.hooks.cap(this.sid)) return false; // a resumed door opens a stream: the page's cap
+    const prev = this.banner.value;
+    this.resuming = true;
+    this.banner.value = { text: 'resuming…' };
+    const r = await hubPost(`sessions/${encodeURIComponent(this.sid)}/resume`);
+    this.resuming = false;
+    if (this.closed) return false;
+    if (r.status === 200) {
+      // The old loop may still be waiting on the stream of the session that
+      // ended (the goodbye window): supersede it, so its stream-end cannot
+      // paint `stopped` over the session just resumed.
+      this.epoch++;
+      if (this.abort) this.abort.abort();
+      batch(() => {
+        this.bye = false;
+        this.ended = null;
+        this.banner.value = null;
+        this.conn.value = 'connecting';
+      });
+      this.run();
+      return true;
+    }
+    this.banner.value = prev;
+    const t = r.status === 409 ? 'held by a live session (here or elsewhere)'
+      : r.status === 404 ? 'no such kept session'
+      : r.status === 503 ? `the door did not come up: ${(r.data && r.data.error) || 'no reason given'}`
+      : r.status === 401 ? 'the perch refused the token (it restarted?). Run bin/perch-open.sh again.'
+      : r.status === 0 ? 'the perch is not answering'
+      : `resume failed: ${r.status}`;
+    this.hooks.toast(t, true);
+    return false;
+  }
 
   close() {
     this.closed = true;
@@ -364,6 +478,7 @@ export class Session {
       case 'turn-state':
         this.setRunning(!!f.running);
         if (!f.running) this.partial = null; // a turn that ended owes no assistant-message
+        if (!f.running && this.stale) this.redraw();
         break;
       case 'lagged':
         this.lagged = true;
@@ -373,7 +488,19 @@ export class Session {
         this.bye = true;
         this.conn.value = 'goodbye';
         clearInterval(this.timer);
-        this.banner.value = { text: (f.text || 'the session said goodbye') + '\n(resume needs the hub)' };
+        this.banner.value = mode() === 'perch'
+          ? { text: f.text || 'the session said goodbye', resume: true }
+          : { text: (f.text || 'the session said goodbye') + '\n(resume needs the hub)' };
+        break;
+      case 'hub-stream-end': // the perch's last frame; draws nothing, run() reads it
+        this.ended = f;
+        break;
+      case 'context-invalidated': // `{what, record?}`: drop what was cached and redraw from the log at a safe point
+        // Live frames only: a replayed one is already what the redraw would show
+        // (and acting on it would loop). Unknown `running` (null: nothing says
+        // so right after connect) counts as idle; only a known running turn waits.
+        if (!this.live) break;
+        if (this.running.value !== true) this.redraw(); else this.stale = true;
         break;
 
       // review #4: a new message, an error and a stop all close the draft,
@@ -585,26 +712,30 @@ export class Session {
 
   askSettled(f) {
     const a = this.asks.value.find((x) => x.id === f.ask_id);
-    if (a) this.dropAsk(a, f.how === 'cancelled' ? { how: 'cancelled' } : { how: 'answered', answer: f.answer });
+    if (a) this.dropAsk(a, f.how === 'cancelled' ? { how: 'cancelled' } : { how: 'answered', answer: f.answer, note: f.note });
   }
 
   // A settled ask leaves the queue but stays in the transcript, folded to
   // what was picked (panes/session.js Settled), so its choices can still be
-  // read. The note is known only when this page sent it.
+  // read. The note is the door's (ask-settled carries it, whoever sent it);
+  // the one this page sent is only a fallback.
   // done: { how: 'answered' | 'cancelled' | 'elsewhere', answer?, note? }
   dropAsk(a, done) {
     this.asks.value = this.asks.value.filter((x) => x !== a);
     this.picked.delete(a.id);
     const sent = a.chosen.peek() && a.chosen.peek().answer === done.answer ? a.chosen.peek() : {};
-    a.done.value = { ...done, note: sent.note };
+    a.done.value = { ...done, note: done.note || sent.note };
     if (a.call) { a.call.ask.value = null; a.call.settled.value = a; }
   }
 
   // Answering is two steps: choose records the reply (the panel shows it as
   // answered, and it can be chosen again until it is sent; a reconnect keeps
-  // it), send posts it. A door that turns the note down (400/422, a door
-  // without the pending eidolon PR) is remembered, so the next try goes
-  // without it; any refusal clears the choice so it can be made again. A 409
+  // it), send posts it. The door has taken notes since eidolon #18 and 422s
+  // only a bad one (over 1024 bytes, or otherwise refused): that shows the
+  // door's reason and keeps notes on. A 400 on an answer with a note is a
+  // door from before #18 refusing the unknown field: remembered, so the next
+  // try goes without it. Any refusal clears the choice so it can be made
+  // again. A 409
   // (answered elsewhere) or 404 (the session is gone) drops the ask.
   // reply: { answer, note? }
   choose(a, reply) {
@@ -631,7 +762,9 @@ export class Session {
     a.chosen.value = null;
     this.picked.delete(a.id);
     const why = `${r.status || 'network'}: ${(r.data && r.data.error) || 'not accepted'}`;
-    if ((r.status === 400 || r.status === 422) && reply.note != null) {
+    if (r.status === 422 && reply.note != null) {
+      a.err.value = `the door refused the note: ${(r.data && r.data.error) || 'not accepted'}`;
+    } else if (r.status === 400 && reply.note != null) {
       this.noNote.value = true;
       a.err.value = `the door did not take the note (${why}); choose again to send without it`;
     } else a.err.value = why;
@@ -690,6 +823,44 @@ export class Session {
       return true;
     }
     this.hooks.toast(`say failed: ${r.status || 'network'} ${(r.data && r.data.error) || ''}`, true);
+    return false;
+  }
+
+  // Why a window cannot be opened for this session now, or null. There is no
+  // door to ask once it said goodbye, stopped, died or is only a kept log.
+  launchOff() {
+    if (this.bye || ['goodbye', 'stopped', 'dead', 'kept', 'gone'].includes(this.conn.value)) return 'not running';
+    return null;
+  }
+
+  // Open a terminal, an editor or a file manager on the machine that runs the
+  // door (POST launch, the operator's act, not a tool call). `path` omitted is
+  // the session's folder; when given it came from a tool line's input and means
+  // what the door's launcher says it means.
+  async launch(window, path) {
+    const off = this.launchOff();
+    if (off) { this.hooks.toast(`cannot open a window: ${off}`, true); return false; }
+    const body = { window };
+    if (path != null) {
+      if (typeof path !== 'string' || path.includes('\0') || new TextEncoder().encode(path).length > 4096) {
+        this.hooks.toast('launch refused: a path of at most 4096 bytes and no NUL is what this route takes', true);
+        return false;
+      }
+      body.path = path;
+    }
+    const r = await post(this.sid, 'launch', body);
+    const why = (r.data && r.data.error) || '';
+    if (r.status === 200) {
+      const o = String((r.data && r.data.opened) || '');
+      this.hooks.toast(`opened: ${o.length > 120 ? o.slice(0, 119) + '…' : o}`);
+      return true;
+    }
+    if (r.status === 501) this.hooks.toast('this door has no launcher configured', true);
+    else if (r.status === 422) this.hooks.toast(`launch refused: ${why}`, true);
+    else if (r.status === 500) this.hooks.toast(`the launcher failed: ${why}`, true);
+    else if (r.status === 401) this.hooks.toast('the door refused the token (it restarted?). Open Minerva again from the launcher.', true);
+    else if (r.status === 0) this.hooks.toast('launch failed: the door is not answering', true);
+    else this.hooks.toast(`launch failed: ${r.status}${why ? ' ' + why : ''}`, true);
     return false;
   }
 

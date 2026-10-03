@@ -51,6 +51,18 @@ export const askLine = (a) => {
   return f.kind === 'approval' ? `${f.tool} ${rend(f.tool, 'input', f.input)}`.trim() : `? ${f.prompt || ''}`;
 };
 
+// The door refuses a note over 1024 bytes of UTF-8 (eidolon core user.rs
+// MAX_WORDS_BYTES): the note line stops there, never inside a code point.
+const NOTE_MAX = 1024;
+const enc = new TextEncoder();
+const noteBytes = (t) => enc.encode(t).length;
+function capBytes(t) {
+  if (noteBytes(t) <= NOTE_MAX) return t;
+  let out = '', n = 0;
+  for (const ch of t) { const b = enc.encode(ch).length; if (n + b > NOTE_MAX) break; out += ch; n += b; }
+  return out;
+}
+
 // The rows of an ask, in order. An answer's `go(note)` records it; `off`
 // says why a row is greyed; `+ note` (id 'note') only opens the note line;
 // `submit` sends every recorded answer and is live once none is missing.
@@ -265,7 +277,7 @@ export function AskPanel({ p, act }) {
       ${v.noting.value && html`<div class="aline"><span class="faint">note ›</span><input ref=${field} type="text" spellcheck="false" autocomplete="off"
         aria-label="note sent with your choice" readOnly=${noteOff || busy} value=${v.note.value}
         placeholder=${noteOff ? 'the door takes no note' : 'sent with the choice you take next; esc drops it'}
-        onInput=${(e) => { v.note.value = e.currentTarget.value; }} /></div>`}
+        onInput=${(e) => { const t = capBytes(e.currentTarget.value); if (t !== e.currentTarget.value) e.currentTarget.value = t; v.note.value = t; }} />${noteBytes(v.note.value) > 900 && html`<span class="faint"> ${noteBytes(v.note.value)}/${NOTE_MAX}</span>`}</div>`}
       <div class="akeys">keys: <span class="key">↑↓ j k</span> choose${key('⏎', 'take')}${(f.kind === 'approval' || a.yesno) && html`${key('y', 'yes')}${key('n', 'no')}`}${f.kind !== 'approval' && key('1-' + Math.min(9, a.options.length), 'option')}${key('c', 'chat')}${key('tab', 'note')}${tabs.length > 1 && key('s', 'submit')}${key('←→ h l', 'asks')}${key('esc', 'composer')}</div>
       ${a.err.value && html`<div class="aerr">${a.err.value}</div>`}
     </div>

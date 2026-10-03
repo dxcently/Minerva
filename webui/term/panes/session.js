@@ -6,6 +6,7 @@
 import { html, K, HUB, Rendered, Component, signal, effect, useRef, useLayoutEffect, useEffect, useMemo, useState } from '../core/ui.js';
 import { IMAGE_TYPES, MAX_IMAGES, looksImage, readImage, readText, tooBig } from '../core/attach.js';
 import { markdown } from '../core/markdown.js';
+import { resolveIn } from '../core/path.js';
 import { render as rend, renderCall } from '../renderers/index.js';
 import { icon, word, shade, CELLS } from '../core/life.js';
 import { tildify, kfmt, hhmm, stateOf, STATE_CLS, MODES } from '../core/state.js';
@@ -34,7 +35,7 @@ export function Pane({ p, rect, focused, mirror, act }) {
     <${Title} p=${p} mirror=${mirror} act=${act} />
     <${Glyphs} p=${p} act=${act} />
     <${Transcript} s=${s} v=${v} />
-    ${banner && html`<div class=${'banner' + (banner.err ? ' err' : '')}>${banner.text}</div>`}
+    ${banner && html`<div class=${'banner' + (banner.err ? ' err' : '')}>${banner.text}${banner.resume && s.canResume() && html` <${K} cls="b" title="resume this session (or r, twice)" on=${() => s.resume()}>resume</${K}> <span class="faint">may continue the last turn</span>`}</div>`}
     ${act.panelPane.value === p.id && html`<${AskPanel} p=${p} act=${act} />`}
     <${Outbox} p=${p} />
     <${Composer} s=${s} p=${p} act=${act} />
@@ -44,7 +45,7 @@ export function Pane({ p, rect, focused, mirror, act }) {
 // Session name, its menu, the project chip, the connection dot.
 function Title({ p, mirror, act }) {
   const s = p.s, conn = s.conn.value, hl = s.hello.value;
-  const dot = { live: 'hi', replaying: 'y', connecting: 'y', reconnecting: 'y', goodbye: 'faint' }[conn] || 'r';
+  const dot = { live: 'hi', replaying: 'y', connecting: 'y', reconnecting: 'y', goodbye: 'faint', stopped: 'faint', kept: 'faint', gone: 'faint' }[conn] || 'r';
   const open = (e, at) => { e.preventDefault(); e.stopPropagation(); act.paneMenu(p, at); };
   return html`<div class="ftitle k ptitle" role="button" tabindex="0" title=${'pane menu (click or right-click)' + (hl ? '\n' + hl.cwd : '')} data-owner=${'pane-' + p.id}
       onClick=${(e) => open(e, under(e.currentTarget))} onContextMenu=${(e) => open(e, atPointer(e))}
@@ -185,11 +186,12 @@ function copy(text, act) {
 
 // A right-click on a row. With text selected in the row, copy and quote take
 // the selection; a selection elsewhere keeps the browser's own menu.
-function rowMenu(e, r, v) {
+function rowMenu(e, r, v, extra = []) {
   const el = e.currentTarget, got = getSelection(), sel = String(got);
   if (sel && !el.contains(got.anchorNode)) return;
   e.preventDefault();
   openMenu([
+    ...extra,
     { label: 'fork from here', off: HUB },
     { label: sel ? 'copy selection' : 'copy', on: () => copy(sel || el.innerText.trim(), v.act) },
     { label: 'copy as markdown', on: () => copy(rowSource(r), v.act) },
@@ -223,7 +225,7 @@ function RowBody({ r, s, v }) {
     case 'fold': return html`<div class="row" onContextMenu=${cm}><${Fold} cls="sys" label=${r.label}>${r.text}</${Fold}></div>`;
     case 'peer': return html`<div class="row peer" onContextMenu=${cm}><span class="b">~ ${r.from}</span>  ${r.text}</div>`;
     case 'pre': return html`<div class="row" onContextMenu=${cm}><pre>${r.text}</pre></div>`;
-    case 'tool': return html`<${ToolRow} c=${r.call} s=${s} v=${v} cm=${cm} />`;
+    case 'tool': return html`<${ToolRow} c=${r.call} s=${s} v=${v} cm=${(e) => rowMenu(e, r, v, toolOpens(r.call.input, s))} />`;
     case 'ask':
       return html`<div class="row" onContextMenu=${cm}>${r.ask.done.value ? html`<${Settled} a=${r.ask} />` : html`<${AskMark} a=${r.ask} s=${s} act=${v.act} />`}</div>`;
     default: return null;
@@ -231,6 +233,25 @@ function RowBody({ r, s, v }) {
 }
 
 // ---------------------------------------------------------------- tool lines
+// `open in editor` and `open folder` for a call whose input names a path
+// (`path` or `file_path`, a string). The path is the model's, so it is resolved
+// against the session's folder (core/path.js) and offered only when it lands
+// inside it; what is sent is that resolved absolute path, shown whole in the
+// item's hint and title and again in the line that says it is opening.
+function toolOpens(input, s) {
+  const raw = input && [input.path, input.file_path].find((x) => typeof x === 'string' && x);
+  if (!raw) return [];
+  const hl = s.hello.value;
+  const r = resolveIn(hl && hl.cwd, raw);
+  const off = s.launchOff() || (r.why ? `not offered: ${r.why}: ${raw}` : null);
+  const go = (w) => () => { s.hooks.toast(`opening ${r.path}`); s.launch(w, r.path); };
+  return [
+    { label: 'open in editor', hint: r.path, off, on: go('editor') },
+    { label: 'open folder', hint: r.path, off, on: go('files') },
+    { sep: true },
+  ];
+}
+
 const VD = { refused: 'r', declined: 'r' };
 
 function ToolRow({ c, s, v, cm }) {

@@ -3,8 +3,9 @@
 // this file arranges panes and routes every action. Every action is reachable
 // by mouse; keys and the `:` line are shortcuts to the same functions.
 import { html, render, K, HUB, signal, computed, effect, batch, useRef, useLayoutEffect, useMemo } from './core/ui.js';
-import { takeToken, DOOR } from './core/api.js';
-import { Session, tildify, kfmt, stateOf, STATE_CLS } from './core/state.js';
+import { takeToken, DOOR, detect, mode, rows, hubPost } from './core/api.js';
+import { list, stale, known, refresh, startPolling, live, keptRows, elsewhere, age, label } from './core/hub.js';
+import { Session, tildify, kfmt, stateOf, STATE_CLS, backoffMs } from './core/state.js';
 import * as tile from './core/tile.js';
 import { menu, openMenu, closeMenu, outside, atPointer, under, Menus } from './core/menu.js';
 import { Pane } from './panes/session.js';
@@ -37,6 +38,7 @@ const ui = {
   tab: signal(null),            // the ask panel's current tab ({ s, a }), while it is pending
   fit: signal(0),               // how much the status line dropped to fit (FIT below)
   token: false,
+  gate: signal(null),           // why a page holding a token has no sessions (perch mode): 'refused' | 'offline'
 };
 function loadSides() {
   let v = null;
@@ -64,12 +66,40 @@ let paneSeq = 0, toastTimer = 0;
 // request after it.)
 const sessionFor = (sid) => {
   const p = ui.panes.value.find((x) => x.sid === sid);
-  return p ? p.s : new Session(sid, { toast, seen: (s) => !!focused.peek() && focused.peek().s === s });
+  return p ? p.s : new Session(sid, { toast, cap: (id) => capped(id, null, true), seen: (s) => !!focused.peek() && focused.peek().s === s });
 };
+
+// The session a bare `:open` means. A door serves one session, DOOR. Under the
+// perch there is no `door` session: it is the focused pane's session, else none.
+function defaultSid() {
+  if (mode() !== 'perch') return DOOR;
+  const p = focused.peek();
+  return p ? p.sid : null;
+}
+
+// The browser allows six connections per host (shared by every tab of the
+// profile) and every session that follows a stream holds one, so under the
+// perch at most MAX_SIDS distinct sessions hold a stream at once (PLAN G7). Only
+// panes that hold a stream count: a stopped, kept, dead, gone, refused or
+// goodbye'd pane holds none (Session.holdsStream). A mirror of such a session is
+// always allowed. `except` is a pane that is about to stop showing its session.
+const MAX_SIDS = 4;
+function capped(sid, except, opens = false) {
+  if (mode() !== 'perch') return false;
+  const panes = ui.panes.peek().filter((x) => x !== except);
+  // `opens`: the session is about to open a stream of its own (a resume), so a pane already showing it is no excuse.
+  if (!opens && panes.some((x) => x.sid === sid)) return false;
+  const sids = new Set(panes.filter((x) => x.s.holdsStream()).map((x) => x.sid));
+  if (sids.has(sid) || sids.size < MAX_SIDS) return false;
+  toast(`${MAX_SIDS} sessions follow a stream: the browser allows 6 connections to the perch across all its tabs; close or stop one first`, true);
+  return true;
+}
 
 // A new pane on `sid`, splitting pane `at` (default: the focused one) to the
 // right (`dir` 'row'), below ('col'), or along its longer side.
-function openPane(sid = DOOR, { at = ui.focus.value, dir } = {}) {
+function openPane(sid = defaultSid(), { at = ui.focus.value, dir } = {}) {
+  if (!sid) { toast('which session? :open <id>'); return null; }
+  if (capped(sid)) return null;
   const id = 'p' + ++paneSeq;
   // queue: messages held here until the turn ends (panes/session.js
   // Outbox); kept by the pane, so a reconnect keeps them.
@@ -96,6 +126,7 @@ function mirrorPane(id = ui.focus.value, dir) {
 function showIn(id, sid, sure = false) {
   const p = byId(id);
   if (!p || p.sid === sid) return;
+  if (capped(sid, p)) return;
   const n = p.queue.peek().length;
   if (n && !sure) {
     const el = document.querySelector(`.pane[data-pane="${id}"] .composer`);
@@ -128,6 +159,37 @@ function closePane(id = ui.focus.value) {
 const focusPane = (id) => { if (ui.focus.value !== id) ui.focus.value = id; };
 const withPane = (fn) => () => { const p = focused.value; if (p) fn(p); else toast('no pane focused'); };
 const cancel = withPane((p) => p.s.cancel());
+// A resume may start a paid turn, so one bare `r` only asks: the same key again
+// within R_CONFIRM_MS (on the same session) does it. The banner click and
+// `:resume` are deliberate already and resume at once.
+const R_CONFIRM_MS = 3000;
+let rArmed = null; // { s, until }
+function resumeKey() {
+  const p = focused.peek();
+  if (!p || !p.s.canResume()) return false;
+  if (rArmed && rArmed.s === p.s && performance.now() < rArmed.until) { rArmed = null; resumeFocused(); return true; }
+  rArmed = { s: p.s, until: performance.now() + R_CONFIRM_MS };
+  ui.hint.value = { mode: 'toast', text: 'press r again to resume (it may continue the last turn), or click resume' };
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { rArmed = null; if (ui.hint.value && ui.hint.value.mode === 'toast') ui.hint.value = null; }, R_CONFIRM_MS);
+  return true;
+}
+const resumeFocused = () => {
+  const p = focused.value;
+  if (!p) return toast('no pane focused', true);
+  if (!p.s.canResume()) return toast(mode() === 'perch' ? 'this session is not resumable' : 'resume needs the perch', true);
+  Promise.resolve(p.s.resume()).then(refresh);
+};
+// Resume session `sid` from a menu: open a pane on it if none shows it, wait for
+// the pane to learn it is resumable (kept / dead), then resume. Only on this click.
+async function resumeSid(sid) {
+  const p = ui.panes.peek().find((x) => x.sid === sid) || openPane(sid);
+  if (!p) return;
+  for (let i = 0; i < 40 && !p.s.canResume(); i++) await new Promise((r) => setTimeout(r, 250));
+  if (!p.s.canResume()) { toast('that session is not resumable now', true); return; }
+  await p.s.resume();
+  refresh();
+}
 const toComposer = withPane((p) => p.focusComposer && p.focusComposer());
 
 // Every open session once, as [sid, Session].
@@ -338,8 +400,10 @@ const KEYREF = [
   ['anywhere', [
     ['i', 'write in the focused pane', toComposer],
     [':', 'a command (tab completes)', () => openCmd()],
+    ['ctrl+⏎', 'new pane with a picker: new / resume / existing / mirror (perch)', () => picker()],
     ['tab ⇧tab', 'next / previous waiting ask', () => cycleAsk(1)],
     ['^c', 'stop the turn', cancel],
+    ['r r', 'resume an ended session: press twice (perch; it may continue the last turn)', () => resumeFocused()],
     ['?', 'this reference', () => {}],
     ['esc', 'close a menu or this', () => {}],
   ]],
@@ -369,6 +433,7 @@ const KEYREF = [
     ['^b', 'the sessions sidebar', () => toggle('lrail')],
     ['^i', 'the inspector', () => toggle('rrail')],
     ['[ ]', 'inspector tab', () => cycleRight(1)],
+    [':term :edit :files', "open a terminal / editor / file manager at the session's folder (or a path)", () => openCmd()],
     ['/', 'filter files (files tab)', () => { ui.rrail.value = false; ui.right.value = 'files'; requestAnimationFrame(() => { const f = document.querySelector('#right .filter input'); if (f) f.focus(); }); }],
   ]],
 ];
@@ -379,17 +444,22 @@ const keyRef = () => { ui.keys.value = !ui.keys.peek(); };
 const COMMANDS = {
   q: ['close the pane', () => closePane()],
   close: ['close the pane', () => closePane()],
-  open: ['open a pane on this door (or on session id <arg>, with the hub)', (arg) => openPane(arg || DOOR)],
+  open: ['open a pane on session <id> (no id: this door / the focused session)', (arg) => openPane(arg || undefined)],
   vsplit: ['mirror the focused pane to the right', () => mirrorPane(undefined, 'row')],
   split: ['mirror the focused pane below', () => mirrorPane(undefined, 'col')],
   stop: ['cancel the running turn', cancel],
   submit: ['send every answered ask (all must be answered)', () => submitAsks() || toast(queue.peek().length ? 'answer every ask to submit' : 'nothing to submit')],
   queue: ['queue text (or the composer) behind the turn', (arg) => withPane((p) => p.s.submit('queue', arg || ''))()],
   reconnect: ['drop the stream and replay', withPane((p) => p.s.reconnect())],
+  new: ["start a session through the perch: :new <folder> [model] (no folder: this session's)", (arg) => newCmd(arg)],
+  resume: ['resume a stopped, dead or kept session (perch); may continue its last turn', () => resumeFocused()],
   sidebar: ['toggle the left sidebar', () => toggle('lrail')],
   inspector: ['toggle the inspector', () => toggle('rrail')],
   keys: ['the key reference', () => keyRef()],
   theme: ['colours: :theme <name> (none: list them)', (arg) => pickLook('theme', arg)],
+  term: ["open a terminal at the focused session's folder (on the door's machine)", withPane((p) => p.s.launch('terminal'))],
+  edit: ["open an editor at the session's folder, or at <path>", (arg) => withPane((p) => p.s.launch('editor', arg || undefined))()],
+  files: ["open a file manager at the session's folder, or at <path>", (arg) => withPane((p) => p.s.launch('files', arg || undefined))()],
   font: ['font: :font <name> (none: list them)', (arg) => pickLook('font', arg)],
 };
 
@@ -401,9 +471,9 @@ function pickLook(what, arg) {
   set(resolve(names, arg)).then((err) => err && toast(err, true));
 }
 
-function openCmd() {
+function openCmd(prefill = '') {
   closeMenu();
-  batch(() => { ui.cmd.value = ''; ui.hint.value = { mode: 'menu' }; });
+  batch(() => { ui.cmd.value = prefill; ui.hint.value = { mode: 'menu' }; });
 }
 function closeCmd() {
   batch(() => { ui.cmd.value = null; if (ui.hint.value && ui.hint.value.mode === 'menu') ui.hint.value = null; });
@@ -413,21 +483,123 @@ const matches = (text) => {
   return Object.keys(COMMANDS).filter((c) => c.startsWith(w));
 };
 function runCmd(text = ui.cmd.value || '') {
-  const [w, ...rest] = text.trim().split(/\s+/);
+  const m = /^\s*(\S+)\s*([\s\S]*)$/.exec(text), w = m && m[1], rest = m ? m[2].trim() : ''; // the argument keeps its inner spacing (a quoted folder)
   closeCmd();
   if (!w) return;
   const c = COMMANDS[w];
-  if (c) c[1](rest.join(' '));
+  if (c) c[1](rest);
   else toast(`:${w}: session commands arrive with the registry (M4)`, true);
 }
 
 // ---------------------------------------------------------------- menus
-// What a split opens: in M1 only a mirror; new, resume and another session
-// arrive with the hub.
+// What a split opens. Door mode: only a mirror (and the sessions already open).
+// Under the perch it also offers every live session and the newest kept ones;
+// picking opens a pane and nothing more (a resume is the pane's own banner
+// action, so a pick never spends by itself).
+const KEPT_PICK = 15;
+const ageOf = (r) => age(r.mtime);
+function livePicks(open) {
+  const rs = live(list.peek());
+  return rs.length ? rs.map((r) => ({ label: label(r), tick: ui.panes.peek().some((x) => x.sid === r.id), on: () => open(r.id) })) : null;
+}
+function keptPicks(open) {
+  const rs = keptRows(list.peek()).slice(0, KEPT_PICK);
+  return rs.length ? rs.map((r) => ({ label: `${label(r)}  ${ageOf(r)}`, hint: r.state === 'dead' ? 'exited' : '', on: () => open(r.id) })) : null;
+}
+
+// ---------------------------------------------------------------- new sessions
+// `POST /hub/sessions {cwd, model?}` (perch only). The perch waits for the
+// door's hello (up to ~20 s), so a hint stays up meanwhile and a second start
+// in the same folder does nothing.
+const HOME_RE = /^(\/home\/[^/]+|\/root)(?=\/|$)/;
+const starting = new Set();
+function homeOf() {
+  const cwds = [...ui.panes.peek().map((x) => { const h = x.s.hello.value; return h && h.cwd; }), ...list.peek().map((r) => r.cwd)];
+  for (const c of cwds) { const m = HOME_RE.exec(c || ''); if (m) return m[1]; }
+  return null;
+}
+// The folder as typed: absolute, or `~` / `~/x` under a home taken from a known cwd.
+function absCwd(raw) {
+  let c = String(raw || '').trim();
+  if (c === '~' || c.startsWith('~/')) {
+    const home = homeOf();
+    if (!home) { toast('give an absolute folder', true); return null; }
+    c = home + c.slice(1);
+  }
+  if (!c.startsWith('/')) { toast('give an absolute folder', true); return null; }
+  return c.length > 1 ? c.replace(/\/+$/, '') || '/' : c;
+}
+const focusedHello = () => { const p = focused.peek(); return (p && p.s.hello.value) || null; };
+const focusedModel = () => (focusedHello() || {}).model || undefined;
+const focusedCwd = () => (focusedHello() || {}).cwd || '';
+
+// `how.open(id)` shows the new session (default: a new pane beside the focused
+// one); `how.except` is the pane that stops showing its session (the cap).
+async function newSession(raw, model, how) {
+  if (mode() !== 'perch') { toast(HUB, true); return; }
+  const cwd = absCwd(raw);
+  if (!cwd || starting.has(cwd)) return;
+  if (capped('\0new', how && how.except)) return; // refuse first, spawn nothing
+  const name = tildify(cwd);
+  starting.add(cwd);
+  clearTimeout(toastTimer);
+  const mine = { mode: 'toast', text: `starting a session in ${name}…` };
+  ui.hint.value = mine;
+  const r = await hubPost('sessions', model ? { cwd, model } : { cwd });
+  starting.delete(cwd);
+  if (ui.hint.peek() === mine) ui.hint.value = null;
+  if (r.status === 201 && r.data && r.data.id) {
+    (how && how.open ? how.open : (id) => openPane(id))(r.data.id);
+    refresh();
+  } else if (r.status === 422) toast(`${name} is not under the perch's --root (default $HOME)`, true);
+  else if (r.status === 503) toast(`the door did not come up: ${(r.data && r.data.error) || 'no reason given'}`, true);
+  else if (r.status === 401) toast('the perch refused the token (it restarted?). Run bin/perch-open.sh again.', true);
+  else if (r.status === 0) toast('the perch is not answering', true);
+  else toast(`could not start a session in ${name} (${r.status}${r.data && r.data.error ? ': ' + r.data.error : ''})`, true);
+}
+
+// A folder with a space goes in double (or single) quotes: `:new "/home/u/My Project" model`.
+const quoteArg = (s) => (/[\s"']/.test(s) ? '"' + s.replace(/"/g, '') + '"' : s);
+const newLine = () => 'new ' + quoteArg(focusedCwd()) + (focusedCwd() ? ' ' : '');
+function words(s) {
+  const out = [], re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m;
+  while ((m = re.exec(String(s || '')))) out.push(m[1] ?? m[2] ?? m[3]);
+  return out;
+}
+function newCmd(arg) {
+  const w = words(arg);
+  if (mode() !== 'perch') { toast(HUB, true); return; }
+  if (!w.length) { openCmd(newLine()); return; }
+  if (w.length > 2) { toast('too many words: quote a folder that has a space, :new "/my dir" [model]', true); return; }
+  newSession(w[0], w[1] || focusedModel());
+}
+
+// `new session ▸`: the folders of open and live sessions (max 8), then any folder.
+function newPick(how) {
+  const model = focusedModel(), shows = model || 'default model';
+  const seen = new Set();
+  for (const x of ui.panes.peek()) { const h = x.s.hello.value; if (h && h.cwd) seen.add(h.cwd); }
+  for (const r of live(list.peek())) if (r.cwd) seen.add(r.cwd);
+  const dirs = [...seen].slice(0, 8).map((c) => ({ label: tildify(c), hint: shows, on: () => newSession(c, model, how) }));
+  return { label: 'new session', hint: shows, sub: [...dirs, ...(dirs.length ? [{ sep: true }] : []), { label: 'other folder…', hint: ':new <dir> [model]', on: () => openCmd(newLine()) }] };
+}
+
 function splitItems(p, dir) {
-  const others = sessions().filter(([sid]) => sid !== p.sid);
+  const others = p ? sessions().filter(([sid]) => sid !== p.sid) : sessions();
+  const mirror = p && { label: 'mirror', hint: dir === 'row' ? ':vsplit' : ':split', on: () => openPane(p.sid, { at: p.id, dir }) };
+  if (mode() === 'perch') {
+    const at = (sid) => openPane(sid, { at: p && p.id, dir });
+    const lp = livePicks(at), kp = keptPicks(at);
+    return [
+      ...(p ? [mirror] : []),
+      newPick({ open: at }),
+      kp ? { label: 'resume…', sub: kp } : { label: 'resume…', off: 'no kept sessions' },
+      lp ? { label: 'existing session', sub: lp } : { label: 'existing session', off: 'no live sessions' },
+    ];
+  }
   return [
-    { label: 'mirror', hint: dir === 'row' ? ':vsplit' : ':split', on: () => openPane(p.sid, { at: p.id, dir }) },
+    mirror,
     { label: 'new session', off: HUB },
     { label: 'resume…', off: HUB },
     others.length ? { label: 'existing session', sub: others.map(([sid, s]) => ({ label: sessionName(s), on: () => openPane(sid, { at: p.id, dir }) })) }
@@ -436,16 +608,44 @@ function splitItems(p, dir) {
 }
 
 function showItems(p) {
-  return [
-    ...sessions().map(([sid, s]) => (sid === p.sid ? { label: sessionName(s), tick: true, off: 'shown here' }
-      : { label: sessionName(s), on: () => showIn(p.id, sid) })),
-    { sep: true },
-    { label: 'new session', off: HUB },
-    { label: 'resume…', off: HUB },
-  ];
+  const open = sessions().map(([sid, s]) => (sid === p.sid ? { label: sessionName(s), tick: true, off: 'shown here' }
+    : { label: sessionName(s), on: () => showIn(p.id, sid) }));
+  if (mode() === 'perch') {
+    const here = new Set(sessions().map(([sid]) => sid));
+    const more = live(list.peek()).filter((r) => !here.has(r.id)).map((r) => ({ label: label(r), on: () => showIn(p.id, r.id) }));
+    const kp = keptPicks((sid) => showIn(p.id, sid));
+    return [
+      ...open, ...more,
+      { sep: true },
+      newPick({ open: (sid) => showIn(p.id, sid), except: p }),
+      kp ? { label: 'resume…', sub: kp } : { label: 'resume…', off: 'no kept sessions' },
+    ];
+  }
+  return [...open, { sep: true }, { label: 'new session', off: HUB }, { label: 'resume…', off: HUB }];
 }
 
+// ctrl+enter: the split picker under the focused pane (along its longer side),
+// or in the middle with none. Door mode keeps its toast.
+function picker() {
+  if (mode() !== 'perch') { toast('new pane with a picker arrives with the hub (M2); :vsplit mirrors this one'); return; }
+  const p = focused.peek();
+  const el = p && document.querySelector(`.pane[data-pane="${p.id}"]`);
+  const r = el && el.getBoundingClientRect();
+  const dir = r && r.height > r.width ? 'col' : 'row';
+  const at = el ? under(el) : { x: innerWidth / 2, y: innerHeight / 2, x2: innerWidth / 2, y2: innerHeight / 2 };
+  openMenu(splitItems(p || null, dir), at, { title: 'new pane', owner: 'picker' });
+}
+
+// A terminal, an editor or a file manager on the machine running the door,
+// at the session's folder. Greyed when there is no door to ask.
+const openItems = (p) => {
+  const off = p.s.launchOff();
+  return [['terminal', 'terminal here'], ['editor', 'editor here'], ['files', 'files here']]
+    .map(([w, label]) => ({ label, off, on: () => p.s.launch(w) }));
+};
+
 const paneMenu = (p, at) => openMenu([
+  { label: 'open', sub: openItems(p) },
   { label: 'split right', sub: splitItems(p, 'row') },
   { label: 'split down', sub: splitItems(p, 'col') },
   { label: 'show…', sub: showItems(p) },
@@ -457,15 +657,65 @@ const paneMenu = (p, at) => openMenu([
 const splitMenu = (p, dir, at) => openMenu(splitItems(p, dir), at,
   { title: dir === 'row' ? 'split right' : 'split down', owner: `split-${dir}-${p.id}` });
 
+// Stop a door of this perch, after asking. 202: stopping; 409: not ours / not live.
+async function stopSession(sid, name) {
+  const r = await hubPost(`sessions/${encodeURIComponent(sid)}/stop`);
+  if (r.status === 202) toast(`stopping ${name}`);
+  else if (r.status === 409) toast('not live under this perch', true);
+  else if (r.status === 401) toast('the perch refused the token (it restarted?). Run bin/perch-open.sh again.', true);
+  else toast(`stop failed: ${r.status || 'network'} ${(r.data && r.data.error) || ''}`, true);
+  refresh();
+  setTimeout(refresh, 1500); // the door takes a moment to exit
+}
+function copyId(id) {
+  const ok = () => toast('copied ' + id), no = () => toast('could not copy; the id is ' + id, true);
+  try { navigator.clipboard.writeText(id).then(ok, no); } catch { no(); }
+}
+const stopAsk = (sid, name, at) => openMenu([
+  { label: 'stop', on: () => stopSession(sid, name) },
+  { label: 'keep it', on: () => {} },
+], at, { title: `stop ${name}? its panes will show "stopped"` });
+
 function sessionMenu(e, p) {
   e.preventDefault();
-  const f = focused.value;
+  const f = focused.value, at = atPointer(e), perch = mode() === 'perch';
   openMenu([
     { label: 'open in new pane', on: () => openPane(p.sid) },
     { label: 'show in focused pane', off: !f ? 'no pane focused' : f.sid === p.sid ? 'shown there' : null, on: () => showIn(f.id, p.sid) },
-    { label: 'fork (latest)', off: HUB },
-    { label: 'close its door', off: HUB },
-  ], atPointer(e), { title: sessionName(p.s) });
+    { label: 'fork (latest)', off: perch ? 'needs the session registry' : HUB },
+    perch ? { label: 'close its door', on: () => stopAsk(p.sid, sessionName(p.s), at) } : { label: 'close its door', off: HUB },
+  ], at, { title: sessionName(p.s) });
+}
+
+// A live session no pane shows: the same menu, by id.
+function idleMenu(e, r) {
+  e.preventDefault();
+  const f = focused.value, at = atPointer(e);
+  openMenu([
+    { label: 'open in new pane', on: () => openPane(r.id) },
+    { label: 'show in focused pane', off: !f ? 'no pane focused' : null, on: () => showIn(f.id, r.id) },
+    { label: 'fork (latest)', off: 'needs the session registry' },
+    { label: 'close its door', on: () => stopAsk(r.id, label(r), at) },
+  ], at, { title: label(r) });
+}
+
+function keptMenu(e, r) {
+  e.preventDefault();
+  openMenu([
+    { label: 'open in new pane', on: () => openPane(r.id) },
+    { label: 'resume (may continue the last turn)', on: () => resumeSid(r.id) },
+    { label: 'copy id', on: () => copyId(r.id) },
+  ], atPointer(e), { title: label(r) });
+}
+
+const ELSEWHERE = 'held by another client (TUI or a door this perch does not own)';
+function elsewhereMenu(e, r) {
+  e.preventDefault();
+  openMenu([
+    { label: 'open in new pane', off: ELSEWHERE },
+    { label: 'resume (may continue the last turn)', off: ELSEWHERE },
+    { label: 'copy id', on: () => copyId(r.id) },
+  ], atPointer(e), { title: label(r) });
 }
 
 function statusMenu(e) {
@@ -475,6 +725,7 @@ function statusMenu(e) {
     { label: 'loaded', hint: 'model, gate, tools', on: openLoaded },
     { label: 'theme', sub: themes.value.map((n) => ({ label: n, tick: n === theme.value, on: () => pickLook('theme', n) })) },
     { label: 'font', sub: Object.entries(FONTS).map(([k, f]) => ({ label: f.label, hint: k === DEFAULT_FONT ? 'default' : '', tick: k === font.value, on: () => pickLook('font', k) })) },
+    p ? { label: 'open', sub: openItems(p) } : { label: 'open', off: 'no pane focused' },
     { sep: true },
     ...Object.entries(COMMANDS).map(([c, [what, fn]]) => ({ label: ':' + c, hint: what, on: () => fn('') })),
   ], atPointer(e), { title: 'status' });
@@ -539,28 +790,76 @@ function SessionItem({ p }) {
 
 // Sessions grouped by project: `▾ name  +`; the name folds the group, `+`
 // starts a session there (the hub).
+// Under the perch a group also lists the live sessions of that folder that no
+// pane shows, dim, `(not open)`.
+// The live sessions no pane shows and the ones held elsewhere are listed 15 at a time, then `more…` shows 50 more (as the kept list does).
+const idleShown = signal(KEPT_PICK), elseShown = signal(KEPT_PICK);
 function Sessions() {
+  const perch = mode() === 'perch';
   const groups = new Map();
+  let idleSeen = 0, idleRest = 0;
+  const grp = (cwd) => { if (!groups.has(cwd)) groups.set(cwd, { ps: [], idle: [] }); return groups.get(cwd); };
   for (const x of ui.panes.value) {
-    const hl = x.s.hello.value, cwd = hl ? hl.cwd : '';
-    if (!groups.has(cwd)) groups.set(cwd, []);
-    groups.get(cwd).push(x);
+    const hl = x.s.hello.value;
+    grp(hl ? hl.cwd : '').ps.push(x);
+  }
+  if (perch) {
+    const shown = new Set(ui.panes.value.map((x) => x.sid));
+    for (const r of live(list.value)) {
+      if (shown.has(r.id)) continue;
+      if (idleSeen++ < idleShown.value) grp(r.cwd || '').idle.push(r); else idleRest++;
+    }
   }
   const fold = (cwd) => {
     const f = new Set(ui.folded.value);
     if (!f.delete(cwd)) f.add(cwd);
     ui.folded.value = f;
   };
-  return [...groups].map(([cwd, ps]) => {
+  if (!groups.size) return html`<div class="faint">no live session</div>`;
+  const more = idleRest > 0 && html`<div class="it" key="more-idle"><${K} cls="faint" on=${() => { idleShown.value += 50; }}>more… (${idleRest})</${K}></div>`;
+  const out = [...groups].map(([cwd, { ps, idle }]) => {
     const open = !ui.folded.value.has(cwd), name = cwd ? project(cwd) : 'connecting…';
     const unread = ps.reduce((n, x, i) => n + (ps.findIndex((y) => y.s === x.s) === i ? x.s.unread.value : 0), 0);
     return html`<div class="grp" key=${cwd}>
       <div class="gh"><${K} cls="gname" title=${(cwd ? tildify(cwd) + '\n' : '') + (open ? 'fold' : 'open')} on=${() => fold(cwd)}>${open ? '▾' : '▸'} ${name}</${K}>
-        <${K} off cls="plus" title=${'new session in ' + name + ': ' + HUB}>+</${K}>
+        <${K} off=${!(perch && cwd)} cls="plus" title=${perch && cwd ? `new session in ${name} (${focusedModel() || 'default model'})` : 'new session in ' + name + ': ' + HUB} on=${() => newSession(cwd, focusedModel())}>+</${K}>
         ${!open && unread > 0 && html`<span class="o">[${unread}]</span>`}</div>
-      ${open && html`<div class="list">${ps.map((x) => html`<${SessionItem} key=${x.id} p=${x} />`)}</div>`}
+      ${open && html`<div class="list">${ps.map((x) => html`<${SessionItem} key=${x.id} p=${x} />`)}
+        ${idle.map((r) => html`<${IdleItem} key=${r.id} r=${r} />`)}</div>`}
     </div>`;
   });
+  return more ? [...out, more] : out;
+}
+
+// A live session of the perch that no pane shows: a click opens a pane on it.
+function IdleItem({ r }) {
+  return html`<div class="it" onContextMenu=${(e) => idleMenu(e, r)}>
+    <div class="l1"><span class="faint">○</span>
+      <${K} cls="grow nm faint" title=${r.id + '\nlive, not open here'} on=${() => openPane(r.id)}>${label(r)}  <span class="faint">(not open)</span></${K}></div>
+  </div>`;
+}
+
+// Kept logs and doors of ours that exited, newest first: 15, then `more…` in steps of 50.
+const keptShown = signal(KEPT_PICK);
+function Kept() {
+  const all = keptRows(list.value), n = keptShown.value, shown = all.slice(0, n), rest = all.length - shown.length;
+  if (!all.length) return html`<div class="faint">none</div>`;
+  return html`<div class="list">${shown.map((r) => html`<div class="it" key=${r.id} onContextMenu=${(e) => keptMenu(e, r)}>
+      <div class="l1"><${K} cls="grow nm faint" title=${r.id + '\n' + (r.state === 'dead' ? 'exited: a door of this perch' : 'kept, not running')}
+        on=${() => openPane(r.id)}>${label(r)}</${K}>
+        ${r.state === 'dead' && html`<span class="faint">exited</span>`}<span class="faint">${ageOf(r)}</span></div>
+    </div>`)}
+    ${rest > 0 && html`<div class="it"><${K} cls="faint" on=${() => { keptShown.value = n + 50; }}>more… (${rest})</${K}></div>`}</div>`;
+}
+
+// Live sessions held by another client: shown, never touched.
+function Elsewhere() {
+  const all = elsewhere(list.value), n = elseShown.value, rs = all.slice(0, n), rest = all.length - rs.length;
+  if (!all.length) return null;
+  return html`<div class="hdr faint">elsewhere</div>
+    <div class="list">${rs.map((r) => html`<div class="it" key=${r.id} onContextMenu=${(e) => elsewhereMenu(e, r)}>
+      <div class="l1"><span class="faint">◌</span><span class="grow nm faint" title=${ELSEWHERE}>${label(r)}</span></div></div>`)}
+    ${rest > 0 && html`<div class="it"><${K} cls="faint" on=${() => { elseShown.value = n + 50; }}>more… (${rest})</${K}></div>`}</div>`;
 }
 
 // The inner border of a sidebar: drag it, or focus it and press ←/→
@@ -597,15 +896,35 @@ function Edge({ d }) {
 
 function Left() {
   const tab = ui.left.value, rail = ui.lrail.value, panes = ui.panes.value;
+  known.value; // redraw once the mode is known
   const p = focused.value, hl = p && p.s.hello.value;
   let body;
   if (tab === 'sessions') {
-    body = html`<${Owl} />
+    body = mode() === 'perch' ? html`<${Owl} />
+      ${stale.value && html`<div class="faint">list stale</div>`}
+      <${Sessions} />
+      <div class="hdr">peers</div><${Needs}>peer list needs the hub</${Needs}>
+      <div class="hdr">kept</div><${Kept} />
+      <${Elsewhere} />`
+      : html`<${Owl} />
       ${panes.length ? html`<${Sessions} />` : html`<div class="faint">no pane. <${K} on=${() => openPane()}>open one</${K}></div>`}
       <div class="hdr">peers</div><${Needs}>peer list needs the hub</${Needs}>
       <div class="hdr">kept</div><${Needs}>other sessions need the hub (M2)</${Needs}>`;
   } else if (tab === 'projects') {
-    body = html`<div class="hdr">this door</div>
+    const perch = mode() === 'perch';
+    const cwds = perch ? [...new Set(live(list.value).map((r) => r.cwd).filter(Boolean))] : [];
+    const goTo = (c) => {
+      const r = live(list.peek()).find((x) => x.cwd === c);
+      if (r) openPane(r.id);
+    };
+    body = perch ? html`<div class="hdr">sessions here</div>
+      ${hl ? html`<div class="list"><div class="it"><div class="l1"><span class="faint">▸</span><span class="grow c" title=${hl.cwd}>${tildify(hl.cwd)}</span></div></div></div>` : html`<div class="faint">—</div>`}
+      <div class="hdr">others</div>
+      ${cwds.length ? html`<div class="list">${cwds.map((c) => html`<div class="it" key=${c}><div class="l1"><span class="faint">▸</span>
+        <${K} cls="grow c" title=${c + '\nopen the first live session here'} on=${() => goTo(c)}>${tildify(c)}</${K}></div></div>`)}</div>`
+        : html`<div class="faint">no live sessions</div>`}
+      <div class="faint">kept sessions carry no folder</div>`
+      : html`<div class="hdr">this door</div>
       ${hl ? html`<div class="list"><div class="it"><div class="l1"><span class="faint">▸</span><span class="grow c" title=${hl.cwd}>${tildify(hl.cwd)}</span></div></div></div>` : html`<div class="faint">—</div>`}
       <div class="hdr">others</div><${Needs}>project list needs the hub</${Needs}>`;
   } else {
@@ -758,9 +1077,16 @@ function Tiles() {
   const lay = tile.layout(tree, box);
   const rect = new Map(lay.panes.map((r) => [r.id, r]));
   let body;
+  const gate = ui.gate.value;
   if (!ui.token) {
     body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle r">no token</div>
-      <div class="empty">${'this page has no token.\n\nopen it from the launcher, or from the URL `eidolon web` printed\nwith #token=<contents of the token file> on the end.\n\nthe token is never sent to a server in the URL: the fragment stays in the browser.'}</div></div>`;
+      <div class="empty">${'this page has no token.\n\nrun bin/perch-open.sh (the perch), or open the URL eidolon web printed\nwith #token=<the token file\'s contents> on the end.\n\nthe token is never sent to a server in the URL: the fragment stays in the browser.'}</div></div>`;
+  } else if (gate) {
+    body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle r">${gate === 'refused' ? 'token refused' : 'not answering'}</div>
+      <div class="empty">${gate === 'refused' ? 'the perch refused the token (it restarted?).\n\nrun bin/perch-open.sh again.' : 'the perch (or the door) is not answering. this page keeps trying and opens by itself when it does.\n\nif it does not, check bin/perch-open.sh --status, then run bin/perch-open.sh again.'}</div></div>`;
+  } else if (!panes.length && mode() === 'perch') {
+    body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle faint">no pane</div>
+      <div class="empty">no session open.${'\n\n'}<${K} cls="hi" on=${() => openCmd()}>${':open <id>'}</${K}>${'\n'}<span class="faint">the sidebar lists the sessions of this perch</span>${'\n\n'}<${K} cls="hi" on=${() => picker()}>ctrl+enter</${K}>  new / resume / existing${'\n'}<${K} cls="hi" on=${() => openCmd('new ')}>${':new <dir>'}</${K}>  start a session in a folder</div></div>`;
   } else if (!panes.length) {
     body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle faint">no pane</div>
       <div class="empty">no pane open.${'\n\n'}<${K} cls="hi" on=${() => openPane()}>:open</${K}>  reconnect this session${'\n'}<span class="faint">ctrl+enter  new pane with a picker (arrives with the hub, M2)</span></div></div>`;
@@ -786,7 +1112,7 @@ function Hint() {
 
 function CmdLine() {
   const ref = useRef(null);
-  useLayoutEffect(() => { ref.current && ref.current.focus(); }, []);
+  useLayoutEffect(() => { const el = ref.current; if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }, []);
   const key = (e) => {
     if (e.key === 'Enter') { e.preventDefault(); runCmd(); }
     else if (e.key === 'Escape') { e.preventDefault(); closeCmd(); }
@@ -936,7 +1262,7 @@ document.addEventListener('keydown', (e) => {
     if (t && t.tagName === 'TEXTAREA' && t.value) return;
     e.preventDefault(); closePane(); return;
   }
-  if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); toast('new pane with a picker arrives with the hub (M2); :vsplit mirrors this one'); return; }
+  if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); picker(); return; }
   if (typing) return;
   if (e.key === ':') { e.preventDefault(); openCmd(); return; }
   if (e.key === '?') { e.preventDefault(); keyRef(); return; }
@@ -949,6 +1275,7 @@ document.addEventListener('keydown', (e) => {
   if (e.ctrlKey && k === 'c' && !String(getSelection())) { e.preventDefault(); p.s.cancel(); return; }
   if (e.ctrlKey || e.altKey || e.metaKey || e.repeat) return;
   if (t && t.closest && t.closest('.ask')) return; // an ask's own keys, handled by its block
+  if (e.key === 'r' && p.s.canResume() && !menu.value) { e.preventDefault(); resumeKey(); return; }
   if (e.key === '[') { cycleRight(-1); return; }
   if (e.key === ']') { cycleRight(1); return; }
   if (e.key === 'i' || e.key === 'Enter') {
@@ -976,4 +1303,24 @@ addEventListener('resize', () => {
   if (narrow && !wasNarrow) batch(() => { ui.lrail.value = true; ui.rrail.value = true; });
   wasNarrow = narrow;
 });
-if (ui.token) openPane(DOOR); // not in rAF: a tab opened in the background must still connect
+// Not in rAF: a tab opened in the background must still connect. A door is
+// opened on at once; under the perch the page opens panes on the sessions that
+// are already live (at most 4) and never starts one.
+// Nothing answering (a perch or a door still coming up) is not final: it is
+// probed again with a growing, jittered wait until something answers, and the
+// screen clears itself then.
+async function boot(n = 0) {
+  const m = await detect();
+  if (m === 'door') { ui.gate.value = null; openPane(DOOR); return; }
+  if (m === 'perch') {
+    ui.gate.value = null;
+    startPolling();
+    for (const r of rows().filter((x) => x.state === 'live').slice(0, 4)) openPane(r.id);
+    return;
+  }
+  if (m === 'refused') { ui.gate.value = 'refused'; return; }
+  if (n === 0) toast('nothing is answering; trying again', true);
+  else ui.gate.value = 'offline';
+  setTimeout(() => boot(n + 1), backoffMs(Math.min(n, 4) + 3, 30000));
+}
+if (ui.token) boot();
