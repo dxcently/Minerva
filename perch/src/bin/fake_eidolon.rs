@@ -31,7 +31,8 @@
 //!
 //! Knobs, all by environment (§12): `FAKE_LOG`, `FAKE_SESSIONS_DIR`, `FAKE_SILENT`,
 //! `FAKE_MODE=0644`, `FAKE_TOKEN_ELSEWHERE`, `FAKE_EXIT_AFTER_MS`, `FAKE_IGNORE_SIGTERM`,
-//! `FAKE_LATE_PANE_MS`, and
+//! `FAKE_LATE_PANE_MS`, `FAKE_EXIT_CODE` (the code `FAKE_EXIT_AFTER_MS` exits with, default 1),
+//! `FAKE_EXIT_BEFORE_BOOT=<code>` (exit before any boot line), and
 //! `FAKE_REFUSE=<path>` (a 401 on that path even with the right token).
 //!
 //! Built only with `--features test-bins` (`required-features` in Cargo.toml), so a normal
@@ -216,6 +217,15 @@ async fn serve(args: Args, argv: Vec<String>) {
     fake.record(&format!("argv {}", argv[1..].join(" ")));
     fake.record(&format!("model {}", args.model.as_deref().unwrap_or("-")));
 
+    // `FAKE_EXIT_BEFORE_BOOT=<code>`: a door that ends before it says anything (no boot lines),
+    // with that exit code. With 0 it is the "exit 0 while `starting`" case, which is a failed
+    // spawn and not a stop.
+    if let Some(code) = std::env::var("FAKE_EXIT_BEFORE_BOOT").ok().and_then(|code| code.parse::<i32>().ok()) {
+        let _ = std::fs::remove_file(&token_file);
+        fake.record("exit-before-boot");
+        std::process::exit(code);
+    }
+
     // A silent door drives §4 step 5's startup timeout: nothing is printed, so the perch
     // never learns a port, and it kills this process (which removes its own token file).
     if std::env::var_os("FAKE_SILENT").is_none() {
@@ -236,7 +246,9 @@ async fn serve(args: Args, argv: Vec<String>) {
             // A door that dies of its own accord leaves its token file behind, exactly as a
             // crashed one does: the perch's child-exit path has to leave no orphan either.
             fake.record("exit-now");
-            std::process::exit(1);
+            // `FAKE_EXIT_CODE` (default 1): 0 is a door that stops on its own accord, cleanly.
+            let code = std::env::var("FAKE_EXIT_CODE").ok().and_then(|code| code.parse::<i32>().ok()).unwrap_or(1);
+            std::process::exit(code);
         });
     }
 

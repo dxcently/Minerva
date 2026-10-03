@@ -13,7 +13,8 @@
 //!   /hub/sessions/<id>/resume, /stop                              (H1b)
 //!   /s/<id>/api/<route>  GET|POST to that session's door, its Bearer injected,
 //!                        SSE passed through, `hub-stream-end` appended   (H1c, this slice)
-//!   /hub/events, /hub/tree, /hub/mesh                             (H2/H3: still 404)
+//!   /hub/tree?session=<id>&path=<rel>  one directory under a live cwd   (H2)
+//!   /hub/events, /hub/mesh                                        (H2/H3: still 404)
 //! ```
 //!
 //! So an **unauthenticated** request to `/hub` or `/s` is a 401 and an authenticated one to
@@ -61,6 +62,7 @@ pub mod proxy;
 pub mod serve;
 pub mod sessions;
 pub mod spawn;
+pub mod tree;
 pub mod watch;
 
 use std::ffi::OsString;
@@ -126,7 +128,8 @@ pub async fn run(opts: Options, cancel: CancellationToken) -> Result<()> {
     println!("listening on http://{bound}/");
     println!("token file: {}", token_file.display());
 
-    let ctx = serve::Ctx { bound, token: Arc::from(token.as_str()), ui, registry, spawner };
+    let tree_slots = tree::Slots::new(tree::MAX_LISTINGS);
+    let ctx = serve::Ctx { bound, token: Arc::from(token.as_str()), ui, registry, spawner, tree_slots };
     let served = serve::run(ctx, listener, cancel).await;
 
     // Last, after the drain. The doors' shutdown — close the watcher to each door, SIGTERM

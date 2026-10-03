@@ -7,7 +7,8 @@
 //! **H1b is the session lifecycle behind the token**: `GET`/`POST /hub/sessions` and
 //! `POST /hub/sessions/<id>/{resume,stop}` (hub.md §3, §4). **H1c is the proxy**: everything
 //! under `/s` is handed to [`proxy::handle`] with its body still unread (hub.md §5), after the
-//! same gates. `/hub/events`, `/hub/tree`, `/hub/mesh` are H2/H3: those are 404s here, after
+//! same gates. `GET /hub/tree` is H2's directory listing ([`tree`]). `/hub/events` and
+//! `/hub/mesh` are H2/H3: 404s here, after
 //! the same gates, so an authenticated caller can tell "not built yet" from "not for you" on
 //! every one of them.
 //!
@@ -44,8 +45,9 @@ use tokio_util::sync::CancellationToken;
 use crate::files::{self, Static};
 use crate::gate;
 use crate::proxy;
-use crate::sessions::{self, ExitWatch, Registry};
+use crate::sessions::{self, ExitWatch, Registry, TreeRoot};
 use crate::spawn::{self, Spawner};
+use crate::tree;
 use crate::watch::{self, Watcher};
 
 #[derive(Clone)]
@@ -61,6 +63,8 @@ pub struct Ctx {
     /// The one thread that forks doors, so `PR_SET_PDEATHSIG` fires when the perch dies
     /// and not when a pool thread goes idle (hub.md §2).
     pub spawner: Arc<Spawner>,
+    /// At most [`tree::MAX_LISTINGS`] directory listings at once; a fifth is a 503.
+    pub tree_slots: tree::Slots,
 }
 
 /// Refused at the cap before the rest is buffered. The door caps its own bodies at the same
@@ -295,7 +299,7 @@ async fn route(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, In
             Ok(body) => body,
             Err(refusal) => return Ok(status(refusal)),
         };
-        // 6. Per-route. The only `/hub` routes are H1b's; `/hub/events`, `/hub/tree`,
+        // 6. Per-route. The `/hub` routes are H1b's and `/hub/tree`; `/hub/events` and
         //    `/hub/mesh` are H2/H3, so they are the 404 of a route that does not exist —
         //    which is what makes a 401 or a 403 the only thing an unauthenticated caller can
         //    tell apart. (`/s` never gets here: it is the proxy's, above. What does is a
@@ -344,17 +348,60 @@ async fn capped(body: Incoming) -> std::result::Result<Bytes, StatusCode> {
 // ---------------------------------------------------------------------------
 
 /// The `/hub/...` routes. `/hub/sessions` is the list and the spawn; its two verbs are per
-/// session. Everything else behind the token is a 404: `/hub/events`, `/hub/tree` and
-/// `/hub/mesh` are H2/H3.
+/// session, and `/hub/tree` is H2's one directory listing. Everything else behind the token
+/// is a 404: `/hub/events` and `/hub/mesh` are H2/H3.
 async fn hub(ctx: &Ctx, method: &Method, path: &str, query: &str, body: &Bytes) -> Response<BoxBody> {
     match (method.as_str(), path) {
         ("GET", "/hub/sessions") => json(StatusCode::OK, &ctx.registry.list()),
         ("POST", "/hub/sessions") => new_session(ctx, body).await,
+        ("GET", "/hub/tree") => tree(ctx, query).await,
         ("POST", _) => match session_verb(path, query) {
             Some((id, Verb::Resume)) => resume(ctx, id).await,
             Some((id, Verb::Stop)) => stop(ctx, id).await,
             None => status(StatusCode::NOT_FOUND),
         },
+        _ => status(StatusCode::NOT_FOUND),
+    }
+}
+
+/// `GET /hub/tree?session=<id>&path=<rel>` (hub.md section 7): the query is parsed in
+/// [`tree::parse_query`] (400), the session must be a live door of ours (404 unknown, 409
+/// `{"state"}` otherwise), and everything about the path is [`tree::list`]'s one empty 404.
+/// The listing runs under `spawn_blocking`, holding one of [`tree::MAX_LISTINGS`] slots (a full house
+/// is a 503), and its root is re-checked against `--root` there.
+async fn tree(ctx: &Ctx, query: &str) -> Response<BoxBody> {
+    let Some((id, rel)) = tree::parse_query(query) else { return status(StatusCode::BAD_REQUEST) };
+    if !sessions::id_ok(&id) {
+        return status(StatusCode::NOT_FOUND);
+    }
+    let root = match ctx.registry.tree_root(&id) {
+        TreeRoot::Live(root) => root,
+        TreeRoot::Not(state) => return json(StatusCode::CONFLICT, &serde_json::json!({ "state": state })),
+        // Kept and live-elsewhere rows are not served (Q9): they get their state, and an id
+        // that is no row at all is a 404.
+        TreeRoot::NotOurs => {
+            return match ctx.registry.list().into_iter().find(|row| row.id == id) {
+                Some(row) => json(StatusCode::CONFLICT, &serde_json::json!({ "state": row.state })),
+                None => status(StatusCode::NOT_FOUND),
+            };
+        }
+    };
+    // A slot before any work, and before the path is looked at, so a full house answers the same
+    // whatever the path is. The permit travels into the blocking task and is dropped when the
+    // listing is done, not when the client has gone.
+    let Some(permit) = ctx.tree_slots.take() else {
+        return problem(StatusCode::SERVICE_UNAVAILABLE, "too many directory listings in flight; retry");
+    };
+    let registry = ctx.registry.clone();
+    let listed = tokio::task::spawn_blocking(move || {
+        let _slot = permit;
+        // The cwd is judged against `--root` now, whoever stored it: a resumed session's cwd is
+        // what its log said, and the tree is not for `/`.
+        let (root, floor) = registry.tree_cwd(&root)?;
+        tree::list(&root, &floor, &rel)
+    });
+    match listed.await {
+        Ok(Some(listing)) => json(StatusCode::OK, &listing),
         _ => status(StatusCode::NOT_FOUND),
     }
 }
@@ -420,7 +467,9 @@ async fn new_session(ctx: &Ctx, body: &Bytes) -> Response<BoxBody> {
         give_up(&ctx.registry, watcher, pid, port, &token, exit).await;
         return problem(StatusCode::SERVICE_UNAVAILABLE, &why);
     };
-    ctx.registry.insert(id.clone(), hello.session, hello.cwd, pid, port, token, watcher, exit);
+    // The cwd that was checked against `--root` at step 1, not the one `hello` names: they are the
+    // same directory from an honest door, and the row must hold the checked one.
+    ctx.registry.insert(id.clone(), hello.session, cwd, pid, port, token, watcher, exit);
     json(StatusCode::CREATED, &serde_json::json!({ "id": id }))
 }
 
@@ -456,11 +505,15 @@ async fn resume(ctx: &Ctx, id: &str) -> Response<BoxBody> {
     if sessions::id_from_log(&ctx.registry.sessions_dir, &up.hello.session).as_deref() != Some(id) {
         let why = format!("the door opened {}, not the log we asked for", up.hello.session.display());
         let Up { pid, port, token, exit, watcher, .. } = up;
-        ctx.registry.dead(id);
+        ctx.registry.dead(id, pid);
         give_up(&ctx.registry, watcher, pid, port, &token, exit).await;
         return problem(StatusCode::SERVICE_UNAVAILABLE, &why);
     }
-    ctx.registry.mark_live(id, &up.hello.session, &up.hello.cwd);
+    // The cwd the log named is kept as the checked path when it is under a `--root`; when it is
+    // not, it is kept as given (the list still shows it) and `/hub/tree` refuses it, because the
+    // tree re-checks its root against `--root` on every request.
+    let cwd = ctx.registry.cwd_under_a_root(&up.hello.cwd).unwrap_or_else(|_| up.hello.cwd.clone());
+    ctx.registry.mark_live(id, &up.hello.session, &cwd);
     json(StatusCode::OK, &serde_json::json!({ "id": id }))
 }
 
@@ -497,7 +550,7 @@ async fn door_up(ctx: &Ctx, argv: Vec<OsString>, id: Option<&str>) -> std::resul
     let mut forked = match spawn::fork_door(&ctx.spawner, &ctx.registry, argv).await {
         Ok(forked) => forked,
         Err(e) => {
-            dead(ctx, id);
+            dead(ctx, id, 0);
             return Err(format!("{e:#}"));
         }
     };
@@ -511,7 +564,7 @@ async fn door_up(ctx: &Ctx, argv: Vec<OsString>, id: Option<&str>) -> std::resul
     let booted = match spawn::boot(&mut forked, &ctx.registry.runtime_dir).await {
         Ok(booted) => booted,
         Err(e) => {
-            dead(ctx, id);
+            dead(ctx, id, pid);
             return Err(format!("{e:#}"));
         }
     };
@@ -525,7 +578,7 @@ async fn door_up(ctx: &Ctx, argv: Vec<OsString>, id: Option<&str>) -> std::resul
             sessions::signal_and_wait(pid, exit, spawn::GIVE_UP_GRACE).await;
             // As in `give_up`: the signal path owns the file, and a new session has no row to find it by.
             sessions::drop_token_file(&spawn::door_token_path(&ctx.registry.runtime_dir, booted.port), &booted.token);
-            dead(ctx, id);
+            dead(ctx, id, pid);
             Err(format!("{e:#}"))
         }
     }
@@ -544,9 +597,11 @@ async fn give_up(registry: &Registry, watcher: Watcher, pid: u32, port: u16, tok
     sessions::drop_token_file(&spawn::door_token_path(&registry.runtime_dir, port), token);
 }
 
-fn dead(ctx: &Ctx, id: Option<&str>) {
+/// Marks the row of the door `pid` (0: the fork never happened) as `dead`; a row that has
+/// since been taken over by a newer door of the same id is left alone.
+fn dead(ctx: &Ctx, id: Option<&str>, pid: u32) {
     if let Some(id) = id {
-        ctx.registry.dead(id);
+        ctx.registry.dead(id, pid);
     }
 }
 

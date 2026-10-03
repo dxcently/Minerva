@@ -9,9 +9,10 @@ lib.rs     bind, the runtime dir, the token mint and its removal on exit
 gate.rs    loopback_only, token_ok (subtle), host_ok, sec_fetch_ok
 serve.rs   accept loop, the gate order, the route match, the H1b session routes, shutdown
 files.rs   the static rules, ported from eidolon/crates/web/src/files.rs
+tree.rs    GET /hub/tree: parse_query, the deny list, containment, the listing, the 4-listing slots
 sessions.rs  the doors we own, the list (kept + ours + roster), the pane count, the ordered stop
 spawn.rs     the argv, the fork, the boot lines, the door's token file, PDEATHSIG
-watch.rs     the perch's own /api/events stream to a door, and closing it before SIGTERM
+watch.rs     the perch's own /api/events stream to a door, and closing it before SIGTERM; reads only until `hello` (capped at 1 MiB), holds no transcript
 proxy.rs     GET|POST /s/<id>/api/<route> to that session's door, panes, the hub-stream-end frame
 bin/fake_eidolon.rs   the stand-in door, built only with `--features test-bins`
 ```
@@ -49,9 +50,19 @@ hold a stop up.
 `serve::run` bounds the graceful shutdown at 3 s (`RESPONSE_DRAIN`, above a pane's 2 s drain
 and well under the door's 10 s), so the perch's token file is removed on that path too.
 
-**Deferred to H2**: the idle reaper, `/hub/events`, `/hub/tree`, `/hub/mesh` (the mesh feed is
+**Deferred to H2**: the idle reaper, `/hub/events`, `/hub/mesh` (the mesh feed is
 H3), and telling "goodbye, then exit" from a crash: the `goodbye` frame is not parsed, so that
-door is classified `dead` with `code:0`, not `stopping`.
+door's pane ends as `dead` with `code:0`, not `stopping` (its list row is `kept`: code 0 is clean).
+
+**H2 notes** (post-H1c review, `logs/agents/perch-post-h1c.review.md`). `dead(id, pid)` is keyed
+by pid as well as id, like `forget`, so a stop's late `dead` cannot mark a newer door of the same
+id. `GET /hub/tree` re-checks the cwd against `--root` on every request (`Registry::tree_cwd`) and
+judges the cwd's own segments below that root; listings hold a `tree::Slots` permit (4) and scan
+at most 100 000 entries. **Open for H2, not fixed (review finding 6):** a recycled pid makes a
+stale roster row read `live-elsewhere` (`kill(pid, 0)`, as upstream's `pid_live`), so resume,
+`/hub/tree` and `/s` refuse with 409 until the stale `meta.json` is deleted by hand. The cure is to
+also require the process start time in `/proc/<pid>/stat` to be earlier than the row's `meta.json`
+mtime.
 
 **Unit tests live here, in `#[cfg(test)] mod tests`** — they need private items
 (`gated_path`, `decode`, `owned_by`, `in_gated`, `set_owner_only`), which moving them out

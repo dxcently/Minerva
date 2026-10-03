@@ -823,14 +823,14 @@ fn a_gated_route_with_a_wrong_token_is_401() {
 #[test]
 fn a_gated_route_that_is_not_built_yet_is_404_with_the_right_token() {
     // The point of H1a, and it still holds for every route a later slice owns: the gate
-    // passed, and what is behind it is not built (`/hub/events`, `/hub/tree`, `/hub/mesh`: H2/H3).
+    // passed, and what is behind it is not built (`/hub/events`, `/hub/mesh`: H2/H3; `GET /hub/tree`
+    // is built since H2 and has its own tests at the end of this file).
     // `/s` is built since H1c, but `x` is no session of this perch, so the proxy answers the
     // same empty 404 for it: a session route for a session that is not there.
     let perch = Perch::start();
     let auth = format!("Bearer {}", perch.token.trim());
     for (method, path) in [
         ("GET", "/hub"),
-        ("GET", "/hub/tree"),
         ("POST", "/hub/tree"),
         ("GET", "/hub/events"),
         ("GET", "/hub/mesh"),
@@ -888,7 +888,10 @@ fn a_query_string_on_a_session_route_is_400() {
     let plain = Request::new(&perch.addr, "GET", "/s/x/api/y").bearer(auth).send(&perch.addr);
     assert_eq!(plain.status, 404, "{}", plain.head);
     // `/hub` keeps its query strings: `/hub/tree?session=…&path=…` is one (H1b).
-    assert_eq!(Request::new(&perch.addr, "GET", "/hub/tree?path=/tmp").bearer(format!("Bearer {}", perch.token.trim())).send(&perch.addr).status, 404);
+    // It is built since H2, so the query reaches the route: an unknown session is its 404.
+    let hub = |path: &str| Request::new(&perch.addr, "GET", path).bearer(format!("Bearer {}", perch.token.trim())).send(&perch.addr).status;
+    assert_eq!(hub("/hub/tree?session=nobody&path=/tmp"), 404);
+    assert_eq!(hub("/hub/sessions?x=1"), 200);
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,7 +1218,7 @@ fn a_log_another_consumer_holds_is_listed_and_not_resumable() {
     let perch = Perch::start_hub(&[]);
     let id = perch.keep_a_log("ctf-pwn-3");
     let log = perch.sessions.path().join("ctf-pwn-3.eid");
-    perch.roster_row("eidolon-9f2c", &log, 999_999);
+    perch.roster_row("eidolon-9f2c", &log, std::process::id());
     let row = perch.row(&id).expect("a kept log is listed");
     assert_eq!(row["state"], "live-elsewhere", "{row}");
     assert_eq!(row["title"], "a peer", "{row}");
@@ -1294,10 +1297,7 @@ fn a_new_session_spawns_reaches_live_and_stops_clean() {
 
     // (d) The log is kept, so the session is still there — and resumable.
     let row = perch.row(&id).expect("a stopped session is still listed");
-    assert!(
-        row["state"] == "dead" || row["state"] == "kept",
-        "a stopped session is dead (the row is still ours) or kept (its log is): {row}"
-    );
+    assert_eq!(row["state"], "kept", "a cleanly stopped session is kept (hub.md section 4), not dead: {row}");
     let resumed = perch.post(&format!("/hub/sessions/{id}/resume"));
     assert_eq!(resumed.status, 200, "{}{}", resumed.head, resumed.body);
     assert_eq!(body_id(&resumed), id, "a resume answers with the id it resumed");
@@ -1344,6 +1344,10 @@ fn a_door_that_ignores_sigterm_is_killed_and_the_perch_removes_its_token_file() 
     // The door never got to run its own `remove_file`, so this is the perch's work.
     assert!(!perch.door_token_file(port).exists(), "an orphaned door token file was left behind");
     assert!(perch.door_token_files().is_empty(), "{:?}", perch.door_token_files());
+    // A SIGKILL is not a clean exit: the row stays `dead` and the proxy answers 503.
+    assert_eq!(perch.state_of(&id).as_deref(), Some("dead"));
+    let gone = perch.apireq("GET", &format!("/s/{id}/api/events")).send(&perch.addr);
+    assert_eq!((gone.status, gone.body.as_str()), (503, "{\"state\":\"dead\"}"), "{}", gone.head);
 }
 
 /// A door that dies by itself is a `dead` row, and its token file does not outlive it.
@@ -1379,7 +1383,7 @@ fn a_second_writer_on_one_log_is_409() {
     let starts = perch.fake_records().iter().filter(|line| line.starts_with("start ")).count();
     assert_eq!(starts, 1, "{:?}", perch.fake_records());
     // A live-elsewhere log is refused as well, before anything is forked.
-    perch.roster_row("eidolon-9f2c", &perch.sessions.path().join("one-writer.eid"), 999_999);
+    perch.roster_row("eidolon-9f2c", &perch.sessions.path().join("one-writer.eid"), std::process::id());
     assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
     assert!(wait_gone(pid, Duration::from_secs(5)));
     let after = perch.post(&format!("/hub/sessions/{id}/resume"));
@@ -2120,7 +2124,7 @@ fn stopping_a_session_closes_its_panes_before_it_signals_the_door() {
     assert!(records.iter().any(|line| line == "sigterm streams=0"), "{records:?}");
     assert!(perch.door_token_files().is_empty(), "no token file left: {:?}", perch.door_token_files());
     assert!(!perch.door_token_file(port).exists());
-    assert_eq!(perch.state_of(&id).as_deref(), Some("dead"));
+    assert_eq!(perch.state_of(&id).as_deref(), Some("kept"), "a requested clean stop leaves the log kept (hub.md section 4)");
 }
 
 /// 9. A door that dies mid-frame: the page gets the half frame, then the perch's own frame (its
@@ -2254,7 +2258,7 @@ fn a_stop_does_not_wait_for_a_pane_that_has_stopped_reading() {
     assert!(!records.iter().any(|line| line == "sigterm-ignored"), "{records:?}");
     assert!(perch.door_token_files().is_empty(), "{:?}", perch.door_token_files());
     assert!(!perch.door_token_file(port).exists());
-    assert_eq!(perch.state_of(&id).as_deref(), Some("dead"));
+    assert_eq!(perch.state_of(&id).as_deref(), Some("kept"), "a requested clean stop leaves the log kept (hub.md section 4)");
     assert!(!perch.err().contains("a pane did not close in time"), "{}", perch.err());
     drop(pane);
 }
@@ -2293,7 +2297,7 @@ fn a_session_that_is_not_live_is_refused_without_a_connection() {
     let (alive, _pid, _port) = live(&perch);
     let kept = perch.keep_a_log("kept-one");
     let held = perch.keep_a_log("held-elsewhere");
-    perch.roster_row("eidolon-9f2c", &perch.sessions.path().join("held-elsewhere.eid"), 999_999);
+    perch.roster_row("eidolon-9f2c", &perch.sessions.path().join("held-elsewhere.eid"), std::process::id());
     let before = perch.fake_records().len();
 
     for (method, path) in [("GET", "events"), ("POST", "say")] {
@@ -2316,10 +2320,63 @@ fn a_session_that_is_not_live_is_refused_without_a_connection() {
     // The live one was untouched by any of it.
     assert_eq!(perch.apireq("POST", &format!("/s/{alive}/api/cancel")).body(b"{}".to_vec()).send(&perch.addr).status, 409);
 
-    // A stopped session is `dead` (the row is still ours) and answers 503, not `kept`.
+    // A cleanly stopped session is `kept` again (hub.md section 4): 409, and no connection.
     assert_eq!(perch.post(&format!("/hub/sessions/{alive}/stop")).status, 202);
     let gone = perch.apireq("GET", &format!("/s/{alive}/api/events")).send(&perch.addr);
-    assert_eq!((gone.status, gone.body.as_str()), (503, "{\"state\":\"dead\"}"), "{}", gone.head);
+    assert_eq!((gone.status, gone.body.as_str()), (409, "{\"state\":\"kept\"}"), "{}", gone.head);
+}
+
+/// A clean stop lists the session `kept`, answers 409 `kept` on the proxy and connects to
+/// nothing; a resume then works. (A SIGKILLed or crashed door stays `dead`: see
+/// `a_door_that_ignores_sigterm_is_killed_and_the_perch_removes_its_token_file` and
+/// `a_door_that_exits_on_its_own_leaves_a_dead_row`.)
+///
+/// Mutation: drop the clean-exit rule (`Exit::clean` always false) and the first assertion goes red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_clean_stop_lists_the_session_kept_and_connects_to_nothing() {
+    let perch = Perch::start_hub(&[]);
+    let (id, pid, port) = live(&perch);
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    assert!(wait_gone(pid, Duration::from_secs(5)));
+    assert_eq!(perch.state_of(&id).as_deref(), Some("kept"));
+    let row = perch.row(&id).unwrap();
+    assert!(row["mtime"].as_u64().is_some(), "the kept row carries the log's mtime: {row}");
+
+    let before = perch.fake_records().len();
+    let refused = perch.apireq("GET", &format!("/s/{id}/api/events")).send(&perch.addr);
+    assert_eq!((refused.status, refused.body.as_str()), (409, "{\"state\":\"kept\"}"), "{}", refused.head);
+    assert_eq!(since(&perch, before), Vec::<String>::new(), "no connection to a stopped door");
+    // The port is free: if the perch connected to it, a listener here would see it.
+    if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+        listener.set_nonblocking(true).unwrap();
+        let _ = perch.apireq("GET", &format!("/s/{id}/api/events")).send(&perch.addr);
+        assert!(listener.accept().is_err(), "the perch connected to a door that exited cleanly");
+    }
+
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/resume")).status, 200, "a clean stop is resumable");
+    assert_eq!(perch.state_of(&id).as_deref(), Some("live"));
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+}
+
+/// A crashed door's leftover `meta.json` (its pid is gone) does not make the log
+/// `live-elsewhere`, and the resume is not a 409; a live pid still does.
+///
+/// Mutation: drop the `pid_alive` check in `Registry::roster` and this goes red at the first resume.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_stale_roster_row_does_not_block_a_resume() {
+    let perch = Perch::start_hub(&[]);
+    let id = perch.keep_a_log("stale-roster");
+    let log = perch.sessions.path().join("stale-roster.eid");
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = gone.id();
+    gone.wait().unwrap();
+    perch.roster_row("web-stale", &log, dead_pid);
+    assert_eq!(perch.state_of(&id).as_deref(), Some("kept"), "a dead pid's row is not live-elsewhere");
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/resume")).status, 200);
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    assert!(perch.runtime.path().join("eidolon/web-stale/meta.json").is_file(), "someone else's row is left alone");
 }
 
 /// 13. H1b review finding 1: a new session whose door names a log outside the sessions dir is
@@ -2345,4 +2402,402 @@ fn a_rejected_new_session_leaves_no_door_token_file_behind() {
     }
     assert!(perch.door_token_files().is_empty(), "an orphaned door token file: {:?}", perch.door_token_files());
     assert!(!perch.door_token_file(port).exists());
+}
+
+// ---------------------------------------------------------------------------
+// H2: GET /hub/tree (hub.md section 7)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "test-bins")]
+impl Perch {
+    fn tree(&self, id: &str, path: &str) -> Answer {
+        self.get(&format!("/hub/tree?session={id}&path={path}"))
+    }
+
+    /// The names in a 200 listing, in the order sent.
+    fn tree_names(answer: &Answer) -> Vec<String> {
+        let body: serde_json::Value = serde_json::from_str(&answer.body).unwrap_or_else(|e| panic!("a JSON listing: {e}: {:?}", answer.body));
+        body["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap().to_string()).collect()
+    }
+}
+
+/// The fixture under the session's cwd: what a project looks like, plus everything the
+/// listing must hide or refuse.
+#[cfg(feature = "test-bins")]
+fn tree_fixture(work: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::fs::create_dir(work.join("src")).unwrap();
+    std::fs::write(work.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(work.join("src/.env"), "KEY=1\n").unwrap();
+    std::fs::write(work.join("src/Secret.TXT"), "s\n").unwrap();
+    std::fs::create_dir(work.join("out")).unwrap();
+    std::fs::write(work.join("a.txt"), "12345").unwrap();
+    std::fs::write(work.join(".env"), "TOKEN=1\n").unwrap();
+    std::fs::write(work.join("id_rsa"), "k\n").unwrap();
+    std::fs::write(work.join("secret.txt"), "s\n").unwrap();
+    std::fs::write(work.join("x.pem"), "p\n").unwrap();
+    std::fs::create_dir(work.join(".git")).unwrap();
+    std::fs::write(work.join(".git/config"), "[core]\n").unwrap();
+    std::os::unix::fs::symlink("..", work.join("up")).unwrap();
+    std::os::unix::fs::symlink("/etc", work.join("etc")).unwrap();
+    std::os::unix::fs::symlink(".git", work.join("history")).unwrap();
+    std::os::unix::fs::symlink("src", work.join("inside")).unwrap();
+    std::fs::write(work.join(std::ffi::OsStr::from_bytes(b"bad-\xff-name")), "x").unwrap();
+}
+
+/// The root listing: kinds and sizes, dirs first, denied names absent, links without a
+/// target, and a non-UTF-8 name counted rather than sent.
+///
+/// Mutation: drop the `denied(&name)` filter in `tree::list` and the hidden-names line goes red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_tree_lists_names_and_kinds_and_hides_what_the_deny_list_names() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, _port) = live(&perch);
+    tree_fixture(&perch.work);
+
+    let answer = perch.tree(&id, "");
+    assert_eq!(answer.status, 200, "{}{}", answer.head, answer.body);
+    assert_eq!(answer.header("content-type").as_deref(), Some("application/json"));
+    let body: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+    assert_eq!(body["path"], "");
+    assert_eq!(body["skipped"], 1, "the non-UTF-8 name is counted: {body}");
+    assert_eq!(body["truncated"], false);
+    let rows: Vec<(String, String, Option<u64>)> = body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap().to_string(), e["kind"].as_str().unwrap().to_string(), e["size"].as_u64()))
+        .collect();
+    let want: Vec<(String, String, Option<u64>)> = [
+        ("out", "dir", None),
+        ("src", "dir", None),
+        ("a.txt", "file", Some(5)),
+        ("etc", "link", None),
+        ("history", "link", None),
+        ("inside", "link", None),
+        ("up", "link", None),
+    ]
+    .into_iter()
+    .map(|(n, k, s)| (n.to_string(), k.to_string(), s))
+    .collect();
+    // `history` is a link named like nothing on the list, so it is listed (as a link); it is
+    // asking to open it that is refused (see the escape test).
+    assert_eq!(rows, want, "dirs first, then by name: {body}");
+    for hidden in [".env", "id_rsa", "secret.txt", "x.pem", ".git"] {
+        assert!(!rows.iter().any(|(name, _, _)| name == hidden), "{hidden} must not be listed: {body}");
+    }
+    // A link shows no target, and nothing in the answer is an absolute path or a file's text.
+    for entry in body["entries"].as_array().unwrap() {
+        assert!(entry.get("target").is_none() && entry.get("path").is_none(), "{entry}");
+    }
+    for leak in ["/etc", "KEY=1", "TOKEN=1", "fn main", &perch.work.display().to_string()] {
+        assert!(!answer.body.contains(leak), "{leak} leaked: {}", answer.body);
+    }
+
+    // A subdirectory, and the deny list inside it (case-insensitive, by name).
+    let sub = perch.tree(&id, "src");
+    assert_eq!(sub.status, 200, "{}", sub.body);
+    assert_eq!(Perch::tree_names(&sub), vec!["main.rs"], "{}", sub.body);
+    assert!(sub.body.contains("\"path\":\"src\""), "{}", sub.body);
+    // A link that stays inside the tree is followed when it is asked for.
+    let inside = perch.tree(&id, "inside");
+    assert_eq!((inside.status, Perch::tree_names(&inside)), (200, vec!["main.rs".to_string()]), "{}", inside.body);
+}
+
+/// Every way out of the cwd, and every way to a denied name, is the same empty 404.
+///
+/// Mutations: remove the `starts_with(root)` check in `tree::list` and `up`/`etc` go red;
+/// remove the canonical-remainder deny check and `history` goes red; remove the per-segment
+/// deny check and `.env`/`.git` go red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_tree_path_cannot_leave_the_cwd_or_name_a_denied_entry() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, _port) = live(&perch);
+    tree_fixture(&perch.work);
+
+    for path in [
+        "up",
+        "etc",
+        "..",
+        "%2e%2e",
+        "%2E%2e",
+        ".",
+        "/etc",
+        "a%00b",
+        "a%5Cb",
+        "src//x",
+        "src/",
+        "src/..",
+        "src/../..",
+        ".git",
+        ".GIT",
+        ".env",
+        "history",
+        "src/.env",
+        "src/.ENV",
+        "src/Secret.TXT",
+        "id_rsa",
+        "x.pem",
+        "secret.txt",
+        "a.txt",
+        "nowhere",
+        "src/main.rs",
+        "up/ui",
+        "up/secret.txt",
+        "etc/passwd",
+    ] {
+        let answer = perch.tree(&id, path);
+        assert_eq!((answer.status, answer.body.as_str()), (404, ""), "path={path}: {}", answer.head);
+    }
+    // 4098 bytes is not a path.
+    let long = "a/".repeat(2049);
+    assert_eq!(perch.tree(&id, &long).status, 404);
+    // …and a good one still works, so the 404s above are the rules and not a broken route.
+    assert_eq!(perch.tree(&id, "src").status, 200);
+}
+
+/// 2 001 entries come back as 2 000 and `truncated`; exactly 2 000 do not.
+///
+/// Mutation: raise `MAX_ENTRIES` or drop the `truncate` and this goes red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_tree_of_2001_entries_is_cut_at_2000() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, _port) = live(&perch);
+    let many = perch.work.join("many");
+    std::fs::create_dir(&many).unwrap();
+    for n in 0..2000 {
+        std::fs::write(many.join(format!("f{n:04}")), "").unwrap();
+    }
+    let exact: serde_json::Value = serde_json::from_str(&perch.tree(&id, "many").body).unwrap();
+    assert_eq!(exact["entries"].as_array().unwrap().len(), 2000);
+    assert_eq!(exact["truncated"], false);
+    std::fs::write(many.join("f2000"), "").unwrap();
+    let cut: serde_json::Value = serde_json::from_str(&perch.tree(&id, "many").body).unwrap();
+    assert_eq!(cut["entries"].as_array().unwrap().len(), 2000);
+    assert_eq!(cut["truncated"], true);
+}
+
+/// The session and query rules: only a live door of ours is listed, and the query is
+/// exactly `session` and `path`.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_tree_is_for_a_live_session_with_a_strict_query_behind_the_token() {
+    let perch = Perch::start_hub(&[]);
+    let (id, pid, _port) = live(&perch);
+    let kept = perch.keep_a_log("kept-one");
+    let held = perch.keep_a_log("held-elsewhere");
+    perch.roster_row("eidolon-9f2c", &perch.sessions.path().join("held-elsewhere.eid"), std::process::id());
+
+    let unknown = perch.tree("nobody", "");
+    assert_eq!((unknown.status, unknown.body.as_str()), (404, ""), "{}", unknown.head);
+    for bad in ["..", "-x", "a%2Fb"] {
+        assert_eq!(perch.tree(bad, "").status, 404, "{bad}");
+    }
+    let refused = perch.tree(&kept, "");
+    assert_eq!((refused.status, refused.body.as_str()), (409, "{\"state\":\"kept\"}"), "{}", refused.head);
+    let elsewhere = perch.tree(&held, "");
+    assert_eq!((elsewhere.status, elsewhere.body.as_str()), (409, "{\"state\":\"live-elsewhere\"}"), "{}", elsewhere.head);
+
+    // No token, wrong token: 401 with nothing in the body, whatever the query.
+    let none = Request::new(&perch.addr, "GET", &format!("/hub/tree?session={id}")).send(&perch.addr);
+    assert_eq!((none.status, none.body.as_str()), (401, ""), "{}", none.head);
+    let wrong = Request::new(&perch.addr, "GET", &format!("/hub/tree?session={id}")).bearer("Bearer nope").send(&perch.addr);
+    assert_eq!(wrong.status, 401);
+
+    // The query is exact.
+    for query in [
+        String::new(),
+        "path=src".to_string(),
+        format!("session={id}&other=1"),
+        format!("session={id}&session={id}"),
+        format!("session={id}&path=a&path=b"),
+        format!("session={id}&path=%zz"),
+        format!("session={id}&path=%ff"),
+        format!("session={id}&"),
+        format!("session={id}&path"),
+        format!("token=x&session={id}"),
+    ] {
+        let answer = perch.get(&format!("/hub/tree?{query}"));
+        assert_eq!(answer.status, 400, "{query}: {}", answer.head);
+    }
+    // `path` may be left out: that is the root. Percent-escaped keys decode once.
+    assert_eq!(perch.get(&format!("/hub/tree?session={id}")).status, 200);
+    assert_eq!(perch.get(&format!("/hub/tree?%73ession={id}&p%61th=")).status, 200);
+    assert_eq!(Request::new(&perch.addr, "POST", &format!("/hub/tree?session={id}")).bearer(perch.auth()).send(&perch.addr).status, 404);
+
+    // A stopped session is kept again: 409, not a listing (Q9).
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    assert!(wait_gone(pid, Duration::from_secs(5)));
+    let stopped = perch.tree(&id, "");
+    assert_eq!((stopped.status, stopped.body.as_str()), (409, "{\"state\":\"kept\"}"), "{}", stopped.head);
+}
+
+// ---------------------------------------------------------------------------
+// H2: GET /hub/tree, after the post-H1c review (logs/agents/perch-post-h1c.review.md)
+// ---------------------------------------------------------------------------
+
+/// A head with the `date` header taken out: the one header that changes between two answers.
+#[cfg(feature = "test-bins")]
+fn head_without_date(answer: &Answer) -> String {
+    answer.head.lines().filter(|line| !line.to_ascii_lowercase().starts_with("date:")).collect::<Vec<_>>().join("\r\n")
+}
+
+/// Finding 1: on NTFS (`/mnt/c`) `GIT~1` is `.git`'s second spelling. The shape is refused as a
+/// segment anywhere in `path`, with the empty 404 a missing entry gets, escaped or not.
+///
+/// Mutation: make `short_name` always false in `tree.rs` and every row here goes red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_tree_path_with_an_ntfs_short_name_is_the_same_empty_404() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, _port) = live(&perch);
+    tree_fixture(&perch.work);
+    // These really exist, so it is the shape and not a missing entry that is refused.
+    std::fs::create_dir_all(perch.work.join("GIT~1/objects")).unwrap();
+    std::fs::create_dir_all(perch.work.join("a/SSH~1/x")).unwrap();
+    std::os::unix::fs::symlink("GIT~1", perch.work.join("alias")).unwrap();
+    for path in ["GIT~1", "git~1", "GIT~1/objects", "a/SSH~1/x", "a/SSH~1", "GIT%7E1", "src/AOIDE~2", "alias"] {
+        let answer = perch.tree(&id, path);
+        assert_eq!((answer.status, answer.body.as_str()), (404, ""), "path={path}: {}", answer.head);
+    }
+    assert_eq!(perch.tree(&id, "a").status, 200, "a good sibling still lists");
+}
+
+/// Findings 1 and 3: a session whose cwd *is* a denied name or an alias, or sits under one,
+/// lists nothing at all, root included.
+///
+/// Mutation: remove the cwd-segment check in `tree::list_bounded` and every row goes red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_tree_of_a_session_whose_cwd_is_a_denied_name_is_not_listable() {
+    let perch = Perch::start_hub(&[]);
+    for cwd in [".ssh", "GIT~1", ".git/sub", "keys/.gnupg"] {
+        let dir = perch.work.join(cwd);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("known_hosts"), "x").unwrap();
+        let answer = perch.post_json("/hub/sessions", serde_json::json!({ "cwd": dir.display().to_string() }));
+        assert_eq!(answer.status, 201, "{cwd}: {}{}", answer.head, answer.body);
+        let id = body_id(&answer);
+        for path in ["", "known_hosts"] {
+            let listed = perch.tree(&id, path);
+            assert_eq!((listed.status, listed.body.as_str()), (404, ""), "cwd={cwd} path={path}: {}", listed.head);
+        }
+    }
+    // The control: the same perch lists an ordinary cwd.
+    let (id, _pid, _port) = live(&perch);
+    assert_eq!(perch.tree(&id, "").status, 200);
+}
+
+/// Finding 2: a resumed session's cwd is whatever its log said. The stand-in door reports the
+/// sessions dir, which is outside `--root`, so the tree refuses it where a new session's works.
+///
+/// Mutation: drop the `tree_cwd` call in `serve::tree` (list `root` as stored) and this goes red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_resumed_session_whose_cwd_is_outside_root_is_not_listable() {
+    let perch = Perch::start_hub(&[]);
+    let id = perch.keep_a_log("resumed-elsewhere");
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/resume")).status, 200);
+    assert_eq!(perch.state_of(&id).as_deref(), Some("live"));
+    std::fs::write(perch.sessions.path().join("visible.txt"), "x").unwrap();
+    let answer = perch.tree(&id, "");
+    assert_eq!((answer.status, answer.body.as_str()), (404, ""), "{}", answer.head);
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+}
+
+/// A denied name, an alias and a missing one are one answer, headers included (the `date` apart).
+///
+/// Mutation: give the denied path a different status or an extra header in `serve::tree` and
+/// this goes red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn denied_and_missing_tree_answers_are_byte_identical() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, _port) = live(&perch);
+    tree_fixture(&perch.work);
+    let missing = perch.tree(&id, "nope");
+    assert_eq!(missing.status, 404);
+    let want = (head_without_date(&missing), missing.body.clone());
+    for path in [".env", "src/.env", ".git", "id_rsa", "GIT~1", "history", "up", "a.txt"] {
+        let got = perch.tree(&id, path);
+        assert_eq!((head_without_date(&got), got.body.clone()), want, "path={path}");
+    }
+}
+
+/// Finding 4: at most `MAX_LISTINGS` listings run at once; the rest are a 503 with a short body,
+/// not a queue. A burst of 48 over a 40 000-entry directory sees both, and when it is over the
+/// slots are free again.
+///
+/// Mutation: drop the `tree_slots.take()` in `serve::tree` and no 503 is ever seen.
+#[cfg(feature = "test-bins")]
+#[test]
+fn concurrent_tree_listings_are_capped_with_a_503() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, _port) = live(&perch);
+    let many = perch.work.join("many");
+    std::fs::create_dir(&many).unwrap();
+    for n in 0..40_000 {
+        std::fs::write(many.join(format!("f{n:05}")), "").unwrap();
+    }
+    let (addr, auth) = (perch.addr.clone(), perch.auth());
+    let mut seen_503 = None;
+    for _round in 0..5 {
+        let threads: Vec<_> = (0..48)
+            .map(|_| {
+                let (addr, auth, id) = (addr.clone(), auth.clone(), id.clone());
+                std::thread::spawn(move || Request::new(&addr, "GET", &format!("/hub/tree?session={id}&path=many")).bearer(auth).send(&addr))
+            })
+            .collect();
+        let answers: Vec<Answer> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(answers.iter().all(|a| a.status == 200 || a.status == 503), "{:?}", answers.iter().map(|a| a.status).collect::<Vec<_>>());
+        assert!(answers.iter().any(|a| a.status == 200), "some listings still run");
+        if let Some(refused) = answers.into_iter().find(|a| a.status == 503) {
+            seen_503 = Some(refused);
+            break;
+        }
+    }
+    let refused = seen_503.expect("a burst of 48 over 4 slots is refused at least once");
+    assert_eq!(refused.header("content-type").as_deref(), Some("application/json"));
+    assert!(refused.body.len() < 100 && refused.body.contains("listing"), "a short reason: {:?}", refused.body);
+    let again = perch.tree(&id, "many");
+    assert_eq!(again.status, 200, "the slots are free again: {}", again.head);
+}
+
+/// Finding 8: a door that exits 0 *on its own* while live is a stop as far as the list goes
+/// (`kept`, `/s` answers 409 kept), and the pane is still told how it ended.
+///
+/// Mutation: make `Exit::clean` false for code 0 and this goes red (it is `dead`).
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_door_that_exits_zero_on_its_own_while_live_ends_kept() {
+    let perch = Perch::start_hub(&[("FAKE_EXIT_AFTER_MS", "3000"), ("FAKE_EXIT_CODE", "0")]);
+    let id = perch.keep_a_log("quits-politely");
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/resume")).status, 200);
+    let (pid, port) = perch.fake_last_start();
+    let mut pane = Pane::open(&perch, &id);
+    assert!(pane.read_until("\"hello\"", Duration::from_secs(5)));
+    assert!(pane.read_to_end(Duration::from_secs(15)), "{:?}", pane.data());
+    let end = pane.end_frame();
+    assert_eq!((end["door"].as_str(), end["exit"].as_str()), (Some("dead"), Some("code:0")), "{end}");
+    assert!(perch.wait_state(&id, "kept", Duration::from_secs(10)), "{:?}", perch.state_of(&id));
+    assert!(wait_gone(pid, Duration::from_secs(5)));
+    assert!(!perch.door_token_file(port).exists());
+    let gone = perch.apireq("GET", &format!("/s/{id}/api/events")).send(&perch.addr);
+    assert_eq!((gone.status, gone.body.as_str()), (409, "{\"state\":\"kept\"}"), "{}", gone.head);
+}
+
+/// ...and exit 0 while still `starting` is a failed spawn, which stays `dead`.
+///
+/// Mutation: drop the `came_up &&` in `Registry::mark_exited` and this goes red (it is `kept`).
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_door_that_exits_zero_while_starting_ends_dead() {
+    let perch = Perch::start_hub(&[("FAKE_EXIT_BEFORE_BOOT", "0")]);
+    let id = perch.keep_a_log("never-came-up");
+    let answer = perch.post(&format!("/hub/sessions/{id}/resume"));
+    assert_eq!(answer.status, 503, "{}{}", answer.head, answer.body);
+    assert_eq!(perch.state_of(&id).as_deref(), Some("dead"), "a spawn that failed is not a stop");
 }

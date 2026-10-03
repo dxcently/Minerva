@@ -14,8 +14,15 @@
 //! The stream is opened with the door's Bearer, read straight off the door's `0600` token
 //! file and held in memory (§10.4). It never reaches a URL, an argument, or a log line.
 //!
+//! The watcher reads frames only until `hello` and holds no transcript: [`HelloScan`] keeps
+//! bytes until `hello` is found (capped at [`HELLO_MAX`]), releases them, and from then on the
+//! stream is read and thrown away. The stream stays open for the door's whole life and a long
+//! session sends every text delta of every turn down it, so keeping them would grow the perch
+//! by the whole transcript, per door.
+//!
 //! Not here, on purpose: panes, the proxy and door SSE passed to a browser (H1c); the
-//! running/parked inference and the idle reaper, which read these same frames (H2).
+//! running/parked inference and the idle reaper, which read these same frames (H2) and will
+//! need a bounded line reader of their own, not this buffer.
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -35,6 +42,10 @@ use tokio_util::sync::CancellationToken;
 /// hub.md §5's connect timeout, for the watcher as much as for the proxy: this is a socket
 /// to a process on this box.
 const CONNECT: Duration = Duration::from_secs(2);
+
+/// How much the watcher reads while looking for `hello`. The door's `hello` is the first frame
+/// and a few hundred bytes; a door that sends this much without one is not a door.
+const HELLO_MAX: usize = 1024 * 1024;
 
 /// What `hello` says that the perch needs (§4 step 7): the log path, hence the id for a new
 /// session, and the cwd, which is what a kept session's tree would be rooted at (H2).
@@ -105,7 +116,10 @@ async fn watch(port: u16, token: Arc<str>, close: CancellationToken, hello_tx: o
     let stream = match tokio::time::timeout(CONNECT, TcpStream::connect((Ipv4Addr::LOCALHOST, port))).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => return give_up(&mut hello_tx, anyhow::Error::new(e).context(format!("connecting to the door on 127.0.0.1:{port}"))),
-        Err(_) => return give_up(&mut hello_tx, anyhow::anyhow!("the door on 127.0.0.1:{port} did not accept a connection within {CONNECT:?}")),
+        Err(_) => {
+            let why = anyhow::anyhow!("the door on 127.0.0.1:{port} did not accept a connection within {CONNECT:?}");
+            return give_up(&mut hello_tx, why);
+        }
     };
     let (mut sender, connection) = match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await {
         Ok(handshake) => handshake,
@@ -139,7 +153,7 @@ async fn watch(port: u16, token: Arc<str>, close: CancellationToken, hello_tx: o
         Err(e) => return give_up(&mut hello_tx, anyhow::Error::new(e).context("asking the door for /api/events")),
     };
 
-    let mut seen = Vec::new();
+    let mut scan = HelloScan::default();
     let mut told = false;
     loop {
         tokio::select! {
@@ -147,16 +161,20 @@ async fn watch(port: u16, token: Arc<str>, close: CancellationToken, hello_tx: o
             frame = body.frame() => match frame {
                 Some(Ok(frame)) => {
                     if let Some(data) = frame.data_ref() {
-                        seen.extend_from_slice(data);
-                    }
-                    if !told {
-                        if let Some(found) = hello_from(&seen) {
-                            // A caller that timed out is gone; there is nothing to hold open.
-                            let Some(tell) = hello_tx.take() else { break };
-                            if tell.send(Ok(found)).is_err() {
+                        match scan.feed(data) {
+                            Ok(Some(found)) => {
+                                // A caller that timed out is gone; there is nothing to hold open.
+                                let Some(tell) = hello_tx.take() else { break };
+                                if tell.send(Ok(found)).is_err() {
+                                    break;
+                                }
+                                told = true;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                give_up(&mut hello_tx, e);
                                 break;
                             }
-                            told = true;
                         }
                     }
                 }
@@ -180,6 +198,40 @@ async fn watch(port: u16, token: Arc<str>, close: CancellationToken, hello_tx: o
 fn give_up(hello_tx: &mut Option<oneshot::Sender<Result<Hello>>>, why: anyhow::Error) {
     if let Some(tell) = hello_tx.take() {
         let _ = tell.send(Err(why));
+    }
+}
+
+/// The bytes read while looking for `hello`, and nothing after it: they accumulate (to
+/// [`HELLO_MAX`]) until `hello` is found, then the buffer is released and every later
+/// [`HelloScan::feed`] appends nothing.
+#[derive(Default)]
+struct HelloScan {
+    buf: Vec<u8>,
+    found: bool,
+}
+
+impl HelloScan {
+    /// One more read from the stream. `Some` exactly once, when `hello` completes.
+    fn feed(&mut self, data: &[u8]) -> Result<Option<Hello>> {
+        if self.found {
+            return Ok(None);
+        }
+        self.buf.extend_from_slice(data);
+        if let Some(found) = hello_from(&self.buf) {
+            self.found = true;
+            self.buf = Vec::new();
+            return Ok(Some(found));
+        }
+        if self.buf.len() > HELLO_MAX {
+            anyhow::bail!("no hello in the first 1 MiB ({HELLO_MAX} bytes) from the door");
+        }
+        Ok(None)
+    }
+
+    /// Bytes held (allocated), not just used: a released buffer is 0.
+    #[cfg(test)]
+    fn buffered(&self) -> usize {
+        self.buf.capacity()
     }
 }
 
@@ -217,7 +269,10 @@ mod tests {
     fn hello_is_read_and_other_frames_are_left_alone() {
         let mut seen = frame(serde_json::json!({"type": "caught-up"}));
         assert!(hello_from(&seen).is_none(), "caught-up is not hello");
-        seen.extend(frame(serde_json::json!({"type": "hello", "session": "/logs/ctf-pwn-3.eid", "cwd": "/work", "model": "mock", "yolo": false, "pending": 0, "protocol": 1})));
+        seen.extend(frame(serde_json::json!({
+            "type": "hello", "session": "/logs/ctf-pwn-3.eid", "cwd": "/work", "model": "mock",
+            "yolo": false, "pending": 0, "protocol": 1
+        })));
         let found = hello_from(&seen).expect("the hello frame is read");
         assert_eq!(found.session, PathBuf::from("/logs/ctf-pwn-3.eid"));
         assert_eq!(found.cwd, PathBuf::from("/work"));
@@ -229,5 +284,86 @@ mod tests {
         assert!(hello_from(half).is_none());
         assert!(hello_from(&frame(serde_json::json!({"type": "hello", "cwd": "/work"}))).is_none());
         assert!(hello_from(b"data: not json\n\n").is_none());
+    }
+
+    fn hello_frame() -> Vec<u8> {
+        frame(serde_json::json!({"type": "hello", "session": "/logs/a.eid", "cwd": "/work", "model": "mock"}))
+    }
+
+    #[test]
+    fn a_hello_split_across_two_reads_is_found() {
+        let bytes = hello_frame();
+        let (head, tail) = bytes.split_at(20);
+        let mut scan = HelloScan::default();
+        assert!(scan.feed(head).unwrap().is_none());
+        assert!(scan.buffered() > 0, "the half frame is held until the rest arrives");
+        let found = scan.feed(tail).unwrap().expect("the second read completes hello");
+        assert_eq!(found.session, PathBuf::from("/logs/a.eid"));
+    }
+
+    /// Any split of the frame is found, down to one byte per read, and exactly once.
+    /// Mutation: parse only the latest read instead of the whole buffer and this goes red.
+    #[test]
+    fn a_hello_fed_one_byte_at_a_time_is_found_once() {
+        let bytes = hello_frame();
+        let mut scan = HelloScan::default();
+        let mut found = Vec::new();
+        for (at, byte) in bytes.iter().enumerate() {
+            if let Some(hello) = scan.feed(&[*byte]).unwrap() {
+                found.push((at, hello.session));
+            }
+        }
+        // `hello_from` reads a `data:` line as soon as it parses, which is before the blank line
+        // that ends the frame: the closing brace is what completes the JSON.
+        assert_eq!(found.len(), 1, "told once: {found:?}");
+        assert_eq!(found[0].1, PathBuf::from("/logs/a.eid"));
+        assert_eq!(scan.buffered(), 0, "and released");
+    }
+
+    /// `hello` and a transcript replay arriving in one read: the cap is judged only when `hello`
+    /// was not found, so a replay larger than the cap does not hide it, and nothing is kept.
+    /// Mutation: check `HELLO_MAX` before looking for `hello` and this goes red.
+    #[test]
+    fn a_hello_followed_by_two_mib_in_the_same_read_is_found_and_nothing_is_kept() {
+        let mut bytes = hello_frame();
+        let piece = frame(serde_json::json!({"type": "text-delta", "text": "x".repeat(4000)}));
+        while bytes.len() < 2 * 1024 * 1024 {
+            bytes.extend_from_slice(&piece);
+        }
+        assert!(bytes.len() > HELLO_MAX);
+        let mut scan = HelloScan::default();
+        let found = scan.feed(&bytes).expect("past the cap is fine when hello is in the read").expect("hello is found");
+        assert_eq!(found.session, PathBuf::from("/logs/a.eid"));
+        assert_eq!(scan.buffered(), 0);
+    }
+
+    /// The leak: after `hello` a door streams its whole transcript, and none of it may be held.
+    /// Mutation: keep appending after `found` (drop the early return) and this goes red.
+    #[test]
+    fn nothing_is_buffered_after_hello() {
+        let mut scan = HelloScan::default();
+        assert!(scan.feed(&hello_frame()).unwrap().is_some());
+        assert_eq!(scan.buffered(), 0);
+        let piece = frame(serde_json::json!({"type": "text-delta", "text": "x".repeat(4000)}));
+        let mut sent = 0;
+        while sent < 10 * 1024 * 1024 {
+            assert!(scan.feed(&piece).unwrap().is_none(), "hello is told once");
+            assert_eq!(scan.buffered(), 0, "after {sent} bytes past hello");
+            sent += piece.len();
+        }
+    }
+
+    /// Mutation: remove the cap and this goes red.
+    #[test]
+    fn a_stream_with_no_hello_is_refused_past_one_mib() {
+        let mut scan = HelloScan::default();
+        let mut sent = 0;
+        while sent < HELLO_MAX {
+            let piece = vec![b'x'; 4096.min(HELLO_MAX - sent)];
+            assert!(scan.feed(&piece).unwrap().is_none(), "{sent} bytes is within the limit");
+            sent += piece.len();
+        }
+        let err = scan.feed(b"x").err().expect("past the limit is refused").to_string();
+        assert!(err.contains("1 MiB"), "{err}");
     }
 }

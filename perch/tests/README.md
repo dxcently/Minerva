@@ -32,8 +32,12 @@ counted and a closed tab not; a stop closing its panes **before** the SIGTERM la
 the fake's `sigterm-received streams=0`, including a pane still being set up, via
 `FAKE_LATE_PANE_MS`); a pane that has stopped reading holding up neither a stop nor a perch
 shutdown; exactly one `hub-stream-end` frame per pane, `stopping` or `dead` as the cause says;
-a session that is not live refused without a connection; and a rejected new session leaving no
+a session that is not live refused without a connection; a clean stop listing the session `kept` (and a SIGKILL or crash `dead`); a stale roster row (dead pid) not blocking a resume; and a rejected new session leaving no
 door token file behind.
+
+The **H2 tree** tests (same file, same feature) build a fixture under a live session's cwd (`.env`, `id_rsa`, `.git`, links out and in, a non-UTF-8 name) and cover the listing, every path escape and deny-list spelling (404), the 2 000 cap, the session states (409) and the strict query (400).
+
+The post-review tree tests add: NTFS 8.3 aliases (`GIT~1`, `a/SSH~1/x`, escaped, through a link) as the same empty 404; a session whose cwd is `.ssh`, `GIT~1` or under `.git`/`.gnupg` listing nothing; a resumed session whose cwd is outside `--root` listing nothing; denied, aliased and missing answers byte-identical (headers, `date` apart); a burst of 48 over a 40 000-entry directory seeing 503s and then free slots; and a door that exits 0 on its own while live ending `kept` (`FAKE_EXIT_AFTER_MS` with `FAKE_EXIT_CODE=0`) but `dead` while starting (`FAKE_EXIT_BEFORE_BOOT=0`). FIFO, dangling-link, `0000`-directory, deleted-cwd, `.git`-file, scan-bound, `dead(id, pid)` and `HelloScan` byte-at-a-time and 2 MiB cases are unit tests in `src/tree.rs`, `src/sessions.rs` and `src/watch.rs`.
 
 Directories are `tempfile`'s, under `/tmp` rather than the 9p mount this repository lives
 on: the `0600` and `0700` checks need a filesystem that keeps its promises.

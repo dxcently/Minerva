@@ -110,6 +110,7 @@ The token gate covers the bare `/hub`, `/s` and everything under them, before pa
     +------------------- dead(exit) <----- child exit ----- stopping
     |                                                          |
     +--------------------------- exited cleanly --------------+
+    +<-- live --exit 0 on its own, no stop asked (kept; a start that exits 0 is dead)
    live-elsewhere: roster has meta.log == this log and pid is not our child (read-only in the list)
 ```
 
@@ -209,7 +210,7 @@ Live sessions only (the root is `hello.cwd` from the watcher, the reopen-time cw
 | 5 | must be a directory; `read_dir`; entries via `symlink_metadata` (links are never followed) | 404 |
 | 6 | drop denied names; sort dirs first then by name; cap 2 000 | `truncated: true` |
 
-Deny list (case-insensitive, whole name): `.git` (hidden entirely), `.env`, `.env.*`, `*.key`, `*.pem`, `*.p12`, `*.pfx`, `*.kdbx`, `id_*`, `*secret*`, `*.token`, `.netrc`, `.ssh`, `.gnupg`, `.aoide`, `credentials*`. A config knob can add names, never remove these.
+Deny list (case-insensitive, whole name): `.git` (hidden entirely), `.env`, `.env.*`, `*.key`, `*.pem`, `*.p12`, `*.pfx`, `*.kdbx`, `id_*`, `*secret*`, `*.token`, `.netrc`, `.ssh`, `.gnupg`, `.aoide`, `.envrc`, `.pgpass`, `.npmrc`, `.pypirc`, `auth.json`, `creds.json`, `*credentials*` (a substring). A config knob can add names, never remove these. A segment shaped like an NTFS 8.3 alias (`~` then a digit, so `GIT~1` for `.git`) is refused as a path segment like a denied name, and the cwd is held to the same rules below its `--root`.
 
 Response: `{"path":"src","entries":[{"name":"main.rs","kind":"file","size":1234},{"name":"lib","kind":"dir"},{"name":"out","kind":"link"}],"skipped":0,"truncated":false}`. Links show no target (a target string can name paths outside the root). Non-UTF-8 names are counted in `skipped`. **No file contents, ever.** File viewing belongs to the door or `/api/launch` (editor window).
 

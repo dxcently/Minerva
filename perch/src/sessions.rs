@@ -15,10 +15,20 @@
 //! **The state machine** (§4), and the only transitions this slice makes:
 //!
 //! ```text
-//!   kept --resume--> starting --hello--> live --stop--> stopping --exit--> dead --> kept (the log stays)
-//!                        |
+//!   kept --resume--> starting --hello--> live --stop--> stopping --clean exit--> kept (our row is dropped)
+//!                        |                  |                 \--any other exit--> dead
+//!                        |                  +--exit on its own, code 0----------> kept
 //!                        +-- boot timeout / spawn failure --> dead
 //! ```
+//!
+//! **A clean exit is `kept`, not `dead`** (§4): a door that exits with code 0, or that exits by
+//! SIGTERM (or 0) after a stop was asked of it, leaves no row of ours, so the list shows its
+//! log as `kept` and `/s/<id>/...` answers 409 `kept`. Anything else (another code, another
+//! signal, a SIGKILL after the grace) stays `dead`, answers 503 and is never connected to.
+//!
+//! **The roster only counts live pids.** A door that exits (or is killed) leaves its
+//! `meta.json`, so a roster row names a process, and counts only while that process exists
+//! (`kill(pid, 0)`; `EPERM` is alive). Other processes' rows are never deleted.
 //!
 //! **Stop is the reason H1b is its own slice** (§4 "Stop"). A real door runs hyper's
 //! `GracefulShutdown`: SIGTERM does *not* end it while an SSE connection is open — it waits
@@ -143,6 +153,18 @@ impl Exit {
     }
 }
 
+impl Exit {
+    /// A door that ended on purpose: code 0, or the SIGTERM a requested stop sends. A SIGKILL
+    /// (the perch's after the grace, or anyone's) and every other code or signal is not.
+    pub fn clean(self, stop_asked: bool) -> bool {
+        match (self.code, self.signal) {
+            (Some(0), _) => true,
+            (None, Some(signal)) => stop_asked && signal == libc::SIGTERM,
+            _ => false,
+        }
+    }
+}
+
 impl std::fmt::Display for Exit {
     /// `hub-stream-end`'s `exit` spelling (hub.md §5): `code:N` or `signal:N`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -259,6 +281,16 @@ pub enum Lookup {
     NotOurs,
 }
 
+/// What `GET /hub/tree` needs to know about an id: a root to list under, or why there is none.
+pub enum TreeRoot {
+    /// Ours and live: the cwd `hello` named.
+    Live(PathBuf),
+    /// Ours, and not live: `starting`, `stopping` or `dead`.
+    Not(State),
+    /// Not a door of ours: kept, live-elsewhere or nothing at all (the caller looks at the list).
+    NotOurs,
+}
+
 /// One row of the door table, as the list and the roster check read it.
 struct Ours {
     id: String,
@@ -334,6 +366,17 @@ impl Registry {
         Ok(path)
     }
 
+    /// `GET /hub/tree`'s root check, run on every request: the cwd canonicalized, and the
+    /// `--root` that contains it (the floor the tree judges the cwd's own segments from). `None`
+    /// is the empty 404: a cwd outside every root (a resumed log can say anything), or one that
+    /// is gone.
+    pub fn tree_cwd(&self, cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+        let path = cwd.canonicalize().ok()?;
+        // The shallowest root that holds it: the one that makes the tree judge the most segments.
+        let floor = self.roots.iter().filter(|root| path.starts_with(root)).min_by_key(|root| root.components().count())?;
+        path.is_dir().then(|| (path, floor.clone()))
+    }
+
     /// The doors this perch owns, for the list.
     fn ours(&self) -> Vec<Ours> {
         self.doors
@@ -361,8 +404,29 @@ impl Registry {
             State::Dead => Lookup::Dead,
             State::Starting | State::Stopping => Lookup::Between(door.state),
             State::Live if door.exit.borrow().is_some() => Lookup::Dead,
-            State::Live => Lookup::Live(Target { port: door.port, token: door.token.clone(), exit: door.exit.clone(), panes: door.panes.clone() }),
+            State::Live => Lookup::Live(Target {
+                port: door.port,
+                token: door.token.clone(),
+                exit: door.exit.clone(),
+                panes: door.panes.clone(),
+            }),
             State::Kept | State::LiveElsewhere => Lookup::NotOurs,
+        }
+    }
+
+    /// `GET /hub/tree`'s one question: the cwd of a live door of ours. Read in one lock, like
+    /// [`Registry::lookup`], and a door whose exit is already published is `dead`.
+    pub fn tree_root(&self, id: &str) -> TreeRoot {
+        let doors = self.doors.lock().unwrap();
+        let Some(door) = doors.iter().find(|door| door.id == id) else { return TreeRoot::NotOurs };
+        match door.state {
+            State::Live if door.exit.borrow().is_some() => TreeRoot::Not(State::Dead),
+            State::Live => match &door.cwd {
+                Some(cwd) => TreeRoot::Live(cwd.clone()),
+                None => TreeRoot::Not(State::Starting),
+            },
+            State::Kept | State::LiveElsewhere => TreeRoot::NotOurs,
+            state => TreeRoot::Not(state),
         }
     }
 
@@ -432,6 +496,10 @@ impl Registry {
                 tracing::debug!(path = %meta.display(), "perch: a roster row did not parse");
                 continue;
             };
+            // A door that exited, cleanly or not, leaves its row behind: only a live pid counts.
+            if !pid_alive(row.pid) {
+                continue;
+            }
             let Some(id) = id_from_log(&self.sessions_dir, &row.log) else { continue };
             if !log_path(&self.sessions_dir, &id).is_file() {
                 continue;
@@ -455,7 +523,8 @@ impl Registry {
     pub fn held(&self, log: &Path) -> bool {
         let log = canonical(log);
         self.doors.lock().unwrap().iter().any(|door| {
-            door.log.as_deref().is_some_and(|held| canonical(held) == log) && matches!(door.state, State::Starting | State::Live | State::Stopping)
+            door.log.as_deref().is_some_and(|held| canonical(held) == log)
+                && matches!(door.state, State::Starting | State::Live | State::Stopping)
         })
     }
 
@@ -540,8 +609,12 @@ impl Registry {
     /// A spawn that never reached `live`: the row stays, as `dead`, because "this door did
     /// not come up" is something the page has to be able to see (and a kept log under the
     /// same id is then honestly reported as dead, not as resumable-now).
-    pub fn dead(&self, id: &str) {
-        if let Some(door) = self.doors.lock().unwrap().iter_mut().find(|door| door.id == id) {
+    ///
+    /// Keyed by pid as well as id, like [`Registry::forget`]: a late call from a stop that ended in
+    /// SIGKILL must not mark a newer door of the same id (a resume that reserved the row after the
+    /// reap) dead. `pid` 0 is the reservation whose fork never happened.
+    pub fn dead(&self, id: &str, pid: u32) {
+        if let Some(door) = self.doors.lock().unwrap().iter_mut().find(|door| door.id == id && door.pid == pid) {
             door.state = State::Dead;
             door.watcher = None;
         }
@@ -559,7 +632,13 @@ impl Registry {
             .collect()
     }
 
-    /// A child exited: the row becomes `dead`, its stream (to a process that is gone) is
+    /// The row of a door that stopped cleanly is dropped, so its log reads `kept` again.
+    fn forget(&self, id: &str, pid: u32) {
+        self.doors.lock().unwrap().retain(|door| !(door.id == id && door.pid == pid));
+    }
+
+    /// A child exited: the row becomes `dead` (or, for a clean exit, is dropped and the log
+    /// reads `kept`; see the module doc), its stream (to a process that is gone) is
     /// dropped, and a token file the door did not get to remove is removed here — a
     /// SIGKILLed door never runs its own `remove_file`.
     ///
@@ -574,10 +653,21 @@ impl Registry {
             let mut doors = self.doors.lock().unwrap();
             // The entry whose child this was: never a `dead` one, whose pid the kernel is
             // free to hand to a later door.
-            let Some(door) = doors.iter_mut().find(|door| door.pid == pid && door.state != State::Dead) else { return };
-            door.state = State::Dead;
-            door.watcher = None;
-            (spawn::door_token_path(&self.runtime_dir, door.port), door.token.clone())
+            let Some(at) = doors.iter().position(|door| door.pid == pid && door.state != State::Dead) else { return };
+            let door = &mut doors[at];
+            // The reap task publishes the exit before it calls this, so it is readable here.
+            // Only a door that came up can have ended on purpose: one that died while `starting`
+            // is a spawn that failed, and stays `dead`.
+            let came_up = matches!(door.state, State::Live | State::Stopping);
+            let clean = came_up && (*door.exit.borrow()).is_some_and(|exit| exit.clean(door.panes.stop_asked()));
+            let cleanup = (spawn::door_token_path(&self.runtime_dir, door.port), door.token.clone());
+            if clean {
+                doors.remove(at);
+            } else {
+                door.state = State::Dead;
+                door.watcher = None;
+            }
+            cleanup
         };
         drop_token_file(&cleanup.0, &cleanup.1);
     }
@@ -628,13 +718,19 @@ impl Registry {
 
         // 2. SIGTERM, so the door drains and removes its own token file. 3. Wait up to
         //    `DRAIN`, then SIGKILL what is left; its token file is the perch's to remove.
-        let killed = signal_and_wait(pid, exit, DRAIN).await;
+        let killed = signal_and_wait(pid, exit.clone(), DRAIN).await;
         if killed.0 {
             tracing::debug!(pid, port, "perch: a door ignored SIGTERM and was killed; its token file is the perch's to remove");
         }
         drop_token_file(&spawn::door_token_path(&self.runtime_dir, port), &token);
-        // The reap task usually got there first; this makes the row `dead` either way.
-        self.dead(id);
+        // The reap task usually got there first; this settles the row either way: dropped (the
+        // log reads `kept`) after a clean exit, `dead` after anything else.
+        let clean = !killed.0 && (*exit.borrow()).is_some_and(|seen| seen.clean(true));
+        if clean {
+            self.forget(id, pid);
+        } else {
+            self.dead(id, pid);
+        }
         Stop::Signalled
     }
 
@@ -678,6 +774,19 @@ pub async fn signal_and_wait(pid: u32, mut exit: ExitWatch, grace: Duration) -> 
     signal(pid, libc::SIGKILL);
     let _ = tokio::time::timeout(SETTLE, wait_exit(&mut exit)).await;
     Killed(true)
+}
+
+/// Whether a process with this pid exists: `kill(pid, 0)` sends nothing. `EPERM` means it
+/// exists and is someone else's, which is alive; `ESRCH` means gone. Pid 0 and anything that
+/// does not fit a `pid_t` would signal a process group or fail oddly, so they are not pids.
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 || pid > libc::pid_t::MAX as u32 {
+        return false;
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Best effort by design: a pid that is already gone gives `ESRCH`, which is the answer
@@ -743,8 +852,12 @@ mod tests {
 
     /// The resume path up to `live`, which is what puts a door of ours in the table.
     fn our_door(registry: &Arc<Registry>, id: &str, log: &Path) {
+        our_door_pid(registry, id, log, 4242, watch::channel(None).1);
+    }
+
+    fn our_door_pid(registry: &Arc<Registry>, id: &str, log: &Path, pid: u32, exit: ExitWatch) {
         assert!(registry.reserve(id, log));
-        registry.attach(id, 4242, watch::channel(None).1);
+        registry.attach(id, pid, exit);
         registry.ready(id, 4477, Arc::from("a-door-token"));
         registry.mark_live(id, log, Path::new("/tmp"));
     }
@@ -786,7 +899,8 @@ mod tests {
         let peer = runtime.path().join("eidolon").join("eidolon-9f2c");
         std::fs::create_dir_all(&peer).unwrap();
         let meta = format!(
-            r#"{{"id":"eidolon-9f2c","pid":999999,"log":"{}","cwd":"/tmp","title":"a peer","busy":true}}"#,
+            r#"{{"id":"eidolon-9f2c","pid":{},"log":"{}","cwd":"/tmp","title":"a peer","busy":true}}"#,
+            std::process::id(),
             dir.path().join("ctf-pwn-3.eid").display()
         );
         std::fs::write(peer.join("meta.json"), meta).unwrap();
@@ -809,15 +923,96 @@ mod tests {
         // Our own door wins over the roster row, on a log of its own.
         let fresh = dir.path().join("fresh.eid");
         std::fs::write(&fresh, "{}\n").unwrap();
-        our_door(&registry, "fresh", &fresh);
+        // A live pid of ours (this process stands in for the child), so the roster check
+        // below is judged on ownership and not on the pid being dead.
+        our_door_pid(&registry, "fresh", &fresh, std::process::id(), watch::channel(None).1);
         let list = registry.list();
         let fresh_row = list.iter().find(|e| e.id == "fresh").expect("our own door is listed");
         assert_eq!(fresh_row.state, State::Live);
         assert_eq!(fresh_row.mtime, mtime_secs(&fresh), "our row carries the log's mtime");
         // …and the pid we own is not a peer, even when the roster names the same log.
-        let meta = format!(r#"{{"id":"ours","pid":4242,"log":"{}"}}"#, fresh.display());
+        let meta = format!(r#"{{"id":"ours","pid":{},"log":"{}"}}"#, std::process::id(), fresh.display());
         std::fs::write(peer.join("meta.json"), meta).unwrap();
         assert!(!registry.roster_holds(&fresh), "our own pid is not someone else holding the log");
+    }
+
+    /// A pid that is certainly not running: a child of this test, already reaped.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    fn roster_row(runtime: &Path, name: &str, pid: u32, log: &Path) {
+        let dir = runtime.join("eidolon").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), format!(r#"{{"id":"{name}","pid":{pid},"log":"{}"}}"#, log.display())).unwrap();
+    }
+
+    /// The stale-row bug: a door that exits (cleanly or by kill -9) leaves its `meta.json`, and
+    /// after a perch restart that row must not make the session `live-elsewhere` for good.
+    /// Mutation: drop the `pid_alive` check in `roster()` and the first half goes red.
+    #[test]
+    fn a_roster_row_counts_only_while_its_pid_is_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        sessions_dir(dir.path());
+        let registry = registry(dir.path(), runtime.path());
+        let log = dir.path().join("ctf-pwn-3.eid");
+
+        roster_row(runtime.path(), "web-stale", dead_pid(), &log);
+        assert!(!registry.roster_holds(&log), "a dead pid does not hold the log");
+        assert_eq!(registry.list()[0].state, State::Kept, "…so the session is kept, not live-elsewhere");
+        assert!(runtime.path().join("eidolon/web-stale/meta.json").is_file(), "another process's row is never deleted");
+
+        roster_row(runtime.path(), "web-live", std::process::id(), &log);
+        assert!(registry.roster_holds(&log), "a live pid holds it");
+        assert_eq!(registry.list()[0].state, State::LiveElsewhere);
+
+        // pid 0 would signal the process group, and a pid past pid_t is not one.
+        assert!(!pid_alive(0) && !pid_alive(u32::MAX));
+        assert!(pid_alive(1), "init exists, and is ours or EPERM");
+    }
+
+    /// The clean-exit rule, as a pure function.
+    #[test]
+    fn only_an_exit_on_purpose_is_clean() {
+        let code = |c| Exit { code: Some(c), signal: None };
+        let sig = |s| Exit { code: None, signal: Some(s) };
+        assert!(code(0).clean(false) && code(0).clean(true));
+        assert!(!code(1).clean(false) && !code(1).clean(true));
+        assert!(sig(libc::SIGTERM).clean(true), "SIGTERM after a requested stop");
+        assert!(!sig(libc::SIGTERM).clean(false), "SIGTERM from outside is a kill");
+        assert!(!sig(libc::SIGKILL).clean(true), "the perch's SIGKILL is not clean");
+        assert!(!Exit::default().clean(true), "a reap that failed says nothing");
+    }
+
+    /// A clean exit drops our row (the log reads `kept`, `lookup` is as for a kept log); any
+    /// other exit stays `dead`. Mutation: make `mark_exited` always mark `dead` and the first
+    /// half goes red.
+    #[test]
+    fn a_clean_exit_leaves_the_log_kept_and_any_other_leaves_it_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        sessions_dir(dir.path());
+        let registry = registry(dir.path(), runtime.path());
+        let log = dir.path().join("ctf-pwn-3.eid");
+
+        let (publish, exit) = watch::channel(None);
+        our_door_pid(&registry, "ctf-pwn-3", &log, 4242, exit);
+        publish.send(Some(Exit { code: Some(0), signal: None })).unwrap();
+        registry.mark_exited(4242);
+        assert_eq!(registry.list()[0].state, State::Kept);
+        assert!(matches!(registry.lookup("ctf-pwn-3"), Lookup::NotOurs));
+        assert!(!registry.held(&log));
+
+        let (publish, exit) = watch::channel(None);
+        our_door_pid(&registry, "ctf-pwn-3", &log, 4243, exit);
+        publish.send(Some(Exit { code: Some(1), signal: None })).unwrap();
+        registry.mark_exited(4243);
+        assert_eq!(registry.list()[0].state, State::Dead);
+        assert!(matches!(registry.lookup("ctf-pwn-3"), Lookup::Dead));
     }
 
     #[test]
@@ -831,7 +1026,7 @@ mod tests {
         assert_eq!(registry.list()[0].state, State::Starting, "a reserved log is listed as starting");
         assert!(registry.held(&log));
         assert!(!registry.reserve("ctf-pwn-3", &log), "§4 step 2: two writers on one log is refused");
-        registry.dead("ctf-pwn-3");
+        registry.dead("ctf-pwn-3", 0);
         assert!(!registry.held(&log), "a dead door does not hold the log");
         // The row is still there, and the list says so: "this door did not come up" is
         // something the page has to be able to see.
@@ -841,6 +1036,55 @@ mod tests {
         // With no row at all the same id is the kept log it always was.
         registry.doors.lock().unwrap().clear();
         assert_eq!(registry.list()[0].state, State::Kept);
+    }
+
+    /// The race: a stop that ended in SIGKILL marks its row `dead` on its last line, and a resume
+    /// of the same id may have reserved and started a newer door in between. Keyed by id alone
+    /// that late call killed the new door's row, `held()` stopped counting it, and a third
+    /// request could start a second writer on the log.
+    /// Mutation: ignore the pid in `dead` and this goes red.
+    #[test]
+    fn a_late_dead_for_an_old_door_does_not_mark_a_newer_door_of_the_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        sessions_dir(dir.path());
+        let registry = registry(dir.path(), runtime.path());
+        let log = dir.path().join("ctf-pwn-3.eid");
+
+        let (publish, exit) = watch::channel(None);
+        our_door_pid(&registry, "ctf-pwn-3", &log, 4242, exit);
+        publish.send(Some(Exit { code: None, signal: Some(libc::SIGKILL) })).unwrap();
+        registry.mark_exited(4242);
+        assert_eq!(registry.list()[0].state, State::Dead);
+        // A resume of the same id, up to live.
+        our_door_pid(&registry, "ctf-pwn-3", &log, 4343, watch::channel(None).1);
+        // …and then the old stop's last line.
+        registry.dead("ctf-pwn-3", 4242);
+        assert_eq!(registry.list()[0].state, State::Live, "the newer door is not the one that was stopped");
+        assert!(registry.held(&log), "so the log is still held and a third resume is refused");
+        // The right pid still marks it.
+        registry.dead("ctf-pwn-3", 4343);
+        assert_eq!(registry.list()[0].state, State::Dead);
+    }
+
+    /// The tree's root check: a cwd is listable only under a `--root`, as the kernel spells it,
+    /// and the floor is the root that holds it. Mutation: always `Some` and the outside case
+    /// goes red.
+    #[test]
+    fn a_tree_root_must_be_under_a_root_and_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        sessions_dir(dir.path());
+        let registry = registry(dir.path(), runtime.path());
+        let inside = dir.path().join("work");
+        std::fs::create_dir(&inside).unwrap();
+        let (cwd, floor) = registry.tree_cwd(&inside).unwrap();
+        assert_eq!((cwd, floor), (inside.canonicalize().unwrap(), dir.path().canonicalize().unwrap()));
+        let outside = tempfile::tempdir().unwrap();
+        assert!(registry.tree_cwd(outside.path()).is_none());
+        assert!(registry.tree_cwd(Path::new("/")).is_none());
+        assert!(registry.tree_cwd(&dir.path().join("nowhere")).is_none());
+        assert!(registry.tree_cwd(&dir.path().join("ctf-pwn-3.eid")).is_none(), "a file is not a cwd");
     }
 
     /// The exit path finds a door by pid, so a stale `dead` row must never answer for a pid

@@ -24,7 +24,9 @@ Knobs, by environment (they reach it because a door's environment is inherited u
 | `FAKE_SILENT` | never print the boot lines (the startup timeout) |
 | `FAKE_MODE=0644` | write the token file world-readable (the perch must refuse it) |
 | `FAKE_TOKEN_ELSEWHERE` | write the token file outside `<runtime>/eidolon` |
-| `FAKE_EXIT_AFTER_MS` | send half a frame to every open stream, then exit 1 |
+| `FAKE_EXIT_AFTER_MS` | send half a frame to every open stream, then exit with `FAKE_EXIT_CODE` (default 1) |
+| `FAKE_EXIT_CODE` | the code `FAKE_EXIT_AFTER_MS` exits with; 0 is a door that stops on its own, cleanly |
+| `FAKE_EXIT_BEFORE_BOOT=<code>` | exit with that code before any boot line (0: a clean exit while `starting`, which is a failed spawn) |
 | `FAKE_IGNORE_SIGTERM` | never exit on SIGTERM (the SIGKILL path) |
 | `FAKE_REFUSE=<path>` | answer 401 on that path even with the right token |
 | `FAKE_LATE_PANE_MS` | hold back the head of the third and later `/api/events` streams (the watcher is the first) by this long, counted as open meanwhile: a pane still being set up when a stop lands |
