@@ -6189,3 +6189,13 @@ template are tagged `template=jev-v3`, and V40 no longer counts as held out.
 ## 2026-10-01 - Minerva runs upstream eidolon's plugins, and extensions/ is retired
 
 The operator chose upstream master with the plugin runtime over keeping the fork's extension host. eidolon `bab3813` and harnox `v0.3.12` are vendored (upstream head has since moved to `24d6bda`). Browser, subagent and jev are vendored from eidolon-plugins `3be1e2b` and installed and trusted in the WSL eidolon. `extensions/` was archived (tag, bundle and tarball in `Minerva-archive/extensions-2026-10-01`; the tag stays local) and then deleted. jev's Python service stays in `jev/`; its `automation.*` path and old-format graphs were retired, and the graphs live only in the jev plugin.
+
+## 2026-10-03 - Three rulings after the web UI work
+
+1. The launcher must not leave a long-lived token in browser history, so a
+   one-time-code redeem replaces loosening the Sec-Fetch gate. Pending operator
+   confirmation.
+2. Minerva never edits eidolon or harnox core: vendored snapshots equal their
+   pinned upstream, and changes go upstream.
+3. Claude subscriptions are reached only through the Claude CLI driver. ChatGPT
+   login is used by eidolon's own chatgpt provider, for personal use.

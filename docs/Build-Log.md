@@ -3691,3 +3691,21 @@ What ran, all on the BotForge practice VM, GLM 5.3 as the scored brain, jev
 - Ceiling: ~12–15 points are unreachable under the standing rules (mford's sudo,
   two offline-blocked apt items, one check the writeup calls bugged). Forensics
   F2 was wrong in every round; the literal answer was deliberately not seeded.
+
+## 2026-10-03 — Web UI end to end, perch post-H1c fixes
+
+- The web UI end-to-end slices 01-13 are done: perch mode vs door mode, the
+  session list, resume, new session, ask notes, the door's launch route and the
+  files tab through `/hub/tree`.
+- Perch fixes after H1c: `GET /hub/tree` (deny list, NTFS 8.3 refusal, scan
+  bound, 4 listings at a time), clean-stop sessions listed as kept (409 from the
+  proxy), roster rows counted only while their pid is alive, and a watcher that
+  keeps no transcript after hello. Tests: 59 lib + 67 http, each fix proven by a
+  mutation.
+- Reviews: an Opus security pass on perch (findings 1-5, 7-9 fixed, PID reuse
+  left as an H2 note); the page was tested and reviewed end to end with the
+  headless Edge harness (`bin/webui-cdp.mjs`).
+- KNOWN OPEN: `bin/perch-open.sh` hands the token over through a redirect file,
+  and opening that file in a real browser gets a 403 from the perch's Sec-Fetch
+  gate (file: pages navigate cross-site). The launcher is not usable in a
+  browser yet.
