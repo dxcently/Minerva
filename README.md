@@ -58,6 +58,7 @@ The launcher's other commands:
 | | |
 |---|---|
 | [`docs/Getting-Started.md`](docs/Getting-Started.md) | install and run, step by step |
+| [`nix/`](nix/README.md) | the root Nix flake: packages, `nix profile install`, updates |
 | [`VENDORED.md`](VENDORED.md) | what is copied in from upstream, at which revision, under which license |
 | [`docs/Hoot.md`](docs/Hoot.md) | the project's own front door: layers, direction, layout, constraints |
 | [`docs/Architecture.md`](docs/Architecture.md) | the box, the serving layer, the face, the core, the vault |

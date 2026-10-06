@@ -1,0 +1,59 @@
+# The Minerva installer and updater.
+#
+# Standalone on purpose, like perch/ and setup/: its own Cargo.toml and Cargo.lock, no workspace, no eidolon-* or
+# aoide-* dependency (MIT, like the rest of Minerva).
+#
+# Two programs share one library:
+#   minerva          Linux (static musl, ships inside the bundle): install / update / rollback / uninstall / the verbs
+#   minerva-install  Windows: the .exe a club member double-clicks; it carries the same bundle and drives WSL
+[package]
+name = "minerva-installer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "minerva-install.exe (Windows) and the `minerva` command (Linux): install, signed update, rollback, uninstall."
+publish = false
+
+[lib]
+name = "minerva_installer"
+
+[[bin]]
+name = "minerva"
+path = "src/bin/minerva.rs"
+
+[[bin]]
+name = "minerva-install"
+path = "src/bin/minerva-install.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# The bundle is a .tar.gz: pure-Rust gzip (no C dependency, so the musl build needs no extra toolchain).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4", default-features = false }
+# Verification only. The operator signs with the `minisign` command; this crate cannot sign.
+minisign-verify = "0.2"
+# The Windows exe's prompts (the same crate setup/ uses). Plain line prompts are the fallback.
+cliclack = "0.5"
+# A private temp dir (mode 0700, unpredictable name) for the plugin install; also what the tests use.
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+# HTTPS to GitHub Releases (rustls; ring compiles with the same C compiler the eidolon build already needs).
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }
+
+[dev-dependencies]
+# Throwaway keys for the tests ONLY. Signing is the operator's step with the `minisign` command.
+minisign = "0.7"
+
+[features]
+# Test-only back doors (MINERVA_KEYS_DIR, update --self-path). Release builds never enable it; build.sh does so only with
+# --test-overrides, for the end-to-end scenarios.
+test-overrides = []

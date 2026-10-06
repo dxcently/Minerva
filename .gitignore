@@ -47,3 +47,10 @@ llama.cpp.prev/
 *.ova
 *.ova.part
 *.qcow2
+
+# Installer build outputs (installer/build.ps1): the bundle, the exe, test keys
+/installer/dist/
+
+# installer build output (the dirty check counts untracked files)
+/installer/target/
+/installer/dist/

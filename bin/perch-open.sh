@@ -42,14 +42,34 @@ for a in "$@"; do
 done
 if [ "$code_only" = 1 ]; then want_code=1; fi
 
-BIN=${MINERVA_PERCH_BIN:-$HOME/perch-target/release/perch}
-PORT=${MINERVA_PERCH_PORT:-47820}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Installed mode: this script sits in <install>/bin next to the prebuilt perch (a release bundle, installed by
+# install.sh or minerva-install.exe). Then the binaries and the UI come from the install, and its bin/ goes first on
+# PATH so the doors the perch starts are the bundled eidolon. In a repo checkout bin/ has no perch binary, so
+# nothing changes there. The MINERVA_* variables below still win in both modes.
+if [ -x "$here/perch" ]; then
+  BIN=${MINERVA_PERCH_BIN:-$here/perch}
+  SETUP_BIN=${MINERVA_SETUP_BIN:-$here/minerva-setup}
+  export PATH="$here:$PATH"
+else
+  BIN=${MINERVA_PERCH_BIN:-$HOME/perch-target/release/perch}
+  SETUP_BIN=${MINERVA_SETUP_BIN:-$HOME/setup-target/release/minerva-setup}
+fi
+PORT=${MINERVA_PERCH_PORT:-47820}
 UI=${MINERVA_UI_DIR:-$here/../webui/term}
 MHOME=${MINERVA_HOME:-$HOME/Minerva}
-SETUP_BIN=${MINERVA_SETUP_BIN:-$HOME/setup-target/release/minerva-setup}
 
 case "$PORT" in ''|*[!0-9]*) echo "perch-open: MINERVA_PERCH_PORT must be a number" >&2; exit 1 ;; esac
+
+# Installed mode only: keep the bundled plugins current and trusted, and run their services (the browser, and jev once
+# set up). Quiet and best effort: a failure here never stops the perch from starting.
+if [ -x "$here/perch" ] && [ -x "$here/minerva" ] && [ "${MINERVA_NO_PLUGIN_SYNC:-}" = "" ]; then
+  case "$mode" in
+    stop) "$here/minerva" services stop --quiet || true ;;
+    status) ;;
+    *) "$here/minerva" plugins sync --if-needed --quiet || true; "$here/minerva" services start --quiet || true ;;
+  esac
+fi
 
 if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
   echo "perch-open: XDG_RUNTIME_DIR is not set; the perch refuses to keep its token in a shared temp dir" >&2

@@ -1,0 +1,4 @@
+# Scoped to installer/ (cargo reads this when building from here). The Windows exe links the C runtime statically, so it does
+# not load VCRUNTIME140.dll (or any other non-system DLL) from its own folder, e.g. a Downloads folder an attacker can write to.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -26,6 +26,18 @@
 #   hoot edit                           open models.ini
 #   hoot which                          show which llama.cpp binaries are in use
 #   hoot help                           this list
+#   hoot update [-Check] [-Rollback]    installed copies only: install the newest signed release / only look / go back one
+#   hoot keys list|inspect|add|remove   installed copies only: who may sign releases (runs `minerva keys` in WSL)
+#   hoot jev-setup [--dry-run]          installed copies only: the optional jev chooser (Python venv, CPU torch, ~1.2 GB)
+#   hoot version                        installed copies only: the hoot and bundle versions
+#
+# Two ways to run: from a repo checkout (dev: it finds perch/eidolon/webui in the checkout) or INSTALLED by
+# minerva-install.exe. Installed mode is on when a file `install.json` sits next to this script (the installer writes
+# it: the WSL distro and prefix). Then the programs come from <prefix>/opt/minerva/current inside that distro, and
+# the llama-server verbs (serve, up, models, ...) are not available (they need a checkout with models.ini).
+# An installed hoot refreshes itself: when install.json's version differs from the installed bundle's (the Linux side
+# was updated by `minerva update` or the installer), hoot copies the bundle's hoot files over itself and asks you to run
+# the command again. A checkout never does this.
 
 [CmdletBinding()]
 param(
@@ -40,7 +52,10 @@ param(
     [string]$Tag = 'latest',
     [switch]$Force,
     # 'web' only: print the one-time link instead of opening the browser.
-    [switch]$NoOpen
+    [switch]$NoOpen,
+    # 'update' only (installed copies).
+    [switch]$Check,
+    [switch]$Rollback
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,6 +70,31 @@ $Setup  = Join-Path $PSScriptRoot 'setup-models.ps1'
 # to, so probe loopback in that case; the server listens there too.
 $Probe  = if ($Bind -in '0.0.0.0', '::', '[::]') { '127.0.0.1' } else { $Bind }
 $Base   = "http://${Probe}:${Port}"
+
+# Installed mode (see the header): install.json = {distro, wsl_prefix, version}, written by minerva-install.exe.
+$Installed = $false
+$WslD = @()
+$OptCur = $null
+$Marker = Join-Path $PSScriptRoot 'install.json'
+if (Test-Path $Marker) {
+    $Inst = Get-Content -Raw $Marker | ConvertFrom-Json
+    if ($Inst.distro -and $Inst.wsl_prefix) {
+        # install.json is a file in a folder on PATH; whatever is in it ends up inside a bash command line. The prefix must
+        # be an absolute Linux path with no quote and no control character (the same bar dev mode sets for the checkout path),
+        # and the distro name plain.
+        if ([string]$Inst.wsl_prefix -notmatch '^/[^\x00-\x1F\x7F''"`$\\]*$' -or ([string]$Inst.wsl_prefix).Contains('..')) {
+            Write-Host '  xx hoot: install.json has a wsl_prefix that is not a plain absolute Linux path; refusing to use it. Reinstall with minerva-install.exe.' -ForegroundColor Red
+            exit 1
+        }
+        if ([string]$Inst.distro -notmatch '^[A-Za-z0-9._ -]{1,64}$') {
+            Write-Host '  xx hoot: install.json has a distro name with odd characters; refusing to use it. Reinstall with minerva-install.exe.' -ForegroundColor Red
+            exit 1
+        }
+        $Installed = $true
+        $WslD = @('-d', [string]$Inst.distro)
+        $OptCur = "$($Inst.wsl_prefix)/opt/minerva/current"
+    }
+}
 
 $W = 66
 
@@ -133,7 +173,7 @@ function Assert-Serveable {
 function ConvertTo-WslPath($p) {
     # Collect all output before taking the first line: Select-Object -First 1 would stop the pipeline
     # early, kill wsl.exe and leave a non-zero $LASTEXITCODE behind.
-    $out = @(& wsl.exe -e wslpath -a $p)
+    $out = @(& wsl.exe @WslD -e wslpath -a $p)
     if ($LASTEXITCODE -ne 0 -or -not $out) { Die "cannot map $p into WSL (wslpath failed)" }
     $path = "$($out[0])".Trim()
     if ($path.Contains("'")) { Die 'the repo path has a quote in it; move the checkout' }
@@ -144,7 +184,7 @@ function ConvertTo-WslPath($p) {
 # Passed through WSLENV, so values are never pasted into a command line. They arrive unchanged, so
 # they must already be WSL paths (/home/you/Minerva), not Windows ones.
 function Set-WslEnv {
-    $names = @('MINERVA_PERCH_PORT', 'MINERVA_HOME', 'MINERVA_PERCH_BIN', 'MINERVA_UI_DIR', 'MINERVA_SETUP_BIN') | Where-Object { Test-Path "env:$_" }
+    $names = @('MINERVA_PERCH_PORT', 'MINERVA_HOME', 'MINERVA_PERCH_BIN', 'MINERVA_UI_DIR', 'MINERVA_SETUP_BIN', 'MINERVA_NO_UPDATE_CHECK') | Where-Object { Test-Path "env:$_" }
     if ($names) {
         $have = @($env:WSLENV -split ':' | Where-Object { $_ })
         # Compared by name with any /flags stripped: `MINERVA_HOME/p` already lists MINERVA_HOME.
@@ -155,16 +195,16 @@ function Set-WslEnv {
 
 function Invoke-PerchOpen([string]$flag) {
     Set-WslEnv
-    $script = (ConvertTo-WslPath $Root) + '/bin/perch-open.sh'
+    $script = if ($Installed) { "$OptCur/bin/perch-open.sh" } else { (ConvertTo-WslPath $Root) + '/bin/perch-open.sh' }
     # Stdout is captured (it is the one-line link for --code); stderr goes straight to the console.
-    $out = & wsl.exe -e bash -lc "'$script' $flag"
+    $out = & wsl.exe @WslD -e bash -lc "'$script' $flag"
     return [pscustomobject]@{ Code = $LASTEXITCODE; Lines = @($out | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) }
 }
 
 # Has `minerva setup` been run? It saves <home>/minerva.toml; the home is MINERVA_HOME or ~/Minerva in WSL.
 function Test-Setup {
     Set-WslEnv
-    & wsl.exe -e bash -lc 'test -f "${MINERVA_HOME:-$HOME/Minerva}/minerva.toml"'
+    & wsl.exe @WslD -e bash -lc 'test -f "${MINERVA_HOME:-$HOME/Minerva}/minerva.toml"'
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -173,13 +213,81 @@ function Test-Setup {
 # (exit 3). A first-run call ($Strict false) goes on with the defaults then; `hoot init` does not.
 function Invoke-Wizard([bool]$Strict) {
     Set-WslEnv
-    $script = (ConvertTo-WslPath $Root) + '/bin/minerva-setup.sh'
-    & wsl.exe -e bash -lc "bash '$script'"
+    $script = if ($Installed) { "$OptCur/bin/minerva-setup.sh" } else { (ConvertTo-WslPath $Root) + '/bin/minerva-setup.sh' }
+    & wsl.exe @WslD -e bash -lc "bash '$script'"
     $code = $LASTEXITCODE
     if ($code -eq 0) { return }
     if ($code -eq 3 -and -not $Strict) { Warn 'the setup wizard is not built; going on with the defaults (hoot init once it is)'; return }
     if ($code -eq 130) { Die 'setup cancelled; run hoot init when you are ready' }
     Die "the setup wizard did not finish (exit $code; the message above says why)"
+}
+
+# Installed copies only: a once-a-day, notice-only check (the Linux side does the asking, signed and cached; this
+# never installs anything and says nothing when it cannot reach the network).
+function Show-UpdateNotice {
+    if (-not $Installed -or $env:MINERVA_NO_UPDATE_CHECK) { return }
+    try {
+        Set-WslEnv
+        $line = @(& wsl.exe @WslD -e "$OptCur/bin/minerva" check-update --as hoot)
+        if ($LASTEXITCODE -eq 0 -and $line.Count -gt 0 -and "$($line[0])".Trim()) { Warn "$($line[0])".Trim() }
+    } catch { }
+}
+
+# The installed bundle's version (what `current` points at), or $null when WSL cannot say.
+function Get-BundleVersion {
+    $v = @(& wsl.exe @WslD -e cat "$OptCur/VERSION")
+    if ($LASTEXITCODE -ne 0 -or -not $v) { return $null }
+    $t = "$($v[0])".Trim()
+    if ($t) { return $t } else { return $null }
+}
+
+# Record which bundle version these hoot files belong to (install.json keeps distro and prefix as they were).
+function Set-InstalledVersion([string]$version) {
+    $o = Get-Content -Raw $Marker | ConvertFrom-Json
+    $o.version = $version
+    [System.IO.File]::WriteAllText($Marker, ($o | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# Copy the bundle's hoot.ps1 over this one. Returns $true when it did.
+function Sync-HootFiles {
+    $unc = @(& wsl.exe @WslD -e wslpath -w "$OptCur/windows")
+    if ($LASTEXITCODE -ne 0 -or -not $unc) { Warn 'could not find the new hoot files; hoot stays as it was'; return $false }
+    $copied = $false
+    # hoot.cmd is deliberately NOT copied: it is a fixed one-liner that ends itself (`& exit /b`), so cmd never re-reads the file
+    # while it runs, and it never changes between versions. Only the script is refreshed. (An install made before the
+    # one-liner was fixed keeps its old hoot.cmd until minerva-install.exe is run again.)
+    $from = Join-Path "$($unc[0])".Trim() 'hoot.ps1'
+    if (Test-Path $from) { Copy-Item -LiteralPath $from -Destination (Join-Path $PSScriptRoot 'hoot.ps1') -Force; $copied = $true }
+    if (-not $copied) { Warn 'the bundle has no hoot.ps1; hoot stays as it was'; return $false }
+    $v = Get-BundleVersion
+    if ($v) { Set-InstalledVersion $v }
+    Ok 'hoot refreshed'
+    return $true
+}
+
+# Installed copies, every launch: when the bundle is not the version these hoot files came from, refresh them. The
+# copy happens at the end of the run (the script is read already), and the person runs the command again.
+function Update-SelfIfStale {
+    if (-not $Installed) { return }
+    $bundle = Get-BundleVersion
+    if (-not $bundle -or $bundle -eq [string]$Inst.version) { return }
+    Say "the installed Minerva is $bundle and this hoot is from $($Inst.version); refreshing hoot"
+    if (Sync-HootFiles) {
+        Say 'hoot is up to date now: run your command again'
+        exit 0
+    }
+}
+
+# hoot keys ..., hoot jev-setup: run the Linux command. A key file named by a Windows path is mapped into WSL first.
+function Invoke-MinervaVerb([string[]]$words) {
+    Set-WslEnv
+    $mapped = @()
+    foreach ($w in $words) {
+        if ($w -ne '-' -and -not $w.StartsWith('-') -and $w -match '[\\/]' -and (Test-Path -LiteralPath $w -PathType Leaf)) { $mapped += (ConvertTo-WslPath (Resolve-Path -LiteralPath $w).ProviderPath) }
+        else { $mapped += $w }
+    }
+    & wsl.exe @WslD -e "$OptCur/bin/minerva" @mapped
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
 # Starts or reuses the server, gets a one-time link, and opens it. Returns nothing.
@@ -196,19 +304,55 @@ function Open-Web {
     if ($NoOpen) { Write-Host $url; return }
     Start-Process $url
     Ok 'opened Minerva in your browser'
+    Show-UpdateNotice
 }
 
 function Invoke-PerchVerb([string]$flag) {
     $r = Invoke-PerchOpen $flag
     foreach ($l in $r.Lines) { Write-Host "  $l" }
     if ($r.Code -ne 0) { exit $r.Code }
+    if ($flag -eq '--status') { Show-UpdateNotice }
 }
+
+# Installed copies have no llama.cpp\ or models.ini: those verbs need a checkout.
+$cmdLower = $Command.ToLower()
+if ($Installed -and ($cmdLower -in 'serve', 'up', 'models', 'get', 'setup', 'edit', 'which' -or ($cmdLower -in 'stop', 'status' -and -not ($Rest -and $Rest[0] -eq 'web')))) {
+    Die "'$Command' needs a Minerva checkout (llama-server lives there). Installed: hoot, hoot init, hoot status web, hoot stop web, hoot update, hoot keys, hoot jev-setup"
+}
+if ($cmdLower -ne 'update') { Update-SelfIfStale }
 
 switch ($Command.ToLower()) {
 
     { $_ -in '', 'web', 'webui' } {
         # 'webui' is the old name: it used to say "moved"; it now opens Minerva too.
         Open-Web
+    }
+
+    'update' {
+        if (-not $Installed) { Die 'hoot update is for an installed Minerva (minerva-install.exe). From a checkout: git pull.' }
+        Set-WslEnv
+        $flags = @($Rest | Where-Object { $_ })
+        if ($Rollback) { $flags += '--rollback' }
+        if ($Check) { $flags += '--check' }
+        & wsl.exe @WslD -e "$OptCur/bin/minerva" update @flags
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        if (-not $Check -and -not ($flags -contains '--check')) { [void](Sync-HootFiles) }
+    }
+
+    'keys' {
+        if (-not $Installed) { Die 'hoot keys is for an installed Minerva (minerva-install.exe)' }
+        Invoke-MinervaVerb (@('keys') + @($Rest | Where-Object { $_ }))
+    }
+
+    'jev-setup' {
+        if (-not $Installed) { Die 'hoot jev-setup is for an installed Minerva (minerva-install.exe)' }
+        Invoke-MinervaVerb (@('jev-setup') + @($Rest | Where-Object { $_ }))
+    }
+
+    'version' {
+        if (-not $Installed) { Die 'hoot version is for an installed Minerva (minerva-install.exe)' }
+        Write-Host "hoot files  $($Inst.version)"
+        Write-Host "bundle      $(Get-BundleVersion)"
     }
 
     'init' {
@@ -377,6 +521,9 @@ switch ($Command.ToLower()) {
             'edit                  edit models.ini'
             'which                 show binaries/config in use'
             'help                  this list'
+            'update                installed copies: install the newest signed release'
+            'keys <verb>           installed copies: list/inspect/add/remove release signing keys'
+            'jev-setup             installed copies: the optional jev chooser (asks first)'
         )
         Write-Host ''
         Write-Host "   llama api  $Base/v1   (Minerva itself runs in WSL; hoot web opens it)" -ForegroundColor DarkGray

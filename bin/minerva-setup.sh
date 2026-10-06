@@ -5,7 +5,10 @@
 #   MINERVA_SETUP_BIN  default $HOME/setup-target/release/minerva-setup. Build it in WSL with:
 #                        cd setup && CARGO_TARGET_DIR=$HOME/setup-target cargo build --release
 set -euo pipefail
-BIN=${MINERVA_SETUP_BIN:-$HOME/setup-target/release/minerva-setup}
+here0=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Installed mode (a release bundle): the prebuilt wizard sits next to this script.
+if [ -x "$here0/minerva-setup" ]; then default_bin=$here0/minerva-setup; else default_bin=$HOME/setup-target/release/minerva-setup; fi
+BIN=${MINERVA_SETUP_BIN:-$default_bin}
 if [ ! -x "$BIN" ]; then
   here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   echo "minerva-setup: the setup wizard is not built: $BIN" >&2
