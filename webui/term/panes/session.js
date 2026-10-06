@@ -70,8 +70,7 @@ function Glyphs({ p, act }) {
     onClick=${(e) => { e.stopPropagation(); on(e.currentTarget); }}
     onKeyDown=${(e) => { if (!e.repeat && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); e.stopPropagation(); on(e.currentTarget); } }}>${ch}</span>`;
   return html`<div class="fglyphs">
-    ${g('⇥', 'split right', `split-row-${p.id}`, (el) => act.splitMenu(p, 'row', under(el)))}
-    ${g('⇩', 'split down', `split-col-${p.id}`, (el) => act.splitMenu(p, 'col', under(el)))}
+    ${g('+', 'split right or down', `split-${p.id}`, (el) => act.splitMenu(p, under(el)))}
     ${g('×', 'close the pane (⌥w  :q)', `close-${p.id}`, () => act.close(p.id))}
   </div>`;
 }

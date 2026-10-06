@@ -113,7 +113,7 @@ Every action is clickable; keys are shortcuts for the same functions.
 | the model, persona or the mode (`YOLO`, `manual`, `auto`) in the status line | the inspector's `loaded` tab (what the door has loaded) |
 | `N waiting` in the status line | focus the oldest ask (`▶ N waiting`: it is holding until you pause typing) |
 | a pane's title (click or right-click) | menu: split right ▸, split down ▸, show… ▸ (sessions, current ticked), mirror, reconnect, close |
-| `⇥` `⇩` `×` on a pane's top border | split right / split down (the picker: mirror; new, resume, existing session need the hub) / close |
+| `+` `×` on a pane's top border | split: a menu of split right ▸ / split down ▸ (each the picker: mirror; new, resume, existing session need the hub) / close |
 | right-click a chat row | copy (the selection, if any), copy as markdown, quote into composer |
 | right-click a sidebar session | open in new pane, show in focused pane, fork (latest), stop this chat, pin, archive, delete |
 | right-click the status line | loaded (the inspector tab), theme ▸, font ▸ (live, current ticked), then every `:` command |

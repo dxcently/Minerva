@@ -813,10 +813,15 @@ function picker() {
   if (mode() !== 'perch') { toast('new pane with a picker arrives with the hub (M2); :vsplit mirrors this one'); return; }
   const p = focused.peek();
   const el = p && document.querySelector(`.pane[data-pane="${p.id}"]`);
-  const r = el && el.getBoundingClientRect();
-  const dir = r && r.height > r.width ? 'col' : 'row';
   const at = el ? under(el) : { x: innerWidth / 2, y: innerHeight / 2, x2: innerWidth / 2, y2: innerHeight / 2 };
-  openMenu(splitItems(p || null, dir), at, { title: 'new pane', owner: 'picker' });
+  openMenu(splitItems(p || null, longSide(p)), at, { title: 'new pane', owner: 'picker' });
+}
+
+// Which way a split of pane `p` goes: along its longer side, so panes stay near square (dwindle).
+function longSide(p) {
+  const el = p && document.querySelector(`.pane[data-pane="${p.id}"]`);
+  const r = el && el.getBoundingClientRect();
+  return r && r.height > r.width ? 'col' : 'row';
 }
 
 // A terminal, an editor or a file manager on the machine running the door,
@@ -837,8 +842,11 @@ const paneMenu = (p, at) => openMenu([
   { label: 'close', hint: '⌥w  :q', on: () => closePane(p.id) },
 ], at, { title: 'pane', owner: 'pane-' + p.id });
 
-const splitMenu = (p, dir, at) => openMenu(splitItems(p, dir), at,
-  { title: dir === 'row' ? 'split right' : 'split down', owner: `split-${dir}-${p.id}` });
+// The border's one split glyph: both sides, each with the same picker.
+const splitMenu = (p, at) => openMenu([
+  { label: 'split right', sub: splitItems(p, 'row') },
+  { label: 'split down', sub: splitItems(p, 'col') },
+], at, { title: 'split', owner: `split-${p.id}` });
 
 // Stop a door of this perch, after asking. 202: stopping; 409: not ours / not live.
 async function stopSession(sid, name) {

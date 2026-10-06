@@ -114,7 +114,7 @@ Switch from the status line's right-click menu (`theme ▸`, `font ▸`, the cur
 | Frame title | the open tab's name, with the collapse glyph (`«` left, `»` right) at its outer end; `[`/`]` cycle the inspector tabs | sidebars, inspector |
 | Activity rail (decided 2026-10-06, replaces the tab strip) | a 3-cell column on each outer edge, always shown: no top cell and no glyph in the rail at all (the collapse `«`/`»` sits only at the outer end of an open panel's title, also in the narrow overlay; a closed panel reopens from any of its rail icons or ctrl+b / ctrl+i), just one icon per tab (left `≡ ▦ ⋈`; right `◉ ▣ ▤ ± ⋔ ▶`; one table, `RAIL_ICONS`). The open tab's icon is lit; click an icon to open that tab, the lit one to close. Both closed is compact mode. State kept in `localStorage`; under 110 cells wide a panel overlays the tiles. Operator ruling: the strips were cut off with no way to reach the hidden tabs, and there was no clear way to collapse | left and right edges |
 | Clickable text | ask tabs and rows, key-reference entries, status-line pieces: underlined on hover, `<span role="button" tabindex="0">`, so "no buttons" is visual only, not a screen-reader loss (reasoned) | inline |
-| Frame glyphs (decided) | `⇥` split right, `⇩` split down, `×` close, cut into each pane's top border on the right; each has a tooltip | pane frames |
+| Frame glyphs (decided) | `+` split (a menu: split right ▸, split down ▸), `×` close, cut into each pane's top border on the right; each has a tooltip | pane frames |
 | Menus (decided) | a square frame of lines, opened by right-click (at the pointer) or a click on a title or glyph (under it); keys: up/down, Enter or right into a submenu, left or Esc out; closes on an outside click; flips to the other side of its anchor rather than run off screen. Greyed lines say why (`needs the hub`) | pane titles, glyphs, chat rows, sidebar sessions, status line |
 
 ---
@@ -124,7 +124,7 @@ Switch from the status line's right-click menu (`theme ▸`, `font ▸`, the cur
 ### 3.1 Baseline screen
 
 ```text
-+- sessions  projects  mesh ---+- ctf-prep ▾ [ctf-prep] ● ---------------- ⇥ ⇩ × -+- rec  files  diff  graph  run -+
++- sessions  projects  mesh ---+- ctf-prep ▾ [ctf-prep] ● ------------------ + × -+- rec  files  diff  graph  run -+
 |  ,___,  minerva              | you  16:40                                          | turns 7                       |
 | [O.o]   Make it,             |   find the flag in ./chall                          | calls 12                      |
 | /)_)    Break it,            | minerva  16:41 · 4.9k in · 310 out · 12.4s          |                               |
@@ -220,7 +220,7 @@ Every key is a shortcut for something also clickable (decided): the composer's b
 | Where | Opens | Live in M1 | Needs the hub |
 |---|---|---|---|
 | pane title, click or right-click | split right ▸ · split down ▸ · show… ▸ · mirror · reconnect · close | mirror, reconnect, close; the split pickers' `mirror` | show…: another session, new session, resume… |
-| `⇥` / `⇩` on the pane frame | the split picker: mirror · new session · resume… · existing session ▸ | mirror | the rest |
+| `+` on the pane frame | the split picker: mirror · new session · resume… · existing session ▸ | mirror | the rest |
 | `×` on the pane frame | closes the pane | yes | - |
 | a chat row, right-click | fork from here · copy · copy as markdown · quote into composer | copy (the selection, if any), copy as markdown, quote | fork from here |
 | a sidebar session, right-click | open beside (a mirror) · show in focused pane · fork (latest) · stop this chat; an unopened or saved row also has open here | open beside, show in focused pane, open here | fork |
@@ -228,7 +228,7 @@ Every key is a shortcut for something also clickable (decided): the composer's b
 
 A pane's session can change (`show…`): the page structures a pane as `{ id, sid }`, so a mirror becomes an independent pane on another session once the hub lists more than one. In M1 only the one door session exists; `:open <id>` opens a pane on another session id, for the hub's `/s/<id>/api/`.
 
-The `ctrl+enter` picker row above is the M2 plan; in M1 the split picker is a menu off the `⇥`/`⇩` glyphs, not a list inside the new pane.
+The `ctrl+enter` picker row above is the M2 plan; in M1 the split picker is a menu off the `+` glyph, not a list inside the new pane.
 
 ### 4.3 Mirroring
 
