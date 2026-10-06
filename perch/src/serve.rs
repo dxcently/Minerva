@@ -25,7 +25,7 @@
 use std::convert::Infallible;
 use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,6 +65,8 @@ pub struct Ctx {
     pub spawner: Arc<Spawner>,
     /// At most [`tree::MAX_LISTINGS`] directory listings at once; a fifth is a 503.
     pub tree_slots: tree::Slots,
+    /// Login codes and the session secrets they are traded for (hub.md section 10.5).
+    pub logins: Arc<crate::login::Logins>,
 }
 
 /// Refused at the cap before the rest is buffered. The door caps its own bodies at the same
@@ -183,6 +185,65 @@ fn presented(req: &Request<Incoming>) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
+/// The open login route and the largest body it will read: a code is 43 characters.
+const REDEEM: &str = "/hub/redeem";
+const REDEEM_BODY: usize = 1024;
+
+/// The cookie's name: the port is in it because cookies are not isolated by port, so two perches
+/// on one host (the operator's and a test's) would otherwise overwrite each other's login.
+fn cookie_name(bound: SocketAddr) -> String {
+    format!("minerva_{}", bound.port())
+}
+
+/// The token as a bearer header: the launcher, the `#token=` path, curl. Constant time.
+fn bearer_ok(ctx: &Ctx, req: &Request<Incoming>) -> bool {
+    presented(req).is_some_and(|presented| gate::token_ok(presented, &ctx.token))
+}
+
+/// The credential, from either place a browser can hold it: the token as a bearer header, or the
+/// session cookie [`redeem`] set. Both are constant time; neither is read from a query or a body.
+///
+/// The bearer keeps gate 3's "absent `Sec-Fetch-Site` passes" (curl sends none, and a page cannot
+/// attach the header). The cookie is attached by the browser itself, and a browser without fetch
+/// metadata on another port of this host is same-site, so the cookie counts only on a request that
+/// says it is `same-origin`: the page's own `fetch` and `EventSource` always do.
+fn authenticated(ctx: &Ctx, req: &Request<Incoming>) -> bool {
+    if bearer_ok(ctx, req) {
+        return true;
+    }
+    if sec_fetch(req) != Some("same-origin") {
+        return false;
+    }
+    let name = cookie_name(ctx.bound);
+    req.headers()
+        .get_all(hyper::header::COOKIE)
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .filter_map(|header| crate::login::cookie_value(header, &name))
+        .fold(false, |ok, value| ok | ctx.logins.session_ok(value))
+}
+
+/// `POST /hub/redeem {"code": "..."}`: a valid code is consumed and answered with a session
+/// cookie (204); anything else, a malformed body included, is the same empty 403.
+///
+/// `HttpOnly` keeps it from page script, `SameSite=Strict` from cross-site requests, and there
+/// is no `Secure` because the origin is plain-http loopback. No `Max-Age`: it ends with the
+/// browser session, and with the perch, whose restart forgets every secret.
+fn redeem(ctx: &Ctx, body: &Bytes) -> Response<BoxBody> {
+    #[derive(serde::Deserialize)]
+    struct Asked {
+        code: String,
+    }
+    let secret = serde_json::from_slice::<Asked>(body).ok().and_then(|asked| ctx.logins.redeem(&asked.code));
+    let Some(secret) = secret else { return status(StatusCode::FORBIDDEN) };
+    let cookie = format!("{}={secret}; HttpOnly; SameSite=Strict; Path=/", cookie_name(ctx.bound));
+    let mut value = HeaderValue::from_str(&cookie).expect("a base64url secret is a header value");
+    value.set_sensitive(true);
+    let mut answer = status(StatusCode::NO_CONTENT);
+    answer.headers_mut().insert(hyper::header::SET_COOKIE, value);
+    answer
+}
+
 fn host_header(req: &Request<Incoming>) -> Option<&str> {
     req.headers().get(HOST).and_then(|h| h.to_str().ok())
 }
@@ -216,6 +277,10 @@ async fn handle(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, I
     if static_route {
         headers.insert("content-security-policy", HeaderValue::from_static(CSP));
         headers.insert("cache-control", HeaderValue::from_static("no-cache"));
+    } else {
+        // What the token or the cookie opens answers JSON and event streams, never a page: a
+        // same-origin navigation to one (the cookie now authenticates it) renders nothing.
+        headers.insert("content-security-policy", HeaderValue::from_static(GATED_CSP));
     }
     Ok(response)
 }
@@ -231,9 +296,16 @@ async fn route(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, In
     // 1. The token, on `/hub`, `/s` and everything under them, before path parsing, so
     //    an unauthenticated caller cannot map the route table by status codes: 401 for
     //    a route that exists, 401 for one that does not. Empty body, constant time.
-    if gated && !presented(&req).is_some_and(|presented| gate::token_ok(presented, &ctx.token)) {
+    //    The one route left open is `POST /hub/redeem`: it is how a browser gets a credential at
+    //    all. Its other gates (host, fetch metadata, a tiny body) still apply, and any other
+    //    method on that path is an ordinary gated 401. The credential is the token as a bearer
+    //    header or the session cookie that redeem set.
+    let redeem = method == Method::POST && path == REDEEM;
+    if gated && !redeem && !authenticated(&ctx, &req) {
         return Ok(status(StatusCode::UNAUTHORIZED));
     }
+    // `POST /hub/code` is the launcher's: the bearer token only, never the cookie (below).
+    let bearer = bearer_ok(&ctx, &req);
 
     // 2. DNS rebinding. On every request, statics included: the bundle is served
     //    without a token, so this is the only thing standing in front of it for a name
@@ -295,7 +367,8 @@ async fn route(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, In
     }
     if gated {
         let (_parts, body) = req.into_parts();
-        let body = match capped(body).await {
+        // The open route is capped tight: nothing unauthenticated gets to make the perch hold 8 MiB.
+        let body = match capped(body, if redeem { REDEEM_BODY } else { MAX_BODY }).await {
             Ok(body) => body,
             Err(refusal) => return Ok(status(refusal)),
         };
@@ -304,7 +377,7 @@ async fn route(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, In
         //    which is what makes a 401 or a 403 the only thing an unauthenticated caller can
         //    tell apart. (`/s` never gets here: it is the proxy's, above. What does is a
         //    percent-encoded spelling of either namespace, which is a 404.)
-        return Ok(hub(&ctx, &method, &path, &query, &body).await);
+        return Ok(hub(&ctx, &method, &path, &query, &body, bearer).await);
     }
 
     // The static UI. No token (the page loads before it has one, so it cannot present
@@ -323,6 +396,9 @@ async fn route(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, In
 
 const ALLOW: &str = "GET, HEAD";
 
+/// On every answer behind the gate: no script, no frame, nothing loaded.
+const GATED_CSP: &str = "default-src 'none'; sandbox";
+
 /// The bundle's policy: its own origin for everything, inline styles because the
 /// bundle draws with them, `data:` icons, and never a frame — a page that can frame
 /// the perch can type into every session behind it.
@@ -335,8 +411,8 @@ const CSP: &str = "default-src 'self'; connect-src 'self'; img-src 'self' data:;
 /// The proxy (`/s`) never calls this. It builds its own `Limited` over the unread body and
 /// streams it to the door, because collecting a `say`'s images first would hold the whole body
 /// in memory and the door waiting (H1b review finding 3).
-async fn capped(body: Incoming) -> std::result::Result<Bytes, StatusCode> {
-    match Limited::new(body, MAX_BODY).collect().await {
+async fn capped(body: Incoming, cap: usize) -> std::result::Result<Bytes, StatusCode> {
+    match Limited::new(body, cap).collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
         Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => Err(StatusCode::PAYLOAD_TOO_LARGE),
         Err(_) => Err(StatusCode::BAD_REQUEST),
@@ -350,10 +426,15 @@ async fn capped(body: Incoming) -> std::result::Result<Bytes, StatusCode> {
 /// The `/hub/...` routes. `/hub/sessions` is the list and the spawn; its two verbs are per
 /// session, and `/hub/tree` is H2's one directory listing. Everything else behind the token
 /// is a 404: `/hub/events` and `/hub/mesh` are H2/H3.
-async fn hub(ctx: &Ctx, method: &Method, path: &str, query: &str, body: &Bytes) -> Response<BoxBody> {
+async fn hub(ctx: &Ctx, method: &Method, path: &str, query: &str, body: &Bytes, bearer: bool) -> Response<BoxBody> {
     match (method.as_str(), path) {
         ("GET", "/hub/sessions") => json(StatusCode::OK, &ctx.registry.list()),
         ("POST", "/hub/sessions") => new_session(ctx, body).await,
+        // Token only: a script in the page's origin cannot read the HttpOnly cookie, and must not be
+        // able to turn it into a code that a second client redeems for a session of its own.
+        ("POST", "/hub/code") if !bearer => status(StatusCode::FORBIDDEN),
+        ("POST", "/hub/code") => json(StatusCode::OK, &serde_json::json!({ "code": ctx.logins.mint_code() })),
+        ("POST", REDEEM) => redeem(ctx, body),
         ("GET", "/hub/tree") => tree(ctx, query).await,
         ("POST", _) => match session_verb(path, query) {
             Some((id, Verb::Resume)) => resume(ctx, id).await,
@@ -439,19 +520,33 @@ fn session_verb<'a>(path: &'a str, query: &str) -> Option<(&'a str, Verb)> {
 async fn new_session(ctx: &Ctx, body: &Bytes) -> Response<BoxBody> {
     #[derive(serde::Deserialize)]
     struct Asked {
-        cwd: String,
+        cwd: Option<String>,
         model: Option<String>,
     }
+    const SHAPE: &str = "expected a JSON body of {\"cwd\": \"<dir>\", \"model\": \"<m>\"?}";
     let Ok(asked) = serde_json::from_slice::<Asked>(body) else {
-        return problem(StatusCode::BAD_REQUEST, "expected a JSON body of {\"cwd\": \"<dir>\", \"model\": \"<m>\"?}");
+        return problem(StatusCode::BAD_REQUEST, SHAPE);
+    };
+    // No cwd is the Minerva home's scratch dir, when the perch has a home; without one it is the
+    // refusal it always was: a body that names no cwd is a 400.
+    let wanted = match (&asked.cwd, &ctx.registry.scratch) {
+        (Some(cwd), _) => PathBuf::from(cwd),
+        (None, Some(scratch)) => match fresh_scratch(scratch) {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %scratch.display(), "perch: a scratch dir could not be created");
+                return problem(StatusCode::SERVICE_UNAVAILABLE, "a scratch directory could not be created under the Minerva home");
+            }
+        },
+        (None, None) => return problem(StatusCode::BAD_REQUEST, SHAPE),
     };
     // §4 step 1, and the reason the perch token is not a licence to start an agent in `/`.
-    let cwd = match ctx.registry.cwd_under_a_root(Path::new(&asked.cwd)) {
+    let cwd = match ctx.registry.cwd_under_a_root(&wanted) {
         Ok(cwd) => cwd,
         Err(_) => return problem(StatusCode::UNPROCESSABLE_ENTITY, "cwd is not a directory under a --root"),
     };
     // §4 step 3: the door's own argv, with no token in it and no `--ui-dir`.
-    let argv = spawn::argv(&ctx.registry.eidolon, spawn::Target::New(&cwd), asked.model.as_deref());
+    let argv = spawn::argv(&ctx.registry.eidolon, ctx.registry.eidolon_config.as_deref(), spawn::Target::New(&cwd), asked.model.as_deref());
     let up = match door_up(ctx, argv, None).await {
         Ok(up) => up,
         Err(why) => return problem(StatusCode::SERVICE_UNAVAILABLE, &why),
@@ -471,6 +566,39 @@ async fn new_session(ctx: &Ctx, body: &Bytes) -> Response<BoxBody> {
     // same directory from an honest door, and the row must hold the checked one.
     ctx.registry.insert(id.clone(), hello.session, cwd, pid, port, token, watcher, exit);
     json(StatusCode::CREATED, &serde_json::json!({ "id": id }))
+}
+
+/// A new directory for one folderless chat: `<scratch>/<YYYYMMDD-HHMMSS>`, then `-2`, `-3`, ... when that is
+/// taken. `create_dir` (not `create_dir_all`) is what makes the name this chat's alone, as eidolon's own
+/// `create_session` does for a log.
+fn fresh_scratch(scratch: &std::path::Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(scratch)?;
+    let stamp = utc_stamp(std::time::SystemTime::now());
+    for n in 1..1000 {
+        let dir = scratch.join(if n == 1 { stamp.clone() } else { format!("{stamp}-{n}") });
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free scratch name"))
+}
+
+/// `YYYYMMDD-HHMMSS` in UTC (days-to-civil, Hinnant's algorithm): a name, not a clock, so no time crate.
+fn utc_stamp(at: std::time::SystemTime) -> String {
+    let secs = at.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}-{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 /// §4 step 2's "Resume can spend" is a UI concern and not this route's: the perch never
@@ -495,7 +623,7 @@ async fn resume(ctx: &Ctx, id: &str) -> Response<BoxBody> {
     if !ctx.registry.reserve(id, &log) {
         return problem(StatusCode::CONFLICT, "that log is already held by a live session");
     }
-    let argv = spawn::argv(&ctx.registry.eidolon, spawn::Target::Kept(&log), None);
+    let argv = spawn::argv(&ctx.registry.eidolon, ctx.registry.eidolon_config.as_deref(), spawn::Target::Kept(&log), None);
     let up = match door_up(ctx, argv, Some(id)).await {
         Ok(up) => up,
         Err(why) => return problem(StatusCode::SERVICE_UNAVAILABLE, &why),
@@ -671,6 +799,14 @@ async fn statics(ui: &Static, method: &Method, path: &str) -> Response<BoxBody> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scratch_stamp_is_the_utc_date_and_time() {
+        let at = |secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        assert_eq!(utc_stamp(at(0)), "19700101-000000");
+        assert_eq!(utc_stamp(at(1_709_209_599)), "20240229-122639", "a leap day");
+        assert_eq!(utc_stamp(at(1_791_158_400 + 3_661)), "20261005-010101");
+    }
 
     #[test]
     fn the_gated_namespaces_are_the_two_the_route_table_names() {

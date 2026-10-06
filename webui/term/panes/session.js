@@ -3,13 +3,14 @@
 // core/state.js Session and holds no session state of its own. Several panes
 // may draw one Session (mirrors share its one stream), so what is tied to the
 // DOM lives in a per-PANE view, never on the Session.
-import { html, K, HUB, Rendered, Component, signal, effect, useRef, useLayoutEffect, useEffect, useMemo, useState } from '../core/ui.js';
+import { html, K, HUB, hubOff, Rendered, Component, signal, effect, useRef, useLayoutEffect, useEffect, useMemo, useState } from '../core/ui.js';
 import { IMAGE_TYPES, MAX_IMAGES, looksImage, readImage, readText, tooBig } from '../core/attach.js';
 import { markdown } from '../core/markdown.js';
 import { resolveIn } from '../core/path.js';
 import { render as rend, renderCall } from '../renderers/index.js';
 import { icon, word, shade, CELLS } from '../core/life.js';
-import { tildify, kfmt, hhmm, stateOf, STATE_CLS, MODES } from '../core/state.js';
+import { tildify, kfmt, hhmm, stateOf, STATE_CLS, MODES, connWord } from '../core/state.js';
+import { mode } from '../core/api.js';
 import { openMenu, atPointer, under } from '../core/menu.js';
 import { AskPanel, AskMark, Settled, quoted } from './asks.js';
 
@@ -52,7 +53,7 @@ function Title({ p, mirror, act }) {
       onKeyDown=${(e) => !e.repeat && (e.key === 'Enter' || e.key === ' ') && open(e, under(e.currentTarget))}>
     <span class="b">${act.name(s)}</span>${mirror && html` <span class="faint">(mirror)</span>`} <span class="faint">▾</span>
     ${hl && html` <span class="proj">[${act.project(hl.cwd)}]</span>`} <span class=${dot}>●</span>
-    ${conn !== 'live' && html` <span class="faint">${conn}</span>`}
+    ${conn !== 'live' && html` <span class="faint">${connWord(conn)}</span>`}
   </div>`;
 }
 
@@ -192,7 +193,7 @@ function rowMenu(e, r, v, extra = []) {
   e.preventDefault();
   openMenu([
     ...extra,
-    { label: 'fork from here', off: HUB },
+    { label: 'fork from here', off: hubOff() },
     { label: sel ? 'copy selection' : 'copy', on: () => copy(sel || el.innerText.trim(), v.act) },
     { label: 'copy as markdown', on: () => copy(rowSource(r), v.act) },
     { label: 'quote into composer', on: () => v.p.prefill(quoted(sel || rowSource(r)) + '\n\n') },
@@ -379,7 +380,7 @@ function Outbox({ p }) {
 // needs the hub: the door restarts between turns) and the verbs. It fits the
 // frame as the status line does: the verbs drop their keys, the labels drop
 // to glyphs, every menu goes into one `⋯`, then only send and stop stay.
-const RESTART = 'needs the hub (restarts the door between turns)';
+const restart = () => (mode() === 'perch' ? 'not available yet (it restarts the chat between turns)' : 'needs the hub (restarts the door between turns)');
 const MIC = 'needs local dictation (hub + whisper.cpp)';
 let attSeq = 0;
 
@@ -530,12 +531,12 @@ function Composer({ s, p, act }) {
     { id: 'attach', full: '+ attach', short: '+', items: () => [
       { label: 'image…', hint: 'png jpeg gif webp · 4 MiB', on: () => pick('image') },
       { label: 'file…', hint: 'text, inlined', on: () => pick('text') },
-      { label: 'folder…', off: `${HUB}: a session's folder is fixed at launch` },
+      { label: 'folder…', off: `${hubOff()}: a chat's folder is fixed when it starts` },
     ] },
     { id: 'model', full: `model ${model}`, short: model.split(/[/:]/).pop(), items: () => [
-      { label: model, tick: true, off: RESTART }, { label: 'another model…', off: RESTART }] },
-    { id: 'effort', full: 'effort ?', short: '◔', items: () => ['low', 'medium', 'high'].map((l) => ({ label: l, off: RESTART })) },
-    { id: 'mode', full: `mode ${yolo ? 'YOLO' : 'gated'}`, short: yolo ? 'YOLO' : '⚑', items: () => MODES.map((m) => ({ label: m, tick: m === 'yolo' && yolo, off: RESTART })) },
+      { label: model, tick: true, off: restart() }, { label: 'another model…', off: restart() }] },
+    { id: 'effort', full: 'effort ?', short: '◔', items: () => ['low', 'medium', 'high'].map((l) => ({ label: l, off: restart() })) },
+    { id: 'mode', full: `mode ${yolo ? 'YOLO' : 'gated'}`, short: yolo ? 'YOLO' : '⚑', items: () => MODES.map((m) => ({ label: m, tick: m === 'yolo' && yolo, off: restart() })) },
     { id: 'mic', full: '◉ mic', short: '◉', off: MIC },
   ];
   const menuAt = (m) => (e) => openMenu(m.items(), under(e.currentTarget), { title: m.full, owner: `cm-${m.id}-${p.id}` });

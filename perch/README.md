@@ -18,21 +18,73 @@ prose rename is a separate human edit, not a code change.
 
 ## Run it
 
-The one command, from WSL (starts or reuses the perch on port 47820 and opens the web UI in
-the Windows browser; the token goes from its `0600` file into a `0600` redirect file and never
-through argv, stdout or a URL you type):
+The one command, from Windows PowerShell: **`hoot`**. It runs `bin/perch-open.sh --code` in WSL
+(starts or reuses the perch on port 47820), gets a login code, and opens
+`http://127.0.0.1:47820/#code=<code>` in your browser. The page trades the code for a session
+cookie and the browser is signed in. The token never leaves its `0600` file: the script gives it to
+`curl` through `-H @file`, never argv, env, stdout or a URL.
 
-```sh
-bin/perch-open.sh              # start or reuse, open the browser
-bin/perch-open.sh --no-browser # print the redirect file's Windows path instead
-bin/perch-open.sh --status     # up or down, url, pid, session counts by state
-bin/perch-open.sh --stop
+```text
+hoot                 open Minerva (starts the server when it is not running)
+hoot web -NoOpen     print the one-time link instead of opening it
+hoot status web      up or down, url, pid, session counts by state
+hoot stop web        stop the perch (chats are kept)
 ```
 
-It needs the binary at `~/perch-target/release/perch` (`MINERVA_PERCH_BIN` to override):
-`cd perch && CARGO_TARGET_DIR=$HOME/perch-target cargo build --release`. `MINERVA_PERCH_PORT`,
-`MINERVA_UI_DIR` and `MINERVA_OPEN_TTL` (seconds the redirect file lives, default 60) are optional.
-It never passes `--sessions-dir`, so the perch's default stays equal to the door's own.
+From WSL the same script is `bin/perch-open.sh [--code] [--no-browser] [--status] [--stop]`:
+`--code` prints exactly one line, the link, and nothing else on stdout.
+
+It needs the binary at `~/perch-target/release/perch` (`MINERVA_PERCH_BIN` to override), built in
+WSL: `cd perch && CARGO_TARGET_DIR=$HOME/perch-target cargo build --release`. The script refuses,
+with that command, a binary that lacks `--home` or `--eidolon-config`. `MINERVA_PERCH_PORT` and
+`MINERVA_UI_DIR` are optional. A chat may work under `$HOME`, the Minerva home and the Windows
+profile folder (the script asks `cmd.exe` for `%USERPROFILE%`, maps it with `wslpath`, and adds that
+`--root` itself; with none found it says so and adds nothing).
+
+**The perch lives in WSL and dies with it.** `hoot` starts it from a `wsl.exe` that exits at once,
+so it stays up only as long as the distro does. If WSL idles out (no WSL window open, nothing
+running), the perch goes with it and the page shows "not answering". Fix: in
+`%UserProfile%\.wslconfig` set `[wsl2]` `vmIdleTimeout=-1`, then `wsl --shutdown` once. (A
+`systemd --user` unit for the perch would also do it, and would be the better home if this becomes
+unattended; not built.)
+
+**Login.** `POST /hub/code` mints a random single-use code valid 30 seconds (at most 4
+outstanding); it needs the bearer **token** (the launcher's), and the cookie alone is a `403`, so a
+script in the page cannot turn the HttpOnly cookie into a code another client could redeem.
+`POST /hub/redeem {"code": "..."}` needs no token: a live code is consumed and answered `204` with
+`Set-Cookie: minerva_<port>=<secret>; HttpOnly; SameSite=Strict; Path=/`; a wrong, used or expired
+one is an empty `403`. The cookie is a fresh per-redeem secret held in memory (not the token),
+accepted wherever the token is **on a request that carries `Sec-Fetch-Site: same-origin`** (the
+page's own `fetch` always does; a browser that sends no fetch metadata gets a `401`), and forgotten
+when the perch restarts. The bearer token keeps the old rules (curl sends no `Sec-Fetch-Site`).
+Every answer behind the gate carries `Content-Security-Policy: default-src 'none'; sandbox`.
+
+On first run `bin/perch-open.sh` also creates the **Minerva home**, `~/Minerva` (`MINERVA_HOME` to
+override; only missing pieces are created): `sessions/`, `scratch/`, `projects.json` (`[]`) and
+`minerva.toml` (`default_model = "chatgpt:gpt-5.6-luna"`, seeded only when missing). It then starts
+the perch with `--root $HOME --home <home>` (plus the Windows profile root).
+
+`config.toml` in the home is **generated, never hand-edited**. eidolon's `--config FILE` replaces
+`~/.config/eidolon/config.toml` outright, so at every start the perch parses the member's own
+`~/.config/eidolon/config.toml` (all of its keys and tables are kept; an empty table when there is
+none), sets `sessions_dir` to the absolute `<home>/sessions` (always overridden: eidolon does not
+expand `~` in that key, and a relative one is read from each door's cwd), sets `default_model` only
+when the member's config has none (from `<home>/minerva.toml`'s `default_model`, else
+`chatgpt:gpt-5.6-luna`), and writes the result atomically with mode `0600` under a header comment.
+Edit `~/.config/eidolon/config.toml` or `~/Minerva/minerva.toml`, not the generated file. The
+files *beside* the member's config (`providers/`, `policy.rn`, `secrets`) are shared as they were.
+The perch lists sessions from the same absolute `<home>/sessions` it wrote, so the doors' logs and
+the list cannot disagree.
+
+- `--home DIR`: generate `DIR/config.toml` as above, run every door as `eidolon --config
+  DIR/config.toml web ...` (new and resumed), list `DIR/sessions`, and add `DIR` to the allowed
+  roots. A `POST /hub/sessions` body with no `cwd` starts in a fresh `DIR/scratch/<YYYYMMDD-HHMMSS>/`
+  (one per chat, `-2`, `-3`, ... on a collision). Without `--home` a body with no `cwd` is a 400.
+  Conflicts with `--eidolon-config` and `--sessions-dir`.
+- `--eidolon-config FILE` (no `--home`): every door is `eidolon --config FILE web ...`. Unless
+  `--sessions-dir` is given, the perch lists the file's top-level `sessions_dir` (parsed with a TOML
+  parser; the door's default when the file has none). A relative or `~` value is refused at start
+  with the reason: the door would resolve it against its own cwd. The perch never writes this file.
 
 By hand:
 
@@ -74,6 +126,8 @@ What is **not** here, on purpose: the idle reaper, `/hub/events` (H2) and
 
 ```text
   /            the UI bundle from --ui-dir: no token, `Host` checked
+  /hub/code                     POST: mint a 30 s single-use login code
+  /hub/redeem                   POST {"code"}: no token; 204 + Set-Cookie, or 403
   /hub/sessions                 GET the list, POST to spawn a new session   (H1b)
   /hub/sessions/<id>/resume     POST: a door on that kept log                (H1b)
   /hub/sessions/<id>/stop       POST: cancel panes, close watcher, SIGTERM   (H1b, H1c)
@@ -152,6 +206,7 @@ at most, then `truncated: true`. There is no config knob yet.
 src/main.rs     argv, SIGINT/SIGTERM -> CancellationToken, the runtime `run` needs
 src/lib.rs      bind, the runtime dir, the token mint and its removal on exit
 src/gate.rs     loopback_only, token_ok (subtle), host_ok, sec_fetch_ok
+src/login.rs    login codes and session cookies: mint, redeem (single use, 30 s), session_ok
 src/serve.rs    accept loop, the gate order, the route match, the session routes, shutdown
 src/files.rs    the static rules, ported from eidolon/crates/web/src/files.rs
 src/tree.rs     GET /hub/tree: one directory under a live cwd, names and kinds only

@@ -7,6 +7,7 @@
 //!
 //! ```text
 //!   perch [--bind 127.0.0.1:0] [--ui-dir DIR] [--root DIR]... [--eidolon PATH] [--sessions-dir DIR]
+//!         [--eidolon-config FILE] [--home DIR]
 //!
 //!   /                    the UI bundle from --ui-dir, no token, `Host` checked
 //!   /hub/sessions        GET the list, POST to spawn one          (H1b)
@@ -56,8 +57,10 @@
 #[cfg(not(unix))]
 compile_error!("the perch is Unix only: it needs a 0600 token file, $XDG_RUNTIME_DIR and SIGTERM");
 
+pub mod config;
 pub mod files;
 pub mod gate;
+pub mod login;
 pub mod proxy;
 pub mod serve;
 pub mod sessions;
@@ -90,6 +93,12 @@ pub struct Options {
     /// `--sessions-dir`: kept logs live here as `<id>.eid`. The door's own default is
     /// `data_local_dir()/eidolon/sessions`.
     pub sessions_dir: PathBuf,
+    /// `--eidolon-config`: passed to every door as eidolon's global `--config`.
+    pub eidolon_config: Option<PathBuf>,
+    /// `--home`'s `scratch/`: the cwd of a new session that names none.
+    pub scratch: Option<PathBuf>,
+    /// How long a login code (`POST /hub/code`) can be redeemed. [`login::CODE_TTL`] outside tests.
+    pub code_ttl: std::time::Duration,
 }
 
 /// The perch's own directory under `$XDG_RUNTIME_DIR`, so its token sits beside the
@@ -113,7 +122,7 @@ pub async fn run(opts: Options, cancel: CancellationToken) -> Result<()> {
     // The registry and the thread that forks doors, before the bind for the same reason the
     // token's directory is: a `--root` that does not exist, or a spawn thread that cannot be
     // started, must refuse the start rather than the first spawn.
-    let registry = sessions::Registry::new(opts.sessions_dir, runtime.clone(), opts.eidolon, opts.roots)?;
+    let registry = sessions::Registry::with_home(opts.sessions_dir, runtime.clone(), opts.eidolon, opts.roots, opts.eidolon_config, opts.scratch)?;
     let spawner = Arc::new(spawn::Spawner::new()?);
     let listener = TcpListener::bind(opts.bind).await.with_context(|| format!("bind {}", opts.bind))?;
     let bound = listener.local_addr().context("read the bound address")?;
@@ -129,7 +138,8 @@ pub async fn run(opts: Options, cancel: CancellationToken) -> Result<()> {
     println!("token file: {}", token_file.display());
 
     let tree_slots = tree::Slots::new(tree::MAX_LISTINGS);
-    let ctx = serve::Ctx { bound, token: Arc::from(token.as_str()), ui, registry, spawner, tree_slots };
+    let logins = Arc::new(login::Logins::new(opts.code_ttl));
+    let ctx = serve::Ctx { bound, token: Arc::from(token.as_str()), ui, registry, spawner, tree_slots, logins };
     let served = serve::run(ctx, listener, cancel).await;
 
     // Last, after the drain. The doors' shutdown — close the watcher to each door, SIGTERM

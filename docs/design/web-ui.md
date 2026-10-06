@@ -8,7 +8,7 @@
 
 ## 0. The answer in one paragraph
 
-The whole page is an emulated terminal: square, monospace, on character cells, coloured with the TUI's own theme. Three columns (sessions sidebar, tiled session panes, inspector) over one status line. There are no buttons: keys, a `:` command line, a clickable key reference (`?`), and frame-title tabs. Panes tile Hyprland-dwindle style at the golden ratio; each pane is one session stream, and a session may be shown in two panes. Pending asks share one tabbed panel above the composer, answered in one batch. The browser talks only to the hub on loopback; the hub owns the doors and their tokens and proxies `/s/<id>/api/*`. The page is plain ES modules with no build step; tool renderers are extensions named in a manifest. The biggest risk is still the page rendering model output as HTML, because the page holds a token that can approve tool calls.
+The whole page is an emulated terminal: square, monospace, on character cells, coloured with the TUI's own theme. Three columns (sessions sidebar, tiled session panes, inspector) over one status line. There are no `<button>` elements and no chrome-style buttons, but the primary actions are visible bracketed text (`[ new chat ]`, `[ open folder… ]`; ruling 2026-10-05); keys, a `:` command line, a clickable key reference (`?`), and frame-title tabs. Panes tile Hyprland-dwindle style at the golden ratio; each pane is one session stream, and a session may be shown in two panes. Pending asks share one tabbed panel above the composer, answered in one batch. The browser talks only to the hub on loopback; the hub owns the doors and their tokens and proxies `/s/<id>/api/*`. The page is plain ES modules with no build step; tool renderers are extensions named in a manifest. The biggest risk is still the page rendering model output as HTML, because the page holds a token that can approve tool calls.
 
 ---
 
@@ -185,7 +185,9 @@ No assets, CSS or names are copied from other apps. The owl is ours (`webui/bran
 
 ### 4.1 Dwindle at the golden ratio
 
-Each new pane splits the **focused** pane's area along its longer side (the newest pane if none is focused): the old pane keeps 0.618, the new one gets 0.382. No cap; panes just shrink. Drag a divider to resize (snapped to cells); drag a pane's title onto another pane to swap, or onto an edge to move.
+Ruling 2026-10-05: **opening a chat switches, splitting is explicit.** A click on a sidebar row, on the start screen, or `:open <id>` shows the chat in the focused pane (or focuses the pane that already shows it, or opens the first pane when there is none). A split happens only by the frame glyphs, `open beside` in a row's right-click menu, ctrl-click or middle-click on a row, `:vsplit` / `:split`, or the picker. The page boots with at most one pane. With no pane the tiles show the start screen: `[ new chat ]` (no folder: the perch uses its scratch folder), `[ open folder… ]` (a path field that also takes a pasted Windows path), the recent chats, and a one-line hint; the first action has focus so Enter starts a chat.
+
+When a split happens, it splits the **focused** pane's area along its longer side (the newest pane if none is focused): the old pane keeps 0.618, the new one gets 0.382. No cap; panes just shrink. Drag a divider to resize (snapped to cells); drag a pane's title onto another pane to swap, or onto an edge to move.
 
 ```text
 1 pane          2 panes                  3 panes
@@ -221,7 +223,7 @@ Every key is a shortcut for something also clickable (decided): the composer's b
 | `⇥` / `⇩` on the pane frame | the split picker: mirror · new session · resume… · existing session ▸ | mirror | the rest |
 | `×` on the pane frame | closes the pane | yes | - |
 | a chat row, right-click | fork from here · copy · copy as markdown · quote into composer | copy (the selection, if any), copy as markdown, quote | fork from here |
-| a sidebar session, right-click | open in new pane · show in focused pane · fork (latest) · close its door | open in new pane (a mirror), show in focused pane | fork, close its door |
+| a sidebar session, right-click | open beside (a mirror) · show in focused pane · fork (latest) · stop this chat; an unopened or saved row also has open here | open beside, show in focused pane, open here | fork |
 | the status line, right-click | loaded (the inspector tab) · theme ▸ · font ▸ · every `:` command | the `:` commands | model, mode (the composer's menus) |
 
 A pane's session can change (`show…`): the page structures a pane as `{ id, sid }`, so a mirror becomes an independent pane on another session once the hub lists more than one. In M1 only the one door session exists; `:open <id>` opens a pane on another session id, for the hub's `/s/<id>/api/`.
@@ -265,7 +267,7 @@ Routes (**observed** `lib.rs:7-19`, `serve.rs:240-277`; launch **(in progress)**
 
 Every frame is one SSE `data:` line of JSON with a `type`; no `id:`, no `event:` (**observed** `stream.rs:44-46`, `wire.rs:28`). Order per connection (**observed** `stream.rs:108-139`): subscribe, `hello`, replayed branch, pending `ask`s oldest first, `caught-up`, then live frames until `lagged` or `goodbye`.
 
-### 5.2 Token hand-off (decided: redirect file)
+### 5.2 Token hand-off (decided: redirect file; superseded 2026-10-05 by the login code and cookie, hub.md 10.5)
 
 ```text
 launcher: hub writes <runtime>/minerva-open.html (0600) containing

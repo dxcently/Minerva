@@ -397,6 +397,22 @@ pre, .pre {
 .kk { color: var(--cyan); font-weight: bold; }
 .m { color: var(--magenta); }
 
+/* ---- the start screen (no pane open): bracketed text actions ---- */
+.home { white-space: pre-wrap; padding: var(--ch) var(--cw); }
+.home .owl.big { white-space: pre; margin-bottom: var(--ch); }
+.home .acts { display: flex; gap: calc(3 * var(--cw)); margin: var(--ch) 0; }
+.home .act { color: var(--bright); }
+.home .act:hover, .home .act:focus-visible { background: var(--sel); color: var(--brightest); text-decoration: none; outline: none; }
+.home .dis.act { color: var(--faint); }
+.home .folder { display: flex; align-items: center; gap: var(--cw); margin-bottom: var(--ch); }
+.home .folder input { flex: 1; min-width: 0; background: transparent; color: var(--fg); border: 0; border-bottom: 1px solid var(--line); font: inherit; padding: 0; border-radius: 0; outline: none; }
+.home .folder input:focus { border-bottom-color: var(--bright); }
+.home .msg { min-height: var(--ch); color: var(--yellow); }
+.home .recent { margin-bottom: var(--ch); }
+.home .rrow { display: flex; gap: calc(2 * var(--cw)); }
+.home .rn { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.home .hintrow { margin-top: var(--ch); }
+
 /* ---- the completion / toast line ---- */
 #hint { padding: 0 var(--cw); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 0; }
 #hint:empty { display: none; }

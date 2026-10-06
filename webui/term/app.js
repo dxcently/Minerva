@@ -3,14 +3,16 @@
 // this file arranges panes and routes every action. Every action is reachable
 // by mouse; keys and the `:` line are shortcuts to the same functions.
 import { html, render, K, HUB, signal, computed, effect, batch, useRef, useLayoutEffect, useMemo } from './core/ui.js';
-import { takeToken, DOOR, detect, mode, rows, hubPost } from './core/api.js';
+import { takeToken, takeCode, redeem, DOOR, detect, mode, rows, hubPost } from './core/api.js';
 import { list, stale, known, refresh, startPolling, live, keptRows, elsewhere, age, label } from './core/hub.js';
-import { Session, tildify, kfmt, stateOf, STATE_CLS, backoffMs } from './core/state.js';
+import { Session, tildify, kfmt, stateOf, STATE_CLS, backoffMs, connWord } from './core/state.js';
 import * as tile from './core/tile.js';
 import { menu, openMenu, closeMenu, outside, atPointer, under, Menus } from './core/menu.js';
 import { Pane } from './panes/session.js';
 import { panel } from './panes/asks.js';
 import { FilesTab } from './panes/files.js';
+import { Home, home } from './panes/home.js';
+import { toWslPath } from './core/path.js';
 import { FONTS, DEFAULT_FONT, theme, themes, font, cell, setTheme, setFont, resolve, startLook } from './core/look.js';
 
 const LEFT_TABS = ['sessions', 'projects', 'mesh'];
@@ -37,7 +39,8 @@ const ui = {
   where: signal('idle'),        // what holds focus: 'ask' | 'note' | 'compose' | 'idle'
   tab: signal(null),            // the ask panel's current tab ({ s, a }), while it is pending
   fit: signal(0),               // how much the status line dropped to fit (FIT below)
-  token: false,
+  token: false,                 // this page can authenticate: a #token= in sessionStorage, or a login cookie
+  login: signal(''),            // the one-time link being traded for a cookie: '' | 'wait' | 'expired'
   gate: signal(null),           // why a page holding a token has no sessions (perch mode): 'refused' | 'offline'
 };
 function loadSides() {
@@ -91,7 +94,7 @@ function capped(sid, except, opens = false) {
   if (!opens && panes.some((x) => x.sid === sid)) return false;
   const sids = new Set(panes.filter((x) => x.s.holdsStream()).map((x) => x.sid));
   if (sids.has(sid) || sids.size < MAX_SIDS) return false;
-  toast(`${MAX_SIDS} sessions follow a stream: the browser allows 6 connections to the perch across all its tabs; close or stop one first`, true);
+  toast(`${MAX_SIDS} chats can be open at once: the browser allows 6 connections to the server across all its tabs; close or stop one first`, true);
   return true;
 }
 
@@ -117,6 +120,20 @@ function mirrorPane(id = ui.focus.value, dir) {
   const p = byId(id);
   if (!p) { openPane(); return; }
   openPane(p.sid, { at: p.id, dir });
+}
+
+// Open a session the way a click means it: show it in the focused pane (or focus
+// the pane that already shows it), and open the first pane when there is none.
+// Splitting is its own act: `beside`, the frame glyphs, `:vsplit` / `:split`.
+function openSession(sid = defaultSid(), { beside = false } = {}) {
+  if (!sid) { toast('which chat? :open <id>'); return null; }
+  const f = focused.peek();
+  if (beside || !f) return openPane(sid);
+  const there = ui.panes.peek().find((x) => x.sid === sid);
+  if (there) { focusPane(there.id); requestAnimationFrame(() => { const p = byId(there.id); if (p && p.focusComposer) p.focusComposer(); }); return there; }
+  showIn(f.id, sid);
+  requestAnimationFrame(() => { const p = byId(f.id); if (p && p.sid === sid && p.focusComposer) p.focusComposer(); });
+  return null;
 }
 
 // Show session `sid` in pane `id` instead of the one it shows. The pane is
@@ -152,8 +169,8 @@ function closePane(id = ui.focus.value) {
     const rest = tile.leaves(ui.tree.value);
     if (ui.focus.value === id) ui.focus.value = rest[rest.length - 1] || null;
   });
-  toast(last ? 'pane closed, and this page stopped following its session (the door keeps it). :open follows it again'
-    : 'pane closed; another pane still shows its session');
+  toast(last ? 'pane closed; the chat keeps running. :open shows it again'
+    : 'pane closed; another pane still shows this chat');
 }
 
 const focusPane = (id) => { if (ui.focus.value !== id) ui.focus.value = id; };
@@ -183,7 +200,8 @@ const resumeFocused = () => {
 // Resume session `sid` from a menu: open a pane on it if none shows it, wait for
 // the pane to learn it is resumable (kept / dead), then resume. Only on this click.
 async function resumeSid(sid) {
-  const p = ui.panes.peek().find((x) => x.sid === sid) || openPane(sid);
+  let p = ui.panes.peek().find((x) => x.sid === sid);
+  if (!p) { openSession(sid); p = ui.panes.peek().find((x) => x.sid === sid); }
   if (!p) return;
   for (let i = 0; i < 40 && !p.s.canResume(); i++) await new Promise((r) => setTimeout(r, 250));
   if (!p.s.canResume()) { toast('that session is not resumable now', true); return; }
@@ -444,14 +462,14 @@ const keyRef = () => { ui.keys.value = !ui.keys.peek(); };
 const COMMANDS = {
   q: ['close the pane', () => closePane()],
   close: ['close the pane', () => closePane()],
-  open: ['open a pane on session <id> (no id: this door / the focused session)', (arg) => openPane(arg || undefined)],
+  open: ['show chat <id> in the focused pane (no id: this door / the focused chat)', (arg) => (arg ? openSession(arg) : openPane())],
   vsplit: ['mirror the focused pane to the right', () => mirrorPane(undefined, 'row')],
   split: ['mirror the focused pane below', () => mirrorPane(undefined, 'col')],
   stop: ['cancel the running turn', cancel],
   submit: ['send every answered ask (all must be answered)', () => submitAsks() || toast(queue.peek().length ? 'answer every ask to submit' : 'nothing to submit')],
   queue: ['queue text (or the composer) behind the turn', (arg) => withPane((p) => p.s.submit('queue', arg || ''))()],
   reconnect: ['drop the stream and replay', withPane((p) => p.s.reconnect())],
-  new: ["start a session through the perch: :new <folder> [model] (no folder: this session's)", (arg) => newCmd(arg)],
+  new: ["start a chat: :new <folder> [model] (no folder: a scratch folder)", (arg) => newCmd(arg)],
   resume: ['resume a stopped, dead or kept session (perch); may continue its last turn', () => resumeFocused()],
   sidebar: ['toggle the left sidebar', () => toggle('lrail')],
   inspector: ['toggle the inspector', () => toggle('rrail')],
@@ -535,28 +553,49 @@ const focusedCwd = () => (focusedHello() || {}).cwd || '';
 
 // `how.open(id)` shows the new session (default: a new pane beside the focused
 // one); `how.except` is the pane that stops showing its session (the cap).
+// `raw` null starts a chat with no folder: the perch picks its scratch folder (201).
+// A perch with no home answers 400, which gets a plain sentence. Resolves true
+// when a session started. No model is sent unless one was asked for: the
+// default is the Minerva config's, not this page's.
 async function newSession(raw, model, how) {
-  if (mode() !== 'perch') { toast(HUB, true); return; }
-  const cwd = absCwd(raw);
-  if (!cwd || starting.has(cwd)) return;
-  if (capped('\0new', how && how.except)) return; // refuse first, spawn nothing
-  const name = tildify(cwd);
-  starting.add(cwd);
+  if (mode() !== 'perch') { toast(HUB, true); return false; }
+  const bare = raw == null, cwd = bare ? null : absCwd(raw);
+  if (!bare && !cwd) return false;
+  const key = cwd || '\0chat';
+  if (starting.has(key)) return false;
+  if (capped('\0new', how && how.except)) return false; // refuse first, spawn nothing
+  const name = bare ? 'a new chat' : tildify(cwd);
+  starting.add(key);
   clearTimeout(toastTimer);
-  const mine = { mode: 'toast', text: `starting a session in ${name}…` };
+  const mine = { mode: 'toast', text: `starting ${bare ? 'a chat' : 'a chat in ' + name}…` };
   ui.hint.value = mine;
-  const r = await hubPost('sessions', model ? { cwd, model } : { cwd });
-  starting.delete(cwd);
+  home.busy.value = true;
+  home.msg.value = '';
+  const body = { ...(cwd ? { cwd } : {}), ...(model ? { model } : {}) };
+  const r = await hubPost('sessions', body);
+  starting.delete(key);
+  home.busy.value = false;
   if (ui.hint.peek() === mine) ui.hint.value = null;
   if (r.status === 201 && r.data && r.data.id) {
-    (how && how.open ? how.open : (id) => openPane(id))(r.data.id);
+    (how && how.open ? how.open : (id) => openSession(id))(r.data.id);
     refresh();
-  } else if (r.status === 422) toast(`${name} is not under the perch's --root (default $HOME)`, true);
-  else if (r.status === 503) toast(`the door did not come up: ${(r.data && r.data.error) || 'no reason given'}`, true);
-  else if (r.status === 401) toast('the perch refused the token (it restarted?). Run bin/perch-open.sh again.', true);
-  else if (r.status === 0) toast('the perch is not answering', true);
-  else toast(`could not start a session in ${name} (${r.status}${r.data && r.data.error ? ': ' + r.data.error : ''})`, true);
+    return true;
+  }
+  const fail = (text) => { home.msg.value = text; toast(text, true); return false; };
+  if (bare && r.status === 400) return fail('a chat without a folder is not available on this server yet: use [ open folder… ] and name one');
+  if (r.status === 422) return fail(`${name} is outside the folders this server may open`);
+  if (r.status === 503) return fail(`the chat did not start: ${(r.data && r.data.error) || 'no reason given'}`);
+  if (r.status === 401) return fail('the server refused the login for this page (it restarted?). Run `hoot` again.');
+  if (r.status === 0) return fail('the server is not answering');
+  return fail(`could not start ${bare ? 'a chat' : 'a chat in ' + name}${r.data && r.data.error ? ': ' + r.data.error : ' (' + r.status + ')'}`);
 }
+
+// The start screen's actions (panes/home.js). A folder may be pasted from Windows.
+const homeAct = {
+  chat: () => newSession(null, undefined),
+  folder: (raw) => newSession(toWslPath(raw), undefined),
+  open: (r, beside) => openSession(r.id, { beside }),
+};
 
 // A folder with a space goes in double (or single) quotes: `:new "/home/u/My Project" model`.
 const quoteArg = (s) => (/[\s"']/.test(s) ? '"' + s.replace(/"/g, '') + '"' : s);
@@ -570,7 +609,7 @@ function words(s) {
 function newCmd(arg) {
   const w = words(arg);
   if (mode() !== 'perch') { toast(HUB, true); return; }
-  if (!w.length) { openCmd(newLine()); return; }
+  if (!w.length) { newSession(null, undefined); return; }
   if (w.length > 2) { toast('too many words: quote a folder that has a space, :new "/my dir" [model]', true); return; }
   newSession(w[0], w[1] || focusedModel());
 }
@@ -661,8 +700,8 @@ const splitMenu = (p, dir, at) => openMenu(splitItems(p, dir), at,
 async function stopSession(sid, name) {
   const r = await hubPost(`sessions/${encodeURIComponent(sid)}/stop`);
   if (r.status === 202) toast(`stopping ${name}`);
-  else if (r.status === 409) toast('not live under this perch', true);
-  else if (r.status === 401) toast('the perch refused the token (it restarted?). Run bin/perch-open.sh again.', true);
+  else if (r.status === 409) toast('that chat is not running here', true);
+  else if (r.status === 401) toast('the server refused the login for this page (it restarted?). Run `hoot` again.', true);
   else toast(`stop failed: ${r.status || 'network'} ${(r.data && r.data.error) || ''}`, true);
   refresh();
   setTimeout(refresh, 1500); // the door takes a moment to exit
@@ -680,10 +719,10 @@ function sessionMenu(e, p) {
   e.preventDefault();
   const f = focused.value, at = atPointer(e), perch = mode() === 'perch';
   openMenu([
-    { label: 'open in new pane', on: () => openPane(p.sid) },
+    { label: 'open beside', hint: 'new pane', on: () => openPane(p.sid) },
     { label: 'show in focused pane', off: !f ? 'no pane focused' : f.sid === p.sid ? 'shown there' : null, on: () => showIn(f.id, p.sid) },
     { label: 'fork (latest)', off: perch ? 'needs the session registry' : HUB },
-    perch ? { label: 'close its door', on: () => stopAsk(p.sid, sessionName(p.s), at) } : { label: 'close its door', off: HUB },
+    perch ? { label: 'stop this chat', on: () => stopAsk(p.sid, sessionName(p.s), at) } : { label: 'stop this chat', off: HUB },
   ], at, { title: sessionName(p.s) });
 }
 
@@ -692,27 +731,29 @@ function idleMenu(e, r) {
   e.preventDefault();
   const f = focused.value, at = atPointer(e);
   openMenu([
-    { label: 'open in new pane', on: () => openPane(r.id) },
-    { label: 'show in focused pane', off: !f ? 'no pane focused' : null, on: () => showIn(f.id, r.id) },
+    { label: 'open here', on: () => openSession(r.id) },
+    { label: 'open beside', hint: 'new pane', on: () => openPane(r.id) },
     { label: 'fork (latest)', off: 'needs the session registry' },
-    { label: 'close its door', on: () => stopAsk(r.id, label(r), at) },
+    { label: 'stop this chat', on: () => stopAsk(r.id, label(r), at) },
   ], at, { title: label(r) });
 }
 
 function keptMenu(e, r) {
   e.preventDefault();
   openMenu([
-    { label: 'open in new pane', on: () => openPane(r.id) },
+    { label: 'open here', on: () => openSession(r.id) },
+    { label: 'open beside', hint: 'new pane', on: () => openPane(r.id) },
     { label: 'resume (may continue the last turn)', on: () => resumeSid(r.id) },
     { label: 'copy id', on: () => copyId(r.id) },
   ], atPointer(e), { title: label(r) });
 }
 
-const ELSEWHERE = 'held by another client (TUI or a door this perch does not own)';
+const ELSEWHERE = 'running in another app (a terminal chat or another server): view only';
 function elsewhereMenu(e, r) {
   e.preventDefault();
   openMenu([
-    { label: 'open in new pane', off: ELSEWHERE },
+    { label: 'open here', off: ELSEWHERE },
+    { label: 'open beside', off: ELSEWHERE },
     { label: 'resume (may continue the last turn)', off: ELSEWHERE },
     { label: 'copy id', on: () => copyId(r.id) },
   ], atPointer(e), { title: label(r) });
@@ -766,6 +807,8 @@ function Tabs({ names, cur, pick, collapse, title, side }) {
 }
 
 const Needs = ({ children }) => html`<div class="needs">${children}</div>`;
+// A feature that is not there yet: on the perch the hub exists, so say only that.
+const Soon = ({ what, door }) => html`<${Needs}>${mode() === 'perch' ? what + ': not available yet' : door || what + ' needs the hub'}</${Needs}>`;
 const Kv = ({ k, v, cls = '' }) => html`<div class="kv"><span class="faint">${k}</span><span class=${'grow ' + cls}>${String(v)}</span></div>`;
 
 function Owl() {
@@ -832,10 +875,13 @@ function Sessions() {
 }
 
 // A live session of the perch that no pane shows: a click opens a pane on it.
+// Middle-click on a row opens it beside (the mousedown is eaten: it would start autoscroll).
+const noMiddle = (e) => { if (e.button === 1) e.preventDefault(); };
+const beside = (e, sid) => { if (e.button === 1) { e.preventDefault(); openPane(sid); } };
 function IdleItem({ r }) {
-  return html`<div class="it" onContextMenu=${(e) => idleMenu(e, r)}>
+  return html`<div class="it" onContextMenu=${(e) => idleMenu(e, r)} onMouseDown=${noMiddle} onAuxClick=${(e) => beside(e, r.id)}>
     <div class="l1"><span class="faint">○</span>
-      <${K} cls="grow nm faint" title=${r.id + '\nlive, not open here'} on=${() => openPane(r.id)}>${label(r)}  <span class="faint">(not open)</span></${K}></div>
+      <${K} cls="grow nm faint" title=${r.id + '\nrunning, not open here\nctrl-click or middle-click: open beside'} on=${(e) => openSession(r.id, { beside: e.ctrlKey || e.metaKey })}>${label(r)}  <span class="faint">(not open)</span></${K}></div>
   </div>`;
 }
 
@@ -844,9 +890,9 @@ const keptShown = signal(KEPT_PICK);
 function Kept() {
   const all = keptRows(list.value), n = keptShown.value, shown = all.slice(0, n), rest = all.length - shown.length;
   if (!all.length) return html`<div class="faint">none</div>`;
-  return html`<div class="list">${shown.map((r) => html`<div class="it" key=${r.id} onContextMenu=${(e) => keptMenu(e, r)}>
-      <div class="l1"><${K} cls="grow nm faint" title=${r.id + '\n' + (r.state === 'dead' ? 'exited: a door of this perch' : 'kept, not running')}
-        on=${() => openPane(r.id)}>${label(r)}</${K}>
+  return html`<div class="list">${shown.map((r) => html`<div class="it" key=${r.id} onContextMenu=${(e) => keptMenu(e, r)} onMouseDown=${noMiddle} onAuxClick=${(e) => beside(e, r.id)}>
+      <div class="l1"><${K} cls="grow nm faint" title=${r.id + '\n' + (r.state === 'dead' ? 'exited' : 'saved, not running') + '\nctrl-click or middle-click: open beside'}
+        on=${(e) => openSession(r.id, { beside: e.ctrlKey || e.metaKey })}>${label(r)}</${K}>
         ${r.state === 'dead' && html`<span class="faint">exited</span>`}<span class="faint">${ageOf(r)}</span></div>
     </div>`)}
     ${rest > 0 && html`<div class="it"><${K} cls="faint" on=${() => { keptShown.value = n + 50; }}>more… (${rest})</${K}></div>`}</div>`;
@@ -856,7 +902,7 @@ function Kept() {
 function Elsewhere() {
   const all = elsewhere(list.value), n = elseShown.value, rs = all.slice(0, n), rest = all.length - rs.length;
   if (!all.length) return null;
-  return html`<div class="hdr faint">elsewhere</div>
+  return html`<div class="hdr faint">in other apps</div>
     <div class="list">${rs.map((r) => html`<div class="it" key=${r.id} onContextMenu=${(e) => elsewhereMenu(e, r)}>
       <div class="l1"><span class="faint">◌</span><span class="grow nm faint" title=${ELSEWHERE}>${label(r)}</span></div></div>`)}
     ${rest > 0 && html`<div class="it"><${K} cls="faint" on=${() => { elseShown.value = n + 50; }}>more… (${rest})</${K}></div>`}</div>`;
@@ -903,8 +949,8 @@ function Left() {
     body = mode() === 'perch' ? html`<${Owl} />
       ${stale.value && html`<div class="faint">list stale</div>`}
       <${Sessions} />
-      <div class="hdr">peers</div><${Needs}>peer list needs the hub</${Needs}>
-      <div class="hdr">kept</div><${Kept} />
+      <div class="hdr">peers</div><${Soon} what="the peer list" />
+      <div class="hdr">saved</div><${Kept} />
       <${Elsewhere} />`
       : html`<${Owl} />
       ${panes.length ? html`<${Sessions} />` : html`<div class="faint">no pane. <${K} on=${() => openPane()}>open one</${K}></div>`}
@@ -915,7 +961,7 @@ function Left() {
     const cwds = perch ? [...new Set(live(list.value).map((r) => r.cwd).filter(Boolean))] : [];
     const goTo = (c) => {
       const r = live(list.peek()).find((x) => x.cwd === c);
-      if (r) openPane(r.id);
+      if (r) openSession(r.id);
     };
     body = perch ? html`<div class="hdr">sessions here</div>
       ${hl ? html`<div class="list"><div class="it"><div class="l1"><span class="faint">▸</span><span class="grow c" title=${hl.cwd}>${tildify(hl.cwd)}</span></div></div></div>` : html`<div class="faint">—</div>`}
@@ -923,14 +969,14 @@ function Left() {
       ${cwds.length ? html`<div class="list">${cwds.map((c) => html`<div class="it" key=${c}><div class="l1"><span class="faint">▸</span>
         <${K} cls="grow c" title=${c + '\nopen the first live session here'} on=${() => goTo(c)}>${tildify(c)}</${K}></div></div>`)}</div>`
         : html`<div class="faint">no live sessions</div>`}
-      <div class="faint">kept sessions carry no folder</div>`
+      <div class="faint">saved chats do not show a folder</div>`
       : html`<div class="hdr">this door</div>
       ${hl ? html`<div class="list"><div class="it"><div class="l1"><span class="faint">▸</span><span class="grow c" title=${hl.cwd}>${tildify(hl.cwd)}</span></div></div></div>` : html`<div class="faint">—</div>`}
       <div class="hdr">others</div><${Needs}>project list needs the hub</${Needs}>`;
   } else {
     body = html`<div class="note">node        paired  grants  seen</div>
       <div class="note dim">──────────  ──────  ──────  ────</div>
-      <${Needs}>mesh reads Aoide through the hub (M3)</${Needs}>`;
+      <${Soon} what="the mesh" door="mesh reads Aoide through the hub (M3)" />`;
   }
   return html`<aside id="left" class="col side frame">
     ${!rail && html`<${Tabs} names=${LEFT_TABS} cur=${tab} pick=${(n) => { ui.left.value = n; }} side="left" collapse=${() => toggle('lrail')} title="collapse to a rail (ctrl+b)" />`}
@@ -968,7 +1014,7 @@ function RunTab({ s }) {
 // The rest is listed dim with what it needs, not hidden.
 function LoadedTab({ s }) {
   const hl = s.hello.value, open = useMemo(() => signal(false), []);
-  if (!hl) return html`<div class="faint">waiting for the door's hello</div>`;
+  if (!hl) return html`<div class="faint">waiting for the chat to start</div>`;
   const tools = [...s.tools.value].sort((a, b) => a[0].localeCompare(b[0]));
   const m = String(hl.model || '?'), at = m.search(/[/:]/);
   const mcp = new Map();
@@ -982,22 +1028,22 @@ function LoadedTab({ s }) {
   return html`
     <div class="hdr">persona</div>
     ${per ? html`<div class="m b">${per.name || per}</div>${per.text && html`<${K} cls="faint" on=${() => { open.value = !open.value; }}>${open.value ? '▾ ' : '▸ '}excerpt</${K}>${open.value ? html`<div class="pre">${per.text}</div>` : html`<div class="faint">${String(per.text).slice(0, 120)}…</div>`}`}`
-      : html`<${Needs}>the persona needs the hub (the door's hello does not name it)</${Needs}>`}
+      : html`<${Soon} what="the persona" door="the persona needs the hub (the door's hello does not name it)" />`}
     <div class="hdr">model</div>
     <${Kv} k="model    " v=${at > 0 ? m.slice(at + 1) : m} cls="c" />
     ${at > 0 ? html`<${Kv} k="provider " v=${m.slice(0, at)} />` : html`<${Needs}>provider: not in the model key</${Needs}>`}
-    <${Needs}>effort needs the hub</${Needs}>
+    <${Soon} what="effort" door="effort needs the hub" />
     <div class="hdr">gate</div>
     <${Kv} k="mode     " v=${hl.yolo ? 'YOLO: the gate answers for you' : 'gated: it asks when policy says'} cls=${hl.yolo ? 'r' : ''} />
     <${Kv} k="verdicts " v=${s.verdicts.value.length} />
-    <${Needs}>the policy itself needs the hub</${Needs}>
+    <${Soon} what="the policy" door="the policy itself needs the hub" />
     <div class="hdr">tools used</div>
     ${plain.length ? plain.map(count) : html`<div class="faint">none called yet</div>`}
-    <${Needs}>the full tool list needs the hub (the door lists none)</${Needs}>
+    <${Soon} what="the full tool list" door="the full tool list needs the hub (the door lists none)" />
     <div class="hdr">mcp servers</div>
     ${mcp.size ? [...mcp].map(([srv, ts]) => html`<div class="kv"><span class="m">${srv}</span></div>${ts.map(([t, n]) => html`<div class="kv"><span class="faint">  </span><span class="hi">${t}</span><span class="grow"></span><span class="faint">${n}×</span></div>`)}`)
-      : html`<${Needs}>MCP servers need the hub (none called yet)</${Needs}>`}
-    <div class="hdr">extensions</div><${Needs}>extensions need the hub</${Needs}>
+      : html`<${Soon} what="MCP servers" door="MCP servers need the hub (none called yet)" />`}
+    <div class="hdr">extensions</div><${Soon} what="extensions" door="extensions need the hub" />
     <div class="hdr">session</div>
     <${Kv} k="file     " v=${tildify(hl.session)} />
     <${Kv} k="cwd      " v=${tildify(hl.cwd)} />
@@ -1007,7 +1053,7 @@ function LoadedTab({ s }) {
 // Git state (branch, +/−, PR) belongs at the top of this tab once a source exists.
 function DiffTab({ s }) {
   const files = [...s.touched.value];
-  return html`<div class="hdr">git</div><${Needs}>branch, +/− and PR need the hub</${Needs}>
+  return html`<div class="hdr">git</div><${Soon} what="branch, +/− and PR" door="branch, +/− and PR need the hub" />
     <div class="hdr">changed</div>
     ${files.length ? files.map(([f, n]) => html`<div class="kv"><span class="grow c" title=${f}>${f}</span><span class="faint">${n} call${n > 1 ? 's' : ''}</span></div>`)
       : html`<div class="faint">no edit or write calls yet</div>`}`;
@@ -1015,7 +1061,7 @@ function DiffTab({ s }) {
 
 // The graph tab's slot. M3 replaces this with a Preact graph component
 // (see web-ui.md section 10); it gets the same { s, sid } props as every tab.
-const GraphTab = () => html`<${Needs}>turn graph needs the hub (M3)</${Needs}>`;
+const GraphTab = () => html`<${Soon} what="the turn graph" door="turn graph needs the hub (M3)" />`;
 
 // Inspector tab -> component. Every tab is a Preact component taking
 // { s: Session, sid }, so a new tab (or a real graph) is one entry here.
@@ -1078,15 +1124,21 @@ function Tiles() {
   const rect = new Map(lay.panes.map((r) => [r.id, r]));
   let body;
   const gate = ui.gate.value;
-  if (!ui.token) {
-    body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle r">no token</div>
-      <div class="empty">${'this page has no token.\n\nrun bin/perch-open.sh (the perch), or open the URL eidolon web printed\nwith #token=<the token file\'s contents> on the end.\n\nthe token is never sent to a server in the URL: the fragment stays in the browser.'}</div></div>`;
+  const login = ui.login.value;
+  if (!ui.token && login === 'wait') {
+    body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle">minerva</div><div class="empty faint">signing in…</div></div>`;
+  } else if (!ui.token && login === 'expired') {
+    body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle r">link expired</div>
+      <div class="empty">${'this link has expired — run `hoot` again'}</div></div>`;
+  } else if (!ui.token) {
+    body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle r">not signed in</div>
+      <div class="empty">${'this page is not signed in.\n\ntype hoot in PowerShell: it opens Minerva already signed in.\n\nto open a bare eidolon server by hand, add #token=<the contents of its token file> to its address; the part after # is never sent to a server.'}</div></div>`;
   } else if (gate) {
     body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle r">${gate === 'refused' ? 'token refused' : 'not answering'}</div>
-      <div class="empty">${gate === 'refused' ? 'the perch refused the token (it restarted?).\n\nrun bin/perch-open.sh again.' : 'the perch (or the door) is not answering. this page keeps trying and opens by itself when it does.\n\nif it does not, check bin/perch-open.sh --status, then run bin/perch-open.sh again.'}</div></div>`;
+      <div class="empty">${gate === 'refused' ? 'the server refused the login for this page (it restarted?).\n\nrun `hoot` again.' : 'the server is not answering. this page keeps trying and opens by itself when it does.\n\nif it does not, run `hoot status web`, then `hoot` again.'}</div></div>`;
   } else if (!panes.length && mode() === 'perch') {
-    body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle faint">no pane</div>
-      <div class="empty">no session open.${'\n\n'}<${K} cls="hi" on=${() => openCmd()}>${':open <id>'}</${K}>${'\n'}<span class="faint">the sidebar lists the sessions of this perch</span>${'\n\n'}<${K} cls="hi" on=${() => picker()}>ctrl+enter</${K}>  new / resume / existing${'\n'}<${K} cls="hi" on=${() => openCmd('new ')}>${':new <dir>'}</${K}>  start a session in a folder</div></div>`;
+    body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle">minerva</div>
+      <div class="scroll"><${Home} act=${homeAct} /></div></div>`;
   } else if (!panes.length) {
     body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle faint">no pane</div>
       <div class="empty">no pane open.${'\n\n'}<${K} cls="hi" on=${() => openPane()}>:open</${K}>  reconnect this session${'\n'}<span class="faint">ctrl+enter  new pane with a picker (arrives with the hub, M2)</span></div></div>`;
@@ -1218,7 +1270,7 @@ function Status() {
   ].filter(Boolean).join(' · ') : '';
   return html`<footer id="status" onContextMenu=${statusMenu}><div class="bar" ref=${ref}>
     <span class="left">
-      <span class=${'badge st-' + STATE_CLS[st]} title=${st === '?' ? 'this page connected after the turn began or before any turn event' : ''}>${st}</span>
+      ${p && html`<span class=${'badge st-' + STATE_CLS[st]} title=${st === '?' ? 'this page connected after the turn began or before any turn event' : ''}>${st}</span>`}
       ${hl && html`<${K} cls="model b" title="the model the door reports: what is loaded" on=${openLoaded}>${hl.model || '?'}</${K}>`}
       ${hl && hl.persona && html`${dot}<${K} cls="persona b" title="the persona: what is loaded" on=${openLoaded}>${hl.persona.name || hl.persona}</${K}>`}
       ${hl && hl.yolo && html`${dot}<${K} cls="yolo b" title="the gate is answering for you" on=${openLoaded}>YOLO</${K}>`}
@@ -1226,7 +1278,7 @@ function Status() {
       ${p && queuedN(p) > 0 && html`${dot}<span class="hi qn" title="held here, sent in order when the turn ends">${queuedN(p)} queued</span>`}
       ${waiting > 0 && html`${dot}<${K} cls="o waitn" title=${ui.held.value ? 'the oldest ask takes focus when you pause typing; click to go now' : queue.value.length ? 'focus the oldest ask' : 'every ask is answered: submit sends them'}
         on=${() => focusHead() || (current.peek() && focusQueued(current.peek()))}>${ui.held.value ? '▶ ' : ''}${waiting} waiting</${K}>`}
-      ${p && conn !== 'live' && lvl < 5 && html`${dot}<span class=${conn === 'replaying' ? 'faint' : 'warn'}>${conn}</span>`}
+      ${p && conn !== 'live' && lvl < 5 && html`${dot}<span class=${conn === 'replaying' ? 'faint' : 'warn'}>${connWord(conn)}</span>`}
       ${budget != null && budget < 3 && html`${dot}<span class="warn">${budget} calls left</span>`}
       ${s && s.queued.value > 0 && html`${dot}<span class="faint">${s.queued.value} queued</span>`}
       ${st === '?' && lvl < 1 && html`${dot}<span class="faint unk">state unknown until next turn event</span>`}
@@ -1315,7 +1367,9 @@ async function boot(n = 0) {
   if (m === 'perch') {
     ui.gate.value = null;
     startPolling();
-    for (const r of rows().filter((x) => x.state === 'live').slice(0, 4)) openPane(r.id);
+    // One pane, on the newest live chat; with none live the start screen shows.
+    const newest = rows().filter((x) => x.state === 'live').sort((a, b) => (b.mtime || 0) - (a.mtime || 0))[0];
+    if (newest) openPane(newest.id);
     return;
   }
   if (m === 'refused') { ui.gate.value = 'refused'; return; }
@@ -1323,4 +1377,31 @@ async function boot(n = 0) {
   else ui.gate.value = 'offline';
   setTimeout(() => boot(n + 1), backoffMs(Math.min(n, 4) + 3, 30000));
 }
-if (ui.token) boot();
+// The one-time link `hoot` opens (#code=...): scrubbed from the URL at once, then traded for a
+// login cookie. No token is ever in this page on that path. A used or old link says so in words.
+let booted = false;
+function bootOnce() { if (!booted) { booted = true; boot(); } }
+// The cookie outlives the link: a reload, a new tab, or the launched URL reopened from history has no
+// code and no token in it but may already be signed in. One probe says: 200 is signed in.
+async function probeCookie() {
+  ui.login.value = 'wait';
+  const signedIn = (await detect()) === 'perch';
+  if (signedIn) ui.token = true;
+  ui.login.value = '';
+  return signedIn;
+}
+async function signIn(code) {
+  ui.login.value = 'wait';
+  const ok = await redeem(code);
+  // A refused code with a cookie that still works (the link was opened a second time) is not an expiry.
+  if (ok) { ui.token = true; ui.login.value = ''; bootOnce(); }
+  else if (await probeCookie()) bootOnce();
+  else ui.login.value = 'expired';
+}
+{
+  const code = takeCode();
+  if (code !== null) signIn(code);
+  else if (ui.token) bootOnce();
+  else probeCookie().then((signedIn) => { if (signedIn) bootOnce(); });
+}
+addEventListener('hashchange', () => { const c = takeCode(); if (c !== null) signIn(c); });

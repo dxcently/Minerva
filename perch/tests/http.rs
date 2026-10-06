@@ -52,6 +52,9 @@ struct Perch {
     /// `--sessions-dir`: the kept logs. A tempdir for every test, so no test ever lists (or
     /// writes) the operator's real sessions.
     sessions: tempfile::TempDir,
+    /// `$XDG_CONFIG_HOME` of the child: where the member's `eidolon/config.toml` would be, so no
+    /// test ever reads the operator's real one.
+    _xdg_config: tempfile::TempDir,
     /// H1b: the tempdir holding the stand-in door's request log. Never read — held so the
     /// tree is not deleted out from under a running door. `None` for a perch started without
     /// the hub flags.
@@ -98,7 +101,7 @@ impl Perch {
     }
 
     fn start_with(ui_dir: bool) -> Self {
-        Self::launch(ui_dir, None)
+        Self::launch(ui_dir, None, &[])
     }
 
     /// A perch with H1b's flags: a `--root` a session may work in, a temp `--sessions-dir`,
@@ -108,10 +111,36 @@ impl Perch {
     /// unchanged (hub.md §4 step 4).
     #[cfg_attr(not(feature = "test-bins"), allow(dead_code))]
     fn start_hub(knobs: &[(&str, &str)]) -> Self {
-        Self::launch(true, Some(knobs.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect()))
+        Self::launch(true, Some(knobs.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect()), &[])
     }
 
-    fn launch(ui_dir: bool, hub: Option<Vec<(String, String)>>) -> Self {
+    /// The perch binary asked to start with `args` and expected to refuse: its whole output.
+    fn refused_start(args: &[std::ffi::OsString]) -> std::process::Output {
+        let runtime = tempfile::tempdir().unwrap();
+        own(runtime.path(), 0o700);
+        let xdg = tempfile::tempdir().unwrap();
+        Command::new(env!("CARGO_BIN_EXE_perch"))
+            .arg("--bind")
+            .arg("127.0.0.1:0")
+            .args(args)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("XDG_CONFIG_HOME", xdg.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("running the perch binary")
+    }
+
+    fn launch(ui_dir: bool, hub: Option<Vec<(String, String)>>, extra: &[std::ffi::OsString]) -> Self {
+        Self::launch_with_member(ui_dir, hub, extra, None)
+    }
+
+    /// [`Perch::start_hub`] with more perch flags (the Minerva-home ones) and the member's `~/.config/eidolon/config.toml` written first.
+    #[cfg_attr(not(feature = "test-bins"), allow(dead_code))]
+    fn start_hub_member(extra: &[std::ffi::OsString], member_config: &str) -> Self {
+        Self::launch_with_member(true, Some(Vec::new()), extra, Some(member_config))
+    }
+
+    fn launch_with_member(ui_dir: bool, hub: Option<Vec<(String, String)>>, extra: &[std::ffi::OsString], member_config: Option<&str>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let ui = root.path().join("ui");
         std::fs::create_dir(&ui).unwrap();
@@ -139,14 +168,25 @@ impl Perch {
         // anything looser, so the child would never print a boot line.
         own(runtime.path(), 0o700);
         let sessions = tempfile::tempdir().unwrap();
+        let xdg_config = tempfile::tempdir().unwrap();
+        if let Some(text) = member_config {
+            std::fs::create_dir_all(xdg_config.path().join("eidolon")).unwrap();
+            std::fs::write(xdg_config.path().join("eidolon/config.toml"), text).unwrap();
+        }
+        // With `--home` the home owns the sessions dir (`<home>/sessions`), and `--sessions-dir` conflicts; an\n        // explicit `--eidolon-config` names it too, and the tests of that want the perch to read it from there.
+        let home_sessions = extra.windows(2).find(|pair| pair[0] == "--home").map(|pair| PathBuf::from(&pair[1]).join("sessions"));
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_perch"));
         command.arg("--bind").arg("127.0.0.1:0");
         // Always, so no test ever reads the operator's real sessions dir.
-        command.arg("--sessions-dir").arg(sessions.path());
+        let owns_sessions = extra.iter().any(|arg| arg == "--home" || arg == "--eidolon-config");
+        if !owns_sessions {
+            command.arg("--sessions-dir").arg(sessions.path());
+        }
         if ui_dir {
             command.arg("--ui-dir").arg(&ui);
         }
+        command.args(extra);
         let mut hub_dir = None;
         let mut fake_log = None;
         if let Some(knobs) = hub {
@@ -158,7 +198,7 @@ impl Perch {
             }
             // The fake's own contract: where it writes its log and where a new session's log
             // goes (the perch names that path in no argv — the door names it itself).
-            command.env("FAKE_LOG", &log).env("FAKE_SESSIONS_DIR", sessions.path());
+            command.env("FAKE_LOG", &log).env("FAKE_SESSIONS_DIR", home_sessions.as_deref().unwrap_or(sessions.path()));
             for (name, value) in knobs {
                 command.env(name, value);
             }
@@ -167,6 +207,7 @@ impl Perch {
         }
         let mut child = command
             .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("XDG_CONFIG_HOME", xdg_config.path())
             // At trace for every test, not just the secrets one: the loud path is the
             // one a token could leak through, so every test is run on it.
             .env("RUST_LOG", "trace")
@@ -199,7 +240,7 @@ impl Perch {
         let token = std::fs::read_to_string(&token_file).expect("the token file the perch printed");
         assert!(!token.trim().is_empty(), "the token file is not empty");
 
-        Self { child, addr, port, token, token_file, runtime, root, ui, work, sessions, _hub: hub_dir, fake_log, boot, stdout, stderr }
+        Self { child, addr, port, token, token_file, runtime, root, ui, work, sessions, _xdg_config: xdg_config, _hub: hub_dir, fake_log, boot, stdout, stderr }
     }
 }
 
@@ -1315,6 +1356,121 @@ fn a_new_session_spawns_reaches_live_and_stops_clean() {
     assert!(perch.door_token_files().is_empty());
 }
 
+/// The Minerva home: the perch generates `<home>/config.toml` from the member's config, every door's
+/// argv carries it (new and resumed), a new session with no cwd works in its own `<home>/scratch/<stamp>`,
+/// and without `--home` that same body is the 400 it always was. Reverting any of these fails here.
+#[cfg(feature = "test-bins")]
+#[test]
+fn the_minerva_home_gives_every_door_its_config_and_a_cwd_less_session_its_scratch() {
+    // Created inside `--root` (the hub harness's), where the perch can canonicalize it at start.
+    let base = tempfile::tempdir().unwrap();
+    let home = base.path().join("Minerva");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"\n").unwrap();
+    let home = home.canonicalize().unwrap();
+    let config = home.join("config.toml");
+    // A stale hand-written config.toml is regenerated away, not honoured.
+    std::fs::write(&config, "sessions_dir = \"/hand/edited\"\n").unwrap();
+    let member = "sessions_dir = \"~/elsewhere\"\nthinking_budget = 4000\n\n[swarm]\nenabled = false\n\n[[providers]]\nname = \"mine\"\n";
+    let perch = Perch::start_hub_member(
+        &["--root".into(), base.path().canonicalize().unwrap().into(), "--home".into(), home.clone().into()],
+        member,
+    );
+    let generated: toml::Table = std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    assert_eq!(generated["sessions_dir"].as_str(), Some(home.join("sessions").to_str().unwrap()), "forced, absolute");
+    assert_eq!(generated["default_model"].as_str(), Some("mock"), "from minerva.toml, the member names none");
+    assert_eq!(generated["thinking_budget"].as_integer(), Some(4000), "the member's keys survive");
+    assert_eq!(generated["swarm"]["enabled"].as_bool(), Some(false));
+    assert_eq!(generated["providers"][0]["name"].as_str(), Some("mine"));
+
+    let answer = perch.post_json("/hub/sessions", serde_json::json!({}));
+    assert_eq!(answer.status, 201, "no cwd + a home is a scratch dir: {}{}", answer.head, answer.body);
+    let id = body_id(&answer);
+    let argv = perch.fake_argv();
+    let scratch = home.join("scratch");
+    assert!(argv.starts_with(&format!("argv --config {} web ", config.display())), "--config leads the door's argv: {argv}");
+    let row = perch.list().into_iter().find(|row| row["id"] == id.as_str()).expect("the new session is listed");
+    let cwd = PathBuf::from(row["cwd"].as_str().unwrap());
+    assert_eq!(cwd.parent(), Some(scratch.as_path()), "a fresh directory under <home>/scratch: {cwd:?}");
+    assert!(cwd.is_dir() && argv.contains(&format!("--cwd {}", cwd.display())), "{argv}");
+
+    // A second chat gets its own directory, so two chats never share files.
+    let other = perch.post_json("/hub/sessions", serde_json::json!({}));
+    assert_eq!(other.status, 201, "{}{}", other.head, other.body);
+    let other_id = body_id(&other);
+    let other_row = perch.list().into_iter().find(|row| row["id"] == other_id.as_str()).unwrap();
+    let other_cwd = PathBuf::from(other_row["cwd"].as_str().unwrap());
+    assert_ne!(other_cwd, cwd, "one scratch directory per chat");
+    assert_eq!(other_cwd.parent(), Some(scratch.as_path()));
+    assert_eq!(perch.post(&format!("/hub/sessions/{other_id}/stop")).status, 202);
+
+    // A named cwd still wins, and is still judged against the roots.
+    assert_eq!(perch.post_json("/hub/sessions", serde_json::json!({ "cwd": "/nowhere/at/all" })).status, 422);
+
+    // Resume: the same config on the reopened door.
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    let (pid, _) = perch.fake_last_start();
+    assert!(wait_gone(pid, Duration::from_secs(5)));
+    let resumed = perch.post(&format!("/hub/sessions/{id}/resume"));
+    assert_eq!(resumed.status, 200, "{}{}", resumed.head, resumed.body);
+    let argv = perch.fake_argv();
+    assert!(argv.starts_with(&format!("argv --config {} web ", config.display())), "a resume carries the config too: {argv}");
+    assert!(argv.contains("--session"), "{argv}");
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+}
+
+/// The listing follows the config the doors run with. With `--home` that is `<home>/sessions` whatever
+/// the member's config says; with an explicit `--eidolon-config` and no `--sessions-dir` it is the file's own
+/// (absolute) `sessions_dir`. Mutations: list the shared default dir instead (the `a` row is missing).
+#[test]
+fn the_listing_follows_the_config_the_doors_run_with() {
+    // --home: a log in <home>/sessions is listed, and the member's own sessions_dir is not.
+    let base = tempfile::tempdir().unwrap();
+    let theirs = base.path().join("theirs");
+    std::fs::create_dir(&theirs).unwrap();
+    std::fs::write(theirs.join("t.eid"), "{}\n").unwrap();
+    let home = base.path().join("Minerva");
+    std::fs::create_dir_all(home.join("sessions")).unwrap();
+    std::fs::write(home.join("sessions/a.eid"), "{}\n").unwrap();
+    let member = format!("sessions_dir = \"{}\"\n", theirs.display());
+    let perch = Perch::launch_with_member(true, None, &["--home".into(), home.clone().into(), "--root".into(), base.path().into()], Some(&member));
+    let ids: Vec<String> = perch.list().iter().map(|row| row["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(ids, ["a"], "<home>/sessions, not the member's directory");
+    drop(perch);
+
+    // An explicit config, no home: its absolute sessions_dir is the listing.
+    let config = base.path().join("c.toml");
+    std::fs::write(&config, format!("sessions_dir = '''{}'''\n", theirs.display())).unwrap();
+    let mut args: Vec<std::ffi::OsString> = vec!["--eidolon-config".into(), config.clone().into()];
+    let perch = Perch::launch(true, None, &args);
+    let ids: Vec<String> = perch.list().iter().map(|row| row["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(ids, ["t"], "the explicit config's own sessions_dir");
+    drop(perch);
+
+    // A `~` or relative sessions_dir would be a different directory to the door: the perch refuses to start.
+    for bad in ["~/x", "rel/x"] {
+        std::fs::write(&config, format!("sessions_dir = \"{bad}\"\n")).unwrap();
+        args = vec!["--eidolon-config".into(), config.clone().into()];
+        let out = Perch::refused_start(&args);
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("not an absolute path"), "{bad}: {:?}", out);
+    }
+}
+
+/// Without `--home` and `--eidolon-config` nothing changes: no `--config` in the argv, and a
+/// body with no cwd is refused.
+#[cfg(feature = "test-bins")]
+#[test]
+fn without_a_home_the_door_argv_has_no_config_and_a_cwd_is_required() {
+    let perch = Perch::start_hub(&[]);
+    assert_eq!(perch.post_json("/hub/sessions", serde_json::json!({})).status, 400);
+    let answer = perch.post_json("/hub/sessions", serde_json::json!({ "cwd": perch.work.display().to_string() }));
+    assert_eq!(answer.status, 201, "{}{}", answer.head, answer.body);
+    let argv = perch.fake_argv();
+    assert!(argv.starts_with("argv web "), "no --config: {argv}");
+    let id = body_id(&answer);
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+}
+
 /// The second half of the Stop finding: a door that ignores SIGTERM is killed after the
 /// grace, and the token file it could not remove is the perch's to remove.
 #[cfg(feature = "test-bins")]
@@ -1626,6 +1782,14 @@ impl Pane {
     fn begin(perch: &Perch, id: &str) -> TcpStream {
         let mut sock = TcpStream::connect(&perch.addr).unwrap();
         let head = format!("GET /s/{id}/api/events HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nAccept: text/event-stream\r\n\r\n", perch.addr, perch.auth());
+        sock.write_all(head.as_bytes()).unwrap();
+        sock
+    }
+
+    /// [`Pane::begin`] with another credential line (`Cookie: ...`) in place of the bearer.
+    fn begin_with(perch: &Perch, id: &str, credential: &str) -> TcpStream {
+        let mut sock = TcpStream::connect(&perch.addr).unwrap();
+        let head = format!("GET /s/{id}/api/events HTTP/1.1\r\nHost: {}\r\n{credential}\r\nAccept: text/event-stream\r\n\r\n", perch.addr);
         sock.write_all(head.as_bytes()).unwrap();
         sock
     }
@@ -2800,4 +2964,191 @@ fn a_door_that_exits_zero_while_starting_ends_dead() {
     let answer = perch.post(&format!("/hub/sessions/{id}/resume"));
     assert_eq!(answer.status, 503, "{}{}", answer.head, answer.body);
     assert_eq!(perch.state_of(&id).as_deref(), Some("dead"), "a spawn that failed is not a stop");
+}
+
+// ---------------------------------------------------------------------------
+// The login code and the session cookie (hub.md section 10.5)
+// ---------------------------------------------------------------------------
+
+impl Perch {
+    /// `POST /hub/code`, with the token, as the launcher does. The code, not its answer.
+    fn mint_code(&self) -> String {
+        let answer = self.post("/hub/code");
+        assert_eq!(answer.status, 200, "{}{}", answer.head, answer.body);
+        let body: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        body["code"].as_str().expect("a code").to_string()
+    }
+
+    /// `POST /hub/redeem` with no credential at all, as a page sends it.
+    fn redeem(&self, code: &str) -> Answer {
+        Request::new(&self.addr, "POST", "/hub/redeem").body(serde_json::to_vec(&serde_json::json!({ "code": code })).unwrap()).send(&self.addr)
+    }
+
+    /// `name=value` of the cookie a redeem set, as a browser would send it back.
+    fn cookie_of(&self, answer: &Answer) -> String {
+        let set = answer.header("set-cookie").unwrap_or_else(|| panic!("no Set-Cookie: {}", answer.head));
+        set.split(';').next().unwrap().to_string()
+    }
+
+    /// A cookie request as the page sends it: the browser says `same-origin`.
+    fn with_cookie(&self, method: &str, path: &str, cookie: &str) -> Answer {
+        Request::new(&self.addr, method, path).header("Cookie", cookie).header("Sec-Fetch-Site", "same-origin").send(&self.addr)
+    }
+
+    /// A cookie request from a browser that sends no fetch metadata at all.
+    fn with_cookie_bare(&self, method: &str, path: &str, cookie: &str) -> Answer {
+        Request::new(&self.addr, method, path).header("Cookie", cookie).send(&self.addr)
+    }
+}
+
+/// 50 ms is the lifetime; the test waits 300 ms.
+fn short_lived_codes() -> Vec<std::ffi::OsString> {
+    vec!["--code-ttl-ms".into(), "50".into()]
+}
+
+/// code -> redeem -> cookie, and the cookie is a credential everywhere the token is.
+/// Mutations: drop the cookie arm of the gate (the cookie request is a 401); make the cookie the
+/// token itself (the value assertion); drop `HttpOnly` or `SameSite=Strict` (the attribute checks).
+#[test]
+fn a_code_is_traded_for_a_cookie_that_works_like_the_token() {
+    let perch = Perch::launch(true, None, &[]);
+    assert_eq!(perch.get("/hub/sessions").status, 200, "the token still works");
+    // Nothing about a code is open without the token.
+    assert_eq!(Request::new(&perch.addr, "POST", "/hub/code").send(&perch.addr).status, 401);
+    let code = perch.mint_code();
+    assert!(code.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') && !code.is_empty(), "the shape the launcher prints");
+
+    let answer = perch.redeem(&code);
+    assert_eq!((answer.status, answer.body.as_str()), (204, ""), "{}", answer.head);
+    let set = answer.header("set-cookie").unwrap();
+    assert!(set.starts_with(&format!("minerva_{}=", perch.port)), "the port is in the name: {set}");
+    assert!(set.contains("; HttpOnly") && set.contains("; SameSite=Strict") && set.contains("; Path=/"), "{set}");
+    assert!(!set.contains("Secure") && !set.to_ascii_lowercase().contains("max-age"), "{set}");
+    let cookie = perch.cookie_of(&answer);
+    assert!(!cookie.contains(perch.token.trim()), "the cookie is its own secret, not the token");
+
+    // No Authorization header anywhere below.
+    let list = perch.with_cookie("GET", "/hub/sessions", &cookie);
+    assert_eq!((list.status, list.body.as_str()), (200, "[]"), "{}", list.head);
+    assert_eq!(perch.with_cookie("GET", "/hub/anything", &cookie).status, 404, "past the gate, not refused by it");
+    // The cookie is not a way to mint more logins: that is the token's (the launcher's) alone.
+    let minted = perch.with_cookie("POST", "/hub/code", &cookie);
+    assert_eq!((minted.status, minted.body.as_str()), (403, ""), "{}", minted.head);
+    assert_eq!(perch.post("/hub/code").status, 200, "the bearer token still mints");
+    assert_eq!(perch.with_cookie("GET", "/s/x/api/events", &cookie).status, 404, "the proxy takes the cookie too");
+    // Among other cookies.
+    assert_eq!(perch.with_cookie("GET", "/hub/sessions", &format!("a=b; {cookie}; c=d")).status, 200);
+    // Wrong value, another port's name, a prefix of the name, a prefix of the value: all 401.
+    let (name, value) = cookie.split_once('=').unwrap();
+    for bad in [
+        format!("{name}=wrong"),
+        format!("minerva_{}={value}", perch.port.wrapping_add(1)),
+        format!("x{name}={value}"),
+        format!("{name}={}", &value[..value.len() - 1]),
+        format!("{name}="),
+    ] {
+        assert_eq!(perch.with_cookie("GET", "/hub/sessions", &bad).status, 401, "{bad}");
+    }
+    // The cookie is attached by the browser, so it counts only on a request that says `same-origin`:
+    // no fetch metadata (an old browser on a sibling port of this host), `same-site` and `none` are all refused.
+    for refused in [perch.with_cookie_bare("GET", "/hub/sessions", &cookie), perch.with_cookie_bare("POST", "/hub/sessions", &cookie)] {
+        assert_eq!(refused.status, 401, "{}", refused.head);
+    }
+    for site in ["same-site", "none", "cross-site"] {
+        let refused = Request::new(&perch.addr, "GET", "/hub/sessions").header("Cookie", &cookie).header("Sec-Fetch-Site", site).send(&perch.addr);
+        assert_eq!(refused.status, 401, "cookie + {site}: {}", refused.head);
+    }
+    assert_eq!(perch.with_cookie("GET", "/hub/sessions", &cookie).status, 200, "same-origin passes");
+    // The bearer keeps its rules: no `Sec-Fetch-Site` passes (curl), `same-site` is still the gate 3 403.
+    assert_eq!(perch.get("/hub/sessions").status, 200);
+    let sibling = perch.apireq("GET", "/hub/sessions").header("Sec-Fetch-Site", "same-site").send(&perch.addr);
+    assert_eq!(sibling.status, 403, "{}", sibling.head);
+    // Gated answers are never a document: no script, no frame, nothing loaded.
+    assert_eq!(list.header("content-security-policy").as_deref(), Some("default-src 'none'; sandbox"), "{}", list.head);
+    assert_eq!(perch.get("/hub/sessions").header("content-security-policy").as_deref(), Some("default-src 'none'; sandbox"));
+    let rebound = Request::new(&perch.addr, "GET", "/hub/sessions").header("Cookie", &cookie).header("Sec-Fetch-Site", "same-origin").host("evil.example:80").send(&perch.addr);
+    assert_eq!(rebound.status, 403, "{}", rebound.head);
+
+    // Neither the code nor the secret is in the output.
+    for out in [perch.out(), perch.err()] {
+        assert!(!out.contains(&code) && !out.contains(value), "a login secret reached the output");
+    }
+}
+
+/// Mutations: leave the code in place after a redeem (the second use is a 204).
+#[test]
+fn a_code_is_single_use_and_a_bad_one_is_refused() {
+    let perch = Perch::launch(true, None, &[]);
+    let code = perch.mint_code();
+    assert_eq!(perch.redeem(&code).status, 204);
+    let again = perch.redeem(&code);
+    assert_eq!((again.status, again.body.as_str()), (403, ""), "{}", again.head);
+    assert!(again.header("set-cookie").is_none());
+    for bad in ["", "nope", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"] {
+        assert_eq!(perch.redeem(bad).status, 403, "{bad:?}");
+    }
+    // A malformed body is the same refusal, not a different oracle.
+    for body in [&b"not json"[..], b"{}", b"{\"code\":7}", b"[]"] {
+        let answer = Request::new(&perch.addr, "POST", "/hub/redeem").body(body).send(&perch.addr);
+        assert_eq!(answer.status, 403, "{:?}", String::from_utf8_lossy(body));
+    }
+    // Any other method on the route is an ordinary gated 401.
+    assert_eq!(Request::new(&perch.addr, "GET", "/hub/redeem").send(&perch.addr).status, 401);
+    // A wrong try does not burn a good code.
+    let code = perch.mint_code();
+    assert_eq!(perch.redeem("nope").status, 403);
+    assert_eq!(perch.redeem(&code).status, 204);
+}
+
+/// Mutations: ignore the age (the late redeem is a 204).
+#[test]
+fn an_expired_code_is_refused() {
+    // Only the late direction is asserted here: a slow machine makes the code older, never younger, so
+    // this cannot flake. "Inside its lifetime" is every other test in this section, at the real 30 s.
+    let perch = Perch::launch(true, None, &short_lived_codes());
+    let stale = perch.mint_code();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(perch.redeem(&stale).status, 403, "past its lifetime");
+}
+
+/// The open route keeps every gate but the token. Mutations: skip the host, fetch-metadata or
+/// body-cap gate for it.
+#[test]
+fn redeem_is_open_only_to_the_token_gate() {
+    let perch = Perch::launch(true, None, &[]);
+    let code = perch.mint_code();
+    let body = serde_json::to_vec(&serde_json::json!({ "code": code })).unwrap();
+    let cross = Request::new(&perch.addr, "POST", "/hub/redeem").header("Sec-Fetch-Site", "cross-site").body(body.clone()).send(&perch.addr);
+    assert_eq!(cross.status, 403, "{}", cross.head);
+    let rebound = Request::new(&perch.addr, "POST", "/hub/redeem").host("evil.example:80").body(body.clone()).send(&perch.addr);
+    assert_eq!(rebound.status, 403, "{}", rebound.head);
+    let big = send_oversize(&perch.addr, "POST", "/hub/redeem", None, 4096);
+    assert_eq!(big.status, 413, "{}", big.head);
+    // None of those spent the code; the page's own `fetch` (`same-origin`) can.
+    let typed = Request::new(&perch.addr, "POST", "/hub/redeem").header("Sec-Fetch-Site", "same-origin").body(body).send(&perch.addr);
+    assert_eq!(typed.status, 204, "{}", typed.head);
+    // No credential, no cookie: still the 401 the gates promise.
+    assert_eq!(Request::new(&perch.addr, "GET", "/hub/sessions").send(&perch.addr).status, 401);
+    assert_eq!(Request::new(&perch.addr, "GET", "/hub/sessions").header("Cookie", "").send(&perch.addr).status, 401);
+}
+
+/// The proxy's SSE route takes the cookie, and nothing of it reaches the door.
+/// Mutations: leave the cookie arm out of the proxy path (the pane is refused).
+#[cfg(feature = "test-bins")]
+#[test]
+fn the_cookie_opens_a_pane() {
+    let mut perch = Perch::start_hub(&[]);
+    let answer = perch.post_json("/hub/sessions", serde_json::json!({ "cwd": perch.work.display().to_string(), "model": "mock" }));
+    assert_eq!(answer.status, 201, "{}{}", answer.head, answer.body);
+    let id = body_id(&answer);
+    let cookie = perch.cookie_of(&perch.redeem(&perch.mint_code()));
+    let mut pane = Pane::adopt(Pane::begin_with(&perch, &id, &format!("Cookie: {cookie}\r\nSec-Fetch-Site: same-origin")));
+    assert!(pane.read_until("\"hello\"", Duration::from_secs(5)), "the stream opened on the cookie alone");
+    drop(pane);
+    let said = Request::new(&perch.addr, "POST", &format!("/s/{id}/api/say")).header("Cookie", &cookie).header("Sec-Fetch-Site", "same-origin").body(br#"{"text":"hi"}"#.to_vec()).send(&perch.addr);
+    assert_eq!(said.status, 202, "{}{}", said.head, said.body);
+    let cookie_value = cookie.split_once('=').unwrap().1.to_string();
+    assert!(perch.fake_records().iter().all(|line| !line.contains(&cookie_value)), "the door was handed the cookie");
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    perch.stop();
 }

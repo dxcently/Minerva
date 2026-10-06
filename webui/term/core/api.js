@@ -36,8 +36,35 @@ export function takeToken() {
   return !!token;
 }
 
+// The launcher's way in is a one-time code, `#code=...`, which `hoot` puts in the URL it opens.
+// The fragment is never sent to a server and is scrubbed at once; the code is traded at
+// POST /hub/redeem for an HttpOnly cookie. From then on there is no token in this page at all:
+// every request and every EventSource-style stream carries the cookie by itself (same origin),
+// and `auth()` has nothing to add.
+//   takeCode()   -> the code, or null; strips it from the URL either way
+//   redeem(code) -> true when the perch set the cookie, false for expired / used / refused
+const CODE = /^[A-Za-z0-9_-]+$/;
+export function takeCode() {
+  const hash = new URLSearchParams(location.hash.replace(/^#/, ''));
+  if (!hash.has('code')) return null;
+  const found = hash.get('code');
+  hash.delete('code');
+  const f = hash.toString();
+  history.replaceState(null, '', location.pathname + location.search + (f ? '#' + f : ''));
+  return found && CODE.test(found) ? found : '';
+}
+
+export async function redeem(code) {
+  if (!code) return false;
+  try {
+    const r = await fetch('/hub/redeem', { method: 'POST', cache: 'no-store', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code }) });
+    return r.status === 204;
+  } catch { return false; }
+}
+
 export function auth(extra = {}) {
-  return { Authorization: 'Bearer ' + token, ...extra };
+  // No token on the cookie path: the browser sends the cookie itself.
+  return token ? { Authorization: 'Bearer ' + token, ...extra } : { ...extra };
 }
 
 // POST a JSON body (or none). Resolves to { status, data } and never throws on

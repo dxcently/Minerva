@@ -64,6 +64,9 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+# The member's `~/.config/eidolon/config.toml` is parsed and re-written (never scanned by hand)
+# when `--home` generates the Minerva home's config. Parse + display only; not an eidolon crate.
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 
 [features]
 # The stand-in door the tests drive (`src/bin/fake_eidolon.rs`). `cargo build` and

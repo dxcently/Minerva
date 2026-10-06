@@ -3709,3 +3709,24 @@ What ran, all on the BotForge practice VM, GLM 5.3 as the scored brain, jev
   and opening that file in a real browser gets a 403 from the perch's Sec-Fetch
   gate (file: pages navigate cross-site). The launcher is not usable in a
   browser yet.
+
+## 2026-10-05 - Web UI made usable: start screen, Minerva home, hoot sign-in
+
+- An Opus UX audit (`logs/agents/ux-audit.md`) reproduced "nothing works": with
+  no live session the page had no composer, old chats opened empty and failed
+  with 409, new chats ran on mock, and the launcher's browser path got a 403.
+- Page: a start screen (`[ new chat ]`, `[ open folder... ]`, recent chats),
+  opening a chat switches the focused pane (splitting is explicit), boot opens
+  one pane, and internal words (door, kept, perch, 409) are gone from the UI.
+- Perch: `--home` generates `~/Minerva/config.toml` from the member's eidolon
+  config (sessions_dir forced to `~/Minerva/sessions`, default_model from
+  `~/Minerva/minerva.toml` or luna), every door runs with `--config`, and a
+  folderless chat gets its own `scratch/<stamp>/`. Sign-in: `POST /hub/code`
+  (token only) mints a 30 s single-use code, `POST /hub/redeem` trades it for an
+  HttpOnly SameSite=Strict cookie holding a per-redeem secret, accepted only on
+  same-origin requests. Tests: 68 lib + 1 main + 75 http.
+- Launcher: bare `hoot` opens Minerva signed in (`perch-open.sh --code`); the
+  redirect file and its 403 are gone. An Opus review
+  (`logs/agents/ux-slices.review.md`) found a reload sign-out bug, cookie-minted
+  codes, a CSRF gap, the config replacing the member's config, and shared
+  scratch; all fixed. Open: N5 logout, N7 localhost, N11 old-chat fold, N12.

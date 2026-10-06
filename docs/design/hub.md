@@ -55,7 +55,7 @@ Relations: a pane belongs to one session; a session has 0 or 1 door; a door has 
 
 | Item | Design | Basis |
 |---|---|---|
-| Binary | `minerva perch [--bind 127.0.0.1:0] [--ui-dir DIR] [--root DIR]... [--idle 30m] [--eidolon PATH] [--sessions-dir DIR]` | proposed |
+| Binary | `minerva perch [--bind 127.0.0.1:0] [--ui-dir DIR] [--root DIR]... [--idle 30m] [--eidolon PATH] [--sessions-dir DIR] [--eidolon-config FILE] [--home DIR]` | built; the last two are the Minerva home (below) |
 | Bind | loopback only (127.0.0.0/8, `::1`), refused before a listener exists, no widening flag | copies lib.rs:137 |
 | Token | `harnox::crypto::random_token()` after bind; `harnox::fs::write_atomic_0600` to `$XDG_RUNTIME_DIR/minerva/perch-<port>.token`; mode re-checked after write, start refused if not owner-only | copies lib.rs:158, :202 |
 | Runtime dir | **refuse to start without `XDG_RUNTIME_DIR`**; check the dir is owned by our uid and mode `& 077 == 0` | reasoned: eidolon falls back to the shared temp dir (presence.rs:109-114) and ignores a failed `chmod 0700` (presence.rs:130, `let _ =`), so a dir another user pre-created stays theirs |
@@ -73,6 +73,8 @@ Static serving: the door's rules, ported (not depended on): one percent-decode, 
 | Method | Path | Token | Does | Answers |
 |---|---|---|---|---|
 | GET, HEAD | `/`, `/<file>` (not `/hub`, `/s`) | no | static UI from `--ui-dir` | 200 / 404 / 405 / 413 |
+| POST | `/hub/code` | yes, **the bearer token only** (a cookie is a 403) | mint a login code: random, single use, 30 s, at most 4 outstanding (section 10.5) | 200 `{code}` |
+| POST | `/hub/redeem` | **no** (host, fetch-metadata and a 1 KiB body cap still apply) | trade a code `{code}` for the session cookie (section 10.5) | 204 + `Set-Cookie` / 403 |
 | GET | `/hub/sessions` | yes | list kept + live (section 4) | 200 `[{id, state, title?, cwd?, busy?, panes, mtime}]` |
 | POST | `/hub/sessions` | yes | spawn a new session `{cwd, model?}` | 201 `{id}` / 422 cwd outside roots / 503 spawn failed |
 | POST | `/hub/sessions/<id>/resume` | yes | spawn a door on a kept log | 200 / 409 live here or elsewhere / 404 |
@@ -94,7 +96,7 @@ The token gate covers the bare `/hub`, `/s` and everything under them, before pa
 
 | Source | Gives | Basis |
 |---|---|---|
-| sessions dir, `*.eid` | kept sessions: stem, mtime | observed main.rs:868-876 (`eidolon sessions` reads the same); default `data_local_dir/eidolon/sessions`, overridable in config (config.rs:587-593). The perch takes `--sessions-dir` and defaults to the same path; **hypothesis** it matches the member's config, since the perch does not parse eidolon's `config.toml` |
+| sessions dir, `*.eid` | kept sessions: stem, mtime | observed main.rs:868-876 (`eidolon sessions` reads the same); default `data_local_dir/eidolon/sessions`, overridable in config (config.rs:587-593). The perch takes `--sessions-dir` and defaults to the same path; with `--home` the perch generates the config the doors run with and lists the same `<home>/sessions` (see "Minerva home"), so the two cannot differ |
 | perch children | live doors this perch owns: pid, port, door token (memory only) | proposed |
 | swarm roster, `$XDG_RUNTIME_DIR/eidolon/*/meta.json` | live sessions of any consumer (TUI, other doors): `pid`, `log`, `cwd`, `busy`, `title` | observed presence.rs:33-53. Read by scanning, the perch never registers (Q2) |
 
@@ -270,9 +272,9 @@ Classes: `audit`, `gate` only (Q7). Excluded: `notification` (forwarded OS notif
 | # | Gate | Refusal | Basis |
 |---|---|---|---|
 | 0 | loopback-only bind, at start | no start | lib.rs:137 |
-| 1 | token on `/hub`, `/hub/*`, `/s`, `/s/*`: `Authorization: Bearer` only, never a query parameter; constant time (`subtle`) | 401, empty body | serve.rs:165, :240; the page uses fetch-based SSE (web-ui.md section 9, M1), so the door's `?token=` escape hatch is not needed |
+| 1 | token on `/hub`, `/hub/*`, `/s`, `/s/*`: `Authorization: Bearer`, or the session cookie of 10.5 on a `Sec-Fetch-Site: same-origin` request; never a query parameter; constant time (`subtle`). `POST /hub/redeem` alone is exempt; `POST /hub/code` takes the bearer token only (cookie: 403). Every gated answer carries `Content-Security-Policy: default-src 'none'; sandbox` | 401, empty body | serve.rs:165, :240; the page uses fetch-based SSE (web-ui.md section 9, M1), so the door's `?token=` escape hatch is not needed |
 | 2 | `Host` equals the bound `ip:port` (or `localhost:port`, Q8) | 403 | serve.rs:118 |
-| 3 | `Sec-Fetch-Site`, when present, is `same-origin` or `none` | 403 | new; a same-origin page always passes, curl sends none |
+| 3 | `Sec-Fetch-Site`, when present, is `same-origin` or `none`. **The cookie** counts as a credential (gate 1) only when it is present and `same-origin`; a bearer request keeps "absent passes" | 403 (cookie without it: the gate 1 401) | new; a same-origin page always passes, curl sends none |
 | 4 | method and path shape | 404 / 405 | section 3 |
 | 5 | body `Limited` at 8 MiB | 413 | serve.rs:87, :408 |
 | 6 | per-route: id regex, cwd under `--root`, tree containment, session state | 404 / 409 / 422 | sections 4, 7 |
@@ -280,6 +282,34 @@ Classes: `audit`, `gate` only (Q7). Excluded: `notification` (forwarded OS notif
 ### 10.3 What the perch token grants
 
 **Everything every door token grants, across every session the perch can reach, at once**: read every transcript, send and steer, cancel, answer any ask (including policy approvals), open terminal/editor/file windows. **Plus**: start a new agent in any directory under `--root`, resume any kept session (which may continue a turn and spend, section 4), stop sessions, list directory names under any live session's cwd, read the mesh snapshot and feed. Leaking it is leaking the operator's whole bench.
+
+### 10.5 Login: code, redeem, cookie (2026-10-05)
+
+```text
+hoot -> wsl.exe -> perch-open.sh --code
+          curl -H @tokenfile  POST /hub/code      -> {"code": c}      (30 s, one use)
+        prints  http://127.0.0.1:<port>/#code=c   -> hoot opens it in the browser
+page:   strips #code=c from the URL, POST /hub/redeem {"code": c}
+          -> 204  Set-Cookie: minerva_<port>=<secret>; HttpOnly; SameSite=Strict; Path=/
+          -> 403  (wrong, used or expired: one empty answer)
+then:   every fetch and stream carries the cookie by itself; no token is in page script at all
+```
+
+**The cookie is not the token.** Each redeem mints its own random secret, kept in memory only (at
+most 32; the oldest is dropped). The token file stays the single master credential: a cookie
+that leaks from a browser profile can be dropped by restarting the perch, and never
+reveals what the launcher reads. A restart forgets every cookie, which is the revocation.
+
+**Threat notes.**
+
+- The code is in the launched URL, so it can appear in browser argv, history and a process list. That is harmless: it works once and dies in 30 s, and the page spends it in the first second.
+- Cookies are **not isolated by port** on `127.0.0.1`: another loopback server (any port, any local user's process that can bind one) is sent this cookie by the browser. That is why the name carries the port (two perches do not overwrite each other's login) and why the cookie is `HttpOnly` (page script, including a compromised extension's, cannot read it). It does not stop a hostile *server* on another port; that case is attacker D in 10.1 and is out of reach of any loopback web login. The gate backstop is gate 3: a request from another port on the same host is `Sec-Fetch-Site: same-site`, which is refused, and `SameSite=Strict` keeps cross-site pages from sending it at all. A browser that sends no fetch metadata would be admitted by "absent passes" (right for curl and the bearer, wrong for an ambient cookie), so the cookie authenticates only on a request that says `same-origin`; the page's own `fetch` always does.
+- `POST /hub/code` accepts the bearer token only. A script in the page's origin cannot read the HttpOnly cookie, but could otherwise call the route with it, read the code (same-origin responses are readable) and hand it to an accomplice that redeems it for a session of its own.
+- A reload or a new tab has no `#code=` and no token in it, and is signed in by the cookie alone: the page probes `GET /hub/sessions` once and boots on a 200 (webui/term/README.md).
+- Redeem is the one open `/hub` route. It keeps gates 2 (Host), 3 (fetch metadata) and 5 (the body cap, 1 KiB here), compares in constant time against every outstanding code, and answers every failure with the same empty 403. Codes are 256 bits; no rate limit is applied.
+- No `Secure` flag: the origin is plain-http loopback (the operator's decision D3), so the cookie is sent over unencrypted loopback; the threat is a local process, not a network.
+- The cookie has no `Max-Age`: it ends with the browser session or the perch, whichever is first.
+- The proxy never forwards the cookie (it rebuilds the door request from five fields).
 
 ### 10.4 Must never happen
 
@@ -323,6 +353,7 @@ Minerva/perch/                own Cargo.toml + Cargo.lock; not an eidolon worksp
 | `hyper` 1 (`server`, `client`, `http1`), `hyper-util` (`tokio`, `server`, `server-graceful`, `http1`), `http-body-util`, `bytes` | the door's exact stack, plus hyper's `client` feature for the proxy | yes (crates/web/Cargo.toml) |
 | `async-stream`, `futures-util` | SSE bodies | yes |
 | `serde`, `serde_json`, `anyhow`, `tracing`, `tracing-subscriber`, `clap` 4 | the usual | yes (Cargo.toml:37-59) |
+| `toml` 0.8 (parse + display only) | the Minerva home's generated config: the member's `config.toml` is parsed and re-written, and an explicit `--eidolon-config`'s `sessions_dir` is read, with a real parser instead of a line scan | yes; third party, no `eidolon-*` |
 | `subtle` 2 | constant-time token compare | yes |
 | `harnox` (git tag v0.3.8, no default features) | `random_token`, `write_atomic_0600`: one mint of a secret, the door's own reason | yes (Cargo.toml:35). Noah's crate, **not** eidolon |
 | `libc` | `prctl(PR_SET_PDEATHSIG)`, `getuid` | in the lock, 0.2.189 |
@@ -391,3 +422,7 @@ Run in WSL2 (ext4 target dir), like the door's reported numbers.
 | Q7 | Mesh event classes: `audit` + `gate`, or also `secret` (names only)? | `audit`, `gate` |
 | Q8 | Accept `Host: localhost:<port>` as well as the IP? A Windows browser over WSL forwarding may send it; the door refuses it (serve.rs:118-132 compares the IP string) | accept `localhost` literally; no other names |
 | Q9 | Should `/hub/tree` also serve kept sessions (root from the log's start record)? | no, live only |
+
+## Minerva home (2026-10-05)
+
+UI sessions live in `~/Minerva` (`MINERVA_HOME`), not eidolon's shared sessions dir, so the page lists only its own chats and a new chat gets a real default model instead of `mock`. `bin/perch-open.sh` creates `sessions/`, `scratch/`, `projects.json` and `minerva.toml` (`default_model`) when missing and starts the perch with `--home`. **The perch generates `<home>/config.toml` at every start**: eidolon's `--config` replaces `~/.config/eidolon/config.toml` outright (`Config::load` reads that one file), so the member's own config is parsed (a TOML parser; every key and table kept, an empty table when there is none), `sessions_dir` is forced to the absolute `<home>/sessions` (eidolon does not expand `~` in that key, and a relative one is read from each door's cwd), `default_model` is set only when absent (from `<home>/minerva.toml`, else `chatgpt:gpt-5.6-luna`), and the file is written atomically, mode `0600`, under a "generated, edit the other files" comment. The files beside the config (`providers/`, `policy.rn`, `secrets`) are `config_dir()`-relative and shared as before. Every door is `eidolon --config <home>/config.toml web ...`, new or resumed, and the perch lists the same `<home>/sessions`. `--home` conflicts with `--eidolon-config` and `--sessions-dir`; an explicit `--eidolon-config` alone has its `sessions_dir` read with the same parser and a relative or `~` value refuses the start. A new session with no `cwd` works in a fresh `<home>/scratch/<YYYYMMDD-HHMMSS>/` made per chat (`-2`, `-3` on a collision), so two chats never share files. Deferred: the old shared `~/.local/share/eidolon/sessions` chats are not shown in the UI. The perch lives in WSL: it dies if WSL idles out, and the fix is `vmIdleTimeout=-1` under `[wsl2]` in `%UserProfile%\.wslconfig` (a `systemd --user` unit is the unbuilt alternative).

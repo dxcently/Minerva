@@ -207,16 +207,23 @@ Useful keys:
 
 ### The browser UI (webui/term)
 
+In Windows PowerShell, type:
+
+```powershell
+hoot
+```
+
+That starts (or reuses) the Minerva server in WSL and opens your browser already signed in: a one-time link that works once and dies after 30 seconds, so there is no password and no token to copy. `hoot status web` says whether it is up and `hoot stop web` stops it (your chats are kept). The first run needs the server built once, in WSL: `cd perch && CARGO_TARGET_DIR=$HOME/perch-target cargo build --release`. `hoot` does not start the local-model server; `hoot up` does that.
+
+To serve one bare `eidolon web` session by hand instead (no chat list, one session):
+
 ```bash
 eidolon web --bind 127.0.0.1:47811 --ui-dir ~/Minerva/webui/term
 #   listening on http://127.0.0.1:47811/
 #   token file: /run/user/<uid>/eidolon/web-47811.token
 ```
 
-1. Print the token with `cat` on the file path the door printed.
-2. In your **Windows** browser, open `http://127.0.0.1:47811/#token=<the token>`.
-
-Windows can reach WSL's loopback by default. The page moves the token out of the URL once it loads.
+Then, in your **Windows** browser, open `http://127.0.0.1:47811/#token=<contents of the token file>`. Windows can reach WSL's loopback by default. The page moves the token out of the URL once it loads.
 
 `webui/term` is milestone M1. The door's attachment and launch routes it uses are in the vendored eidolon (upstream master). See [`webui/term/README.md`](../webui/term/README.md) for keys and layout.
 
@@ -334,6 +341,7 @@ The repo's `opencode.json` already declares a `hoot` provider for the Windows mo
 | `hoot up` exits at once | A `models.ini` path is missing, or the llama.cpp build lacks an option | `hoot status`; check the paths in `models.ini`. `spec-type` and `reasoning` were only tested on the old build, so comment them out to test. |
 | An Ollama model returns 401/403 | The key is wrong or revoked, or the plan doesn't include that model | Rerun `eidolon secret set ollama`; check the plan. |
 | An Ollama model returns 429 | Too many concurrent requests or the allowance is used up | Wait, or run fewer agents at once. |
-| The web UI shows 401 | The token is missing from that tab | Reopen with `#token=...`. Each new tab needs it once. |
+| The web UI says "this link has expired" or "not signed in" | The one-time link was used or is older than 30 seconds, or the server restarted | Type `hoot` again. (A bare `eidolon web` door still takes `#token=...`.) |
+| The web page says "not answering" a while after `hoot`, and `hoot status web` says down | The Minerva server (the perch) runs inside WSL and stops when WSL idles out with no window open | In `%UserProfile%\.wslconfig` add `[wsl2]` and `vmIdleTimeout=-1`, run `wsl --shutdown` once, then `hoot`. (A `systemd --user` unit would also work; not set up.) |
 
 Anything not covered here: ask in the club channel, and add the answer to this table.

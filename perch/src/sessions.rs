@@ -312,6 +312,11 @@ pub struct Registry {
     pub runtime_dir: PathBuf,
     /// The door binary to spawn (`--eidolon`).
     pub eidolon: PathBuf,
+    /// `--eidolon-config`: handed to every door as `--config`, so new and resumed sessions
+    /// share one config (and one sessions dir). `None` is the door's own default.
+    pub eidolon_config: Option<PathBuf>,
+    /// `--home`'s `scratch/`: where a new session with no `cwd` works. `None` refuses it.
+    pub scratch: Option<PathBuf>,
     /// `--root`, canonicalized once at start: a new session's cwd must sit under one.
     roots: Vec<PathBuf>,
     doors: Mutex<Vec<Door>>,
@@ -342,6 +347,19 @@ impl Registry {
     /// canonical paths, and a `--root` that does not exist refuses the start rather than
     /// failing every spawn with a 422 nobody can act on.
     pub fn new(sessions_dir: PathBuf, runtime_dir: PathBuf, eidolon: PathBuf, roots: Vec<PathBuf>) -> Result<Arc<Self>> {
+        Self::with_home(sessions_dir, runtime_dir, eidolon, roots, None, None)
+    }
+
+    /// [`Registry::new`] plus the Minerva home's two settings: the config every door is given
+    /// and the scratch directory a cwd-less new session works in.
+    pub fn with_home(
+        sessions_dir: PathBuf,
+        runtime_dir: PathBuf,
+        eidolon: PathBuf,
+        roots: Vec<PathBuf>,
+        eidolon_config: Option<PathBuf>,
+        scratch: Option<PathBuf>,
+    ) -> Result<Arc<Self>> {
         let mut checked = Vec::new();
         for root in roots {
             let path = root.canonicalize().with_context(|| format!("--root {} is not an existing directory", root.display()))?;
@@ -349,7 +367,7 @@ impl Registry {
             checked.push(path);
         }
         anyhow::ensure!(!checked.is_empty(), "no --root and no $HOME: a new session's cwd could not be checked against anything");
-        Ok(Arc::new(Self { sessions_dir, runtime_dir, eidolon, roots: checked, doors: Mutex::new(Vec::new()) }))
+        Ok(Arc::new(Self { sessions_dir, runtime_dir, eidolon, eidolon_config, scratch, roots: checked, doors: Mutex::new(Vec::new()) }))
     }
 
     /// §4 step 1, for a new session: the cwd as the kernel spells it, and only if some

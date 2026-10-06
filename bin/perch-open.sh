@@ -1,42 +1,52 @@
 #!/usr/bin/env bash
-# perch-open.sh: start (or reuse) the Minerva perch in WSL and open the web UI in the
-# Windows browser. The perch token goes from its 0600 file into a 0600 redirect file and
-# nowhere else: never argv, stdout, a log, a clipboard or a URL you type (web-ui.md 5.2).
+# perch-open.sh: start (or reuse) the Minerva server (the perch) in WSL and sign a browser in.
+# The perch token never leaves its 0600 file: this script reads it for curl through `-H @file`
+# (never argv, env, stdout or a log), and browsers get a 30 s single-use login code instead
+# (`POST /hub/code`), which the page trades for an HttpOnly cookie (docs/design/hub.md 10.5).
+# `hoot` (bin/hoot.ps1) runs this with --code and opens the one URL line it prints.
 #
-# usage: bin/perch-open.sh [--no-browser] [--status] [--stop]
-#   (none)         start or reuse the perch, write the redirect file, open it, print the url
-#   --no-browser   same, but print `open file: <windows path>` instead of opening it
+# usage: bin/perch-open.sh [--code] [--no-browser] [--status] [--stop]
+#   --code         start or reuse the perch, mint a login code, print exactly one line on stdout:
+#                  http://127.0.0.1:<port>/#code=<code>   (everything else goes to stderr)
+#   (none)         start or reuse the perch, mint a code and open the URL in the Windows browser
+#   --no-browser   start or reuse the perch and print its address; no code, no browser
 #   --status       is it up, its url and pid, session rows by state (counts only)
 #   --stop         SIGTERM the perch, wait up to 15 s, report stopped / still running
 # environment (all optional):
-#   MINERVA_PERCH_BIN   default $HOME/perch-target/release/perch
+#   MINERVA_PERCH_BIN   default $HOME/perch-target/release/perch. Build it in WSL with:
+#                         cd perch && CARGO_TARGET_DIR=$HOME/perch-target cargo build --release
 #   MINERVA_PERCH_PORT  default 47820
 #   MINERVA_UI_DIR      default <repo>/webui/term, found from this script's path
-#   MINERVA_OPEN_TTL    seconds the redirect file lives, default 60
+#   MINERVA_HOME        the Minerva home, default $HOME/Minerva: sessions/, scratch/, projects.json and
+#                       minerva.toml created when missing; the perch regenerates config.toml at every start
+#   Roots a chat may work in: $HOME, the Minerva home and the Windows profile folder (USERPROFILE).
 
 set -euo pipefail
 umask 077
 
 mode=open
 browser=1
+want_code=1
+code_only=0
 for a in "$@"; do
   case "$a" in
-    --no-browser) browser=0 ;;
+    --code) code_only=1; browser=0 ;;
+    --no-browser) browser=0; want_code=0 ;;
     --status) mode=status ;;
     --stop) mode=stop ;;
-    -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "perch-open: unknown argument: $a (try --help)" >&2; exit 2 ;;
   esac
 done
+if [ "$code_only" = 1 ]; then want_code=1; fi
 
 BIN=${MINERVA_PERCH_BIN:-$HOME/perch-target/release/perch}
 PORT=${MINERVA_PERCH_PORT:-47820}
-TTL=${MINERVA_OPEN_TTL:-60}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 UI=${MINERVA_UI_DIR:-$here/../webui/term}
+MHOME=${MINERVA_HOME:-$HOME/Minerva}
 
 case "$PORT" in ''|*[!0-9]*) echo "perch-open: MINERVA_PERCH_PORT must be a number" >&2; exit 1 ;; esac
-case "$TTL" in ''|*[!0-9]*) echo "perch-open: MINERVA_OPEN_TTL must be a number" >&2; exit 1 ;; esac
 
 if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
   echo "perch-open: XDG_RUNTIME_DIR is not set; the perch refuses to keep its token in a shared temp dir" >&2
@@ -49,7 +59,6 @@ PIDF=$STATE/perch-$PORT.pid
 OUTF=$STATE/perch-$PORT.out
 LOGF=$STATE/perch-$PORT.log
 TOKF=$STATE/perch-$PORT.token
-OPENF=$STATE/open-$PORT.html
 URL=http://127.0.0.1:$PORT/
 
 alive() { [ -f "$PIDF" ] && kill -0 "$(<"$PIDF")" 2>/dev/null; }
@@ -106,7 +115,7 @@ fi
 if [ "$mode" = status ]; then
   if reusable; then
     body=$(hub_get /hub/sessions)
-    counts=$(printf '%s' "$body" | grep -o '"state":"[a-z-]*"' | sed 's/"state":"//;s/"//' | sort | uniq -c \
+    counts=$(printf '%s' "$body" | { grep -o '"state":"[a-z-]*"' || true; } | sed 's/"state":"//;s/"//' | sort | uniq -c \
       | awk '{printf "%s%s %s", (n++?" · ":""), $2, $1}')
     echo "up: $URL (pid $(<"$PIDF"))"
     echo "sessions: ${counts:-none}"
@@ -127,6 +136,19 @@ else
     echo "build it:  cd perch && CARGO_TARGET_DIR=\$HOME/perch-target cargo build --release" >&2
     exit 1
   fi
+  # An old build lacks --home or --eidolon-config and would refuse the start with a usage error: say
+  # what to do instead. The help is captured first: a pipe into `grep -q` can die of SIGPIPE under pipefail.
+  help=$("$BIN" --help 2>&1 || true)
+  for flag in --home --eidolon-config; do
+    case $help in
+      *"$flag"*) ;;
+      *)
+        echo "perch-open: $BIN is an old build (it has no $flag); rebuild it in WSL:" >&2
+        echo "  cd $(cd "$here/.." && pwd)/perch && CARGO_TARGET_DIR=\$HOME/perch-target cargo build --release" >&2
+        exit 1
+        ;;
+    esac
+  done
   if listening; then
     echo "perch-open: port $PORT is already in use by something that is not our perch; set MINERVA_PERCH_PORT" >&2
     exit 1
@@ -134,8 +156,30 @@ else
   [ -d "$UI" ] || { echo "perch-open: UI dir not found: $UI" >&2; exit 1; }
   UI=$(cd "$UI" && pwd)
   rm -f "$PIDF" "$OUTF" "$LOGF" "$TOKF"
-  # No --sessions-dir (the perch's default must equal the door's own) and no --root.
-  setsid nohup "$BIN" --bind "127.0.0.1:$PORT" --ui-dir "$UI" >"$OUTF" 2>"$LOGF" </dev/null &
+  # The Minerva home: UI sessions live there, not in eidolon's shared sessions dir. The dirs,
+  # projects.json and minerva.toml are created only when missing. config.toml is NOT written here: the
+  # perch generates it at every start from ~/.config/eidolon/config.toml (every key kept), with
+  # sessions_dir forced to <home>/sessions and default_model filled from minerva.toml when the member's
+  # config names none. Edit ~/.config/eidolon/config.toml or minerva.toml, never <home>/config.toml.
+  case "$MHOME" in /*) ;; *) echo "perch-open: MINERVA_HOME must be an absolute path: $MHOME" >&2; exit 1 ;; esac
+  mkdir -p "$MHOME/sessions" "$MHOME/scratch"
+  if [ ! -e "$MHOME/minerva.toml" ]; then printf 'default_model = "chatgpt:gpt-5.6-luna"\n' >"$MHOME/minerva.toml"; fi
+  if [ ! -e "$MHOME/projects.json" ]; then printf '[]\n' >"$MHOME/projects.json"; fi
+  # Roots: $HOME, plus the Windows profile when it can be found (so a pasted C:\Users\you\...
+  # folder is allowed); --home adds the Minerva home as one more root. The profile folder is asked of
+  # cmd.exe (run from /mnt/c, so it does not complain about a UNC working directory) and mapped by
+  # wslpath, so a renamed account or a custom automount root still resolves; without one, no extra root.
+  roots=(--root "$HOME")
+  winprofile=$(cd /mnt/c 2>/dev/null && cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r\n' || true)
+  winroot=
+  case "$winprofile" in ''|'%USERPROFILE%') ;; *) winroot=$(wslpath -u "$winprofile" 2>/dev/null || true) ;; esac
+  if [ -n "$winroot" ] && [ -d "$winroot" ]; then
+    roots+=(--root "$winroot")
+  else
+    echo "perch-open: no Windows profile folder found; pasted C:\... folders will be refused" >&2
+  fi
+  setsid nohup "$BIN" --bind "127.0.0.1:$PORT" --ui-dir "$UI" "${roots[@]}" --home "$MHOME" \
+    >"$OUTF" 2>"$LOGF" </dev/null &
   spid=$!
   tokline=
   for _ in $(seq 1 40); do
@@ -156,19 +200,32 @@ else
   printf '%s\n' "${pid:-$spid}" >"$PIDF"
 fi
 
-# Redirect file: the only place the token is written besides its own file.
-rm -f "$OPENF"
-printf '<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer">\n<title>Minerva</title><script>location.replace("http://127.0.0.1:%s/#token=%s")</script>\n' \
-  "$PORT" "$(<"$TOKF")" >"$OPENF"
-chmod 600 "$OPENF"
-WINP=$(wslpath -w "$OPENF")
-
-if [ "$browser" = 1 ]; then
-  powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '$WINP'" >/dev/null
-else
-  echo "open file: $WINP (deleted in ${TTL}s)"
+if [ "$want_code" = 0 ]; then
+  echo "minerva perch on $URL (pid $(<"$PIDF"), log $LOGF)$reused"
+  exit 0
 fi
-setsid nohup bash -c 'sleep "$1"; rm -f "$2"' _ "$TTL" "$OPENF" >/dev/null 2>&1 </dev/null &
-disown 2>/dev/null || true
 
+# A login code: 30 s, single use, minted behind the token. The token goes to curl through the
+# 0600 header file only. An old perch (started before codes existed) answers 404 here.
+mkhdr
+reply=$(curl -sS --max-time 5 -X POST -H "@$HDR" -w '\n%{http_code}' "${URL}hub/code") || { rmhdr; echo "perch-open: the perch did not answer POST /hub/code" >&2; exit 1; }
+rmhdr
+status=${reply##*$'\n'}
+body=${reply%$'\n'*}
+if [ "$status" = 404 ]; then
+  echo "perch-open: the running perch is too old for login codes; stop it (perch-open.sh --stop) and run this again" >&2
+  exit 1
+fi
+if [ "$status" != 200 ]; then echo "perch-open: POST /hub/code answered $status" >&2; exit 1; fi
+code=$(printf '%s' "$body" | sed -n 's/.*"code":"\([A-Za-z0-9_-]*\)".*/\1/p')
+[ -n "$code" ] || { echo "perch-open: the perch gave no code" >&2; exit 1; }
+LINK="${URL}#code=$code"
+
+if [ "$code_only" = 1 ]; then
+  printf '%s\n' "$LINK"
+  exit 0
+fi
+# Opened by the Windows shell: the URL is the only thing in argv, and it is a code that is dead in
+# 30 s or at first use.
+powershell.exe -NoProfile -NonInteractive -Command "Start-Process '$LINK'" >/dev/null
 echo "minerva perch on $URL (pid $(<"$PIDF"), log $LOGF)$reused"

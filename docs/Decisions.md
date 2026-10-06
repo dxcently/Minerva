@@ -6199,3 +6199,15 @@ The operator chose upstream master with the plugin runtime over keeping the fork
    pinned upstream, and changes go upstream.
 3. Claude subscriptions are reached only through the Claude CLI driver. ChatGPT
    login is used by eidolon's own chatgpt provider, for personal use.
+
+## 2026-10-05 - The web UI bends toward visible UI
+
+The operator accepted the UX audit's decisions: the home is `~/Minerva` in WSL;
+the UI lists only its own chats (its own sessions_dir); sign-in is a one-time
+code traded for an HttpOnly cookie; the default model is `chatgpt:gpt-5.6-luna`;
+folders are picked in an in-page browser (Windows paths pasted are converted);
+primary actions are visible bracketed text actions, with keys and `:` commands
+kept as shortcuts; bare `hoot` opens Minerva without starting llama; opening a
+chat switches the pane and splitting is explicit; the perch titles chats from
+eidolon's own outputs (reverses D4). This settles the 2026-10-03 pending
+one-time-code ruling.

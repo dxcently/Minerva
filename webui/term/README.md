@@ -6,11 +6,13 @@ A terminal screen in a browser (design: `docs/design/web-ui.md`). Preact + `@pre
 
 Through the perch (the hub), from WSL on Windows:
 
-```sh
-bin/perch-open.sh    # starts or reuses `minerva perch` on 127.0.0.1:47820 and opens this page
+```text
+hoot                 # in Windows PowerShell: starts or reuses the Minerva server and opens this page, signed in
+hoot status web      # is it up
+hoot stop web        # stop it (chats are kept)
 ```
 
-The token travels in a `0600` redirect file the browser opens (its Windows path is `\\wsl.localhost\...`), so it never touches argv, stdout, the clipboard or a URL you type. `--no-browser` prints that path instead; `--status` and `--stop` do what they say.
+`hoot` runs `bin/perch-open.sh --code` in WSL, which mints a 30 second single-use login code and prints `http://127.0.0.1:47820/#code=<code>`. The page strips the `#code=` at once, trades it at `POST /hub/redeem` for an `HttpOnly` `SameSite=Strict` cookie, and from then on sends no token at all: every request and stream carries the cookie. A reload or a new tab needs nothing (no code, no token in it: the page asks `GET /hub/sessions` once and the cookie answers; a second use of an old link with the cookie still good just opens); a second use of the same link, or one older than 30 seconds, shows "this link has expired — run `hoot` again". `bin/perch-open.sh --status` and `--stop` also work from WSL.
 
 Or straight to one `eidolon web` door (door mode, no perch), from WSL on Windows:
 
@@ -20,11 +22,11 @@ eidolon web --bind 127.0.0.1:47811 --ui-dir /mnt/c/Users/<you>/Projects/Minerva/
 #          token file: /run/user/<uid>/eidolon/web-47811.token
 ```
 
-Open `http://127.0.0.1:47811/#token=<contents of the token file>`. The page moves the token into `sessionStorage` and strips it from the URL (`#token=` and `?token=` both), so F5 keeps working in that tab. A new tab needs the fragment again. The token only ever leaves in an `Authorization` header. Once the hub exists, the hub's redirect file does this step (web-ui.md 5.2).
+Open `http://127.0.0.1:47811/#token=<contents of the token file>`. The page moves the token into `sessionStorage` and strips it from the URL (`#token=` and `?token=` both), so F5 keeps working in that tab. A new tab needs the fragment again. The token only ever leaves in an `Authorization` header. The `#token=` path is for a bare `eidolon web` door only; under the perch, `hoot` signs the page in with a code (above).
 
 If nothing answers at boot (a perch or door still coming up), the page does not stick: it toasts once, then shows `not answering` and probes again with a growing jittered wait (about 1-2 s up to 15-30 s) until something answers; the screen clears by itself.
 
-The page tells the two apart at boot with `GET /hub/sessions` (200 with a list = perch mode, 404 = door mode). Under the perch it opens a pane on each live session (at most 4) and never starts one, and a bare `:open` follows the focused pane (there is no `door` session there). Door mode is unchanged: one pane on the door.
+The page tells the two apart at boot with `GET /hub/sessions` (200 with a list = perch mode, 404 = door mode). Under the perch it opens ONE pane, on the newest live session, and never starts one; with none live the start screen shows (below), and a bare `:open` follows the focused pane (there is no `door` session there). Door mode is unchanged: one pane on the door.
 
 ### When a session ends
 
@@ -34,8 +36,8 @@ Under the perch a pane does not retry for ever. The perch's last frame (`hub-str
 |---|---|---|---|
 | stopped | the perch stopped the door (a stop) | `stopped` | yes |
 | dead | the door exited, or 503 `dead` at connect | `the door exited (<exit>)` | yes |
-| kept | 409 `kept` at connect: a log, no process | `kept, not running` | yes |
-| gone | 404 at connect: not a session of this perch | `no session <id> under this perch` | no |
+| kept | 409 `kept` at connect: a log, no process | `saved, not running` | yes |
+| gone | 404 at connect: not a session of this perch | `no chat <id> here` | no |
 | goodbye | the session ended itself | its own text | yes (perch only; door mode says `resume needs the hub`) |
 
 A door that ended the stream and is still there (`live`), 409 `starting` or `stopping`, and 502 reconnect with a backoff: 250 ms doubled for each reconnect that follows too soon (a stream that held 5 s resets it), up to 15 s, jittered; a `lagged` frame and a `context-invalidated` redraw wait the same way. A resume that lands while the old stream is still draining supersedes it: the old connection's frames, `hub-stream-end` included, are dropped, so a freshly resumed session never shows `stopped`. A `context-invalidated` frame from the door (shed what was cached) makes the page replay the log through a quiet reconnect at the next point no turn is running; a session whose state is still unknown (just connected, no `turn-state` yet) counts as idle for this, and only a live frame counts (a replayed one is ignored, so it cannot loop).
@@ -47,12 +49,12 @@ The list comes from `GET /hub/sessions` (`core/hub.js`), polled every 5 s (a pol
 | where | what |
 |---|---|
 | `sessions` tab, project groups | the open panes, plus live sessions of that folder no pane shows: dim `○ <id>  (not open)`; a click opens a pane |
-| `kept` | kept logs and exited doors of this perch (`exited`), newest 15 by mtime as `<id or title>  <age>` (`5m`, `3h`, `2d`); `more… (N)` shows 50 more. A click opens a pane (it reads `kept, not running` with `resume`) |
+| `kept` | kept logs and exited doors of this perch (`exited`), newest 15 by mtime as `<id or title>  <age>` (`5m`, `3h`, `2d`); `more… (N)` shows 50 more. A click opens a pane (it reads `saved, not running` with `resume`) |
 | `elsewhere` | live sessions held by another client (a TUI, a door this perch does not own): read-only, menu lines greyed; the first 15, then `more… (N)` for 50 more (the not-open live sessions in the `sessions` tab do the same) |
 | `projects` tab | `sessions here` (the focused pane's folder); `others`: the folders of live sessions, a click opens the first one there. Kept sessions carry no folder |
 | `peers`, `mesh` | still placeholders |
 
-Right-click menus: a session in a group has `close its door` (asks `stop <name>? its panes will show "stopped"`: `stop` / `keep it`; 202 toasts and polls, 409 says `not live under this perch`); a kept row has `open in new pane`, `resume (may continue the last turn)`, `copy id`. `fork (latest)` stays greyed (needs the session registry). In a pane's split and show menus, `existing session` lists every live session and `resume…` the newest 15 kept; a pick only opens a pane (resume stays the pane's own banner action). `new session` is live: see below.
+Opening: a click on a row, a recent chat on the start screen, or `:open <id>` shows the chat in the focused pane (the first pane if none; the pane that already shows it is just focused). Ctrl-click or middle-click on a row, or `open beside` in its menu, splits instead. Right-click menus: a session in a group has `open beside`, `show in focused pane` and `stop this chat` (asks `stop <name>? its panes will show "stopped"`: `stop` / `keep it`; 202 toasts and polls, 409 says `that chat is not running here`); a kept row has `open here`, `open beside`, `resume (may continue the last turn)`, `copy id`. `fork (latest)` stays greyed (needs the session registry). In a pane's split and show menus, `existing session` lists every live session and `resume…` the newest 15 kept; a pick only opens a pane (resume stays the pane's own banner action). `new session` is live: see below.
 
 The cap: at most 4 distinct sessions hold an event stream at once. Only panes that hold a stream count: a pane that reads stopped, kept, dead, gone, refused or goodbye holds none. Opening a fifth is refused with a toast, and so is resuming a fifth; a mirror of an open session is always allowed. Door mode is unchanged (the old greyed lines).
 
@@ -68,7 +70,7 @@ app.js               sidebars, split tree, inspector tabs (INSPECTOR map, the lo
 core/ui.js           the one import point for Preact, hooks, signals, htm; K = clickable text
 core/menu.js         right-click / title menus: one open at a time, submenus, keys, kept on screen
 core/look.js         theme + font: base16 parser, --base0X on <html>, per-font size, cell measured, localStorage
-core/path.js         resolveIn(cwd, path): a tool-input path resolved against the session's folder, for the tool-row open items
+core/path.js         resolveIn(cwd, path): a tool-input path resolved against the session's folder, for the tool-row open items; toWslPath(raw): a pasted Windows path as a WSL one
 core/api.js          apiBase(sessionId): the ONE place URLs are built. Hub = `/s/${sid}/api/`; hubGet/hubPost/hubTree (`/hub/sessions...`, `/hub/tree?...`) and detect() (perch or door)
 core/hub.js          the perch's session list as signals: polled GET /hub/sessions, stale flag, kept/live/elsewhere views, age()
 core/sse.js          fetch-based SSE (Bearer header, never ?token=)
@@ -77,6 +79,7 @@ core/state.js        one session stream as signals: frames -> rows, calls, asks,
 core/life.js         port of eidolon crates/tui/src/life.rs (the Life strip)
 core/markdown.js     safe subset as vnodes: fences, headings, `code`, **bold**, http(s) links
 core/tile.js         split tree: dwindle at 0.618, per-split ratio, drag, promote on close
+panes/home.js        the start screen: [ new chat ], [ open folder… ], recent chats, the hint row
 panes/session.js     one pane: frame glyphs, transcript, start screen, row menus, draft, the outbox (queued messages), composer and its menus
 panes/asks.js        the tabbed ask panel (batch submit) and the transcript's ask markers
 panes/files.js       the inspector's files tab: `folder` (the session's directory, lazily, through GET /hub/tree) and `touched` (files edit/write calls touched), one / filter
@@ -114,16 +117,28 @@ Every action is clickable; keys are shortcuts for the same functions.
 
 Menus: up/down move, Enter or right opens a submenu, Enter runs, left or Esc backs out, Tab closes; hover selects and opens submenus. A click outside closes; a second click on the title that opened one closes it. A menu that would run off an edge opens on the other side of its anchor. Greyed lines say why (`needs the hub`, `needs eidolon PR`).
 
+### The start screen (perch only)
+
+Shown whenever no pane is open, and on boot when no chat is live (`panes/home.js`). Visible bracketed text actions, focusable in order with Tab and run with Enter or a click (2026-10-05 ruling: they are buttons in function, TUI in look; keys and `:` stay as shortcuts). `[ new chat ]` has focus at boot, so Enter alone starts a chat.
+
+| action | does |
+|---|---|
+| `[ new chat ]` | `POST /hub/sessions` with no folder (the perch answers 201 with its scratch folder, or 400 when it has no Minerva home: the page says so in a sentence). No model is sent: the default is the Minerva config's. A bare `:new` does the same |
+| `[ open folder… ]` | a path field (placeholder for the later folder picker): a WSL path, or a pasted Windows path (a drive path becomes its `/mnt/c/...` form, `core/path.js toWslPath`); Enter or `[ start ]` starts a chat there, Esc closes it |
+| recent chats | up to 8 running or saved chats, newest first; a click shows it in the pane, ctrl-click or middle-click opens it beside |
+
+A hint row names `ctrl+enter` (the new-pane picker), `?` and `:`.
+
 ### Starting a session (perch only)
 
 `POST /hub/sessions {cwd, model?}`. The perch waits for the door's hello (up to about 20 s), so the hint line says `starting a session in <~folder>…` meanwhile and a second start in the same folder does nothing. A page load never starts one; only an explicit pick does.
 
 | how | does |
 |---|---|
-| `:new <folder> [model]` | start there. A folder with a space goes in quotes: `:new "/home/u/My Project" chatgpt:gpt-5.6-luna` (double or single); more than two unquoted words is refused. `~/x` expands from the home prefix of any known cwd (`/home/<user>`); with none known, or a relative folder, the toast is `give an absolute folder`. `:new` alone opens the `:` line prefilled with the focused session's folder |
+| `:new <folder> [model]` | start there (a bare `:new`: a chat with no folder, as `[ new chat ]`). A folder with a space goes in quotes: `:new "/home/u/My Project" chatgpt:gpt-5.6-luna` (double or single); more than two unquoted words is refused. `~/x` expands from the home prefix of any known cwd (`/home/<user>`); with none known, or a relative folder, the toast is `give an absolute folder`. `:new` alone opens the `:` line prefilled with the focused session's folder |
 | the `+` on a project group | a session in that group's folder (greyed in door mode) |
 | split / show menu, `new session ▸` | the folders of open and live sessions (max 8), then `other folder…` (the `:new` line). A pick opens the session in the new split, or in this pane (show; the queued-message guard applies) |
-| ctrl+enter | the same menu as split (`mirror`, `new session`, `resume…`, `existing session`) under the focused pane, along its longer side; in the middle with no pane. Door mode keeps its toast |
+| ctrl+enter | the same menu as split (a pick there splits: it is the explicit path) (`mirror`, `new session`, `resume…`, `existing session`) under the focused pane, along its longer side; in the middle with no pane. Door mode keeps its toast |
 
 Model: `:new` takes it as the second word; otherwise the focused session's model, else none (the door's default). The menus say which they will use (`default model` when none). The 4-session cap is checked before the POST. Answers: 422 `<folder> is not under the perch's --root (default $HOME)`; 503 `the door did not come up: <reason>`; anything else toasts the status.
 
@@ -164,7 +179,7 @@ Model: `:new` takes it as the second word; otherwise the focused session's model
 
 **The operator's risk:** the launcher (the door's `[terminal]` config) decides what a path means. A config that puts `{path}` or `{dir}` into a shell string (for example `files = ["nu", "-e", "ya \"{path}\""]`, or a terminal that parses `;` itself) can be made to run commands by a file or folder name inside the session's folder, which the model can create. Keep `{path}` and `{dir}` as separate argv elements, never inside a string a shell or another command parser will read. The page's check narrows what is offered; it cannot make an unsafe launcher config safe.
 
-A goodbye'd, stopped, dead or kept session greys the items with `not running` (no door to ask). Answers toast as: 200 `opened: <command line>` (cut at 120 chars); 501 `this door has no launcher configured`; 422 `launch refused: <reason>`; 500 `the launcher failed: <reason>`. A path over 4096 bytes or with a NUL is refused here with the door's own words, and no request is sent.
+A goodbye'd, stopped, dead or kept session greys the items with `not running` (no door to ask). Answers toast as: 200 `opened: <command line>` (cut at 120 chars); 501 `this server has no launcher configured`; 422 `launch refused: <reason>`; 500 `the launcher failed: <reason>`. A path over 4096 bytes or with a NUL is refused here with the door's own words, and no request is sent.
 
 ## The files tab
 

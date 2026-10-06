@@ -7,8 +7,9 @@
 //
 // usage (from WSL):
 //   "/mnt/c/Program Files/nodejs/node.exe" bin/webui-cdp.mjs <page> [step ...]
-//   <page>  the redirect file's Windows path from `bin/perch-open.sh --no-browser`, or an
-//           http(s) URL that carries no token (e.g. the no-token screen).
+//   <page>  an http(s) URL: the one-time link from `bin/perch-open.sh --code` (single use, 30 s; the
+//           page trades it for a cookie), or any URL that carries no token. A redirect file from
+//           an older perch-open.sh still works.
 // steps (one argv token each, name=value):
 //   wait-text=<s>   poll document.body.innerText until it contains s
 //   gone-text=<s>   poll until it no longer contains s
@@ -19,6 +20,11 @@
 //   text=<css>      print `TEXT <css>: <innerText>` (first match; `body` for the whole body)
 //   eval=<js>       print `EVAL: <JSON result>` (refused if it mentions location, sessionStorage,
 //                   localStorage or token)
+//   auth-state      print booleans only: URL fragment empty, web storage entries, token key present,
+//                   cookie readable by script (the login cookie is HttpOnly, so it must be false)
+//   reload          reload the page (the login cookie is all that is left: the code is long gone)
+//   new-tab         open a second tab on the bare address (no fragment) in the same profile and
+//                   drive that one from here on; the cookie is the only credential it has
 //   shot=<path.png> write a screenshot
 //   sleep=<ms>
 //   timeout=<s>     timeout for the following wait steps (default 20)
@@ -205,9 +211,10 @@ async function poll(cdp, timeoutS, want, present, label) {
 
 async function runStep(cdp, step, state) {
   const i = step.indexOf('=');
-  if (i < 1) throw new Error('step must be name=value');
-  const name = step.slice(0, i);
-  const val = step.slice(i + 1);
+  // `auth-state`, `reload` and `new-tab` take no value.
+  const name = i < 0 ? step : step.slice(0, i);
+  const val = i < 0 ? '' : step.slice(i + 1);
+  if (i === 0) throw new Error('step must be name=value');
   switch (name) {
     case 'timeout': {
       const n = Number(val);
@@ -231,6 +238,21 @@ async function runStep(cdp, step, state) {
       }
       return `ok ${step}`;
     }
+    case 'reload': {
+      await cdp.send('Page.reload', { ignoreCache: true });
+      await sleep(300);
+      return 'ok reload';
+    }
+    case 'new-tab': {
+      // The bare address of the page under test, built here and never printed.
+      const bare = new URL(pageUrl(state.page)).origin + '/';
+      const made = await cdp.send('Target.createTarget', { url: bare });
+      const att = await cdp.send('Target.attachToTarget', { targetId: made.targetId, flatten: true });
+      cdp.sessionId = att.sessionId;
+      await cdp.send('Page.enable');
+      await cdp.send('Runtime.enable');
+      return 'ok new-tab';
+    }
     case 'key': await pressKey(cdp, val); return `ok ${step}`;
     case 'type': await cdp.send('Input.insertText', { text: val }); return `ok type=<${[...val].length} chars>`;
     case 'text': {
@@ -242,6 +264,12 @@ async function runStep(cdp, step, state) {
       if (/location|sessionStorage|localStorage|token/i.test(val)) throw new Error('eval refused: source mentions a secret-bearing name');
       const v = await cdp.evalJs(val);
       return `EVAL: ${JSON.stringify(v === undefined ? null : v)}`;
+    }
+    case 'auth-state': {
+      // Booleans and counts only, never a value: the URL has no fragment left, nothing is in
+      // web storage, and the HttpOnly login cookie is not readable by page script.
+      const v = await cdp.evalJs(`({ hashEmpty: location.hash === '', hasCodeParam: /code=/.test(location.href), storageEntries: sessionStorage.length + localStorage.length, tokenKey: sessionStorage.getItem('minerva-token') !== null, scriptSeesCookie: document.cookie.length > 0 })`);
+      return `AUTH: ${JSON.stringify(v)}`;
     }
     case 'shot': {
       const r = await cdp.send('Page.captureScreenshot', { format: 'png' });
@@ -314,7 +342,7 @@ async function main() {
     const nav = await cdp.send('Page.navigate', { url: pageUrl(page) });
     if (nav.errorText) throw new Error('navigate: ' + nav.errorText);
 
-    const state = { timeout: 20 };
+    const state = { timeout: 20, page };
     for (const step of steps) {
       try {
         console.log(await runStep(cdp, step, state));

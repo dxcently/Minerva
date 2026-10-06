@@ -128,7 +128,14 @@ struct Args {
 
 impl Args {
     fn parse(argv: &[String]) -> Result<Self, String> {
-        let mut rest = argv.iter().skip(1);
+        let mut rest = argv.iter().skip(1).peekable();
+        // eidolon's global `--config <file>`, which the perch puts before the subcommand when it
+        // was given `--eidolon-config`. Understood and ignored: the argv line the fake records
+        // already carries it, which is what a test reads.
+        if rest.peek().map(|arg| arg.as_str()) == Some("--config") {
+            rest.next();
+            rest.next().ok_or("--config needs a value")?;
+        }
         match rest.next().map(String::as_str) {
             Some("web") => {}
             other => return Err(format!("expected the `web` subcommand, got {other:?}")),

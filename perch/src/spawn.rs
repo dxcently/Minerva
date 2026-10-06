@@ -53,9 +53,17 @@ pub enum Target<'a> {
 }
 
 /// The argv, and nothing but the argv. `--ui-dir` is absent on purpose (the door serves no
-/// statics under the perch) and no element is ever a token.
-pub fn argv(eidolon: &Path, target: Target<'_>, model: Option<&str>) -> Vec<OsString> {
-    let mut argv = vec![eidolon.as_os_str().to_os_string(), "web".into(), "--bind".into(), "127.0.0.1:0".into()];
+/// statics under the perch) and no element is ever a token. `config` is the perch's
+/// `--eidolon-config`: eidolon's global `--config <file>`, placed before the subcommand, so
+/// every door a perch spawns (new or resumed) reads the same config and writes the same
+/// sessions dir. A path, never a secret.
+pub fn argv(eidolon: &Path, config: Option<&Path>, target: Target<'_>, model: Option<&str>) -> Vec<OsString> {
+    let mut argv = vec![eidolon.as_os_str().to_os_string()];
+    if let Some(config) = config {
+        argv.push("--config".into());
+        argv.push(config.as_os_str().to_os_string());
+    }
+    argv.extend(["web".into(), "--bind".into(), "127.0.0.1:0".into()]);
     match target {
         Target::New(cwd) => {
             argv.push("--cwd".into());
@@ -303,9 +311,17 @@ mod tests {
     #[test]
     fn the_argv_is_the_doors_and_carries_no_token_and_no_ui_dir() {
         let eidolon = Path::new("/usr/bin/eidolon");
-        let fresh = argv(eidolon, Target::New(Path::new("/home/me/work")), None);
+        let fresh = argv(eidolon, None, Target::New(Path::new("/home/me/work")), None);
         assert_eq!(words(&fresh), ["/usr/bin/eidolon", "web", "--bind", "127.0.0.1:0", "--cwd", "/home/me/work"]);
-        let resumed = argv(eidolon, Target::Kept(Path::new("/logs/ctf-pwn-3.eid")), Some("sonnet"));
+        // `--eidolon-config`: the global flag, before the subcommand, on a new session and a resume alike.
+        let configured = argv(eidolon, Some(Path::new("/h/Minerva/config.toml")), Target::New(Path::new("/h/Minerva/scratch")), None);
+        assert_eq!(
+            words(&configured),
+            ["/usr/bin/eidolon", "--config", "/h/Minerva/config.toml", "web", "--bind", "127.0.0.1:0", "--cwd", "/h/Minerva/scratch"]
+        );
+        let reopened = argv(eidolon, Some(Path::new("/h/Minerva/config.toml")), Target::Kept(Path::new("/l/a.eid")), None);
+        assert_eq!(words(&reopened)[..4], ["/usr/bin/eidolon", "--config", "/h/Minerva/config.toml", "web"]);
+        let resumed = argv(eidolon, None, Target::Kept(Path::new("/logs/ctf-pwn-3.eid")), Some("sonnet"));
         assert_eq!(
             words(&resumed),
             ["/usr/bin/eidolon", "web", "--bind", "127.0.0.1:0", "--session", "/logs/ctf-pwn-3.eid", "-m", "sonnet"]

@@ -40,9 +40,25 @@ struct Cli {
     #[arg(long, value_name = "PATH", default_value = "eidolon")]
     eidolon: PathBuf,
     /// Kept session logs, as `<id>.eid`. Default: `<data dir>/eidolon/sessions`, the
-    /// door's own.
-    #[arg(long, value_name = "DIR")]
+    /// door's own. Not with `--home`, which owns it (`<home>/sessions`).
+    #[arg(long, value_name = "DIR", conflicts_with = "home")]
     sessions_dir: Option<PathBuf>,
+    /// Run every door as `eidolon --config <FILE> web ...`. Without `--sessions-dir`, the
+    /// kept logs are the file's own top-level `sessions_dir`, which must be absolute (eidolon does
+    /// not expand `~` there); the door's default when it has none. The file must exist and is never
+    /// written. Not with `--home`, which generates its own.
+    #[arg(long, value_name = "FILE", conflicts_with = "home")]
+    eidolon_config: Option<PathBuf>,
+    /// The Minerva home (`~/Minerva`). The perch generates `<home>/config.toml` from the member's
+    /// `~/.config/eidolon/config.toml` at every start (`sessions_dir` forced to `<home>/sessions`,
+    /// `default_model` from `<home>/minerva.toml` or a default, when absent), runs every door with it
+    /// and lists `<home>/sessions`. `<home>/scratch/<n>/` is where a new session that names no cwd
+    /// works, and the home is one more allowed `--root`.
+    #[arg(long, value_name = "DIR")]
+    home: Option<PathBuf>,
+    /// How long a login code lives, in milliseconds. For tests; the default is the contract.
+    #[arg(long, value_name = "MS", default_value_t = 30_000, hide = true)]
+    code_ttl_ms: u64,
 }
 
 #[tokio::main]
@@ -65,12 +81,22 @@ async fn main() -> Result<()> {
     let cancel = CancellationToken::new();
     tokio::spawn(cancel_on_signals(term, cancel.clone()));
 
+    let member = perch::config::member_config_path();
+    let resolved = perch::config::resolve(cli.home.as_deref(), cli.sessions_dir, cli.eidolon_config, &member)?;
+    let mut roots = roots_or_home(cli.root)?;
+    let scratch = resolved.home.as_ref().map(|home| {
+        roots.push(home.clone());
+        home.join("scratch")
+    });
     let options = perch::Options {
         bind: cli.bind,
         ui_dir: cli.ui_dir,
-        roots: roots_or_home(cli.root)?,
+        roots,
         eidolon: cli.eidolon,
-        sessions_dir: cli.sessions_dir.unwrap_or_else(default_sessions_dir),
+        sessions_dir: resolved.sessions_dir,
+        eidolon_config: resolved.config,
+        scratch,
+        code_ttl: std::time::Duration::from_millis(cli.code_ttl_ms),
     };
     perch::run(options, cancel).await
 }
@@ -89,19 +115,6 @@ fn roots_or_home(asked: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     Ok(vec![home])
 }
 
-/// `--sessions-dir`'s default is the door's own (`config.rs::sessions_dir`):
-/// `data_local_dir()/eidolon/sessions`. `dirs::data_local_dir()` is `$XDG_DATA_HOME`, or
-/// `$HOME/.local/share` — spelled out here because hub.md §11's dependency table has no
-/// `dirs` in it, and one default is not worth a crate.
-fn default_sessions_dir() -> PathBuf {
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute() && !path.as_os_str().is_empty())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    data.join("eidolon").join("sessions")
-}
-
 /// SIGINT and SIGTERM cancel the same token: the keystroke and the supervisor's
 /// `timeout(1)` mean the same thing here, and an unhandled SIGTERM would kill the
 /// process with a token file still on disk.
@@ -118,4 +131,17 @@ async fn cancel_on_signals(mut term: Signal, cancel: CancellationToken) {
     }
     tracing::info!("stopping");
     cancel.cancel();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_home_owns_the_config_and_the_sessions_dir_so_the_flags_that_name_them_conflict() {
+        assert!(Cli::try_parse_from(["perch", "--home", "/h"]).is_ok());
+        assert!(Cli::try_parse_from(["perch", "--eidolon-config", "/c.toml"]).is_ok());
+        assert!(Cli::try_parse_from(["perch", "--home", "/h", "--eidolon-config", "/c.toml"]).is_err());
+        assert!(Cli::try_parse_from(["perch", "--home", "/h", "--sessions-dir", "/s"]).is_err());
+    }
 }

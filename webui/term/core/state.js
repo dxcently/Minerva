@@ -23,6 +23,8 @@ export const kfmt = (n) => (n >= 10000 ? (n / 1000).toFixed(0) + 'k' : n >= 1000
 export const tildify = (p) => String(p || '').replace(/^\/home\/[^/]+(?=\/|$)|^\/root(?=\/|$)/, '~');
 export const MODES = ['yolo', 'accept edits', 'manual', 'auto'];
 
+// A connection state as a person reads it (the state names are the code's own).
+export const connWord = (c) => ({ kept: 'saved' }[c] || c);
 export const STATE_CLS = { RUN: 'run', IDLE: 'idle', ASK: 'ask', '?': 'unknown', OFF: 'off', BYE: 'bye', NONE: 'off' };
 // Where a session stands, in one word: the status line's badge and the
 // composer frame's colour both read it. ASK: an ask of its is not yet sent
@@ -36,7 +38,7 @@ export function stateOf(s) {
   const run = s.running.value;
   return run === true ? 'RUN' : run === false ? 'IDLE' : '?';
 }
-const deadText = (exit) => (exit ? `the door exited (${exit})` : 'the door exited');
+const deadText = (exit) => (exit ? `the chat process exited (${exit})` : 'the chat process exited');
 const pad = (n) => String(n).padStart(2, '0');
 const DAYS = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
 const MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
@@ -263,7 +265,7 @@ export class Session {
       this.setRunning(null);
       if (res.status === 401) {
         this.conn.value = 'refused';
-        this.banner.value = { text: mode() === 'perch' ? 'the perch refused the token (it restarted?). Run bin/perch-open.sh again.' : 'the door refused the token. Open Minerva again from the launcher.', err: true };
+        this.banner.value = { text: mode() === 'perch' ? 'the server refused the login for this page (it restarted?). Run `hoot` again.' : 'the server refused the login for this page. Run `hoot` again.', err: true };
         return;
       }
       this.live = false;
@@ -273,9 +275,9 @@ export class Session {
         const e = this.ended, st = res.data && res.data.state;
         if (e && e.door === 'stopping') { this.finish('stopped', 'stopped'); return; }
         if (e && e.door === 'dead') { this.finish('dead', deadText(e.exit)); return; }
-        if (res.status === 409 && st === 'kept') { this.finish('kept', 'kept, not running'); return; }
+        if (res.status === 409 && st === 'kept') { this.finish('kept', 'saved, not running'); return; }
         if (res.status === 503 && st === 'dead') { this.finish('dead', deadText(null)); return; }
-        if (res.status === 404) { this.finish('gone', `no session ${this.sid} under this perch`); return; }
+        if (res.status === 404) { this.finish('gone', `no chat ${this.sid} here`); return; }
         // `live`, 409 starting|stopping, 502 and anything else: try again
       }
       if (this.lagged || this.refresh || (mode() === 'perch' && this.ended && this.ended.door === 'live')) {
@@ -339,11 +341,11 @@ export class Session {
       return true;
     }
     this.banner.value = prev;
-    const t = r.status === 409 ? 'held by a live session (here or elsewhere)'
+    const t = r.status === 409 ? 'this chat is already running (here or in another app)'
       : r.status === 404 ? 'no such kept session'
-      : r.status === 503 ? `the door did not come up: ${(r.data && r.data.error) || 'no reason given'}`
-      : r.status === 401 ? 'the perch refused the token (it restarted?). Run bin/perch-open.sh again.'
-      : r.status === 0 ? 'the perch is not answering'
+      : r.status === 503 ? `the chat did not start: ${(r.data && r.data.error) || 'no reason given'}`
+      : r.status === 401 ? 'the server refused the login for this page (it restarted?). Run `hoot` again.'
+      : r.status === 0 ? 'the server is not answering'
       : `resume failed: ${r.status}`;
     this.hooks.toast(t, true);
     return false;
@@ -822,7 +824,10 @@ export class Session {
       else if (mode === 'steer') this.hooks.toast('steer sent; it lands at the next safe point');
       return true;
     }
-    this.hooks.toast(`say failed: ${r.status || 'network'} ${(r.data && r.data.error) || ''}`, true);
+    // A sentence, not a status code: the cases a person can act on.
+    this.hooks.toast(r.status === 409 || r.status === 404 ? 'this chat is not running; use resume to continue it'
+      : r.status === 0 ? 'could not reach the server; the message was not sent'
+      : `the message was not sent (${r.status}${r.data && r.data.error ? ': ' + r.data.error : ''})`, true);
     return false;
   }
 
@@ -855,11 +860,11 @@ export class Session {
       this.hooks.toast(`opened: ${o.length > 120 ? o.slice(0, 119) + '…' : o}`);
       return true;
     }
-    if (r.status === 501) this.hooks.toast('this door has no launcher configured', true);
+    if (r.status === 501) this.hooks.toast('this server has no launcher configured', true);
     else if (r.status === 422) this.hooks.toast(`launch refused: ${why}`, true);
     else if (r.status === 500) this.hooks.toast(`the launcher failed: ${why}`, true);
-    else if (r.status === 401) this.hooks.toast('the door refused the token (it restarted?). Open Minerva again from the launcher.', true);
-    else if (r.status === 0) this.hooks.toast('launch failed: the door is not answering', true);
+    else if (r.status === 401) this.hooks.toast('the server refused the login for this page (it restarted?). Run `hoot` again.', true);
+    else if (r.status === 0) this.hooks.toast('launch failed: the server is not answering', true);
     else this.hooks.toast(`launch failed: ${r.status}${why ? ' ' + why : ''}`, true);
     return false;
   }

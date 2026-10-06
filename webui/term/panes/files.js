@@ -90,8 +90,8 @@ const bump = () => { ver.value++; };
 // What a non-200 answer says. 404 is the same line for a missing and a denied
 // name (the perch hides both alike). 429/503/anything else: busy, retry.
 function fail(status, data) {
-  if (status === 0) return { err: 'perch not answering', retry: true };
-  if (status === 401) return { err: 'the perch refused the token (it restarted?). Run bin/perch-open.sh again.' };
+  if (status === 0) return { err: 'the server is not answering', retry: true };
+  if (status === 401) return { err: 'the server refused the login for this page (it restarted?). Run `hoot` again.' };
   if (status === 404) return { err: 'not found' };
   if (status === 409) return { err: `the folder lists only while the session runs (${data && typeof data.state === 'string' ? data.state : 'not running'})` };
   return { err: 'busy, retry', retry: true };
@@ -158,7 +158,7 @@ function Folder({ sid, q }) {
   ver.value; // redraw when a listing lands
   const text = q.value.trim().toLowerCase();
   useEffect(() => { if (mode() === 'perch' && sid) load(sid, ''); }, [sid]);
-  if (mode() !== 'perch') return html`<div class="faint">the folder needs the perch</div>`;
+  if (mode() !== 'perch') return html`<div class="faint">the folder list needs the Minerva server (type hoot)</div>`;
   if (!sid) return null;
   const toggle = (p) => {
     const k = key(sid, p);

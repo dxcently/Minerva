@@ -1,13 +1,19 @@
-# hoot -- the model-server launcher for Minerva
+# hoot -- opens Minerva, and launches its model server
 #
 # Strictly 7-bit ASCII on purpose: PowerShell 5.1 reads .ps1 as ANSI unless the
 # file carries a BOM, so box-drawing glyphs turn to mojibake. ASCII always works.
 #
 # The ONE native-Windows piece of Minerva is llama-server (upstream
 # ggml-org/llama.cpp, Vulkan build) in router mode. Everything else --
-# eidolon, Aoide, jev, the web door (webui/term), bench -- runs in WSL and
-# is started there, not from here (decided 2026-09-26).
+# eidolon, Aoide, jev, the Minerva server (webui/term), bench -- runs in WSL.
+# `hoot` alone starts (or reuses) the server there through wsl.exe and opens
+# the browser, already signed in (a 30 s single-use link; no password, no
+# token in the URL). It does not start llama-server unless you ask (hoot up).
 #
+#   hoot                                open Minerva in the browser (same as: hoot web)
+#   hoot web [-NoOpen]                  the same; -NoOpen prints the one-time link instead
+#   hoot status web                     is the Minerva server up, and its sessions
+#   hoot stop web                       stop the Minerva server (chats are kept)
 #   hoot serve [-Port N] [-Bind ADDR]   start llama-server (router mode), foreground
 #   hoot up    [-Port N] [-Bind ADDR]   the same, backgrounded; waits for the API
 #   hoot stop                           stop llama-server (and its model children)
@@ -17,10 +23,11 @@
 #   hoot setup [-Tag T] [-Force]        fetch upstream llama.cpp (win-vulkan-x64)
 #   hoot edit                           open models.ini
 #   hoot which                          show which llama.cpp binaries are in use
+#   hoot help                           this list
 
 [CmdletBinding()]
 param(
-    [Parameter(Position = 0)][string]$Command = 'help',
+    [Parameter(Position = 0)][string]$Command = '',
     [Parameter(Position = 1, ValueFromRemainingArguments = $true)][string[]]$Rest,
     [int]$Port = 8080,
     [string]$Bind = '127.0.0.1',
@@ -29,7 +36,9 @@ param(
     # existing llama.cpp\ build. Declared here because an advanced script
     # refuses -Names it does not know, even with a remaining-args catch-all.
     [string]$Tag = 'latest',
-    [switch]$Force
+    [switch]$Force,
+    # 'web' only: print the one-time link instead of opening the browser.
+    [switch]$NoOpen
 )
 
 $ErrorActionPreference = 'Stop'
@@ -115,7 +124,65 @@ function Assert-Serveable {
     if (-not (Test-Path $Ini)) { Die "missing $Ini" }
 }
 
+# ---- Minerva (the WSL server) -----------------------------------------------
+# bin/perch-open.sh in WSL does the work; hoot only calls it and opens one URL.
+# WSL does the mapping (wslpath), so a custom automount root in wsl.conf works too; the path goes as an
+# argument, never through a shell.
+function ConvertTo-WslPath($p) {
+    # Collect all output before taking the first line: Select-Object -First 1 would stop the pipeline
+    # early, kill wsl.exe and leave a non-zero $LASTEXITCODE behind.
+    $out = @(& wsl.exe -e wslpath -a $p)
+    if ($LASTEXITCODE -ne 0 -or -not $out) { Die "cannot map $p into WSL (wslpath failed)" }
+    $path = "$($out[0])".Trim()
+    if ($path.Contains("'")) { Die 'the repo path has a quote in it; move the checkout' }
+    return $path
+}
+
+# Settings that may be overridden from Windows (a second server on another port, a test home).
+# Passed through WSLENV, so values are never pasted into a command line. They arrive unchanged, so
+# they must already be WSL paths (/home/you/Minerva), not Windows ones.
+function Set-WslEnv {
+    $names = @('MINERVA_PERCH_PORT', 'MINERVA_HOME', 'MINERVA_PERCH_BIN', 'MINERVA_UI_DIR') | Where-Object { Test-Path "env:$_" }
+    if ($names) {
+        $have = @($env:WSLENV -split ':' | Where-Object { $_ })
+        # Compared by name with any /flags stripped: `MINERVA_HOME/p` already lists MINERVA_HOME.
+        $listed = @($have | ForEach-Object { ($_ -split '/')[0] })
+        $env:WSLENV = (@($have) + @($names | Where-Object { $listed -notcontains $_ })) -join ':'
+    }
+}
+
+function Invoke-PerchOpen([string]$flag) {
+    Set-WslEnv
+    $script = (ConvertTo-WslPath $Root) + '/bin/perch-open.sh'
+    # Stdout is captured (it is the one-line link for --code); stderr goes straight to the console.
+    $out = & wsl.exe -e bash -lc "'$script' $flag"
+    return [pscustomobject]@{ Code = $LASTEXITCODE; Lines = @($out | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) }
+}
+
+# Starts or reuses the server, gets a one-time link, and opens it. Returns nothing.
+function Open-Web {
+    Say 'starting Minerva'
+    $r = Invoke-PerchOpen '--code'
+    if ($r.Code -ne 0) { Die 'the Minerva server did not start (the message above says why)' }
+    $url = $r.Lines | Select-Object -Last 1
+    if ($url -notmatch '^http://127\.0\.0\.1:\d+/#code=[A-Za-z0-9_-]+$') { Die 'the Minerva server answered with something that is not a link' }
+    if ($NoOpen) { Write-Host $url; return }
+    Start-Process $url
+    Ok 'opened Minerva in your browser'
+}
+
+function Invoke-PerchVerb([string]$flag) {
+    $r = Invoke-PerchOpen $flag
+    foreach ($l in $r.Lines) { Write-Host "  $l" }
+    if ($r.Code -ne 0) { exit $r.Code }
+}
+
 switch ($Command.ToLower()) {
+
+    { $_ -in '', 'web', 'webui' } {
+        # 'webui' is the old name: it used to say "moved"; it now opens Minerva too.
+        Open-Web
+    }
 
     'serve' {
         Banner
@@ -160,6 +227,7 @@ switch ($Command.ToLower()) {
     }
 
     'stop' {
+        if ($Rest -and $Rest[0] -eq 'web') { Invoke-PerchVerb '--stop'; break }
         Banner
         $killed = 0
         # The router spawns a child process per loaded model; killing the parent
@@ -177,6 +245,7 @@ switch ($Command.ToLower()) {
     }
 
     'status' {
+        if ($Rest -and $Rest[0] -eq 'web') { Invoke-PerchVerb '--status'; break }
         Banner
         $srvUp = Test-Api "$Base/v1/models"
         $procs = @(Get-Server)
@@ -249,12 +318,11 @@ switch ($Command.ToLower()) {
         }
     }
 
-    { $_ -in 'shim', 'webui', 'aoide', 'theme', 'bench', 'jev' } {
+    { $_ -in 'shim', 'aoide', 'theme', 'bench', 'jev' } {
         # Removed 2026-09-26, when hoot became the model-server launcher
         # only. Kept as a catch for old muscle memory, the way 'jev' was.
         Banner
         switch ($_) {
-            'webui' { Die 'webui moved: Open WebUI is retired; the face is webui/term, served by eidolon web in WSL' }
             'bench' { Die 'bench moved: llama.cpp\llama-bench.exe directly, or the bench loop in WSL' }
             default { Die "$_ moved: eidolon, Aoide and jev run in WSL now -- start them there" }
         }
@@ -263,6 +331,8 @@ switch ($Command.ToLower()) {
     default {
         Banner
         Box 'commands' @(
+            '(none) | web          open Minerva in the browser, signed in'
+            'stop web | status web stop / check the Minerva server'
             'serve                 start the llama.cpp router (foreground)'
             'up                    start the router in the background'
             'stop                  stop the router'
@@ -272,9 +342,10 @@ switch ($Command.ToLower()) {
             'setup [-Tag] [-Force] fetch upstream llama.cpp (win-vulkan-x64)'
             'edit                  edit models.ini'
             'which                 show binaries/config in use'
+            'help                  this list'
         )
         Write-Host ''
-        Write-Host "   api  $Base/v1   (eidolon, Aoide, jev, webui/term: in WSL)" -ForegroundColor DarkGray
+        Write-Host "   llama api  $Base/v1   (Minerva itself runs in WSL; hoot web opens it)" -ForegroundColor DarkGray
         Write-Host ''
     }
 }
