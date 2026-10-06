@@ -18,6 +18,8 @@
 //!   /s/<id>/api/<route>  GET|POST to that session's door, its Bearer injected,
 //!                        SSE passed through, `hub-stream-end` appended   (H1c, this slice)
 //!   /hub/tree?session=<id>&path=<rel>  one directory under a live cwd   (H2)
+//!   /hub/file?session=<id>&path=<rel>  one image file under a live cwd (rawfile.rs)
+//!   /hub/sessions/<id>/rename, /promote, /hub/projects/rename      (names, and an inbox chat's folder: relocate.rs)
 //!   /hub/events, /hub/mesh                                        (H2/H3: still 404)
 //! ```
 //!
@@ -60,20 +62,29 @@
 #[cfg(not(unix))]
 compile_error!("the perch is Unix only: it needs a 0600 token file, $XDG_RUNTIME_DIR and SIGTERM");
 
+pub mod archive;
 pub mod config;
 pub mod dirs;
 pub mod files;
+pub mod fork;
 pub mod folders;
 pub mod gate;
+pub mod images;
 pub mod login;
 pub mod models;
+pub mod pending;
+pub mod names;
 pub mod projects;
 pub mod proxy;
+pub mod rawfile;
+pub mod relocate;
 pub mod restart;
 pub mod serve;
+pub(crate) mod statefile;
 pub mod sessions;
 pub mod spawn;
 pub mod titles;
+pub mod trash;
 pub mod tree;
 pub mod watch;
 
@@ -151,7 +162,13 @@ pub async fn run(opts: Options, cancel: CancellationToken) -> Result<()> {
     let tree_slots = tree::Slots::new(tree::MAX_LISTINGS);
     let logins = Arc::new(login::Logins::new(opts.code_ttl));
     let ctx = serve::Ctx { bound, token: Arc::from(token.as_str()), ui, registry, spawner, tree_slots, logins };
+    // An inbox chat's folder follows its title between turns (relocate.rs); it stops with the perch, before the doors are stopped.
+    let tidy = tokio::spawn(relocate::tidy_loop(ctx.clone(), cancel.clone()));
+    // A fork's first message that was running when the perch last stopped (`forks.json` says): held off now, settled in the background.
+    let orphans = pending::adopt(&ctx);
+    tokio::spawn(pending::recover(ctx.clone(), orphans));
     let served = serve::run(ctx, listener, cancel).await;
+    tidy.abort();
 
     // Last, after the drain. The doors' shutdown — close the watcher to each door, SIGTERM
     // it, wait, SIGKILL what is left and remove its token file — has already happened inside

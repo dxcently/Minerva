@@ -54,10 +54,10 @@ pub struct Projects {
 }
 
 impl Projects {
-    /// Reads `file` (absent is empty). A file that does not parse is left alone on disk and read as empty: the next
-    /// successful change replaces it, and the warning says so.
+    /// Reads `file` (absent is empty). A file that does not parse is set aside as `projects.json.bad-<ts>` ([`crate::statefile`]),
+    /// so the next change writes a new file and never overwrites the bad one.
     pub fn open(file: Option<PathBuf>) -> Self {
-        let items = file.as_deref().map(read_list).unwrap_or_default();
+        let items = crate::statefile::load(file.as_deref());
         Self { file, items: Mutex::new(items) }
     }
 
@@ -91,18 +91,38 @@ impl Projects {
         Ok((project, true))
     }
 
-    /// Forgets entry `n` (its place in the list). `Ok(None)` is no such entry.
-    pub fn remove(&self, n: usize) -> std::result::Result<Option<Project>, AddError> {
+    /// Forgets the project whose folder is `path` (by path, never by position: a second tab's stale list must not be
+    /// able to remove a different entry). `Ok(None)` is no such project.
+    pub fn remove(&self, path: &str) -> std::result::Result<Option<Project>, AddError> {
         let Some(file) = &self.file else { return Err(AddError::NoHome) };
         let mut items = self.items.lock().unwrap();
-        if n >= items.len() {
-            return Ok(None);
-        }
+        let path = if path.len() > 1 { path.trim_end_matches('/') } else { path };
+        let Some(at) = items.iter().position(|p| p.path == path) else { return Ok(None) };
         let mut next = items.clone();
-        let gone = next.remove(n);
+        let gone = next.remove(at);
         write(file, &next).map_err(|e| AddError::Write(format!("{e:#}")))?;
         *items = next;
         Ok(Some(gone))
+    }
+
+    /// Renames the project whose folder is `path` (exactly as listed; the folder is never touched). `Ok(None)` is no such project.
+    pub fn rename(&self, path: &str, name: &str) -> std::result::Result<Option<Project>, AddError> {
+        let Some(file) = &self.file else { return Err(AddError::NoHome) };
+        let name = clean_name(name).map_err(AddError::BadName)?;
+        let mut items = self.items.lock().unwrap();
+        let path = if path.len() > 1 { path.trim_end_matches('/') } else { path };
+        let Some(at) = items.iter().position(|p| p.path == path) else { return Ok(None) };
+        let mut next = items.clone();
+        next[at].name = name;
+        let renamed = next[at].clone();
+        write(file, &next).map_err(|e| AddError::Write(format!("{e:#}")))?;
+        *items = next;
+        Ok(Some(renamed))
+    }
+
+    /// Whether `dir` is a project's folder or one inside it: such a folder is never renamed or moved by the perch.
+    pub fn holds(&self, dir: &Path) -> bool {
+        self.items.lock().unwrap().iter().any(|p| dir.starts_with(&p.path))
     }
 
     /// The name of the project `cwd` is in (its folder or one inside it); the deepest wins.
@@ -115,21 +135,6 @@ impl Projects {
             .max_by_key(|p| Path::new(&p.path).components().count())
             .map(|p| p.name.clone())
     }
-}
-
-fn read_list(file: &Path) -> Vec<Project> {
-    let bytes = match std::fs::read(file) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => {
-            tracing::warn!(error = %e, path = %file.display(), "perch: projects.json could not be read; starting with none");
-            return Vec::new();
-        }
-    };
-    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, path = %file.display(), "perch: projects.json does not parse; starting with none");
-        Vec::new()
-    })
 }
 
 fn write(file: &Path, items: &[Project]) -> Result<()> {
@@ -145,16 +150,42 @@ pub struct Cwds {
 
 impl Cwds {
     pub fn open(file: Option<PathBuf>) -> Self {
-        let map = file
-            .as_deref()
-            .and_then(|f| std::fs::read(f).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+        let map = crate::statefile::load(file.as_deref());
         Self { file, map: Mutex::new(map) }
     }
 
     pub fn get(&self, id: &str) -> Option<PathBuf> {
         self.map.lock().unwrap().get(id).map(PathBuf::from)
+    }
+
+    /// Whether some chat other than `id` that still has a log (not trashed) is remembered in exactly `dir`: such a folder is shared (a fork's) and is moved by neither.
+    pub fn shared(&self, id: &str, dir: &Path, has_log: impl Fn(&str) -> bool) -> bool {
+        let text = dir.to_string_lossy();
+        self.map.lock().unwrap().iter().any(|(other, cwd)| other != id && *cwd == text && has_log(other))
+    }
+
+    /// Every chat other than `id` that still has a log (not trashed) and is remembered in exactly `dir`: the chats a move of that folder takes along.
+    pub fn sharing(&self, id: &str, dir: &Path, has_log: impl Fn(&str) -> bool) -> Vec<String> {
+        let text = dir.to_string_lossy();
+        let mut found: Vec<String> = self.map.lock().unwrap().iter().filter(|(other, cwd)| *other != id && **cwd == text && has_log(other)).map(|(other, _)| other.clone()).collect();
+        found.sort();
+        found
+    }
+
+    /// Forgets the folder of a chat that is gone for good (the trash was emptied).
+    pub fn forget(&self, id: &str) {
+        let mut map = self.map.lock().unwrap();
+        if map.remove(id).is_none() {
+            return;
+        }
+        if let Some(file) = &self.file {
+            let written = serde_json::to_vec(&*map).context("serializing the chat folders").and_then(|body| {
+                harnox::fs::write_atomic_0600(file, &body).with_context(|| format!("writing {}", file.display()))
+            });
+            if let Err(e) = written {
+                tracing::warn!(error = %format!("{e:#}"), "perch: the chat folders could not be saved");
+            }
+        }
     }
 
     /// Remembers `cwd` for `id`; a write that fails is logged and the memory still has it.
@@ -200,8 +231,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(Projects::open(Some(file.clone())).list(), projects.list());
-        assert_eq!(projects.remove(5), Ok(None));
-        assert_eq!(projects.remove(0).unwrap().unwrap().name, "work");
+        assert_eq!(projects.remove("/nowhere"), Ok(None));
+        assert_eq!(projects.remove(folder.to_str().unwrap()).unwrap().unwrap().name, "work");
         assert!(folder.is_dir(), "forgetting a project never deletes the folder");
         assert_eq!(Projects::open(Some(file)).list().len(), 1);
     }

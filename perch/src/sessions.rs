@@ -45,7 +45,7 @@
 //! Not here, on purpose: the idle reaper, `running`/`parked` inference, `/hub/events`,
 //! `/hub/tree`, `/hub/mesh` (H2/H3). The pane count is only reported in the list.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -134,6 +134,19 @@ pub struct Entry {
     /// Absent for the Minerva home's own, and for any chat that is running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<&'static str>,
+    /// Put in `other` by hand (archive.rs). Never set on a live chat or a shared-dir one.
+    pub archived: bool,
+    /// Idle for 7 days and not live, pinned or archived: `other` for now, computed at listing time.
+    pub auto_other: bool,
+    /// Pinned to the top of the sidebar. Never set on a shared-dir chat.
+    pub pinned: bool,
+    /// Its folder is a chat folder directly under `<home>/scratch` (the sidebar's `inbox`), which is what can be made a project.
+    pub inbox: bool,
+    /// A fork-from-here that has had no first message yet: a copy of the log with no door, shown beside its source (pending.rs).
+    pub pending: bool,
+    /// The chat a fork-from-here was taken from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_of: Option<String>,
 }
 
 /// The channel a door's reaper publishes its exit on: `None` while the child is alive. One
@@ -337,6 +350,16 @@ pub struct Registry {
     pub projects: crate::projects::Projects,
     /// `<home>/chat-cwds.json`: the folder each chat was started in, kept across restarts (a saved row has no door to ask).
     cwds: crate::projects::Cwds,
+    /// `<home>/archive.json`: which chats are archived or pinned (archive.rs); refuses a change without `--home`.
+    pub archive: crate::archive::Archive,
+    /// `<home>/names.json`: the names people gave chats, which beat the title eidolon derives (names.rs).
+    pub names: crate::names::Names,
+    /// `<home>/forks.json`: the chats made by fork-from-here, and which of them have not had their first message yet (pending.rs).
+    pub forks: crate::pending::Forks,
+    /// The ids whose folder is being renamed or moved right now (relocate.rs): one at a time per chat.
+    moving: Mutex<HashSet<String>>,
+    /// The model and `--yolo` each chat last ran with, by id, for this run: what a fork of a saved chat starts with.
+    flags_seen: Mutex<HashMap<String, (String, bool)>>,
     doors: Mutex<Vec<Door>>,
 }
 
@@ -347,6 +370,29 @@ const SETTLE: Duration = Duration::from_secs(2);
 /// How long a stop waits for the panes it cancelled to finish closing (H1c). A pane ends in
 /// the time it takes to drop a socket; this only bounds a pane that has wedged.
 const PANE_DRAIN: Duration = Duration::from_secs(2);
+
+/// A live door whose folder is a chat folder of the inbox, as relocate.rs reads it each tick.
+pub struct Follow {
+    pub id: String,
+    /// The folder the door runs in, as the door said it.
+    pub dir: PathBuf,
+    /// What its folder should be named after: a name given by hand, else the derived title; `None` before there is one.
+    pub title: Option<String>,
+    /// A turn is running (the door's own `turn-state`).
+    pub running: bool,
+}
+
+/// The right to rename or move one chat's folder; dropping it gives the right back. See [`Registry::begin_move`].
+pub struct MoveGuard {
+    registry: Arc<Registry>,
+    id: String,
+}
+
+impl Drop for MoveGuard {
+    fn drop(&mut self) {
+        self.registry.moving.lock().unwrap().remove(&self.id);
+    }
+}
 
 /// Whether a live door can be restarted right now, for `POST /hub/sessions/<id>/restart`.
 #[derive(Debug)]
@@ -404,6 +450,9 @@ impl Registry {
         let home = scratch.as_deref().and_then(Path::parent).map(Path::to_path_buf);
         let projects = crate::projects::Projects::open(home.as_ref().map(|h| h.join("projects.json")));
         let cwds = crate::projects::Cwds::open(home.as_ref().map(|h| h.join("chat-cwds.json")));
+        let archive = crate::archive::Archive::open(home.as_ref().map(|h| h.join("archive.json")));
+        let names = crate::names::Names::open(home.as_ref().map(|h| h.join("names.json")));
+        let forks = crate::pending::Forks::open(home.as_ref().map(|h| h.join("forks.json")));
         Ok(Arc::new(Self {
             sessions_dir,
             runtime_dir,
@@ -415,6 +464,11 @@ impl Registry {
             roots: checked,
             projects,
             cwds,
+            archive,
+            names,
+            forks,
+            moving: Mutex::new(HashSet::new()),
+            flags_seen: Mutex::new(HashMap::new()),
             doors: Mutex::new(Vec::new()),
         }))
     }
@@ -430,7 +484,20 @@ impl Registry {
             "cwd {} is outside every --root",
             path.display()
         );
+        anyhow::ensure!(!self.is_home_internal(&path), "cwd {} is the Minerva home's own, not a place for a chat", path.display());
         Ok(path)
+    }
+
+    /// Whether `path` (canonical) is the Minerva home or something under it that is not a chat folder of the inbox (`<home>/scratch/*`
+    /// and what is under those): the home is a root so the inbox works, but its `sessions/`, `trash/`, `config.toml`, state files and
+    /// `scratch/` itself are the perch's own and are never a chat's folder, a project or a place the picker offers to make things in.
+    pub fn is_home_internal(&self, path: &Path) -> bool {
+        let Some(home) = self.home().and_then(|home| home.canonicalize().ok()) else { return false };
+        if !path.starts_with(&home) {
+            return false;
+        }
+        let scratch = home.join("scratch");
+        !(path.starts_with(&scratch) && path != scratch)
     }
 
     /// The canonical `--root`s, in the order they were given: the picker's first screen.
@@ -444,8 +511,82 @@ impl Registry {
     }
 
     /// The folder a chat was started in, as far as this perch knows (a door it holds, or one it remembered).
-    fn known_cwd(&self, id: &str) -> Option<PathBuf> {
+    pub(crate) fn known_cwd(&self, id: &str) -> Option<PathBuf> {
         self.titles.lock().unwrap().cwd(id).map(Path::to_path_buf).or_else(|| self.cwds.get(id))
+    }
+
+    /// `<home>/scratch` as the kernel spells it (as given when it does not exist yet).
+    fn scratch_real(&self) -> Option<PathBuf> {
+        self.scratch.as_deref().map(|s| s.canonicalize().unwrap_or_else(|_| s.to_path_buf()))
+    }
+
+    /// `cwd` when it is a chat folder of the inbox: a real directory directly under `<home>/scratch` (not deeper, not scratch
+    /// itself, not a link). The only folders the perch ever renames or moves.
+    pub fn inbox_dir(&self, cwd: &Path) -> Option<PathBuf> {
+        let scratch = self.scratch_real()?;
+        let dir = cwd.canonicalize().ok()?;
+        (dir.parent() == Some(scratch.as_path()) && dir.is_dir()).then_some(dir)
+    }
+
+    /// The folder to pass a reopened door as `--cwd`: the one this chat was last remembered in, if it is still there. The log
+    /// names the folder the chat was born in, which a rename or a move leaves behind (and a hop makes absent).
+    pub fn reopen_cwd(&self, id: &str) -> Option<PathBuf> {
+        self.cwds.get(id).filter(|dir| dir.is_dir())
+    }
+
+    /// Remember where a chat's tools run now (after its folder was renamed or moved).
+    pub fn set_cwd(&self, id: &str, cwd: &Path) {
+        self.titles.lock().unwrap().remember_cwd(id, cwd);
+        self.cwds.remember(id, cwd);
+    }
+
+    /// Whether another chat is remembered in exactly this folder (a fork shares its source's): neither is moved by the other's rename.
+    pub fn shared_cwd(&self, id: &str, dir: &Path) -> bool {
+        self.cwds.shared(id, dir, |other| log_path(&self.sessions_dir, other).is_file())
+    }
+
+    /// Every other chat with a log that is remembered in exactly `dir`: what a move of that folder takes along (a fork shares its source's).
+    pub fn sharers(&self, id: &str, dir: &Path) -> Vec<String> {
+        self.cwds.sharing(id, dir, |other| log_path(&self.sessions_dir, other).is_file())
+    }
+
+    /// The right to rename or move this chat's folder, held until the guard drops: `None` when another such change is in flight.
+    pub fn begin_move(self: &Arc<Self>, id: &str) -> Option<MoveGuard> {
+        self.moving.lock().unwrap().insert(id.to_string()).then(|| MoveGuard { registry: self.clone(), id: id.to_string() })
+    }
+
+    /// Whether a rename or move of this chat's folder is in flight, which a resume must not race.
+    pub fn is_moving(&self, id: &str) -> bool {
+        self.moving.lock().unwrap().contains(id)
+    }
+
+    /// The model and `--yolo` this chat last ran with: the live door's own, else what this run remembered. `None` is unknown.
+    pub fn flags_of(&self, id: &str) -> Option<(String, bool)> {
+        let live = self.doors.lock().unwrap().iter().find(|door| door.id == id && door.state == State::Live && !door.model.is_empty()).map(|door| (door.model.clone(), door.yolo));
+        live.or_else(|| self.flags_seen.lock().unwrap().get(id).cloned()).or_else(|| self.titles.lock().unwrap().model(id).map(|model| (model.to_string(), false)))
+    }
+
+    /// Every live door whose folder is a chat folder of the inbox, with the name its folder should follow (a name given by hand,
+    /// else the title eidolon derived; `None` before there is one) and whether a turn is running. relocate.rs decides what to do.
+    pub fn inbox_doors(&self) -> Vec<Follow> {
+        let Some(scratch) = self.scratch_real() else { return Vec::new() };
+        let doors: Vec<(String, PathBuf, bool)> = self
+            .doors
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|door| door.state == State::Live && door.pid != 0)
+            .filter_map(|door| Some((door.id.clone(), door.cwd.clone()?, door.watcher.as_ref().is_some_and(Watcher::running))))
+            .filter(|(_, cwd, _)| cwd.parent() == Some(scratch.as_path()))
+            .collect();
+        let cache = self.titles.lock().unwrap();
+        doors
+            .into_iter()
+            .map(|(id, dir, running)| {
+                let title = self.names.get(&id).or_else(|| cache.title(&log_path(&self.sessions_dir, &id)).map(str::to_string));
+                Follow { id, dir, title, running }
+            })
+            .collect()
     }
 
     /// `GET /hub/tree`'s root check, run on every request: the cwd canonicalized, and the
@@ -539,7 +680,11 @@ impl Registry {
                 continue;
             }
             match titles::run(&self.eidolon, config.as_deref(), &["sessions".into()], titles::SESSIONS_CAP, titles::SESSIONS_TIMEOUT).await {
-                Ok(out) => self.titles.lock().unwrap().learn(&dir, &logs, &titles::parse_sessions(&out)),
+                Ok(out) => {
+                    let mut cache = self.titles.lock().unwrap();
+                    cache.learn(&dir, &logs, &titles::parse_sessions(&out));
+                    cache.learn_models(&titles::parse_models(&out));
+                }
                 Err(e) => {
                     tracing::debug!(dir = %dir.display(), error = %e, "perch: eidolon sessions gave no titles");
                     self.titles.lock().unwrap().failed(&dir);
@@ -572,9 +717,13 @@ impl Registry {
         titles::run(&self.eidolon, config, &["log".into(), "--json".into(), path.into()], titles::LOG_CAP, titles::LOG_TIMEOUT).await
     }
 
-    /// The title of a row: the roster's (eidolon's own, while a door is live), else what `eidolon sessions` said
-    /// of the log, else the fallback name.
+    /// The title of a row: the name a person gave it, else the roster's (eidolon's own, while a door is live), else what
+    /// `eidolon sessions` said of the log, else the fallback name (a scratch chat's birth name).
     fn title_of(&self, id: &str, log: &Path, roster: Option<&str>, cwd: Option<&Path>, mtime: Option<u64>) -> String {
+        // A name a person gave beats every derived one (names.rs).
+        if let Some(name) = self.names.get(id) {
+            return name;
+        }
         if let Some(title) = roster.map(str::trim).filter(|t| !t.is_empty()) {
             return title.to_string();
         }
@@ -587,10 +736,32 @@ impl Registry {
         titles::fallback(cwd.as_deref(), self.scratch.as_deref(), project.as_deref(), mtime)
     }
 
+    /// The title of a chat in the trash: what was learned while it was in `sessions/` (this run), else the fallback name.
+    pub fn trash_title(&self, id: &str, mtime: Option<u64>) -> String {
+        self.title_of(id, &log_path(&self.sessions_dir, id), None, None, mtime)
+    }
+
+    /// Forgets the folder a chat was started in, once its log is gone for good.
+    pub fn forget_cwd(&self, id: &str) {
+        self.cwds.forget(id);
+        self.names.forget(id);
+        self.forks.forget(id);
+    }
+
     /// `GET /hub/sessions`: kept + ours + `live-elsewhere`, one row per id — a door of ours
     /// wins over a roster entry, which wins over the kept log. The second source (`other`) adds only ids
     /// the first does not have, flagged read-only.
     pub fn list(&self) -> Vec<Entry> {
+        self.list_at(crate::archive::now_ms())
+    }
+
+    /// Whether a door holds the log in some way, which keeps a chat out of `other` and the trash.
+    pub fn is_live(state: State) -> bool {
+        matches!(state, State::Starting | State::Live | State::Stopping | State::LiveElsewhere)
+    }
+
+    /// [`Registry::list`] at a given time (ms), which is what the 7-day rule is judged against.
+    pub fn list_at(&self, now: u64) -> Vec<Entry> {
         let mut by_id: BTreeMap<String, Entry> = BTreeMap::new();
         let roster = self.roster();
         let roster_title = |id: &str| roster.iter().find(|(rid, _)| rid == id).and_then(|(_, row)| row.title.as_deref());
@@ -599,7 +770,7 @@ impl Registry {
         for (path, mtime) in titles::logs_in(&self.sessions_dir).unwrap_or_default() {
             let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| id_ok(id)) else { continue };
             let title = self.title_of(id, &path, None, None, mtime);
-            by_id.insert(id.to_string(), Entry { id: id.to_string(), state: State::Kept, cwd: self.known_cwd(id).map(|p| p.display().to_string()), panes: 0, mtime, title: Some(title), origin: None });
+            by_id.insert(id.to_string(), Entry { id: id.to_string(), state: State::Kept, cwd: self.known_cwd(id).map(|p| p.display().to_string()), panes: 0, mtime, title: Some(title), origin: None, archived: false, auto_other: false, pinned: false, inbox: false, pending: false, fork_of: None });
         }
         // Eidolon's own dir (source 1b): read-only, and only ids this UI does not have.
         if let Some(other) = &self.other {
@@ -609,7 +780,7 @@ impl Registry {
                     continue;
                 }
                 let title = self.title_of(id, &path, None, None, mtime);
-                by_id.insert(id.to_string(), Entry { id: id.to_string(), state: State::Kept, cwd: self.known_cwd(id).map(|p| p.display().to_string()), panes: 0, mtime, title: Some(title), origin: Some("other") });
+                by_id.insert(id.to_string(), Entry { id: id.to_string(), state: State::Kept, cwd: self.known_cwd(id).map(|p| p.display().to_string()), panes: 0, mtime, title: Some(title), origin: Some("other"), archived: false, auto_other: false, pinned: false, inbox: false, pending: false, fork_of: None });
             }
         }
 
@@ -629,6 +800,12 @@ impl Registry {
                 mtime,
                 title: Some(title),
                 origin: None,
+                archived: false,
+                auto_other: false,
+                pinned: false,
+                inbox: false,
+                pending: false,
+                fork_of: None,
             };
             by_id.insert(door.id.clone(), row);
         }
@@ -650,11 +827,32 @@ impl Registry {
                 mtime,
                 title: Some(self.title_of(id, &log, peer.title.as_deref(), peer.cwd.as_deref(), mtime)),
                 origin: None,
+                archived: false,
+                auto_other: false,
+                pinned: false,
+                inbox: false,
+                pending: false,
+                fork_of: None,
             };
             by_id.insert(id.clone(), row);
         }
 
-        by_id.into_values().collect()
+        let mut rows: Vec<Entry> = by_id.into_values().collect();
+        let scratch_real = self.scratch_real();
+        for row in &mut rows {
+            row.inbox = scratch_real.as_deref().zip(row.cwd.as_deref()).is_some_and(|(scratch, cwd)| Path::new(cwd).parent() == Some(scratch));
+            if let Some(fork) = self.forks.get(&row.id) {
+                row.pending = fork.pending;
+                row.fork_of = Some(fork.from);
+            }
+            // A shared-dir chat is `other` by its origin and read-only: no mark applies to it.
+            if row.origin.is_some() {
+                continue;
+            }
+            let flags = self.archive.flags(&row.id, row.mtime, Self::is_live(row.state), now);
+            (row.archived, row.auto_other, row.pinned) = (flags.archived, flags.auto_other, flags.pinned);
+        }
+        rows
     }
 
     /// The swarm roster, as `(id, row)` for the rows whose log is a kept log here — kept
@@ -773,6 +971,7 @@ impl Registry {
             door.model = model.to_string();
             door.yolo = yolo;
         }
+        self.flags_seen.lock().unwrap().insert(id.to_string(), (model.to_string(), yolo));
     }
 
     /// A resumed door's own stream, held from `hello` on like a new session's: it is what tells the perch whether a turn is
@@ -832,6 +1031,13 @@ impl Registry {
             door.state = State::Dead;
             door.watcher = None;
         }
+    }
+
+    /// Forgets the dead row of a door that never came up on a log the perch made itself (a fork's copy, removed again), so the
+    /// list does not show a chat that is not there. A row that is not dead is left alone.
+    pub fn forget_dead(&self, id: &str) {
+        self.doors.lock().unwrap().retain(|door| door.id != id || door.state != State::Dead);
+        self.cwds.forget(id);
     }
 
     /// Every id we are holding, for the shutdown path. Only live-ish doors have a stream to
@@ -1004,9 +1210,13 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 /// Best effort by design: a pid that is already gone gives `ESRCH`, which is the answer
-/// this wanted anyway.
+/// this wanted anyway. The signal goes to the door's whole process group (a door is its own group leader, see `spawn::fork`), so
+/// the tool subprocesses it started get it too; a door that is not a leader (it cannot be, here) would get it alone.
 fn signal(pid: u32, sig: libc::c_int) {
-    let sent = unsafe { libc::kill(pid as libc::pid_t, sig) };
+    let mut sent = unsafe { libc::killpg(pid as libc::pid_t, sig) };
+    if sent != 0 {
+        sent = unsafe { libc::kill(pid as libc::pid_t, sig) };
+    }
     if sent != 0 {
         tracing::debug!(pid, sig, error = %std::io::Error::last_os_error(), "perch: a signal to a door did not land");
     }

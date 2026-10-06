@@ -59,7 +59,7 @@ impl Static {
 /// Capped again at read time, in case the file grew since [`Static::resolve`].
 pub fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?.take(MAX_FILE).read_to_end(&mut bytes)?;
+    crate::rawfile::open_regular(path)?.0.take(MAX_FILE).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 

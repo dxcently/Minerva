@@ -14,8 +14,8 @@
 //! something runs it once for the whole directory (it prints ~200 logs in ~35 ms).
 //!
 //! **The fallback** for a chat with no user message yet is `<project> · HH:MM`: the folder name
-//! when the perch knows the cwd (a door it holds, a roster row, or one it started and remembers), `new chat`
-//! for a scratch chat, and `chat` when it has no way to know (a log from an earlier perch run: the cwd is
+//! when the perch knows the cwd (a door it holds, a roster row, or one it started and remembers), the birth
+//! name (`quiet-owl-lantern`, no time) for an inbox chat, and `chat` when it has no way to know (a log from an earlier perch run: the cwd is
 //! inside the journal, which is exactly what is not decoded here). The time is the log's mtime, local.
 //!
 //! Every child is spawned from an argv array (no shell), with a time bound and a cap on what it may print,
@@ -107,6 +107,21 @@ pub fn parse_sessions(out: &[u8]) -> HashMap<String, String> {
     found
 }
 
+/// `eidolon sessions`' second column: `stem -> model`, for the rows that have one.
+pub fn parse_models(out: &[u8]) -> HashMap<String, String> {
+    let mut found = HashMap::new();
+    for line in String::from_utf8_lossy(out).lines() {
+        let mut cols = line.split('\t');
+        let (Some(path), Some(model), Some(_records)) = (cols.next(), cols.next(), cols.next()) else { continue };
+        let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) else { continue };
+        let model = model.trim();
+        if !model.is_empty() && !model.starts_with('(') {
+            found.insert(stem.to_string(), model.to_string());
+        }
+    }
+    found
+}
+
 struct Seen {
     mtime: Option<u64>,
     title: Option<String>,
@@ -120,6 +135,8 @@ pub struct Cache {
     failed: HashMap<PathBuf, Instant>,
     /// The cwd a door of this perch's was started in, by id: what names a chat's folder after the door is gone.
     cwds: HashMap<String, PathBuf>,
+    /// The model `eidolon sessions` named for a chat, by id: what a fork of a saved chat starts with when nothing fresher is known.
+    models: HashMap<String, String>,
 }
 
 impl Cache {
@@ -143,6 +160,14 @@ impl Cache {
         }
     }
 
+    pub fn learn_models(&mut self, models: &HashMap<String, String>) {
+        self.models.extend(models.iter().map(|(stem, model)| (stem.clone(), model.clone())));
+    }
+
+    pub fn model(&self, id: &str) -> Option<&str> {
+        self.models.get(id).map(String::as_str)
+    }
+
     pub fn failed(&mut self, dir: &Path) {
         self.failed.insert(dir.to_path_buf(), Instant::now());
     }
@@ -160,10 +185,18 @@ impl Cache {
     }
 }
 
-/// `new chat · HH:MM` for a scratch chat, `<project> · HH:MM` for a chat in a named project, the folder's name for
-/// any other folder, and `chat · HH:MM` (no cwd known). `scratch` is the perch's scratch directory: a cwd under it.
-/// A scratch stamp is never a name.
+/// The chat's birth name (`quiet-owl-lantern`, no time) for an inbox chat, `<project> · HH:MM` for a chat in a named project,
+/// the folder's name for any other folder, and `chat · HH:MM` (no cwd known). `scratch` is the perch's scratch directory: a cwd
+/// under it. A scratch folder from before birth names, a bare timestamp, is never a name: it reads `new chat · HH:MM`.
 pub fn fallback(cwd: Option<&Path>, scratch: Option<&Path>, project: Option<&str>, mtime: Option<u64>) -> String {
+    let birth = cwd
+        .zip(scratch)
+        .and_then(|(cwd, scratch)| cwd.strip_prefix(scratch).ok())
+        .and_then(|rest| rest.components().next())
+        .and_then(|first| first.as_os_str().to_str());
+    if let Some(birth) = birth.filter(|name| name.chars().any(|c| c.is_ascii_alphabetic())) {
+        return birth.to_string();
+    }
     let name = match cwd {
         Some(cwd) if scratch.is_some_and(|scratch| cwd.starts_with(scratch)) => "new chat".to_string(),
         Some(_) if project.is_some() => project.unwrap_or_default().to_string(),
@@ -239,6 +272,9 @@ mod tests {
         assert!(fallback(Some(Path::new("/h/proj")), None, None, None) == "proj");
         assert!(fallback(Some(Path::new("/h/proj/sub")), None, Some("My App"), Some(0)).starts_with("My App · "));
         assert!(fallback(Some(Path::new("/h/Minerva/scratch/20261005-1")), Some(Path::new("/h/Minerva/scratch")), None, Some(0)).starts_with("new chat · "));
+        let scratch = Some(Path::new("/h/Minerva/scratch"));
+        assert_eq!(fallback(Some(Path::new("/h/Minerva/scratch/quiet-owl-lantern")), scratch, None, Some(0)), "quiet-owl-lantern", "the birth name, no time");
+        assert_eq!(fallback(Some(Path::new("/h/Minerva/scratch/quiet-owl-lantern/sub")), scratch, None, None), "quiet-owl-lantern");
         assert!(fallback(None, None, None, Some(0)).starts_with("chat · "));
         assert_eq!(hhmm(0).map(|t| t.len()), Some(5));
     }

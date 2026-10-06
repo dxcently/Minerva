@@ -7,6 +7,10 @@
 //! stays on the id and reconnects, which replays the log. `effort` is not a flag of `web` (there is none in eidolon's CLI at
 //! this revision), so there is no effort route and the page shows none.
 //!
+//! **Every reopen passes `--cwd`** when the perch remembers a folder for the chat (`chat-cwds.json`): eidolon's `web --session <log> --cwd <dir>`
+//! runs the tools in `<dir>` and leaves the log's start record alone, which is how a chat survives its folder being renamed to its
+//! title or moved into a project.
+//!
 //! **Only between turns.** A restart in the middle of a turn would cut it off, so a door whose `turn-state` says running is
 //! a 409 with a sentence to show. The perch knows because the stream it holds to each door ([`crate::watch`]) reads
 //! `turn-state`; that is also why a resumed door's stream is kept now, as a new session's always was.
@@ -41,7 +45,15 @@ pub(crate) async fn bring_up(ctx: &Ctx, id: &str, log: &Path, model: Option<&str
     if !ctx.registry.reserve(id, log) {
         return Err(Failed::Held);
     }
-    let argv = spawn::argv(&ctx.registry.eidolon, ctx.registry.eidolon_config.as_deref(), spawn::Target::Kept(log), model, yolo);
+    // `--cwd` is eidolon's reopen-time override: the tools run where the perch last put this chat (its folder may have been renamed
+    // after its title, or moved into a project), while the log keeps naming the folder it was born in. Passed whenever the perch
+    // remembers a folder that is still there; for a chat that never moved it is the folder the log names, which changes nothing.
+    let cwd = ctx.registry.reopen_cwd(id);
+    let target = match &cwd {
+        Some(cwd) => spawn::Target::KeptIn(log, cwd),
+        None => spawn::Target::Kept(log),
+    };
+    let argv = spawn::argv(&ctx.registry.eidolon, ctx.registry.eidolon_config.as_deref(), target, model, yolo);
     let up = door_up(ctx, argv, Some(id)).await.map_err(Failed::Spawn)?;
     let Up { pid, port, token, exit, watcher, hello } = up;
     // The door must have opened the log we asked it to. A door that opened another one is exactly the two-writers case, wearing a hat.
@@ -110,6 +122,10 @@ pub(crate) async fn restart(ctx: &Ctx, id: &str, body: &Bytes) -> Response<BoxBo
     let (want_model, want_yolo) = (asked.model.clone().unwrap_or_else(|| model.clone()), asked.yolo.unwrap_or(yolo));
     if want_model == model && want_yolo == yolo {
         return json(StatusCode::OK, &serde_json::json!({ "id": id, "model": model, "yolo": yolo, "restarted": false }));
+    }
+    // Stopping and reopening a log that ends mid-turn would carry the turn on by itself (hub.md section 4): a paid turn nobody asked for.
+    if crate::fork::settled(ctx, &log, false).await != Some(true) {
+        return problem(StatusCode::CONFLICT, "that chat ended mid-turn; continue it first");
     }
     // `-m` is always passed when the door told us its model: a resume with no `-m` is the config's default, not "the same".
     let keep = Some(model.as_str()).filter(|m| !m.is_empty());

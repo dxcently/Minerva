@@ -50,6 +50,8 @@ pub const GIVE_UP_GRACE: Duration = Duration::from_secs(2);
 pub enum Target<'a> {
     New(&'a Path),
     Kept(&'a Path),
+    /// A kept session reopened with the cwd its tools run in, when that is not the one its log names (a folder that was renamed or moved): `--session <log> --cwd <dir>`.
+    KeptIn(&'a Path, &'a Path),
 }
 
 /// The argv, and nothing but the argv. `--ui-dir` is absent on purpose (the door serves no
@@ -76,6 +78,12 @@ pub fn argv(eidolon: &Path, config: Option<&Path>, target: Target<'_>, model: Op
         Target::Kept(log) => {
             argv.push("--session".into());
             argv.push(log.as_os_str().to_os_string());
+        }
+        Target::KeptIn(log, cwd) => {
+            argv.push("--session".into());
+            argv.push(log.as_os_str().to_os_string());
+            argv.push("--cwd".into());
+            argv.push(cwd.as_os_str().to_os_string());
         }
     }
     if let Some(model) = model {
@@ -179,6 +187,9 @@ fn fork(argv: &[OsString]) -> io::Result<tokio::process::Child> {
     // §4 step 4. stderr is inherited: a door's complaints belong in the perch's own log,
     // and nothing on that path is a secret either.
     command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit());
+    // Its own process group (pgid == pid): a stop signals the group, so the tool subprocesses a door started die with it, and a ctrl-c
+    // at the perch's terminal does not reach doors that the perch is stopping in its own order.
+    command.process_group(0);
     // §2's hypothesis, made true by where this function runs: this thread is the perch's
     // spawn thread and outlives every door, so PDEATHSIG fires when the *perch* dies.
     unsafe {
@@ -335,6 +346,12 @@ mod tests {
         assert_eq!(
             words(&yolo),
             ["/usr/bin/eidolon", "--config", "/h/Minerva/config.toml", "--yolo", "web", "--bind", "127.0.0.1:0", "--session", "/l/a.eid", "-m", "mock"]
+        );
+        // A reopen whose folder was renamed or moved names it: `--cwd` after `--session`, before `-m` (eidolon's reopen-time override).
+        let moved = argv(eidolon, None, Target::KeptIn(Path::new("/l/a.eid"), Path::new("/h/scratch/juice-shop-recon")), Some("mock"), false);
+        assert_eq!(
+            words(&moved),
+            ["/usr/bin/eidolon", "web", "--bind", "127.0.0.1:0", "--session", "/l/a.eid", "--cwd", "/h/scratch/juice-shop-recon", "-m", "mock"]
         );
         // §10.4 row 1: there is no token to pass, and this is where that would show. The
         // door mints its own; `--ui-dir` is the perch's statics, not the door's.

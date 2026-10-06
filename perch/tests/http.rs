@@ -1382,14 +1382,14 @@ fn the_minerva_home_gives_every_door_its_config_and_a_cwd_less_session_its_scrat
     let config = home.join("config.toml");
     // A stale hand-written config.toml is regenerated away, not honoured.
     std::fs::write(&config, "sessions_dir = \"/hand/edited\"\n").unwrap();
-    let member = "sessions_dir = \"~/elsewhere\"\nthinking_budget = 4000\n\n[swarm]\nenabled = false\n\n[[providers]]\nname = \"mine\"\n";
+    let member = "default_model = \"theirs\"\nsessions_dir = \"~/elsewhere\"\nthinking_budget = 4000\n\n[swarm]\nenabled = false\n\n[[providers]]\nname = \"mine\"\n";
     let perch = Perch::start_hub_member(
         &["--root".into(), base.path().canonicalize().unwrap().into(), "--home".into(), home.clone().into()],
         member,
     );
     let generated: toml::Table = std::fs::read_to_string(&config).unwrap().parse().unwrap();
     assert_eq!(generated["sessions_dir"].as_str(), Some(home.join("sessions").to_str().unwrap()), "forced, absolute");
-    assert_eq!(generated["default_model"].as_str(), Some("mock"), "from minerva.toml, the member names none");
+    assert_eq!(generated["default_model"].as_str(), Some("mock"), "minerva.toml beats the member's own default_model");
     assert_eq!(generated["thinking_budget"].as_integer(), Some(4000), "the member's keys survive");
     assert_eq!(generated["swarm"]["enabled"].as_bool(), Some(false));
     assert_eq!(generated["providers"][0]["name"].as_str(), Some("mine"));
@@ -2776,7 +2776,7 @@ fn a_tree_is_for_a_live_session_with_a_strict_query_behind_the_token() {
         assert_eq!(perch.tree(bad, "").status, 404, "{bad}");
     }
     let refused = perch.tree(&kept, "");
-    assert_eq!((refused.status, refused.body.as_str()), (409, "{\"state\":\"kept\"}"), "{}", refused.head);
+    assert_eq!((refused.status, refused.body.as_str()), (409, "{\"error\":\"this chat's folder isn't known\",\"state\":\"kept\"}"), "a kept chat with no known folder: {}", refused.head);
     let elsewhere = perch.tree(&held, "");
     assert_eq!((elsewhere.status, elsewhere.body.as_str()), (409, "{\"state\":\"live-elsewhere\"}"), "{}", elsewhere.head);
 
@@ -2807,11 +2807,11 @@ fn a_tree_is_for_a_live_session_with_a_strict_query_behind_the_token() {
     assert_eq!(perch.get(&format!("/hub/tree?%73ession={id}&p%61th=")).status, 200);
     assert_eq!(Request::new(&perch.addr, "POST", &format!("/hub/tree?session={id}")).bearer(perch.auth()).send(&perch.addr).status, 404);
 
-    // A stopped session is kept again: 409, not a listing (Q9).
+    // A stopped session is kept again: now a saved chat, listed read-only from the folder the perch remembers.
     assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
     assert!(wait_gone(pid, Duration::from_secs(5)));
     let stopped = perch.tree(&id, "");
-    assert_eq!((stopped.status, stopped.body.as_str()), (409, "{\"state\":\"kept\"}"), "{}", stopped.head);
+    assert_eq!(stopped.status, 200, "{}{}", stopped.head, stopped.body);
 }
 
 // ---------------------------------------------------------------------------
@@ -3403,17 +3403,21 @@ fn projects_are_named_folders_kept_once_and_forgotten_without_touching_files() {
     assert_eq!(perch.post_json("/hub/projects", serde_json::json!({ "nope": 1 })).status, 400);
     assert_eq!(json_of(&perch.get("/hub/projects")).as_array().unwrap().len(), 2, "a refusal adds nothing");
 
-    // Delete forgets the entry and only that.
-    assert_eq!(perch.apireq("DELETE", "/hub/projects/0").send(&perch.addr).status, 204);
+    // Delete forgets the entry by its path, and only that: a stale list cannot remove a different one.
+    let delete = |body: serde_json::Value| perch.apireq("DELETE", "/hub/projects").body(serde_json::to_vec(&body).unwrap()).send(&perch.addr);
+    assert_eq!(delete(serde_json::json!({ "path": format!("{}/", proj.display()) })).status, 204);
     assert!(proj.join("keep.txt").is_file() && proj.is_dir(), "the folder and its files are untouched");
     let left = json_of(&perch.get("/hub/projects"));
     assert_eq!(left.as_array().unwrap().len(), 1);
     assert_eq!(left[0]["name"], "The Two");
-    for missing in ["/hub/projects/5", "/hub/projects/x", "/hub/projects/-1", "/hub/projects/+0", "/hub/projects/0/1"] {
-        assert_eq!(perch.apireq("DELETE", missing).send(&perch.addr).status, 404, "{missing}");
+    assert_eq!(delete(serde_json::json!({ "path": proj })).status, 404, "a second tab asking again removes nothing else");
+    assert_eq!(json_of(&perch.get("/hub/projects")).as_array().unwrap().len(), 1, "the other entry survived the stale delete");
+    assert_eq!(delete(serde_json::json!({ "nope": 1 })).status, 400);
+    assert_eq!(perch.apireq("DELETE", "/hub/projects").send(&perch.addr).status, 400, "no body names nothing");
+    for gone in ["/hub/projects/0", "/hub/projects/x", "/hub/projects/0/1"] {
+        assert_eq!(perch.apireq("DELETE", gone).send(&perch.addr).status, 405, "{gone}: removal by position no longer exists");
     }
-    assert_eq!(perch.apireq("DELETE", "/hub/projects").send(&perch.addr).status, 405, "only an entry can be deleted");
-    assert_eq!(Request::new(&perch.addr, "DELETE", "/hub/projects/0").send(&perch.addr).status, 401, "behind the token like the rest");
+    assert_eq!(Request::new(&perch.addr, "DELETE", "/hub/projects").body(b"{}".to_vec()).send(&perch.addr).status, 401, "behind the token like the rest");
     assert_eq!(perch.apireq("DELETE", "/hub/sessions/x").send(&perch.addr).status, 405, "no other DELETE exists");
 }
 
@@ -3434,13 +3438,14 @@ fn chat_titles_name_the_project_or_new_chat_and_never_a_scratch_stamp() {
     let scratch_b = body_id(&perch.post_json("/hub/sessions", serde_json::json!({})));
     let title = |id: &str| perch.row(id).unwrap()["title"].as_str().unwrap().to_string();
     assert!(title(&in_project).starts_with("Pretty Name · "), "{}", title(&in_project));
-    for id in [&scratch_a, &scratch_b] {
-        let t = title(id);
-        assert!(t.starts_with("new chat · "), "{t}");
-        assert!(t.split_once(" · ").is_some_and(|(_, at)| at.len() == 5), "only a time after the name, no stamp: {t}");
-    }
     let cwd_of = |id: &str| perch.row(id).unwrap()["cwd"].as_str().unwrap().to_string();
     let (ca, cb) = (cwd_of(&scratch_a), cwd_of(&scratch_b));
+    // Before it has a title an inbox chat is called by its birth name, which is its folder's: three lowercase words, no time, no stamp.
+    for (id, cwd) in [(&scratch_a, &ca), (&scratch_b, &cb)] {
+        let t = title(id);
+        assert_eq!(Some(t.as_str()), std::path::Path::new(cwd).file_name().and_then(|n| n.to_str()), "{t}");
+        assert!(t.split('-').count() == 3 && t.chars().all(|c| c.is_ascii_lowercase() || c == '-'), "{t}");
+    }
     assert_ne!(ca, cb, "two [new chat] are two folders");
     assert!(ca.starts_with(home.join("scratch").to_str().unwrap()));
 
@@ -3611,7 +3616,9 @@ fn a_restart_resumes_the_same_log_with_the_new_flags_and_keeps_the_rest() {
     assert_eq!(said, serde_json::json!({ "id": id, "model": "mock:alpha", "yolo": true, "restarted": true }));
     let argv = perch.fake_argv();
     assert!(argv.starts_with(&format!("argv --config {} --yolo web ", config.display())), "{argv}");
-    assert!(argv.contains(&format!("--session {}", log.display())) && !argv.contains("--cwd"), "the same log, not a new chat: {argv}");
+    // The same log (not a new chat), and the folder the perch remembers for it as eidolon's reopen-time `--cwd`.
+    let cwd = perch.row(&id).unwrap()["cwd"].as_str().unwrap().to_string();
+    assert!(argv.contains(&format!("--session {} --cwd {cwd} ", log.display())), "the same log and its folder: {argv}");
     assert!(argv.ends_with(" -m mock:alpha"), "{argv}");
     assert_eq!(starts(&perch), 2);
     assert_eq!(perch.state_of(&id).as_deref(), Some("live"), "the same id is live again");
@@ -3695,4 +3702,1505 @@ fn a_restart_waits_for_the_turn_to_end() {
     assert!(perch.fake_argv().contains("--yolo"), "{}", perch.fake_argv());
     assert_eq!(starts(), 3);
     assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+}
+
+// ---------------------------------------------------------------------------
+// Archive, pin and trash (hub.md section 7b)
+// ---------------------------------------------------------------------------
+
+/// Sets a log's mtime to `days` ago, as a chat that was last used then.
+#[cfg(feature = "test-bins")]
+fn age(path: &std::path::Path, days: u64) {
+    let at = std::time::SystemTime::now() - Duration::from_secs(days * 86_400 + 60);
+    std::fs::OpenOptions::new().write(true).open(path).unwrap().set_modified(at).unwrap();
+}
+
+/// `(archived, auto_other, pinned)` of a listed chat.
+#[cfg(feature = "test-bins")]
+fn flags_of(perch: &Perch, id: &str) -> (bool, bool, bool) {
+    let row = perch.row(id).unwrap_or_else(|| panic!("{id} is listed"));
+    let flag = |name: &str| row[name].as_bool().unwrap_or_else(|| panic!("{name} on {row}"));
+    (flag("archived"), flag("auto_other"), flag("pinned"))
+}
+
+/// A Minerva chat idle for 7 days is `auto_other` (computed at listing time, no file moves); a fresh one and a live one never
+/// are; archive puts one in `other` now and unarchive brings it back with a fresh week; continuing an archived chat unarchives it.
+/// Mutations: change 7 days; drop the live exemption; drop `unarchived_at` from the idle clock; leave the mark on a resumed chat.
+#[cfg(feature = "test-bins")]
+#[test]
+fn an_idle_week_is_other_and_archive_unarchive_and_the_grace_work() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_base, home, perch) = start_home("");
+    let sessions = home.join("sessions");
+    for id in ["fresh", "six", "eight", "live", "mine"] {
+        std::fs::write(sessions.join(format!("{id}.eid")), chat_log(Some(id))).unwrap();
+    }
+    age(&sessions.join("six.eid"), 6);
+    age(&sessions.join("eight.eid"), 8);
+    age(&sessions.join("live.eid"), 30);
+    age(&sessions.join("mine.eid"), 30);
+    assert_eq!(flags_of(&perch, "fresh"), (false, false, false));
+    assert_eq!(flags_of(&perch, "six"), (false, false, false), "6 days is still active");
+    assert_eq!(flags_of(&perch, "eight"), (false, true, false), "8 days idle is `other`");
+    assert!(sessions.join("eight.eid").is_file(), "nothing is moved for it");
+    // A live chat never ages out, however old its log is.
+    assert_eq!(perch.post("/hub/sessions/live/resume").status, 200);
+    assert_eq!(flags_of(&perch, "live"), (false, false, false));
+    assert_eq!(perch.post("/hub/sessions/live/archive").status, 409, "a running chat is not archived");
+    assert_eq!(perch.post("/hub/sessions/live/stop").status, 202);
+    assert!(perch.wait_state("live", "kept", Duration::from_secs(5)));
+    // Archive by hand, and back.
+    assert_eq!(perch.post("/hub/sessions/fresh/archive").status, 204);
+    assert_eq!(flags_of(&perch, "fresh"), (true, false, false));
+    let file = home.join("archive.json");
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    let on_disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(on_disk["fresh"]["archived"], true, "{on_disk}");
+    assert_eq!(perch.post("/hub/sessions/fresh/unarchive").status, 204);
+    assert_eq!(flags_of(&perch, "fresh"), (false, false, false));
+    // An old chat, un-archived, is not back in `other` the next moment: it has a fresh week from the unarchive.
+    assert_eq!(perch.post("/hub/sessions/eight/archive").status, 204);
+    assert_eq!(flags_of(&perch, "eight"), (true, false, false));
+    assert_eq!(perch.post("/hub/sessions/eight/unarchive").status, 204);
+    assert_eq!(flags_of(&perch, "eight"), (false, false, false), "the grace after unarchive");
+    // Continuing an archived chat brings it out of `other`.
+    assert_eq!(perch.post("/hub/sessions/mine/archive").status, 204);
+    assert_eq!(perch.post("/hub/sessions/mine/resume").status, 200);
+    assert_eq!(perch.post("/hub/sessions/mine/stop").status, 202);
+    assert!(perch.wait_state("mine", "kept", Duration::from_secs(5)));
+    assert_eq!(flags_of(&perch, "mine"), (false, false, false), "continuing it is activity");
+    // Bad ids and unknown chats are the 404 of a route that is not there; the token gate is ahead of them.
+    for verb in ["archive", "unarchive", "pin", "unpin", "trash"] {
+        assert_eq!(perch.post(&format!("/hub/sessions/nope/{verb}")).status, 404, "{verb}");
+        assert_eq!(perch.post(&format!("/hub/sessions/..%2Fsaved/{verb}")).status, 404, "{verb} with a path piece");
+        assert_eq!(Request::new(&perch.addr, "POST", &format!("/hub/sessions/fresh/{verb}")).send(&perch.addr).status, 401, "{verb} needs the token");
+    }
+}
+
+/// A pinned chat never ages into `other`; archiving unpins, pinning an archived chat brings it out; a shared-dir chat refuses
+/// archive, pin and trash and is not touched. Mutations: let `auto_other` win over a pin; keep the pin through archive; allow a
+/// shared-dir pin.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_pinned_chat_stays_out_of_other_and_a_shared_dir_chat_cannot_be_marked() {
+    let (_base, home, perch) = start_home("");
+    let sessions = home.join("sessions");
+    std::fs::write(sessions.join("old.eid"), chat_log(Some("old"))).unwrap();
+    age(&sessions.join("old.eid"), 40);
+    let shared = perch.shared();
+    std::fs::write(shared.join("theirs.eid"), chat_log(Some("theirs"))).unwrap();
+    assert_eq!(flags_of(&perch, "old"), (false, true, false));
+    assert_eq!(perch.post("/hub/sessions/old/pin").status, 204);
+    assert_eq!(flags_of(&perch, "old"), (false, false, true), "pinned: never `other`, however old");
+    assert_eq!(perch.post("/hub/sessions/old/archive").status, 204);
+    assert_eq!(flags_of(&perch, "old"), (true, false, false), "archiving unpins");
+    assert_eq!(perch.post("/hub/sessions/old/pin").status, 204);
+    assert_eq!(flags_of(&perch, "old"), (false, false, true), "pinning brings it out of `other`");
+    assert_eq!(perch.post("/hub/sessions/old/unpin").status, 204);
+    assert_eq!(flags_of(&perch, "old"), (false, true, false), "unpinned, it is as idle as it was");
+    // Shared dir: refused, and nothing changed on disk or in the list.
+    for verb in ["archive", "pin", "trash"] {
+        assert_eq!(perch.post(&format!("/hub/sessions/theirs/{verb}")).status, 403, "{verb}");
+    }
+    let row = perch.row("theirs").unwrap();
+    assert_eq!((row["origin"].as_str(), row["pinned"].as_bool(), row["archived"].as_bool()), (Some("other"), Some(false), Some(false)), "{row}");
+    assert!(shared.join("theirs.eid").is_file());
+    assert!(!home.join("trash").join("theirs.eid").exists());
+}
+
+/// Delete is a move into `<home>/trash`: the chat leaves the list and appears in `GET /hub/trash`; restore puts it back (409 when
+/// the name is taken; not pinned again); empty needs `confirm` and removes only regular `.eid` files inside the trash dir; a
+/// live chat is 409 unless `stop`. Mutations: copy instead of move; empty without the confirm; empty following a symlink out of
+/// the trash; trash a live chat without stopping it.
+#[cfg(feature = "test-bins")]
+#[test]
+fn delete_moves_to_trash_and_restore_and_empty_touch_only_the_trash() {
+    let (base, home, perch) = start_home("");
+    let sessions = home.join("sessions");
+    let trash = home.join("trash");
+    for id in ["a", "b", "run"] {
+        std::fs::write(sessions.join(format!("{id}.eid")), chat_log(Some(id))).unwrap();
+    }
+    assert_eq!(perch.post("/hub/sessions/a/pin").status, 204);
+    assert_eq!(json_of(&perch.get("/hub/trash")), serde_json::json!([]));
+    assert_eq!(perch.post("/hub/sessions/a/trash").status, 204);
+    assert!(!sessions.join("a.eid").exists() && trash.join("a.eid").is_file(), "moved, not copied");
+    assert!(perch.row("a").is_none(), "gone from the list");
+    let listed = json_of(&perch.get("/hub/trash"));
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed[0]["id"], "a");
+    assert!(listed[0]["title"].as_str().is_some_and(|t| !t.is_empty()) && listed[0]["mtime"].as_u64().is_some(), "{listed}");
+    assert_eq!(perch.post("/hub/sessions/a/trash").status, 404, "already gone");
+    // Restore: back, not pinned, a fresh week; and 409 when the name is taken.
+    assert_eq!(perch.post("/hub/trash/a/restore").status, 204);
+    assert!(sessions.join("a.eid").is_file() && !trash.join("a.eid").exists());
+    assert_eq!(flags_of(&perch, "a"), (false, false, false), "a restored chat is not pinned again");
+    assert_eq!(perch.post("/hub/sessions/a/trash").status, 204);
+    std::fs::write(sessions.join("a.eid"), chat_log(Some("new a"))).unwrap();
+    assert_eq!(perch.post("/hub/trash/a/restore").status, 409, "a chat of that name is there");
+    assert!(trash.join("a.eid").is_file() && sessions.join("a.eid").is_file(), "neither was overwritten");
+    assert_eq!(perch.post("/hub/trash/zzz/restore").status, 404);
+    assert_eq!(perch.post("/hub/trash/..%2Fa/restore").status, 404);
+    assert_eq!(perch.get("/hub/trash/a/restore").status, 404);
+    // A live chat: 409 unless it is stopped first.
+    assert_eq!(perch.post("/hub/sessions/run/resume").status, 200);
+    assert_eq!(perch.post("/hub/sessions/run/trash").status, 409);
+    assert!(sessions.join("run.eid").is_file(), "still there");
+    let stopped = perch.post_json("/hub/sessions/run/trash", serde_json::json!({ "stop": true }));
+    assert_eq!(stopped.status, 204, "{}{}", stopped.head, stopped.body);
+    assert!(trash.join("run.eid").is_file() && !sessions.join("run.eid").exists());
+    assert!(perch.row("run").is_none());
+    assert!(perch.door_token_files().is_empty(), "the door was stopped cleanly");
+    // Empty: needs the confirm, and removes only `.eid` regular files in the trash.
+    let outside = base.path().join("outside.eid");
+    std::fs::write(&outside, "keep").unwrap();
+    std::os::unix::fs::symlink(&outside, trash.join("link.eid")).unwrap();
+    std::fs::write(trash.join("notes.txt"), "keep").unwrap();
+    std::fs::create_dir(trash.join("dir.eid")).unwrap();
+    assert_eq!(perch.post("/hub/trash/empty").status, 400);
+    assert_eq!(perch.post_json("/hub/trash/empty", serde_json::json!({ "confirm": false })).status, 400);
+    assert!(trash.join("a.eid").is_file(), "nothing was removed without the confirm");
+    let emptied = perch.post_json("/hub/trash/empty", serde_json::json!({ "confirm": true }));
+    assert_eq!((emptied.status, json_of(&emptied)["removed"].clone()), (200, serde_json::json!(2)), "{}", emptied.body);
+    assert!(!trash.join("a.eid").exists() && !trash.join("run.eid").exists(), "the trashed chats are gone for good");
+    assert!(outside.is_file() && trash.join("notes.txt").is_file() && trash.join("dir.eid").is_dir(), "only chats in the trash");
+    assert!(std::fs::symlink_metadata(trash.join("link.eid")).is_ok(), "a symlink is not followed or removed");
+    assert!(sessions.join("a.eid").is_file() && sessions.join("b.eid").is_file(), "sessions/ is untouched");
+    assert_eq!(json_of(&perch.get("/hub/trash")), serde_json::json!([]));
+}
+
+// ---------------------------------------------------------------------------
+// Images in a chat: GET /hub/sessions/<id>/{images,image/<record>/<n>,transcript}
+// ---------------------------------------------------------------------------
+
+/// Standard padded base64, for fixtures: the bytes the tests use are ASCII, so the response body can be compared as text.
+#[cfg(feature = "test-bins")]
+fn b64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// One image to put in a fixture log: media type, bytes, alt.
+#[cfg(feature = "test-bins")]
+type Pic<'a> = (&'a str, Vec<u8>, Option<&'a str>);
+
+/// A log as `eidolon log --json` prints it, with images: `(record, images)`, each record a user message.
+#[cfg(feature = "test-bins")]
+fn image_log(messages: &[(u64, Vec<Pic>)]) -> String {
+    let mut text = chat_log(None);
+    for (record, images) in messages {
+        let mut content: Vec<serde_json::Value> = images
+            .iter()
+            .map(|(media, bytes, alt)| {
+                let mut block = serde_json::json!({ "type": "image", "source": { "type": "base64", "media_type": media, "data": b64(bytes) } });
+                if let Some(alt) = alt {
+                    block["alt"] = (*alt).into();
+                }
+                block
+            })
+            .collect();
+        content.push(serde_json::json!({ "type": "text", "text": "look" }));
+        let line = serde_json::json!({ "id": record, "parent": record - 1, "ts_ms": 2, "kind": { "UserMessage": { "role": "user", "content": content } } });
+        text.push_str(&format!("{line}\n"));
+    }
+    text
+}
+
+/// The list names every image block with its place, the bytes route answers them with the declared type and the headers that
+/// make them inert and cacheable, and everything that is not one is a 404 (a type outside the four is a 415). Mutations: no
+/// `nosniff`; a type other than the log's; an svg served; a record or index parsed loosely (`+1`, `1.0`); a query accepted.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_chats_images_are_listed_and_served_as_what_the_log_declares() {
+    let (_base, home, perch) = start_home("");
+    let log = image_log(&[
+        (1, vec![("image/png", b"PNG-ONE".to_vec(), Some("dot.png")), ("image/jpeg", b"JPEG-TWO".to_vec(), None)]),
+        (2, vec![("image/svg+xml", b"<svg/>".to_vec(), Some("evil.svg"))]),
+    ]);
+    std::fs::write(home.join("sessions/pics.eid"), &log).unwrap();
+    let list = perch.get("/hub/sessions/pics/images");
+    assert_eq!(list.status, 200, "{}", list.head);
+    assert_eq!(list.header("content-type").as_deref(), Some("application/json"), "{}", list.head);
+    let rows: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 3, "{rows}");
+    assert_eq!(rows[0], serde_json::json!({ "record": 1, "n": 0, "media_type": "image/png", "where": "user", "bytes": 7, "alt": "dot.png" }));
+    assert_eq!((rows[1]["n"].as_u64(), rows[1]["media_type"].as_str(), rows[1].get("alt")), (Some(1), Some("image/jpeg"), None));
+    assert_eq!(rows[2]["media_type"], "image/svg+xml");
+
+    let one = perch.get("/hub/sessions/pics/image/1/0");
+    assert_eq!((one.status, one.body.as_str()), (200, "PNG-ONE"), "{}", one.head);
+    assert_eq!(one.header("content-type").as_deref(), Some("image/png"), "{}", one.head);
+    assert_eq!(one.header("content-length").as_deref(), Some("7"), "{}", one.head);
+    assert_eq!(one.header("x-content-type-options").as_deref(), Some("nosniff"), "{}", one.head);
+    assert_eq!(one.header("cache-control").as_deref(), Some("private, max-age=3600"), "{}", one.head);
+    assert_eq!(one.header("content-security-policy").as_deref(), Some("default-src 'none'; sandbox"), "{}", one.head);
+    let two = perch.get("/hub/sessions/pics/image/1/1");
+    assert_eq!((two.status, two.body.as_str(), two.header("content-type").as_deref()), (200, "JPEG-TWO", Some("image/jpeg")), "{}", two.head);
+    // Listed, never served: the type is not one of the four.
+    assert_eq!(perch.get("/hub/sessions/pics/image/2/0").status, 415);
+    // Not images: a record with none, an index past the end, a record that is not there, and every spelling that is not a number.
+    for path in [
+        "/hub/sessions/pics/image/0/0",
+        "/hub/sessions/pics/image/1/2",
+        "/hub/sessions/pics/image/9/0",
+        "/hub/sessions/pics/image/+1/0",
+        "/hub/sessions/pics/image/1/-0",
+        "/hub/sessions/pics/image/1.0/0",
+        "/hub/sessions/pics/image/abc/0",
+        "/hub/sessions/pics/image//0",
+        "/hub/sessions/pics/image/1/0?x=1",
+        "/hub/sessions/pics/images?x=1",
+        "/hub/sessions/nope/image/1/0",
+        "/hub/sessions/nope/images",
+        "/hub/sessions/..%2Fpics/image/1/0",
+    ] {
+        assert_eq!(perch.get(path).status, 404, "{path}");
+    }
+    assert_eq!(perch.post("/hub/sessions/pics/image/1/0").status, 404);
+    assert_eq!(perch.post("/hub/sessions/pics/images").status, 404);
+    assert!(perch.fake_records().iter().all(|line| !line.starts_with("start ")), "reading images starts no door");
+    assert_eq!(std::fs::read_to_string(home.join("sessions/pics.eid")).unwrap(), log, "nothing is written");
+}
+
+/// A transcript with fifteen images is one eidolon run, not fifteen; a chat that grew is read again, and one in the other
+/// source is read without the home's config. Mutations: no cache; a cache that ignores the log changing.
+#[cfg(feature = "test-bins")]
+#[test]
+fn many_images_cost_one_eidolon_run_until_the_log_changes() {
+    let (_base, home, perch) = start_home("");
+    let shots: Vec<Pic> = (0..5).map(|i| ("image/png", format!("shot-{i}").into_bytes(), None)).collect();
+    let path = home.join("sessions/many.eid");
+    std::fs::write(&path, image_log(&[(1, shots.clone()), (2, shots.clone()), (3, shots.clone())])).unwrap();
+    let runs = |perch: &Perch| perch.fake_helpers().iter().filter(|h| h.starts_with("helper log --json ")).count();
+    assert_eq!(perch.get("/hub/sessions/many/images").status, 200);
+    for (record, n) in [(1, 0), (1, 4), (2, 2), (3, 0), (3, 4)] {
+        let got = perch.get(&format!("/hub/sessions/many/image/{record}/{n}"));
+        assert_eq!((got.status, got.body.as_str()), (200, format!("shot-{n}").as_str()), "{record}/{n}");
+    }
+    assert_eq!(runs(&perch), 1, "one run for the list and five images: {:?}", perch.fake_helpers());
+    // The chat grows: the next request reads it again and sees the new record.
+    std::fs::write(&path, image_log(&[(1, shots.clone()), (2, shots.clone()), (3, shots.clone()), (4, vec![("image/gif", b"GIF-NEW".to_vec(), None)])])).unwrap();
+    let new = perch.get("/hub/sessions/many/image/4/0");
+    assert_eq!((new.status, new.body.as_str(), new.header("content-type").as_deref()), (200, "GIF-NEW", Some("image/gif")), "{}", new.head);
+    assert_eq!(runs(&perch), 2, "a changed log is read again, once: {:?}", perch.fake_helpers());
+    // The other source: read-only, no config.
+    std::fs::write(perch.shared().join("old.eid"), image_log(&[(1, vec![("image/webp", b"WEBP-OLD".to_vec(), Some("old.webp"))])])).unwrap();
+    let old = perch.get("/hub/sessions/old/image/1/0");
+    assert_eq!((old.status, old.body.as_str(), old.header("content-type").as_deref()), (200, "WEBP-OLD", Some("image/webp")), "{}", old.head);
+    assert!(perch.fake_helpers().iter().any(|h| h.contains("/eidolon/sessions/old.eid") && h.ends_with("config=false")), "{:?}", perch.fake_helpers());
+}
+
+/// The read is bounded: a log whose output is over the cap is a 413, not a truncated picture. And a chat whose pictures alone are
+/// over the plain log route's 16 MiB still has a transcript: the same lines with every `data` emptied. Mutations: no cap; a
+/// transcript that keeps the bytes; one that drops the other fields.
+#[cfg(feature = "test-bins")]
+#[test]
+fn the_image_read_is_capped_and_the_transcript_carries_no_bytes() {
+    let (_base, home, perch) = start_home("");
+    let big = vec![b'x'; 5 * 1024 * 1024];
+    let pics: Vec<Pic> = (0..3).map(|_| ("image/png", big.clone(), Some("big.png"))).collect();
+    std::fs::write(home.join("sessions/big.eid"), image_log(&[(1, pics)])).unwrap();
+    assert_eq!(perch.get("/hub/sessions/big/log").status, 413, "the plain log is over its 16 MiB");
+    let lean = perch.get("/hub/sessions/big/transcript");
+    assert_eq!(lean.status, 200, "{}", lean.head);
+    assert_eq!(lean.header("content-type").as_deref(), Some("application/x-ndjson"), "{}", lean.head);
+    assert!(lean.body.len() < 4096, "{} bytes", lean.body.len());
+    let user: serde_json::Value = serde_json::from_str(lean.body.lines().nth(1).unwrap()).unwrap();
+    let blocks = user["kind"]["UserMessage"]["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 4, "{user}");
+    assert_eq!((blocks[0]["source"]["data"].as_str(), blocks[0]["source"]["media_type"].as_str(), blocks[0]["alt"].as_str()), (Some(""), Some("image/png"), Some("big.png")));
+    assert_eq!(blocks[3]["text"], "look");
+    assert_eq!(user["id"], 1);
+    assert_eq!(perch.get("/hub/sessions/big/image/1/2").body.len(), big.len(), "and the pictures are still there");
+    // Over the cap: 129 MiB of output.
+    std::fs::write(home.join("sessions/huge.eid"), vec![b'x'; 129 * 1024 * 1024]).unwrap();
+    for path in ["/hub/sessions/huge/images", "/hub/sessions/huge/transcript", "/hub/sessions/huge/image/1/0"] {
+        let refused = perch.get(path);
+        assert_eq!(refused.status, 413, "{path}: {}", refused.head);
+        assert!(refused.body.contains("too large"), "{}", refused.body);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fork (hub.md section 7c): a new chat copied from one, whole
+// ---------------------------------------------------------------------------
+
+/// A chat that ends on a clean turn boundary (a `TurnSettled` last), which is what a fork needs; `chat_log` ends mid-turn.
+#[cfg(feature = "test-bins")]
+fn settled_log(first: &str) -> String {
+    let end = serde_json::json!({ "id": 3, "parent": 2, "ts_ms": 4, "kind": { "TurnSettled": { "stop_reason": "EndTurn", "usage": {} } } });
+    format!("{}{end}
+", chat_log(Some(first)))
+}
+
+#[cfg(feature = "test-bins")]
+fn sha(path: &std::path::Path) -> Vec<u8> {
+    std::fs::read(path).unwrap()
+}
+
+/// Fork copies the log byte for byte to a new id in the Minerva home, brings a door up on the *copy* (`--session <copy>`, the
+/// Minerva config, and no `--cwd`, since the log names the folder), lists it live, and never touches the source; two forks are two
+/// ids. Mutations: open the source instead of the copy; copy into the shared dir; reuse an id; write to the source.
+#[cfg(feature = "test-bins")]
+#[test]
+fn fork_copies_the_log_and_opens_the_copy_as_a_live_chat() {
+    let (_base, home, perch) = start_home("");
+    let sessions = home.join("sessions");
+    std::fs::write(sessions.join("src.eid"), settled_log("hello")).unwrap();
+    let before = sha(&sessions.join("src.eid"));
+    let made = perch.post("/hub/sessions/src/fork");
+    assert_eq!(made.status, 201, "{}{}", made.head, made.body);
+    let (new, again) = (body_id(&made), body_id(&perch.post_json("/hub/sessions/src/fork", serde_json::json!({}))));
+    assert_ne!(new, "src");
+    assert_ne!(new, again, "two forks are two chats");
+    assert_eq!(json_of(&made)["from"], "src");
+    assert_eq!(sha(&sessions.join(format!("{new}.eid"))), before, "the copy is byte for byte the source");
+    assert_eq!(sha(&sessions.join("src.eid")), before, "the source is untouched");
+    assert_eq!(perch.state_of(&new).as_deref(), Some("live"));
+    assert_eq!(perch.state_of("src").as_deref(), Some("kept"), "the original is not started by a fork");
+    let argv = perch.fake_records().into_iter().find(|l| l.starts_with("argv ") && l.contains(&format!("{new}.eid"))).expect("an argv for the copy");
+    assert!(argv.contains(&format!("{new}.eid")) && !argv.contains("src.eid") && !argv.contains("--cwd"), "{argv}");
+    assert!(argv.contains("minerva.toml") || argv.contains("--config"), "the Minerva config: {argv}");
+    assert!(!argv.contains(" --at"), "{argv}");
+    // The fork is its own chat: stop it and the original can still be resumed.
+    assert_eq!(perch.post(&format!("/hub/sessions/{new}/stop")).status, 202);
+    assert_eq!(perch.post("/hub/sessions/src/resume").status, 200);
+}
+
+/// A source that is live is copied as it stands, and stays live and untouched; a source another process holds is copied too (the
+/// perch only reads it). Mutation: refuse a live source.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_live_source_can_be_forked_and_keeps_running() {
+    let (_base, home, perch) = start_home("");
+    let sessions = home.join("sessions");
+    std::fs::write(sessions.join("run.eid"), settled_log("hi")).unwrap();
+    assert_eq!(perch.post("/hub/sessions/run/resume").status, 200);
+    let (pid, _) = perch.fake_last_start();
+    let before = sha(&sessions.join("run.eid"));
+    let made = perch.post("/hub/sessions/run/fork");
+    assert_eq!(made.status, 201, "{}{}", made.head, made.body);
+    assert_eq!(sha(&sessions.join(format!("{}.eid", body_id(&made)))), before);
+    assert_eq!(perch.state_of("run").as_deref(), Some("live"), "the source door keeps going");
+    assert!(!is_gone(pid));
+}
+
+/// A point that cannot be forked from (a user message, a record that is not there) is a 422 with a sentence, a `at` that is not a number
+/// a 400, and neither spends anything: no file, no door. Bad ids, unknown chats and a bad body are 404, 404 and 400; a chat in the
+/// trash is not forkable. Mutations: ignore `at` and fork the whole chat; let an id name a path; accept a user message.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_point_that_cannot_be_forked_from_and_bad_requests_start_nothing() {
+    let (_base, home, perch) = start_home("");
+    let sessions = home.join("sessions");
+    std::fs::write(sessions.join("src.eid"), settled_log("hello")).unwrap();
+    let count = || std::fs::read_dir(&sessions).unwrap().count();
+    let (files, starts) = (count(), perch.fake_records().iter().filter(|l| l.starts_with("start ")).count());
+    let at = perch.post_json("/hub/sessions/src/fork", serde_json::json!({ "at": 1 }));
+    assert_eq!(at.status, 422, "{}{}", at.head, at.body);
+    assert!(at.body.contains("assistant's replies"), "a sentence for the page: {}", at.body);
+    assert_eq!(perch.post_json("/hub/sessions/src/fork", serde_json::json!({ "at": 99 })).status, 422, "no such record");
+    assert_eq!(perch.post_json("/hub/sessions/src/fork", serde_json::json!({ "at": "two" })).status, 400);
+    assert_eq!(perch.apireq("POST", "/hub/sessions/src/fork").body(b"[1".to_vec()).send(&perch.addr).status, 400);
+    for bad in ["nope", "..", "a%2fb", ".hidden"] {
+        assert_eq!(perch.post(&format!("/hub/sessions/{bad}/fork")).status, 404, "{bad}");
+    }
+    assert_eq!(perch.post("/hub/sessions/src/../src/fork").status, 404);
+    assert_eq!(count(), files, "nothing was copied");
+    assert_eq!(perch.fake_records().iter().filter(|l| l.starts_with("start ")).count(), starts, "no door was forked");
+    assert_eq!(perch.post("/hub/sessions/src/trash").status, 204);
+    assert_eq!(perch.post("/hub/sessions/src/fork").status, 404);
+}
+
+/// A shared-dir chat (`origin: "other"`) is forkable: the copy lands in the Minerva home and the original is not touched.
+/// Mutation: write the copy beside the source.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_shared_dir_chat_can_be_forked_into_the_minerva_home() {
+    let (_base, home, perch) = start_home("");
+    let shared = perch.shared();
+    std::fs::write(shared.join("theirs.eid"), settled_log("theirs")).unwrap();
+    let before = sha(&shared.join("theirs.eid"));
+    let made = perch.post("/hub/sessions/theirs/fork");
+    assert_eq!(made.status, 201, "{}{}", made.head, made.body);
+    let new = body_id(&made);
+    assert_eq!(sha(&home.join("sessions").join(format!("{new}.eid"))), before);
+    assert!(!shared.join(format!("{new}.eid")).exists());
+    assert_eq!(sha(&shared.join("theirs.eid")), before);
+    assert_eq!(perch.row(&new).unwrap()["origin"], serde_json::Value::Null, "the copy is the Minerva home's own");
+    assert_eq!(perch.row("theirs").unwrap()["origin"], "other");
+}
+
+/// A copy whose door does not come up is removed and is a 503, never a dead row in the list. Mutation: leave the copy.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_fork_whose_door_does_not_start_leaves_no_copy() {
+    let base = tempfile::tempdir().unwrap();
+    let home = base.path().join("Minerva");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"
+").unwrap();
+    let home = home.canonicalize().unwrap();
+    let extra: Vec<std::ffi::OsString> = vec!["--root".into(), base.path().canonicalize().unwrap().into(), "--home".into(), home.clone().into()];
+    let perch = Perch::launch_with_member(true, Some(vec![("FAKE_EXIT_BEFORE_BOOT".into(), "3".into())]), &extra, Some(""));
+    let sessions = home.join("sessions");
+    std::fs::write(sessions.join("src.eid"), settled_log("hello")).unwrap();
+    let answer = perch.post("/hub/sessions/src/fork");
+    assert_eq!(answer.status, 503, "{}{}", answer.head, answer.body);
+    assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), 1, "only the source is left");
+    assert_eq!(perch.list().len(), 1, "{:?}", perch.list());
+}
+
+// ---------------------------------------------------------------------------
+// GET /hub/file (rawfile.rs): one image under the cwd
+// ---------------------------------------------------------------------------
+
+/// The route over the wire: a png under the cwd is served with the headers that make it only drawable; svg, text, a
+/// disguised file and an over-cap file are 415/413; every way out is the empty 404; no token is 401.
+/// Mutation: drop the route arm and the first assert goes red; drop a header and the header asserts do.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_file_route_serves_an_image_under_the_cwd_and_nothing_else() {
+    let perch = Perch::start_hub(&[]);
+    let (id, _pid, _port) = live(&perch);
+    let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+    let work = &perch.work;
+    std::fs::write(work.join("shot.png"), png).unwrap();
+    std::fs::write(work.join("x.svg"), "<svg xmlns='http://www.w3.org/2000/svg'><script>1</script></svg>").unwrap();
+    std::fs::write(work.join("a.txt"), "hello").unwrap();
+    std::fs::write(work.join("fake.png"), "<html>").unwrap();
+    let mut big = png.to_vec();
+    big.resize(20 * 1024 * 1024 + 1, 0);
+    std::fs::write(work.join("big.png"), &big).unwrap();
+    std::fs::write(work.join("secret.png"), png).unwrap();
+    std::fs::write(work.join("a~1.png"), png).unwrap();
+    std::fs::create_dir(work.join(".git")).unwrap();
+    std::fs::write(work.join(".git/h.png"), png).unwrap();
+    std::fs::write(perch.root.path().join("out.png"), png).unwrap();
+    std::os::unix::fs::symlink("../out.png", work.join("up.png")).unwrap();
+    let file = |path: &str| perch.get(&format!("/hub/file?session={id}&path={path}"));
+
+    let ok = file("shot.png");
+    assert_eq!(ok.status, 200, "{}", ok.head);
+    for (name, want) in [
+        ("content-type", "image/png"),
+        ("x-content-type-options", "nosniff"),
+        ("content-security-policy", "default-src 'none'; sandbox"),
+        ("cache-control", "private, no-cache"),
+        ("content-disposition", "inline"),
+        ("content-length", "12"),
+    ] {
+        assert_eq!(ok.header(name).as_deref(), Some(want), "{name}: {}", ok.head);
+    }
+    assert!(!ok.has_cors());
+
+    for (path, want) in [("x.svg", 415), ("a.txt", 415), ("fake.png", 415), ("big.png", 413)] {
+        assert_eq!(file(path).status, want, "{path}");
+    }
+    for path in [
+        "..%2Fout.png",
+        "%2Fetc%2Fpasswd",
+        "up.png",
+        "secret.png",
+        "a~1.png",
+        ".git%2Fh.png",
+        "missing.png",
+        "",
+        "shot.png%00",
+        "sub%5Cx.png",
+    ] {
+        let answer = file(path);
+        assert_eq!((answer.status, answer.body.as_str()), (404, ""), "{path}: {}", answer.head);
+    }
+    assert_eq!(perch.get("/hub/file?session=nobody&path=shot.png").status, 404);
+    assert_eq!(perch.get("/hub/file?session=..&path=shot.png").status, 404);
+    assert_eq!(perch.get("/hub/file").status, 400);
+    assert_eq!(perch.get(&format!("/hub/file?session={id}&path=a&path=b")).status, 400);
+    let none = Request::new(&perch.addr, "GET", &format!("/hub/file?session={id}&path=shot.png")).send(&perch.addr);
+    assert_eq!((none.status, none.body.as_str()), (401, ""), "{}", none.head);
+    let post = Request::new(&perch.addr, "POST", &format!("/hub/file?session={id}&path=shot.png")).bearer(perch.auth()).send(&perch.addr);
+    assert_eq!(post.status, 404);
+}
+
+/// A chat that ends mid-turn (a message with no `TurnSettled` after it, as a running turn leaves it) is 409 and nothing is
+/// copied, because a door on the copy would carry the turn on and spend; once the turn is settled the same chat forks. When
+/// eidolon cannot say, it is 503 and nothing is copied. Mutations: skip the check; copy before checking.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_chat_in_the_middle_of_a_turn_is_not_forked() {
+    let (_base, home, perch) = start_home("");
+    let sessions = home.join("sessions");
+    std::fs::write(sessions.join("mid.eid"), chat_log(Some("hello"))).unwrap();
+    let starts = || perch.fake_records().iter().filter(|l| l.starts_with("start ")).count();
+    let answer = perch.post("/hub/sessions/mid/fork");
+    assert_eq!(answer.status, 409, "{}{}", answer.head, answer.body);
+    assert!(answer.body.contains("turn"), "{}", answer.body);
+    assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), 1, "nothing copied");
+    assert_eq!(starts(), 0);
+    std::fs::write(sessions.join("mid.eid"), settled_log("hello")).unwrap();
+    assert_eq!(perch.post("/hub/sessions/mid/fork").status, 201);
+}
+
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_fork_when_eidolon_cannot_say_is_503_and_copies_nothing() {
+    let base = tempfile::tempdir().unwrap();
+    let home = base.path().join("Minerva");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"\n").unwrap();
+    let home = home.canonicalize().unwrap();
+    let extra: Vec<std::ffi::OsString> = vec!["--root".into(), base.path().canonicalize().unwrap().into(), "--home".into(), home.clone().into()];
+    let perch = Perch::launch_with_member(true, Some(vec![("FAKE_HELPER_FAIL".into(), "1".into())]), &extra, Some(""));
+    std::fs::write(home.join("sessions").join("src.eid"), settled_log("hello")).unwrap();
+    assert_eq!(perch.post("/hub/sessions/src/fork").status, 503);
+    assert_eq!(std::fs::read_dir(home.join("sessions")).unwrap().count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Names: birth names, a folder that follows the title, rename, promote (relocate.rs)
+// ---------------------------------------------------------------------------
+
+/// [`start_home`] with the stand-in's own knobs (`FAKE_SAY_RUNS`, ...).
+#[cfg(feature = "test-bins")]
+fn start_home_with(knobs: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Perch) {
+    let base = tempfile::tempdir().unwrap();
+    let home = base.path().join("Minerva");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"\n").unwrap();
+    let home = home.canonicalize().unwrap();
+    let extra: Vec<std::ffi::OsString> = vec!["--root".into(), base.path().canonicalize().unwrap().into(), "--home".into(), home.clone().into()];
+    let knobs = knobs.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect();
+    let perch = Perch::launch_with_member(true, Some(knobs), &extra, Some(""));
+    (base, home, perch)
+}
+
+/// Gives a live chat's log a first message, the way a turn would, with an mtime a few seconds on so `eidolon sessions` is asked again.
+#[cfg(feature = "test-bins")]
+fn say_in_log(home: &std::path::Path, id: &str, first: &str) {
+    let log = home.join("sessions").join(format!("{id}.eid"));
+    std::fs::write(&log, settled_log(first)).unwrap();
+    let at = std::time::SystemTime::now() + Duration::from_secs(5);
+    std::fs::OpenOptions::new().write(true).open(&log).unwrap().set_modified(at).unwrap();
+}
+
+#[cfg(feature = "test-bins")]
+fn cwd_of(perch: &Perch, id: &str) -> PathBuf {
+    PathBuf::from(perch.row(id).unwrap_or_else(|| panic!("{id} is listed"))["cwd"].as_str().expect("a cwd"))
+}
+
+/// The list, polled until the chat's folder is `want` and it is live.
+#[cfg(feature = "test-bins")]
+fn wait_cwd(perch: &Perch, id: &str, want: &std::path::Path, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if perch.row(id).is_some_and(|row| row["cwd"].as_str() == want.to_str() && row["state"] == "live") {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(feature = "test-bins")]
+fn starts_of(perch: &Perch) -> usize {
+    perch.fake_records().iter().filter(|line| line.starts_with("start ")).count()
+}
+
+/// A new chat works in `scratch/<three-word-name>`; once it has a title and is between turns its folder is renamed to the title's slug
+/// (`juice-shop-recon`), the door comes back on the SAME log with `--cwd <new>`, the model and `--yolo` it had, and the files go along.
+/// Two chats with one title get `-2`. Mutations: leave the folder alone; reopen without `--cwd`; drop the model or yolo on the way.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_new_chat_is_born_with_a_three_word_folder_and_follows_its_title_between_turns() {
+    let (_base, home, perch) = start_home_with(&[]);
+    let scratch = home.join("scratch");
+    let id = body_id(&perch.post_json("/hub/sessions", serde_json::json!({ "model": "mock:alpha" })));
+    let birth = cwd_of(&perch, &id);
+    assert_eq!(birth.parent(), Some(scratch.as_path()));
+    let name = birth.file_name().unwrap().to_str().unwrap().to_string();
+    assert!(name.split('-').count() == 3 && name.chars().all(|c| c.is_ascii_lowercase() || c == '-'), "a birth name: {name}");
+    assert_eq!(perch.row(&id).unwrap()["title"], name.as_str(), "called by its birth name until it has a title");
+    assert_eq!(perch.row(&id).unwrap()["inbox"], true);
+    std::fs::write(birth.join("notes.txt"), "kept").unwrap();
+    // Yolo on, so the way back has something to keep.
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{id}/restart"), serde_json::json!({ "yolo": true })).status, 200);
+    let before = starts_of(&perch);
+
+    say_in_log(&home, &id, "juice shop recon");
+    let want = scratch.join("juice-shop-recon");
+    assert!(wait_cwd(&perch, &id, &want, Duration::from_secs(12)), "the folder follows the title: {:?}", perch.row(&id));
+    assert!(!birth.exists(), "the birth folder is gone");
+    assert_eq!(std::fs::read_to_string(want.join("notes.txt")).unwrap(), "kept", "the files went with it");
+    assert_eq!(perch.row(&id).unwrap()["title"], "juice shop recon");
+    assert_eq!(starts_of(&perch), before + 1, "one reopen, and no more (a settled name is left alone)");
+    let argv = perch.fake_argv();
+    let log = home.join("sessions").join(format!("{id}.eid"));
+    assert!(argv.contains("--yolo web "), "yolo kept: {argv}");
+    assert!(argv.contains(&format!("--session {} --cwd {} -m mock:alpha", log.display(), want.display())), "same log, new folder, same model: {argv}");
+    assert!(std::fs::read_to_string(home.join("chat-cwds.json")).unwrap().contains("juice-shop-recon"));
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(starts_of(&perch), before + 1, "settled: no further restart");
+
+    // Another chat with the same title: its folder is `-2`.
+    let other = body_id(&perch.post_json("/hub/sessions", serde_json::json!({})));
+    say_in_log(&home, &other, "Juice shop RECON");
+    assert!(wait_cwd(&perch, &other, &scratch.join("juice-shop-recon-2"), Duration::from_secs(12)), "{:?}", perch.row(&other));
+    for id in [&id, &other] {
+        assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    }
+}
+
+/// A running turn is never cut off for a folder: the rename waits for the turn to end. Mutation: rename while `turn-state` is running.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_busy_chat_keeps_its_folder_until_the_turn_ends() {
+    let (_base, home, perch) = start_home_with(&[("FAKE_SAY_RUNS", "1")]);
+    let id = body_id(&perch.post_json("/hub/sessions", serde_json::json!({})));
+    let birth = cwd_of(&perch, &id);
+    assert_eq!(perch.post_json(&format!("/s/{id}/api/say"), serde_json::json!({ "text": "go" })).status, 202);
+    assert!(wait_record(&perch, Duration::from_secs(3), |lines| lines.iter().any(|line| line == "turn-state true")));
+    say_in_log(&home, &id, "slow recon");
+    let starts = starts_of(&perch);
+    std::thread::sleep(Duration::from_millis(3500));
+    assert_eq!(cwd_of(&perch, &id), birth, "mid-turn: not touched");
+    assert!(birth.is_dir() && starts_of(&perch) == starts);
+    // A promote is a 409 for the same reason.
+    let busy = perch.post_json(&format!("/hub/sessions/{id}/promote"), serde_json::json!({ "parent": home.parent().unwrap(), "name": "slow" }));
+    assert_eq!(busy.status, 409, "{}{}", busy.head, busy.body);
+    assert!(busy.body.contains("turn is running"), "{}", busy.body);
+    assert!(birth.is_dir());
+    assert_eq!(perch.post(&format!("/s/{id}/api/cancel")).status, 204);
+    assert!(wait_cwd(&perch, &id, &home.join("scratch").join("slow-recon"), Duration::from_secs(12)), "{:?}", perch.row(&id));
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+}
+
+/// Only inbox folders are renamed: a chat in a project folder, or in a scratch folder that is registered as a project, keeps its
+/// folder when it is titled or renamed. Mutations: rename any live chat's folder; skip the project check.
+#[cfg(feature = "test-bins")]
+#[test]
+fn project_folders_are_never_renamed() {
+    let (base, home, perch) = start_home_with(&[]);
+    let root = base.path().canonicalize().unwrap();
+    let proj = root.join("my-app");
+    std::fs::create_dir(&proj).unwrap();
+    assert_eq!(perch.post_json("/hub/projects", serde_json::json!({ "path": proj })).status, 201);
+    let in_project = body_id(&perch.post_json("/hub/sessions", serde_json::json!({ "cwd": proj })));
+    let in_inbox = body_id(&perch.post_json("/hub/sessions", serde_json::json!({})));
+    let inbox_dir = cwd_of(&perch, &in_inbox);
+    assert_eq!(perch.post_json("/hub/projects", serde_json::json!({ "path": inbox_dir, "name": "kept" })).status, 201, "a scratch folder that is a project");
+    say_in_log(&home, &in_project, "ship the thing");
+    say_in_log(&home, &in_inbox, "ship the other thing");
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{in_project}/rename"), serde_json::json!({ "title": "Shipping" })).status, 200);
+    std::thread::sleep(Duration::from_millis(3500));
+    assert_eq!(cwd_of(&perch, &in_project), proj);
+    assert_eq!(cwd_of(&perch, &in_inbox), inbox_dir, "a project in scratch is still a project");
+    assert!(proj.is_dir() && inbox_dir.is_dir() && !home.join("scratch").join("ship-the-other-thing").exists());
+    assert_eq!(perch.row(&in_project).unwrap()["title"], "Shipping");
+    for id in [&in_project, &in_inbox] {
+        assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    }
+}
+
+/// `POST /hub/sessions/<id>/rename`: the name is stored (0600), beats the derived title in the list, clears with an empty one, and
+/// refuses bad names and shared-dir chats; a saved inbox chat's folder follows at once, and every way of reopening it (resume, restart,
+/// fork) passes the new folder as `--cwd`. Mutations: ignore the stored name; rename no folder; reopen without `--cwd`.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_rename_beats_the_title_and_the_folder_follows_and_every_reopen_passes_cwd() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_base, home, perch) = start_home_with(&[]);
+    let scratch = home.join("scratch");
+    let id = body_id(&perch.post_json("/hub/sessions", serde_json::json!({ "model": "mock:beta" })));
+    let birth = cwd_of(&perch, &id);
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    assert!(perch.wait_state(&id, "kept", Duration::from_secs(5)));
+    say_in_log(&home, &id, "derived title");
+    assert_eq!(perch.row(&id).unwrap()["title"], "derived title");
+
+    let rename = |body: serde_json::Value| perch.post_json(&format!("/hub/sessions/{id}/rename"), body);
+    let done = rename(serde_json::json!({ "title": "  Cozy Name  " }));
+    assert_eq!(done.status, 200, "{}{}", done.head, done.body);
+    assert_eq!(json_of(&done)["title"], "Cozy Name");
+    assert_eq!(perch.row(&id).unwrap()["title"], "Cozy Name", "the custom name beats the derived one");
+    assert_eq!(std::fs::metadata(home.join("names.json")).unwrap().permissions().mode() & 0o777, 0o600);
+    let folder = scratch.join("cozy-name");
+    assert_eq!(cwd_of(&perch, &id), folder, "a saved inbox chat's folder follows at once");
+    assert!(folder.is_dir() && !birth.exists());
+    assert_eq!(starts_of(&perch), 1, "a saved chat has no door to restart");
+
+    // Every reopen passes the folder: resume, restart, and a fork's door.
+    let log = home.join("sessions").join(format!("{id}.eid"));
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/resume")).status, 200);
+    let want = format!("--session {} --cwd {}", log.display(), folder.display());
+    assert!(perch.fake_argv().contains(&want), "resume: {}", perch.fake_argv());
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{id}/restart"), serde_json::json!({ "model": "mock:beta", "yolo": true })).status, 200);
+    assert!(perch.fake_argv().contains(&want), "restart: {}", perch.fake_argv());
+    std::fs::write(&log, settled_log("derived title")).unwrap();
+    let forked = body_id(&perch.post(&format!("/hub/sessions/{id}/fork")));
+    let argv = perch.fake_records().into_iter().rev().find(|l| l.starts_with("argv ") && l.contains(&format!("{forked}.eid"))).expect("the fork's argv");
+    assert!(argv.contains(&format!("--cwd {} ", folder.display())), "fork: {argv}");
+    // The fork keeps the source's model and yolo, and is called `<title> (fork)`.
+    assert!(argv.contains("--yolo web ") && argv.ends_with(" -m mock:beta"), "{argv}");
+    assert_eq!(perch.row(&forked).unwrap()["title"], "Cozy Name (fork)");
+    // They share one folder, so a rename of either moves it for both, and both doors come back in it.
+    let before = starts_of(&perch);
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{forked}/rename"), serde_json::json!({ "title": "Forked Off" })).status, 200);
+    let moved = scratch.join("forked-off");
+    assert!(wait_cwd(&perch, &forked, &moved, Duration::from_secs(8)) && wait_cwd(&perch, &id, &moved, Duration::from_secs(8)), "{:?} {:?}", perch.row(&forked), perch.row(&id));
+    assert!(moved.is_dir() && !folder.exists());
+    assert_eq!(starts_of(&perch), before + 2, "each door came back once");
+    let argv = perch.fake_argv();
+    assert!(argv.contains(&format!("--cwd {}", moved.display())), "{argv}");
+    // Two titles never take turns renaming a folder they share: the tidy loop leaves it be.
+    std::thread::sleep(Duration::from_millis(3500));
+    assert_eq!((cwd_of(&perch, &forked), cwd_of(&perch, &id)), (moved.clone(), moved.clone()));
+    assert_eq!(starts_of(&perch), before + 2);
+
+    // An empty name clears; a bad one is a 400; a shared-dir chat is read-only; no such chat is a 404.
+    assert_eq!(json_of(&rename(serde_json::json!({ "title": "" })))["title"], "derived title");
+    assert_eq!(rename(serde_json::json!({ "title": "a\nb" })).status, 400);
+    assert_eq!(rename(serde_json::json!({ "title": "x".repeat(121) })).status, 400);
+    assert_eq!(rename(serde_json::json!({ "name": "x" })).status, 400);
+    assert_eq!(rename(serde_json::json!({ "title": "x".repeat(120) })).status, 200);
+    std::fs::write(perch.shared().join("theirs.eid"), chat_log(Some("shared"))).unwrap();
+    assert_eq!(perch.post_json("/hub/sessions/theirs/rename", serde_json::json!({ "title": "mine now" })).status, 403);
+    assert_eq!(perch.post_json("/hub/sessions/nothing-here/rename", serde_json::json!({ "title": "x" })).status, 404);
+    assert_eq!(perch.get(&format!("/hub/sessions/{id}/rename")).status, 404, "POST only");
+    for id in [&id, &forked] {
+        assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    }
+}
+
+/// `POST /hub/projects/rename`: relabels a project, never touches the folder; 404 unknown, 400 a bad name.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_project_can_be_renamed_and_its_folder_is_left_alone() {
+    let (base, _home, perch) = start_home_with(&[]);
+    let proj = base.path().canonicalize().unwrap().join("my-app");
+    std::fs::create_dir(&proj).unwrap();
+    assert_eq!(perch.post_json("/hub/projects", serde_json::json!({ "path": proj })).status, 201);
+    let done = perch.post_json("/hub/projects/rename", serde_json::json!({ "path": proj, "name": " Pretty App " }));
+    assert_eq!(done.status, 200, "{}{}", done.head, done.body);
+    assert_eq!(json_of(&done)["name"], "Pretty App");
+    assert_eq!(json_of(&perch.get("/hub/projects"))[0]["name"], "Pretty App");
+    assert!(proj.is_dir());
+    assert_eq!(perch.post_json("/hub/projects/rename", serde_json::json!({ "path": "/nowhere", "name": "x" })).status, 404);
+    assert_eq!(perch.post_json("/hub/projects/rename", serde_json::json!({ "path": proj, "name": "a\nb" })).status, 400);
+    assert_eq!(perch.post_json("/hub/projects/rename", serde_json::json!({ "path": proj, "name": "  " })).status, 400);
+    assert_eq!(perch.get("/hub/projects/rename").status, 404);
+}
+
+/// `POST /hub/sessions/<id>/promote`: the inbox folder is moved under a chosen parent, registered as a project, and the chat reopens in
+/// it; refused for a chat that is not in the inbox, a parent outside the roots or inside the inbox, a target that exists, a bad name and
+/// a shared folder. Mutations: copy instead of move; skip the project; skip any refusal.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_promoted_chat_moves_into_a_project_and_reopens_there() {
+    let (base, home, perch) = start_home_with(&[]);
+    let root = base.path().canonicalize().unwrap();
+    let projects = root.join("projects");
+    std::fs::create_dir(&projects).unwrap();
+    let id = body_id(&perch.post_json("/hub/sessions", serde_json::json!({ "model": "mock:alpha" })));
+    let birth = cwd_of(&perch, &id);
+    std::fs::create_dir(birth.join("loot")).unwrap();
+    std::fs::write(birth.join("loot/a.txt"), "alpha").unwrap();
+    let promote = |body: serde_json::Value| perch.post_json(&format!("/hub/sessions/{id}/promote"), body);
+
+    // Refusals first: nothing may have moved.
+    assert_eq!(promote(serde_json::json!({ "parent": "/etc", "name": "x" })).status, 422, "outside the roots");
+    assert_eq!(promote(serde_json::json!({ "parent": home.join("scratch"), "name": "x" })).status, 422, "inside the inbox");
+    assert_eq!(promote(serde_json::json!({ "parent": projects, "name": "a/b" })).status, 400);
+    assert_eq!(promote(serde_json::json!({ "parent": projects, "name": ".." })).status, 400);
+    assert_eq!(promote(serde_json::json!({ "parent": projects })).status, 400);
+    std::fs::create_dir(projects.join("taken")).unwrap();
+    assert_eq!(promote(serde_json::json!({ "parent": projects, "name": "taken" })).status, 409, "the target exists");
+    assert!(birth.join("loot/a.txt").is_file() && perch.state_of(&id).as_deref() == Some("live"));
+    assert_eq!(starts_of(&perch), 1, "a refusal stops nothing");
+
+    let done = promote(serde_json::json!({ "parent": projects, "name": "recon-kit" }));
+    assert_eq!(done.status, 200, "{}{}", done.head, done.body);
+    let target = projects.join("recon-kit");
+    assert_eq!(json_of(&done)["path"], target.to_str().unwrap());
+    assert_eq!(json_of(&done)["restarted"], true);
+    assert!(!birth.exists(), "moved, not copied");
+    assert_eq!(std::fs::read_to_string(target.join("loot/a.txt")).unwrap(), "alpha");
+    assert!(wait_cwd(&perch, &id, &target, Duration::from_secs(5)));
+    let listed = json_of(&perch.get("/hub/projects"));
+    assert_eq!(listed[0]["name"], "recon-kit");
+    assert_eq!(listed[0]["path"], target.to_str().unwrap());
+    let log = home.join("sessions").join(format!("{id}.eid"));
+    assert!(perch.fake_argv().contains(&format!("--session {} --cwd {} -m mock:alpha", log.display(), target.display())), "{}", perch.fake_argv());
+    assert_eq!(perch.row(&id).unwrap()["inbox"], false);
+    // Now it works in a project folder: not an inbox chat any more, and its folder follows nothing.
+    assert_eq!(promote(serde_json::json!({ "parent": projects, "name": "again" })).status, 409);
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+
+    // A chat in a folder of its own that was never in the inbox, and a shared-dir chat.
+    let in_work = body_id(&perch.post_json("/hub/sessions", serde_json::json!({ "cwd": perch.work.display().to_string() })));
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{in_work}/promote"), serde_json::json!({ "parent": projects, "name": "w" })).status, 409);
+    std::fs::write(perch.shared().join("theirs.eid"), chat_log(Some("shared"))).unwrap();
+    assert_eq!(perch.post_json("/hub/sessions/theirs/promote", serde_json::json!({ "parent": projects, "name": "w" })).status, 403);
+
+    // A fork shares its source's folder: promoting the source moves it for both, and the fork's door comes back there.
+    let saved = body_id(&perch.post_json("/hub/sessions", serde_json::json!({})));
+    let saved_dir = cwd_of(&perch, &saved);
+    assert_eq!(perch.post(&format!("/hub/sessions/{saved}/stop")).status, 202);
+    assert!(perch.wait_state(&saved, "kept", Duration::from_secs(5)));
+    let fork = body_id(&perch.post(&format!("/hub/sessions/{saved}/fork")));
+    let shared = perch.post_json(&format!("/hub/sessions/{saved}/promote"), serde_json::json!({ "parent": projects, "name": "shared" }));
+    assert_eq!(shared.status, 200, "{}{}", shared.head, shared.body);
+    let target = projects.join("shared");
+    assert!(!saved_dir.exists() && target.is_dir(), "moved once, for both");
+    assert_eq!(cwd_of(&perch, &saved), target);
+    assert!(wait_cwd(&perch, &fork, &target, Duration::from_secs(8)), "{:?}", perch.row(&fork));
+    assert!(perch.fake_argv().contains(&format!("--cwd {}", target.display())), "{}", perch.fake_argv());
+    assert_eq!(perch.post(&format!("/hub/sessions/{fork}/stop")).status, 202);
+
+    // A saved chat is promoted with no door to restart.
+    std::fs::remove_dir(projects.join("taken")).unwrap();
+    let lone = body_id(&perch.post_json("/hub/sessions", serde_json::json!({})));
+    assert_eq!(perch.post(&format!("/hub/sessions/{lone}/stop")).status, 202);
+    assert!(perch.wait_state(&lone, "kept", Duration::from_secs(5)));
+    let before = starts_of(&perch);
+    let moved = perch.post_json(&format!("/hub/sessions/{lone}/promote"), serde_json::json!({ "parent": projects, "name": "taken" }));
+    assert_eq!(moved.status, 200, "{}{}", moved.head, moved.body);
+    assert_eq!(json_of(&moved)["restarted"], false);
+    assert_eq!(starts_of(&perch), before, "promoting a saved chat starts nothing");
+    assert_eq!(cwd_of(&perch, &lone), projects.join("taken"));
+    assert_eq!(perch.state_of(&lone).as_deref(), Some("kept"));
+}
+
+/// A fork of a chat starts with the source's model and yolo and is called `<title> (fork)`. Mutation: a fork with no `-m`.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_fork_keeps_the_model_and_the_mode_and_is_named_for_its_source() {
+    let (_base, home, perch) = start_home_with(&[]);
+    let id = body_id(&perch.post_json("/hub/sessions", serde_json::json!({ "model": "mock:beta" })));
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{id}/restart"), serde_json::json!({ "yolo": true })).status, 200);
+    say_in_log(&home, &id, "plain old title");
+    let forked = body_id(&perch.post(&format!("/hub/sessions/{id}/fork")));
+    let argv = perch.fake_records().into_iter().rev().find(|l| l.starts_with("argv ") && l.contains(&format!("{forked}.eid"))).unwrap();
+    assert!(argv.contains("--yolo web ") && argv.ends_with(" -m mock:beta"), "{argv}");
+    assert_eq!(perch.row(&forked).unwrap()["title"], "plain old title (fork)");
+    // A saved source is forked on what this run remembers of it.
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    assert!(perch.wait_state(&id, "kept", Duration::from_secs(5)));
+    let again = body_id(&perch.post(&format!("/hub/sessions/{id}/fork")));
+    let argv = perch.fake_records().into_iter().rev().find(|l| l.starts_with("argv ") && l.contains(&format!("{again}.eid"))).unwrap();
+    assert!(argv.contains("--yolo web ") && argv.ends_with(" -m mock:beta"), "{argv}");
+    for id in [&forked, &again] {
+        assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /hub/tree and /hub/file for a SAVED chat (read-only, same path checks)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "test-bins")]
+const SAVED_PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+
+/// A chat started in `dir` (under the roots) and stopped: kept, with its folder remembered.
+#[cfg(feature = "test-bins")]
+fn saved_in(perch: &Perch, dir: &std::path::Path) -> String {
+    let id = body_id(&perch.post_json("/hub/sessions", serde_json::json!({ "cwd": dir })));
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    assert!(perch.wait_state(&id, "kept", Duration::from_secs(5)));
+    id
+}
+
+/// A saved chat whose folder is known lists and serves an image exactly as a live one does, with the deny list still on.
+/// Mutation: put back the 409 for a kept row in `tree::base` and the first two asserts go red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_saved_chat_tree_and_image_are_served_with_the_same_checks() {
+    let (base, _home, perch) = start_home("");
+    let proj = base.path().canonicalize().unwrap().join("proj");
+    std::fs::create_dir(&proj).unwrap();
+    std::fs::write(proj.join("shot.png"), SAVED_PNG).unwrap();
+    std::fs::write(proj.join("secret.png"), SAVED_PNG).unwrap();
+    std::fs::write(proj.join(".env"), "K=1").unwrap();
+    std::fs::create_dir(proj.join(".git")).unwrap();
+    std::fs::write(proj.join(".git/h.png"), SAVED_PNG).unwrap();
+    let id = saved_in(&perch, &proj);
+
+    let tree = perch.get(&format!("/hub/tree?session={id}&path="));
+    assert_eq!(tree.status, 200, "{}{}", tree.head, tree.body);
+    assert_eq!(Perch::tree_names(&tree), vec!["shot.png".to_string()], "denied names are still hidden");
+    let file = perch.get(&format!("/hub/file?session={id}&path=shot.png"));
+    assert_eq!(file.status, 200, "{}", file.head);
+    assert_eq!(file.header("content-type").as_deref(), Some("image/png"));
+    for path in ["secret.png", ".git%2Fh.png", "..%2Fx.png", "missing.png"] {
+        assert_eq!(perch.get(&format!("/hub/file?session={id}&path={path}")).status, 404, "{path}");
+    }
+}
+
+/// The folder is judged again on every request: gone or moved is a 404 with a sentence; a link that now leaves the roots too.
+/// Mutation: skip `registry.tree_cwd` for a saved row and the outside case lists /tmp.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_saved_chat_whose_folder_moved_or_left_the_roots_is_refused_with_a_sentence() {
+    let (base, _home, perch) = start_home("");
+    let root = base.path().canonicalize().unwrap();
+    let (moved, left) = (root.join("moved"), root.join("left"));
+    for dir in [&moved, &left] {
+        std::fs::create_dir(dir).unwrap();
+        std::fs::write(dir.join("shot.png"), SAVED_PNG).unwrap();
+    }
+    let (a, b) = (saved_in(&perch, &moved), saved_in(&perch, &left));
+    assert_eq!(perch.get(&format!("/hub/tree?session={a}&path=")).status, 200);
+    std::fs::rename(&moved, root.join("moved-away")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("shot.png"), SAVED_PNG).unwrap();
+    std::fs::remove_dir_all(&left).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &left).unwrap();
+    for id in [&a, &b] {
+        for url in [format!("/hub/tree?session={id}&path="), format!("/hub/file?session={id}&path=shot.png")] {
+            let answer = perch.get(&url);
+            assert_eq!(answer.status, 404, "{url}: {}{}", answer.head, answer.body);
+            assert!(answer.body.contains("folder"), "a sentence for the page: {}", answer.body);
+        }
+    }
+}
+
+/// A trashed chat is no row: 404. A saved chat from the shared dir whose folder the perch does not know is 409 with a sentence.
+/// Mutation: answer 200/404 for a kept row with no cwd and the second half goes red.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_trashed_saved_chat_is_404_and_one_with_no_known_folder_is_409() {
+    let (base, home, perch) = start_home("");
+    let proj = base.path().canonicalize().unwrap().join("proj");
+    std::fs::create_dir(&proj).unwrap();
+    let id = saved_in(&perch, &proj);
+    assert_eq!(perch.get(&format!("/hub/tree?session={id}&path=")).status, 200);
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/trash")).status, 204);
+    assert_eq!(perch.get(&format!("/hub/tree?session={id}&path=")).status, 404);
+    assert_eq!(perch.get(&format!("/hub/file?session={id}&path=shot.png")).status, 404);
+
+    std::fs::write(home.join("sessions").join("nocwd.eid"), chat_log(Some("hello"))).unwrap();
+    for url in ["/hub/tree?session=nocwd&path=", "/hub/file?session=nocwd&path=shot.png"] {
+        let answer = perch.get(url);
+        assert_eq!(answer.status, 409, "{url}: {}{}", answer.head, answer.body);
+        assert!(answer.body.contains("isn't known") && answer.body.contains("kept"), "{}", answer.body);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fork from a point (hub.md section 7c): a pending copy, then a first message that runs `eidolon resume --at`
+// ---------------------------------------------------------------------------
+
+/// Three turns, as eidolon writes them: ids 1/2/3 are the first (user, reply, settled), 4/5/6 the second, 7/8/9 the third; record 2 is a
+/// reply that ended its turn, 5 too. Every record's parent is the one before.
+#[cfg(feature = "test-bins")]
+fn branchy_log() -> String {
+    let said = |role: &str, text: &str| serde_json::json!({ "role": role, "content": [{ "type": "text", "text": text }] });
+    let rec = |id: u64, kind: serde_json::Value| serde_json::json!({ "id": id, "parent": if id == 0 { serde_json::Value::Null } else { serde_json::json!(id - 1) }, "ts_ms": id, "kind": kind });
+    let mut lines = vec![rec(0, serde_json::json!({ "SessionStart": { "model": "mock", "cwd": "/tmp", "system": null } }))];
+    for (turn, first) in [(0u64, "one"), (1, "two"), (2, "three")] {
+        let base = 1 + turn * 3;
+        lines.push(rec(base, serde_json::json!({ "UserMessage": said("user", first) })));
+        lines.push(rec(base + 1, serde_json::json!({ "AssistantMessage": said("assistant", &format!("answer {first}")) })));
+        lines.push(rec(base + 2, serde_json::json!({ "TurnSettled": { "stop_reason": "EndTurn", "usage": {} } })));
+    }
+    lines.iter().map(|line| format!("{line}\n")).collect()
+}
+
+/// A saved chat in `perch.work` that ran with `mock:beta` and `--yolo`, whose log is [`branchy_log`]. Returns its id.
+#[cfg(feature = "test-bins")]
+fn branchy_chat(perch: &Perch, home: &std::path::Path) -> String {
+    let id = body_id(&perch.post_json("/hub/sessions", serde_json::json!({ "cwd": perch.work.display().to_string(), "model": "mock:beta" })));
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{id}/restart"), serde_json::json!({ "yolo": true })).status, 200);
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    assert!(perch.wait_state(&id, "kept", Duration::from_secs(5)));
+    std::fs::write(home.join("sessions").join(format!("{id}.eid")), branchy_log()).unwrap();
+    id
+}
+
+#[cfg(feature = "test-bins")]
+fn first_state(perch: &Perch, id: &str) -> serde_json::Value {
+    json_of(&perch.get(&format!("/hub/sessions/{id}/first")))
+}
+
+/// The state of a fork's first message, polled until it is `want`.
+#[cfg(feature = "test-bins")]
+fn wait_first(perch: &Perch, id: &str, want: &str, within: Duration) -> serde_json::Value {
+    let deadline = Instant::now() + within;
+    loop {
+        let state = first_state(perch, id);
+        if state["state"] == want {
+            return state;
+        }
+        assert!(Instant::now() < deadline, "the first message of {id} never reached {want}: {state}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(feature = "test-bins")]
+fn transcript_ids(perch: &Perch, id: &str) -> Vec<u64> {
+    let answer = perch.get(&format!("/hub/sessions/{id}/transcript"));
+    assert_eq!(answer.status, 200, "{}", answer.head);
+    answer.body.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["id"].as_u64().unwrap()).collect()
+}
+
+#[cfg(feature = "test-bins")]
+fn resumes(perch: &Perch) -> Vec<String> {
+    perch.fake_records().into_iter().filter(|line| line.starts_with("resume ")).collect()
+}
+
+/// A fork at a reply is a PENDING copy: byte for byte the source, no door, listed with `pending` and its source, shows only the chain up
+/// to the point, and cannot be resumed, restarted or forked whole (a door on it would open at the end of the whole copy). The source is
+/// untouched, and nothing was spent. A pending fork can be trashed. Mutations: start a door for it; serve the whole copy as its
+/// transcript; let a resume through; touch the source.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_fork_from_a_reply_is_a_pending_copy_with_no_door() {
+    let (_base, home, perch) = start_home_with(&[]);
+    let id = branchy_chat(&perch, &home);
+    let log = home.join("sessions").join(format!("{id}.eid"));
+    let before = sha(&log);
+    let starts = starts_of(&perch);
+    let made = perch.post_json(&format!("/hub/sessions/{id}/fork"), serde_json::json!({ "at": 2 }));
+    assert_eq!(made.status, 201, "{}{}", made.head, made.body);
+    let new = body_id(&made);
+    let said = json_of(&made);
+    assert_eq!((said["pending"].clone(), said["at"].clone(), said["from"].clone()), (true.into(), 2.into(), id.clone().into()));
+    assert_eq!(sha(&home.join("sessions").join(format!("{new}.eid"))), before, "the copy is whole until its first message");
+    assert_eq!(sha(&log), before, "the source is untouched");
+    assert_eq!(starts_of(&perch), starts, "no door for a pending fork");
+    assert!(resumes(&perch).is_empty(), "and no turn");
+    let row = perch.row(&new).unwrap();
+    assert_eq!((row["state"].clone(), row["pending"].clone(), row["fork_of"].clone()), ("kept".into(), true.into(), id.clone().into()), "{row}");
+    assert_eq!(row["cwd"], perch.work.display().to_string(), "it works where its source does, so it sits in the source's group");
+    assert!(row["title"].as_str().unwrap().ends_with(" (fork)"), "{row}");
+    assert_eq!(perch.row(&id).unwrap()["pending"], false);
+    assert_eq!(transcript_ids(&perch, &new), [0, 1, 2], "history up to and including the point, not the whole copy");
+    assert_eq!(transcript_ids(&perch, &id), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], "the source shows everything");
+    assert_eq!(first_state(&perch, &new)["state"], "none");
+    // Nothing may open a door on it, or fork it whole, or fork from it.
+    for path in [format!("/hub/sessions/{new}/resume"), format!("/hub/sessions/{new}/fork")] {
+        let refused = perch.post(&path);
+        assert_eq!(refused.status, 409, "{path}: {}{}", refused.head, refused.body);
+        assert!(refused.body.contains("first message"), "{}", refused.body);
+    }
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/fork"), serde_json::json!({ "at": 2 })).status, 409);
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/restart"), serde_json::json!({ "yolo": true })).status, 409);
+    assert_eq!(starts_of(&perch), starts);
+    // `first` is only for a pending fork.
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{id}/first"), serde_json::json!({ "text": "x" })).status, 404);
+    assert_eq!(perch.get(&format!("/hub/sessions/{id}/first")).status, 404);
+    // Trash works on it, and it is still pending when it comes back.
+    assert_eq!(perch.post(&format!("/hub/sessions/{new}/trash")).status, 204);
+    assert!(perch.row(&new).is_none());
+    assert_eq!(perch.post(&format!("/hub/trash/{new}/restore")).status, 204);
+    assert_eq!(perch.row(&new).unwrap()["pending"], true);
+}
+
+/// The first message runs stock `eidolon --config C --yolo resume <copy> --at 2 --cwd <dir> -- <text>` (no `-m`: resume has none), with
+/// stdin closed, and when it exits 0 with the turn settled the fork is an ordinary live chat: a door on the copy with the source's
+/// model and mode, pending gone, its history the old branch plus the new turn; the original is unchanged. Mutations: a door before the
+/// run; the message as a flag; no `--at`/`--cwd`/`--config`; leave the fork pending after it ran.
+#[cfg(feature = "test-bins")]
+#[test]
+fn the_first_message_runs_resume_at_the_point_and_then_the_door_comes_up() {
+    let (_base, home, perch) = start_home_with(&[]);
+    let id = branchy_chat(&perch, &home);
+    let log = home.join("sessions").join(format!("{id}.eid"));
+    let before = sha(&log);
+    let new = body_id(&perch.post_json(&format!("/hub/sessions/{id}/fork"), serde_json::json!({ "at": 2 })));
+    let copy = home.join("sessions").join(format!("{new}.eid"));
+    // Refusals first: an empty message, a bad body, an image type the door does not take. None of them runs anything.
+    for body in [serde_json::json!({ "text": "   " }), serde_json::json!({ "words": "x" }), serde_json::json!({ "text": "x", "images": [{ "media_type": "image/bmp", "data": "AAAA" }] })] {
+        assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/first"), body.clone()).status, 400, "{body}");
+    }
+    assert!(resumes(&perch).is_empty());
+    let started = perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "-rf go on" }));
+    assert_eq!(started.status, 202, "{}{}", started.head, started.body);
+    let done = wait_first(&perch, &new, "done", Duration::from_secs(10));
+    assert!(done["out"].as_str().unwrap().contains("echo: -rf go on"), "the run's output is kept for the page: {done}");
+    let records = perch.fake_records();
+    let ran: Vec<&String> = records.iter().filter(|l| l.starts_with("resume ")).collect();
+    assert_eq!(ran.len(), 1, "{records:?}");
+    let line = ran[0];
+    let want = format!("config=true yolo=true log={} at=2 cwd={} images= text=-rf go on", copy.display(), perch.work.display());
+    assert!(line.contains(&want), "{line}");
+    assert!(!line.contains(" -m "), "resume takes no -m");
+    let door = records.iter().position(|l| l.starts_with("argv ") && l.contains(&format!("{new}.eid"))).expect("a door for the copy");
+    assert!(records.iter().position(|l| l.starts_with("resume ")).unwrap() < door, "the turn ran before the door came up");
+    assert!(records[door].contains("--yolo web ") && records[door].contains(&format!("--cwd {}", perch.work.display())) && records[door].ends_with(" -m mock:beta"), "{}", records[door]);
+    let row = perch.row(&new).unwrap();
+    assert_eq!((row["state"].clone(), row["pending"].clone(), row["fork_of"].clone()), ("live".into(), false.into(), id.clone().into()), "{row}");
+    assert_eq!(transcript_ids(&perch, &new), [0, 1, 2, 10, 11, 12], "the old branch up to the point, then the new turn");
+    assert_eq!(sha(&log), before, "the original is unchanged");
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "again" })).status, 404, "it is not pending any more");
+    assert_eq!(perch.post(&format!("/hub/sessions/{new}/stop")).status, 202);
+    assert!(perch.wait_state(&new, "kept", Duration::from_secs(5)));
+    assert_eq!(perch.row(&new).unwrap()["pending"], false);
+    assert_eq!(transcript_ids(&perch, &new), [0, 1, 2, 10, 11, 12], "a saved fork shows its own branch too");
+}
+
+/// A run that fails (eidolon exits non-zero) leaves the fork pending with the sentence, appends nothing, starts no door, and can be
+/// tried again; a turn that stops part way (no `TurnSettled`) is a failure too, because a door on it would carry the turn on by itself.
+/// Mutations: bring the door up anyway; drop the pending mark on failure; ignore the settled check.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_failed_first_message_keeps_the_fork_pending_and_can_be_retried() {
+    let (_base, home, perch) = start_home_with(&[("FAKE_RESUME_FAIL", "3")]);
+    let id = branchy_chat(&perch, &home);
+    let new = body_id(&perch.post_json(&format!("/hub/sessions/{id}/fork"), serde_json::json!({ "at": 5 })));
+    let copy = home.join("sessions").join(format!("{new}.eid"));
+    let before = sha(&copy);
+    let starts = starts_of(&perch);
+    for round in 1..=2 {
+        assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "try" })).status, 202, "round {round}");
+        let failed = wait_first(&perch, &new, "failed", Duration::from_secs(10));
+        let why = failed["error"].as_str().unwrap();
+        assert!(why.contains("exited") && why.contains("provider refused"), "the sentence says what eidolon said: {why}");
+        assert_eq!(resumes(&perch).len(), round);
+    }
+    assert_eq!((sha(&copy), starts_of(&perch)), (before, starts), "nothing appended, no door");
+    assert_eq!(perch.row(&new).unwrap()["pending"], true);
+    assert_eq!(transcript_ids(&perch, &new), [0, 1, 2, 3, 4, 5]);
+    assert_eq!(perch.post(&format!("/hub/sessions/{new}/trash")).status, 204, "a failed fork can still be trashed");
+
+    let (_base, home, perch) = start_home_with(&[("FAKE_RESUME_UNSETTLED", "1")]);
+    let id = branchy_chat(&perch, &home);
+    let new = body_id(&perch.post_json(&format!("/hub/sessions/{id}/fork"), serde_json::json!({ "at": 2 })));
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "half" })).status, 202);
+    let failed = wait_first(&perch, &new, "failed", Duration::from_secs(10));
+    assert!(failed["error"].as_str().unwrap().contains("did not finish"), "{failed}");
+    assert_eq!(perch.row(&new).unwrap()["pending"], true);
+    assert!(perch.fake_records().iter().all(|l| !(l.starts_with("argv ") && l.contains(&format!("{new}.eid")))), "no door on a log that ends mid-turn");
+}
+
+/// A first message that runs too long is killed (its process is gone) and the fork stays pending, with a sentence that says so.
+/// While it runs, a second first message and a trash are refused. Mutations: no timeout; leave the child running; allow a second run.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_first_message_that_runs_too_long_is_killed_and_a_running_one_blocks_the_rest() {
+    let (_base, home, perch) = start_home_with(&[("FAKE_RESUME_SLEEP_MS", "30000"), ("MINERVA_PERCH_FIRST_MS", "1500")]);
+    let id = branchy_chat(&perch, &home);
+    let new = body_id(&perch.post_json(&format!("/hub/sessions/{id}/fork"), serde_json::json!({ "at": 2 })));
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "slow" })).status, 202);
+    let running = wait_first(&perch, &new, "running", Duration::from_secs(5));
+    assert!(running["elapsed_ms"].as_u64().is_some());
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "again" })).status, 409, "one run at a time");
+    let trash = perch.post(&format!("/hub/sessions/{new}/trash"));
+    assert_eq!(trash.status, 409, "{}{}", trash.head, trash.body);
+    let failed = wait_first(&perch, &new, "failed", Duration::from_secs(10));
+    assert!(failed["error"].as_str().unwrap().contains("longer than"), "{failed}");
+    let line = resumes(&perch).pop().expect("a resume was run");
+    let pid: u32 = line.split_whitespace().find_map(|w| w.strip_prefix("pid=")).unwrap().parse().unwrap();
+    assert!(wait_gone(pid, Duration::from_secs(5)), "the timed-out eidolon was killed, not left running");
+    assert_eq!(perch.row(&new).unwrap()["pending"], true);
+    assert_eq!(perch.post(&format!("/hub/sessions/{new}/trash")).status, 204);
+}
+
+/// Images in the first message go to `--image <file>` (written `0600` in a folder of the home, gone when the run ends); the unsupported
+/// kinds and too many are a 400 with nothing run. Mutations: drop the images; leave the files behind; pass base64 in argv.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_first_message_can_carry_images_as_files_that_do_not_outlive_the_run() {
+    let (_base, home, perch) = start_home_with(&[]);
+    let id = branchy_chat(&perch, &home);
+    let new = body_id(&perch.post_json(&format!("/hub/sessions/{id}/fork"), serde_json::json!({ "at": 2 })));
+    let pics: Vec<serde_json::Value> = (0..9).map(|_| serde_json::json!({ "media_type": "image/png", "data": "QUJD" })).collect();
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "x", "images": pics })).status, 400, "nine is too many");
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "x", "images": [{ "media_type": "image/png", "data": "not base64!" }] })).status, 400);
+    assert!(resumes(&perch).is_empty());
+    let sent = perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "look", "images": [{ "media_type": "image/png", "data": "QUJD" }, { "media_type": "image/webp", "data": "QUJDRA==" }] }));
+    assert_eq!(sent.status, 202, "{}{}", sent.head, sent.body);
+    wait_first(&perch, &new, "done", Duration::from_secs(10));
+    let line = resumes(&perch).pop().unwrap();
+    assert!(line.contains(" images=3,4 text=look"), "the fake read both files by the paths it was given: {line}");
+    assert!(!home.join(format!("first-{new}")).exists(), "the picture files are gone");
+}
+
+/// A folder several chats share moves for ALL of them: renaming the source moves the folder under its fork (live) and under a pending
+/// fork (only its remembered folder changes), the live ones come back with `--cwd <new>`, the same model and mode; a chat that is
+/// mid-turn among them refuses the rename, by name, and nothing moves or is renamed. Mutations: refuse a shared folder as before; move
+/// it for the asked chat only; ignore a busy sharer.
+#[cfg(feature = "test-bins")]
+#[test]
+fn renaming_a_shared_folder_moves_it_for_every_chat_and_refuses_when_one_is_busy() {
+    let (_base, home, perch) = start_home_with(&[("FAKE_SAY_RUNS", "1")]);
+    let scratch = home.join("scratch");
+    let src = body_id(&perch.post_json("/hub/sessions", serde_json::json!({ "model": "mock:alpha" })));
+    let birth = cwd_of(&perch, &src);
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{src}/restart"), serde_json::json!({ "yolo": true })).status, 200);
+    // The log the forks copy: settled, with records (the stand-in door's own log has none).
+    std::fs::write(home.join("sessions").join(format!("{src}.eid")), branchy_log()).unwrap();
+    let fork = body_id(&perch.post(&format!("/hub/sessions/{src}/fork")));
+    assert_eq!(cwd_of(&perch, &fork), birth, "a fork shares its source's folder");
+    // A fork from a point beside them: saved, never had a door.
+    let pending = body_id(&perch.post_json(&format!("/hub/sessions/{src}/fork"), serde_json::json!({ "at": 2 })));
+    assert_eq!(cwd_of(&perch, &pending), birth);
+
+    // A turn in the fork: the rename of the SOURCE is refused and says whose turn it is, and nothing changed.
+    assert_eq!(perch.post_json(&format!("/s/{fork}/api/say"), serde_json::json!({ "text": "work" })).status, 202);
+    assert!(wait_record(&perch, Duration::from_secs(3), |lines| lines.iter().any(|line| line == "turn-state true")));
+    let busy = perch.post_json(&format!("/hub/sessions/{src}/rename"), serde_json::json!({ "title": "Moved Together" }));
+    assert_eq!(busy.status, 409, "{}{}", busy.head, busy.body);
+    assert!(busy.body.contains("(fork)") && busy.body.contains("wait for it to finish"), "it names the chat to wait for: {}", busy.body);
+    assert_eq!(cwd_of(&perch, &src), birth);
+    assert!(birth.is_dir() && !scratch.join("moved-together").exists());
+    assert_ne!(perch.row(&src).unwrap()["title"], "Moved Together", "the name was not kept either");
+    assert_eq!(perch.post(&format!("/s/{fork}/api/cancel")).status, 204);
+    assert!(wait_record(&perch, Duration::from_secs(3), |lines| lines.iter().any(|line| line == "turn-state false")));
+
+    let before = starts_of(&perch);
+    let done = perch.post_json(&format!("/hub/sessions/{src}/rename"), serde_json::json!({ "title": "Moved Together" }));
+    assert_eq!(done.status, 200, "{}{}", done.head, done.body);
+    let moved = scratch.join("moved-together");
+    assert!(moved.is_dir() && !birth.exists(), "the folder moved once");
+    for id in [&src, &fork] {
+        assert!(wait_cwd(&perch, id, &moved, Duration::from_secs(8)), "{id}: {:?}", perch.row(id));
+    }
+    assert_eq!(cwd_of(&perch, &pending), moved, "a pending fork's remembered folder follows");
+    assert_eq!(perch.row(&pending).unwrap()["state"], "kept");
+    assert_eq!(starts_of(&perch), before + 2, "the two live doors came back, the pending one has none");
+    let argv: Vec<String> = perch.fake_records().into_iter().filter(|l| l.starts_with("argv ")).rev().take(2).collect();
+    assert!(argv.iter().all(|l| l.contains(&format!("--cwd {}", moved.display())) && l.contains("--yolo web ")), "{argv:?}");
+    assert!(argv.iter().any(|l| l.contains(&format!("{src}.eid")) && l.ends_with(" -m mock:alpha")), "{argv:?}");
+    // The pending fork still opens where its source now works: its first message is run with the new folder.
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{pending}/first"), serde_json::json!({ "text": "go" })).status, 202);
+    wait_first(&perch, &pending, "done", Duration::from_secs(10));
+    assert!(resumes(&perch).pop().unwrap().contains(&format!(" cwd={} ", moved.display())));
+    for id in [&src, &fork, &pending] {
+        assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    }
+}
+
+/// Promoting a shared inbox folder moves it for every chat that uses it, and a chat mid-turn among them refuses it, by name.
+/// Mutations: refuse a shared folder as before; move it for the asked chat only.
+#[cfg(feature = "test-bins")]
+#[test]
+fn promoting_a_shared_folder_moves_every_chat_and_waits_for_a_busy_one() {
+    let (base, home, perch) = start_home_with(&[("FAKE_SAY_RUNS", "1")]);
+    let projects = base.path().canonicalize().unwrap().join("projects");
+    std::fs::create_dir(&projects).unwrap();
+    let src = body_id(&perch.post_json("/hub/sessions", serde_json::json!({ "model": "mock:alpha" })));
+    let birth = cwd_of(&perch, &src);
+    std::fs::write(home.join("sessions").join(format!("{src}.eid")), branchy_log()).unwrap();
+    assert_eq!(perch.post(&format!("/hub/sessions/{src}/stop")).status, 202);
+    assert!(perch.wait_state(&src, "kept", Duration::from_secs(5)));
+    std::fs::write(home.join("sessions").join(format!("{src}.eid")), branchy_log()).unwrap();
+    let fork = body_id(&perch.post(&format!("/hub/sessions/{src}/fork")));
+    assert_eq!(perch.post_json(&format!("/s/{fork}/api/say"), serde_json::json!({ "text": "work" })).status, 202);
+    assert!(wait_record(&perch, Duration::from_secs(3), |lines| lines.iter().any(|line| line == "turn-state true")));
+    let promote = |name: &str| perch.post_json(&format!("/hub/sessions/{src}/promote"), serde_json::json!({ "parent": projects, "name": name }));
+    let busy = promote("both");
+    assert_eq!(busy.status, 409, "{}{}", busy.head, busy.body);
+    assert!(busy.body.contains("same folder") && busy.body.contains("wait for it to finish"), "{}", busy.body);
+    assert!(birth.is_dir() && !projects.join("both").exists());
+    assert_eq!(perch.post(&format!("/s/{fork}/api/cancel")).status, 204);
+    assert!(wait_record(&perch, Duration::from_secs(3), |lines| lines.iter().any(|line| line == "turn-state false")));
+    let done = promote("both");
+    assert_eq!(done.status, 200, "{}{}", done.head, done.body);
+    let target = projects.join("both");
+    assert!(target.is_dir() && !birth.exists());
+    assert_eq!(cwd_of(&perch, &src), target);
+    assert!(wait_cwd(&perch, &fork, &target, Duration::from_secs(8)), "{:?}", perch.row(&fork));
+    assert_eq!(json_of(&done)["restarted"], false, "the source was saved: no door to bring back");
+    assert_eq!(perch.post(&format!("/hub/sessions/{fork}/stop")).status, 202);
+}
+
+// ---------------------------------------------------------------------------
+// The second review round (2026-10-06): unsettled doors, model order, runs that outlive the perch, process groups, the home's own folders
+// ---------------------------------------------------------------------------
+
+/// Writes `text` as a chat's log with an mtime a few seconds on, so `eidolon sessions` is asked again.
+#[cfg(feature = "test-bins")]
+fn write_log(home: &std::path::Path, id: &str, text: &str) {
+    let log = home.join("sessions").join(format!("{id}.eid"));
+    std::fs::write(&log, text).unwrap();
+    let at = std::time::SystemTime::now() + Duration::from_secs(5);
+    std::fs::OpenOptions::new().write(true).open(&log).unwrap().set_modified(at).unwrap();
+}
+
+/// A live door whose log ends mid-turn (a message unanswered: a provider error, a cancel) is never stopped to move its folder or to
+/// switch its model: reopening that log would carry the turn on by itself, a paid turn nobody asked for. The tidy loop skips it
+/// quietly, promote and restart are a 409 with a sentence, and nothing is started or moved; once the log is settled the folder follows.
+/// Mutations: drop the settled check in `relocate` (the folder moves and a door is started); drop it in `restart`.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_door_whose_log_ended_mid_turn_is_not_stopped_to_be_moved_or_restarted() {
+    let (_base, home, perch) = start_home_with(&[]);
+    let id = body_id(&perch.post_json("/hub/sessions", serde_json::json!({ "model": "mock:alpha" })));
+    let birth = cwd_of(&perch, &id);
+    write_log(&home, &id, &chat_log(Some("slow recon")));
+    let starts = starts_of(&perch);
+    std::thread::sleep(Duration::from_millis(3500));
+    assert_eq!(cwd_of(&perch, &id), birth, "the tidy loop leaves an unsettled chat's folder alone");
+    assert_eq!(starts_of(&perch), starts, "and starts no door on its log");
+    let promote = perch.post_json(&format!("/hub/sessions/{id}/promote"), serde_json::json!({ "parent": home.parent().unwrap(), "name": "slow" }));
+    assert_eq!(promote.status, 409, "{}{}", promote.head, promote.body);
+    assert!(promote.body.contains("ended mid-turn"), "{}", promote.body);
+    let restart = perch.post_json(&format!("/hub/sessions/{id}/restart"), serde_json::json!({ "yolo": true }));
+    assert_eq!(restart.status, 409, "{}{}", restart.head, restart.body);
+    assert!(restart.body.contains("ended mid-turn"), "{}", restart.body);
+    assert!(birth.is_dir() && starts_of(&perch) == starts, "nothing moved, nothing reopened");
+    // Settled again: the same chat is moved as before.
+    say_in_log(&home, &id, "slow recon");
+    assert!(wait_cwd(&perch, &id, &home.join("scratch").join("slow-recon"), Duration::from_secs(15)), "{:?}", perch.row(&id));
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+}
+
+/// A new chat that names no model gets the Minerva config's: no `-m` in the door's argv at all. A bad model name is a 400 and starts nothing.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_new_chat_with_no_model_passes_none_and_a_bad_model_is_a_400() {
+    let (_base, _home, perch) = start_home_with(&[]);
+    let starts = starts_of(&perch);
+    let bad = perch.post_json("/hub/sessions", serde_json::json!({ "model": "mock; rm -rf" }));
+    assert_eq!(bad.status, 400, "{}{}", bad.head, bad.body);
+    assert_eq!(starts_of(&perch), starts);
+    let id = body_id(&perch.post_json("/hub/sessions", serde_json::json!({})));
+    let argv = perch.fake_argv();
+    assert!(!argv.contains(" -m ") && !argv.contains("--model"), "the config's default_model decides, not the request: {argv}");
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+}
+
+/// The Minerva home is a root so the inbox works, but its own folders are not a chat's folder, a project, a place to make folders, or
+/// something the picker lists; `scratch/<chat>` still is. Mutation: drop `is_home_internal` from `cwd_under_a_root`.
+#[cfg(feature = "test-bins")]
+#[test]
+fn the_minerva_homes_own_folders_are_not_offered() {
+    let (_base, home, perch) = start_home_with(&[]);
+    for dir in [home.clone(), home.join("sessions"), home.join("scratch")] {
+        let answer = perch.post_json("/hub/sessions", serde_json::json!({ "cwd": dir }));
+        assert_eq!(answer.status, 422, "{}: {}{}", dir.display(), answer.head, answer.body);
+        assert_eq!(perch.post_json("/hub/projects", serde_json::json!({ "path": dir })).status, 422, "{}", dir.display());
+    }
+    assert_eq!(perch.get(&format!("/hub/dirs?path={}", home.join("sessions").display())).status, 404, "not listed");
+    assert_eq!(perch.get(&format!("/hub/dirs?path={}", home.display())).status, 404);
+    assert_eq!(perch.post_json("/hub/dirs", serde_json::json!({ "parent": home, "name": "mine" })).status, 422);
+    assert!(!home.join("mine").exists());
+    let made = home.join("scratch").join("a-chat-folder");
+    std::fs::create_dir_all(&made).unwrap();
+    let id = body_id(&perch.post_json("/hub/sessions", serde_json::json!({ "cwd": made })));
+    assert_eq!(perch.get(&format!("/hub/dirs?path={}", home.join("scratch").display())).status, 200, "scratch is listed, to reach its chats");
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+}
+
+#[cfg(feature = "test-bins")]
+fn pgid_of(pid: u32) -> u32 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_else(|e| panic!("/proc/{pid}/stat: {e}"));
+    stat.rsplit_once(')').unwrap().1.split_whitespace().nth(2).unwrap().parse().unwrap()
+}
+
+/// The pid a fork's first-message run reported (`resume pid=<n> ...`), waited for.
+#[cfg(feature = "test-bins")]
+fn run_pid(perch: &Perch) -> u32 {
+    let line = (0..50).find_map(|_| resumes(perch).pop().or_else(|| { std::thread::sleep(Duration::from_millis(100)); None })).expect("a resume");
+    line.split_whitespace().find_map(|w| w.strip_prefix("pid=")).unwrap().parse().unwrap()
+}
+
+/// A door and a fork's first-message run are each their own process group, so a stop or a timeout can signal the group and the tools
+/// they started die too. Mutation: drop `process_group(0)` in `spawn::fork` or in `pending::ran`.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_door_and_a_first_message_run_are_their_own_process_groups() {
+    let (_base, home, perch) = start_home_with(&[("FAKE_RESUME_SLEEP_MS", "6000")]);
+    let id = branchy_chat(&perch, &home);
+    let live = body_id(&perch.post_json("/hub/sessions", serde_json::json!({})));
+    let (door, _) = perch.fake_last_start();
+    assert_eq!(pgid_of(door), door, "a door leads its own group");
+    assert_eq!(perch.post(&format!("/hub/sessions/{live}/stop")).status, 202);
+    let new = body_id(&perch.post_json(&format!("/hub/sessions/{id}/fork"), serde_json::json!({ "at": 2 })));
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "slow" })).status, 202);
+    wait_first(&perch, &new, "running", Duration::from_secs(5));
+    let pid = run_pid(&perch);
+    assert_eq!(pgid_of(pid), pid, "the run leads its own group");
+}
+
+/// forks.json as a map.
+#[cfg(feature = "test-bins")]
+fn forks_json(home: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(home.join("forks.json")).unwrap()).unwrap()
+}
+
+/// A second perch on the same home as one that was killed, with the stand-in's own knobs.
+#[cfg(feature = "test-bins")]
+fn relaunch(base: &tempfile::TempDir, home: &std::path::Path, knobs: &[(&str, &str)]) -> Perch {
+    let extra: Vec<std::ffi::OsString> = vec!["--root".into(), base.path().canonicalize().unwrap().into(), "--home".into(), home.to_path_buf().into()];
+    let knobs = knobs.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect();
+    Perch::launch_with_member(true, Some(knobs), &extra, Some(""))
+}
+
+/// A first message under way: the pending fork, the run's pid, and the perch killed with `kill -9` while the run goes on.
+#[cfg(feature = "test-bins")]
+fn orphaned_first_message(knobs: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, String, u32, Perch) {
+    let (base, home, perch) = start_home_with(knobs);
+    let id = branchy_chat(&perch, &home);
+    let new = body_id(&perch.post_json(&format!("/hub/sessions/{id}/fork"), serde_json::json!({ "at": 2 })));
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "while away" })).status, 202);
+    wait_first(&perch, &new, "running", Duration::from_secs(5));
+    let pid = run_pid(&perch);
+    let running = forks_json(&home)[&new]["running"].clone();
+    assert_eq!(running["pid"], pid, "the run is written down while it runs: {running}");
+    assert_eq!(running["base"], 9, "with the highest record the copy had");
+    assert_eq!(unsafe { libc::kill(perch.child.id() as i32, libc::SIGKILL) }, 0, "kill -9 the perch");
+    assert!(!is_gone(pid), "the run outlives the perch");
+    // Returned so its work folder (where the run was told to work) outlives the run.
+    (base, home, new, pid, perch)
+}
+
+/// The perch dies while a first message runs and a new one starts on the same home: the run is still going, so the fork reads `running`,
+/// a second first message is a 409, and when the run ends having written a settled turn the fork is an ordinary saved chat, with no
+/// door brought up and nothing continued. Mutations: keep `running` in memory only (the restart says `none` and lets a second run in).
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_run_that_outlives_the_perch_is_found_and_settled_without_bringing_a_door_up() {
+    let (base, home, new, pid, _first) = orphaned_first_message(&[("FAKE_RESUME_SLEEP_MS", "5000")]);
+    let perch = relaunch(&base, &home, &[]);
+    let state = first_state(&perch, &new);
+    assert_eq!(state["state"], "running", "{state}");
+    let again = perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "a second one" }));
+    assert_eq!(again.status, 409, "{}{}", again.head, again.body);
+    assert!(resumes(&perch).is_empty(), "no second run");
+    assert!(wait_gone(pid, Duration::from_secs(20)));
+    wait_first(&perch, &new, "none", Duration::from_secs(10));
+    let row = perch.row(&new).unwrap();
+    assert_eq!((row["pending"].clone(), row["state"].clone()), (false.into(), "kept".into()), "{row}");
+    assert_eq!(starts_of(&perch), 0, "nothing was brought up");
+    assert!(resumes(&perch).is_empty());
+    assert!(forks_json(&home)[&new].get("running").is_none(), "the mark is cleared");
+}
+
+/// The run is dead when the perch comes back, and wrote a turn that stopped part way: the fork says so, stays pending, and nothing is
+/// continued (no door, no resume). Mutation: bring a door up on it, or settle it.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_run_that_died_part_way_is_failed_with_a_sentence_and_never_continued() {
+    let (base, home, new, pid, _first) = orphaned_first_message(&[("FAKE_RESUME_SLEEP_MS", "1500"), ("FAKE_RESUME_UNSETTLED", "1")]);
+    assert!(wait_gone(pid, Duration::from_secs(10)));
+    let perch = relaunch(&base, &home, &[]);
+    let failed = wait_first(&perch, &new, "failed", Duration::from_secs(10));
+    assert!(failed["error"].as_str().unwrap().contains("did not finish"), "{failed}");
+    assert_eq!(perch.row(&new).unwrap()["pending"], true);
+    assert_eq!(starts_of(&perch), 0);
+    assert!(resumes(&perch).is_empty());
+}
+
+/// The run was killed before it wrote anything: the fork is simply pending again (state none) and a new first message can be sent.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_run_that_wrote_nothing_leaves_the_fork_pending_and_free_to_try_again() {
+    let (base, home, new, pid, _first) = orphaned_first_message(&[("FAKE_RESUME_SLEEP_MS", "30000")]);
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
+    assert!(wait_gone(pid, Duration::from_secs(10)));
+    let perch = relaunch(&base, &home, &[]);
+    wait_first(&perch, &new, "none", Duration::from_secs(10));
+    assert_eq!(perch.row(&new).unwrap()["pending"], true);
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "again" })).status, 202);
+    wait_first(&perch, &new, "done", Duration::from_secs(10));
 }

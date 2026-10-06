@@ -127,6 +127,38 @@ pub struct Listing {
     pub truncated: bool,
 }
 
+/// Where a tree or file request starts: the cwd of a live door, or the remembered folder of a saved (kept) chat.
+/// A saved chat is served read-only through exactly the same checks; only the words of a refusal differ.
+pub enum Base {
+    Live(std::path::PathBuf),
+    Saved(std::path::PathBuf),
+}
+
+/// The 404 sentence of a saved chat whose folder cannot be used now (moved, deleted, or no longer under a `--root`).
+pub const SAVED_GONE: &str = "this chat's folder has moved, been deleted, or is no longer allowed";
+
+/// The one question both `/hub/tree` and `/hub/file` ask first: which cwd, or which refusal. A live door's cwd as ever
+/// (409 `{"state"}` when it is between states); else a kept row whose folder is known ([`Base::Saved`]); a kept row with no
+/// known folder is a 409 with a sentence; a row that is live elsewhere keeps its 409 state; anything else (a trashed id
+/// is no row at all) is 404. The cwd is re-judged against `--root` by the caller, per request.
+pub fn base(ctx: &crate::serve::Ctx, id: &str) -> Result<Base, Box<hyper::Response<crate::serve::BoxBody>>> {
+    use crate::serve::{json, status};
+    use crate::sessions::{State, TreeRoot};
+    use hyper::StatusCode;
+    match ctx.registry.tree_root(id) {
+        TreeRoot::Live(root) => Ok(Base::Live(root)),
+        TreeRoot::Not(state) => Err(Box::new(json(StatusCode::CONFLICT, &serde_json::json!({ "state": state })))),
+        TreeRoot::NotOurs => match ctx.registry.list().into_iter().find(|row| row.id == id) {
+            Some(row) if row.state == State::Kept => match row.cwd {
+                Some(cwd) => Ok(Base::Saved(cwd.into())),
+                None => Err(Box::new(json(StatusCode::CONFLICT, &serde_json::json!({ "state": row.state, "error": "this chat's folder isn't known" })))),
+            },
+            Some(row) => Err(Box::new(json(StatusCode::CONFLICT, &serde_json::json!({ "state": row.state })))),
+            None => Err(Box::new(status(StatusCode::NOT_FOUND))),
+        },
+    }
+}
+
 /// Steps 2-6, blocking: the caller runs it under `spawn_blocking`. `None` is the 404.
 ///
 /// `floor` is the `--root` that contains `root` (the cwd): the cwd's own segments below it are
@@ -135,7 +167,9 @@ pub fn list(root: &Path, floor: &Path, rel: &str) -> Option<Listing> {
     list_bounded(root, floor, rel, SCAN_MAX)
 }
 
-fn list_bounded(root: &Path, floor: &Path, rel: &str, scan_max: usize) -> Option<Listing> {
+/// Steps 2-4, blocking: the canonical path `rel` names under `root` (the cwd), or `None`, which is every
+/// refusal. Whether it is a directory or a file is the caller's question; [`list`] and the file route share it.
+pub fn resolve(root: &Path, floor: &Path, rel: &str) -> Option<std::path::PathBuf> {
     let segments = segments(rel)?;
     if segments.iter().any(|s| refused(s)) {
         return None;
@@ -157,6 +191,11 @@ fn list_bounded(root: &Path, floor: &Path, rel: &str, scan_max: usize) -> Option
     if inside.components().any(|c| refused(&c.as_os_str().to_string_lossy())) {
         return None;
     }
+    Some(real)
+}
+
+fn list_bounded(root: &Path, floor: &Path, rel: &str, scan_max: usize) -> Option<Listing> {
+    let real = resolve(root, floor, rel)?;
     if !std::fs::metadata(&real).ok()?.is_dir() {
         return None;
     }
@@ -391,7 +430,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let locked = dir.path().join("locked");
         std::fs::create_dir(&locked).unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         // Root reads anything; the check is only meaningful for an ordinary user.
         if unsafe { libc::geteuid() } != 0 {
             assert!(list(dir.path(), dir.path(), "locked").is_none());

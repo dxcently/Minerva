@@ -46,7 +46,7 @@ use crate::files::{self, Static};
 use crate::folders;
 use crate::gate;
 use crate::proxy;
-use crate::sessions::{self, ExitWatch, Registry, TreeRoot};
+use crate::sessions::{self, ExitWatch, Registry};
 use crate::spawn::{self, Spawner};
 use crate::titles;
 use crate::tree;
@@ -348,7 +348,7 @@ async fn route(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, In
     //    method with no route must not be answered as though its body had been read, and
     //    an unbounded PUT must not be read at all. The proxy is what reads a POST's body,
     //    as a stream.
-    if gated && method != Method::GET && method != Method::POST && !(method == Method::DELETE && path.starts_with("/hub/projects/")) {
+    if gated && method != Method::GET && method != Method::POST && !(method == Method::DELETE && path == "/hub/projects") {
         return Ok(status(StatusCode::METHOD_NOT_ALLOWED));
     }
 
@@ -438,28 +438,46 @@ async fn hub(ctx: &Ctx, method: &Method, path: &str, query: &str, body: &Bytes, 
         ("POST", "/hub/code") => json(StatusCode::OK, &serde_json::json!({ "code": ctx.logins.mint_code() })),
         ("POST", REDEEM) => redeem(ctx, body),
         ("GET", "/hub/tree") => tree(ctx, query).await,
+        ("GET", "/hub/file") => crate::rawfile::serve(ctx, query).await,
         ("GET", "/hub/models") => crate::restart::models(ctx).await,
         ("GET", "/hub/projects") => folders::projects_get(ctx),
         ("POST", "/hub/projects") => folders::projects_post(ctx, body).await,
-        ("DELETE", _) if path.starts_with("/hub/projects/") => folders::projects_delete(ctx, &path["/hub/projects/".len()..]),
+        ("DELETE", "/hub/projects") => folders::projects_delete(ctx, body),
+        ("POST", "/hub/projects/rename") => folders::projects_rename(ctx, body),
+        ("GET", "/hub/trash") => crate::trash::list(ctx).await,
+        ("POST", "/hub/trash/empty") => crate::trash::empty(ctx, body).await,
         ("GET", "/hub/dirs") => folders::dirs_get(ctx, query).await,
         ("POST", "/hub/dirs") => folders::dirs_post(ctx, body).await,
-        ("GET", _) => match session_verb(path, query) {
-            Some((id, Verb::Log)) => log(ctx, id).await,
+        ("GET", _) => match (crate::images::route(path), session_verb(path, query)) {
+            (Some(found), _) => crate::images::serve(ctx, found, query).await,
+            (None, Some((id, Verb::Log))) => log(ctx, id).await,
+            (None, Some((id, Verb::First))) => crate::pending::state(ctx, id),
             _ => status(StatusCode::NOT_FOUND),
         },
         ("POST", _) => match session_verb(path, query) {
             Some((id, Verb::Resume)) => resume(ctx, id).await,
             Some((id, Verb::Stop)) => stop(ctx, id).await,
             Some((id, Verb::Restart)) => crate::restart::restart(ctx, id, body).await,
-            Some((_, Verb::Log)) | None => status(StatusCode::NOT_FOUND),
+            Some((id, Verb::Fork)) => crate::fork::fork(ctx, id, body).await,
+            Some((id, Verb::First)) => crate::pending::first(ctx, id, body).await,
+            Some((id, Verb::Archive)) => crate::trash::archive(ctx, id, true).await,
+            Some((id, Verb::Unarchive)) => crate::trash::archive(ctx, id, false).await,
+            Some((id, Verb::Pin)) => crate::trash::pin(ctx, id, true).await,
+            Some((id, Verb::Unpin)) => crate::trash::pin(ctx, id, false).await,
+            Some((id, Verb::Trash)) => crate::trash::trash(ctx, id, body).await,
+            Some((id, Verb::Rename)) => crate::relocate::rename(ctx, id, body).await,
+            Some((id, Verb::Promote)) => crate::relocate::promote(ctx, id, body).await,
+            Some((_, Verb::Log)) | None => match trash_verb(path, query) {
+                Some(id) => crate::trash::restore(ctx, id).await,
+                None => status(StatusCode::NOT_FOUND),
+            },
         },
         _ => status(StatusCode::NOT_FOUND),
     }
 }
 
 /// `GET /hub/tree?session=<id>&path=<rel>` (hub.md section 7): the query is parsed in
-/// [`tree::parse_query`] (400), the session must be a live door of ours (404 unknown, 409
+/// [`tree::parse_query`] (400), the session must be a live door of ours or a saved chat whose folder is known ([`tree::base`]; 404 unknown, 409
 /// `{"state"}` otherwise), and everything about the path is [`tree::list`]'s one empty 404.
 /// The listing runs under `spawn_blocking`, holding one of [`tree::MAX_LISTINGS`] slots (a full house
 /// is a 503), and its root is re-checked against `--root` there.
@@ -468,17 +486,10 @@ async fn tree(ctx: &Ctx, query: &str) -> Response<BoxBody> {
     if !sessions::id_ok(&id) {
         return status(StatusCode::NOT_FOUND);
     }
-    let root = match ctx.registry.tree_root(&id) {
-        TreeRoot::Live(root) => root,
-        TreeRoot::Not(state) => return json(StatusCode::CONFLICT, &serde_json::json!({ "state": state })),
-        // Kept and live-elsewhere rows are not served (Q9): they get their state, and an id
-        // that is no row at all is a 404.
-        TreeRoot::NotOurs => {
-            return match ctx.registry.list().into_iter().find(|row| row.id == id) {
-                Some(row) => json(StatusCode::CONFLICT, &serde_json::json!({ "state": row.state })),
-                None => status(StatusCode::NOT_FOUND),
-            };
-        }
+    let (root, saved) = match tree::base(ctx, &id) {
+        Ok(tree::Base::Live(root)) => (root, false),
+        Ok(tree::Base::Saved(root)) => (root, true),
+        Err(refusal) => return *refusal,
     };
     // A slot before any work, and before the path is looked at, so a full house answers the same
     // whatever the path is. The permit travels into the blocking task and is dropped when the
@@ -487,15 +498,17 @@ async fn tree(ctx: &Ctx, query: &str) -> Response<BoxBody> {
         return problem(StatusCode::SERVICE_UNAVAILABLE, "too many directory listings in flight; retry");
     };
     let registry = ctx.registry.clone();
-    let listed = tokio::task::spawn_blocking(move || {
+    let listed = tokio::task::spawn_blocking(move || -> Result<Option<tree::Listing>, ()> {
         let _slot = permit;
         // The cwd is judged against `--root` now, whoever stored it: a resumed session's cwd is
         // what its log said, and the tree is not for `/`.
-        let (root, floor) = registry.tree_cwd(&root)?;
-        tree::list(&root, &floor, &rel)
+        // A saved chat whose folder is unusable now says so in a sentence; a live one keeps the empty 404.
+        let Some((root, floor)) = registry.tree_cwd(&root) else { return if saved { Err(()) } else { Ok(None) } };
+        Ok(tree::list(&root, &floor, &rel))
     });
     match listed.await {
-        Ok(Some(listing)) => json(StatusCode::OK, &listing),
+        Ok(Ok(Some(listing))) => json(StatusCode::OK, &listing),
+        Ok(Err(())) => problem(StatusCode::NOT_FOUND, tree::SAVED_GONE),
         _ => status(StatusCode::NOT_FOUND),
     }
 }
@@ -505,8 +518,32 @@ enum Verb {
     Stop,
     /// `{"model"?, "yolo"?}`: stop the door and resume the same log with the new flags, between turns (restart.rs).
     Restart,
+    /// `{"at"?}`: a new chat copied from this one, whole (fork.rs).
+    Fork,
+    /// `{"text", "images"?, "yolo"?}` runs a pending fork's first message; a `GET` is how it is going (pending.rs).
+    First,
     /// `GET` only; a `POST` to it is the 404 of a route that is not there.
     Log,
+    /// Into `other` by hand, and back; pinned to the top, and not (trash.rs).
+    Archive,
+    Unarchive,
+    Pin,
+    Unpin,
+    /// `{"stop"?: bool}`: move the log into `<home>/trash/` (trash.rs).
+    Trash,
+    /// `{"title"}`: a name by hand; an inbox chat's folder follows it (relocate.rs).
+    Rename,
+    /// `{"parent", "name"}`: an inbox chat's folder becomes a project (relocate.rs).
+    Promote,
+}
+
+/// `POST /hub/trash/<id>/restore`: the id, when the path is exactly that.
+fn trash_verb<'a>(path: &'a str, query: &str) -> Option<&'a str> {
+    if !query.is_empty() {
+        return None;
+    }
+    let (id, verb) = path.strip_prefix("/hub/trash/")?.split_once('/')?;
+    (verb == "restore").then_some(id)
 }
 
 /// `<id>/resume` and `<id>/stop`, and the id is handed back exactly as it was spelled: it is
@@ -525,7 +562,16 @@ fn session_verb<'a>(path: &'a str, query: &str) -> Option<(&'a str, Verb)> {
             "resume" => Verb::Resume,
             "stop" => Verb::Stop,
             "restart" => Verb::Restart,
+            "fork" => Verb::Fork,
+            "first" => Verb::First,
             "log" => Verb::Log,
+            "archive" => Verb::Archive,
+            "unarchive" => Verb::Unarchive,
+            "pin" => Verb::Pin,
+            "unpin" => Verb::Unpin,
+            "trash" => Verb::Trash,
+            "rename" => Verb::Rename,
+            "promote" => Verb::Promote,
             _ => return None,
         },
     ))
@@ -546,11 +592,14 @@ async fn new_session(ctx: &Ctx, body: &Bytes) -> Response<BoxBody> {
     let Ok(asked) = serde_json::from_slice::<Asked>(body) else {
         return problem(StatusCode::BAD_REQUEST, SHAPE);
     };
+    if asked.model.as_deref().is_some_and(|model| !crate::models::key_ok(model)) {
+        return problem(StatusCode::BAD_REQUEST, "that is not a model name (letters, digits and : . _ - / @ + only)");
+    }
     // No cwd is the Minerva home's scratch dir, when the perch has a home; without one it is the
     // refusal it always was: a body that names no cwd is a 400.
     let wanted = match (&asked.cwd, &ctx.registry.scratch) {
         (Some(cwd), _) => PathBuf::from(cwd),
-        (None, Some(scratch)) => match fresh_scratch(scratch) {
+        (None, Some(scratch)) => match crate::names::fresh_scratch(scratch) {
             Ok(dir) => dir,
             Err(e) => {
                 tracing::warn!(error = %e, path = %scratch.display(), "perch: a scratch dir could not be created");
@@ -587,39 +636,6 @@ async fn new_session(ctx: &Ctx, body: &Bytes) -> Response<BoxBody> {
     ctx.registry.insert(id.clone(), hello.session, cwd, pid, port, token, watcher, exit);
     ctx.registry.set_flags(&id, &model, yolo);
     json(StatusCode::CREATED, &serde_json::json!({ "id": id }))
-}
-
-/// A new directory for one folderless chat: `<scratch>/<YYYYMMDD-HHMMSS>`, then `-2`, `-3`, ... when that is
-/// taken. `create_dir` (not `create_dir_all`) is what makes the name this chat's alone, as eidolon's own
-/// `create_session` does for a log.
-fn fresh_scratch(scratch: &std::path::Path) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(scratch)?;
-    let stamp = utc_stamp(std::time::SystemTime::now());
-    for n in 1..1000 {
-        let dir = scratch.join(if n == 1 { stamp.clone() } else { format!("{stamp}-{n}") });
-        match std::fs::create_dir(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free scratch name"))
-}
-
-/// `YYYYMMDD-HHMMSS` in UTC (days-to-civil, Hinnant's algorithm): a name, not a clock, so no time crate.
-fn utc_stamp(at: std::time::SystemTime) -> String {
-    let secs = at.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}{month:02}{day:02}-{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 /// `GET /hub/sessions/<id>/log`: a saved chat as eidolon's own `log --json` lines (one record per line), so the page
@@ -666,14 +682,22 @@ async fn resume(ctx: &Ctx, id: &str) -> Response<BoxBody> {
     if ctx.registry.id_of_log(&log).as_deref() != Some(id) {
         return status(StatusCode::NOT_FOUND);
     }
+    // A fork from a point has no door until its first message has run: a door on the copy would open at the end of the whole copy.
+    if ctx.registry.forks.is_pending(id) {
+        return problem(StatusCode::CONFLICT, "that fork is waiting for its first message: send one, and it opens by itself");
+    }
     // §4 step 2, both halves: our own children, and the roster — upstream has no `flock`, so
     // two writers on one log is a corruption the perch can at least refuse to start.
-    if ctx.registry.held(&log) || ctx.registry.roster_holds(&log) {
+    if ctx.registry.held(&log) || ctx.registry.roster_holds(&log) || ctx.registry.is_moving(id) {
         return problem(StatusCode::CONFLICT, "that log is already held by a live session");
     }
     // Reserve, fork, check it opened this log, go live: restart.rs, which a model switch shares.
     match crate::restart::bring_up(ctx, id, &log, None, false).await {
-        Ok(_) => json(StatusCode::OK, &serde_json::json!({ "id": id })),
+        Ok(_) => {
+            // Continuing a chat is activity: an archived one is back among the active (with a fresh week).
+            crate::trash::continued(ctx, id);
+            json(StatusCode::OK, &serde_json::json!({ "id": id }))
+        }
         Err(crate::restart::Failed::Held) => problem(StatusCode::CONFLICT, "that log is already held by a live session"),
         Err(crate::restart::Failed::Spawn(why)) => problem(StatusCode::SERVICE_UNAVAILABLE, &why),
     }
@@ -833,14 +857,6 @@ async fn statics(ui: &Static, method: &Method, path: &str) -> Response<BoxBody> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_scratch_stamp_is_the_utc_date_and_time() {
-        let at = |secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-        assert_eq!(utc_stamp(at(0)), "19700101-000000");
-        assert_eq!(utc_stamp(at(1_709_209_599)), "20240229-122639", "a leap day");
-        assert_eq!(utc_stamp(at(1_791_158_400 + 3_661)), "20261005-010101");
-    }
 
     #[test]
     fn the_gated_namespaces_are_the_two_the_route_table_names() {

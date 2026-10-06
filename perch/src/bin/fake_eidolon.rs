@@ -4,6 +4,9 @@
 //! one. This binary is the door's **contract** and nothing else (hub.md §12), modelled on
 //! eidolon at `0194f2b` (see `README.md` beside this file for what that means):
 //!
+//! - `eidolon [--config C] [--yolo] resume <log> --at N [--cwd D] [--image P]... [--] <text>`: records the argv to FAKE_LOG, reads stdin to
+//!   EOF, then appends user + assistant (`echo: <text>`) + turn-settled records after `at` (knobs FAKE_RESUME_SLEEP_MS, FAKE_RESUME_FAIL=<code>,
+//!   FAKE_RESUME_UNSETTLED);
 //! - the argv `eidolon [--config C] [--yolo] web --bind ADDR (--cwd DIR | --session PATH) [-m MODEL]`, and the
 //!   argv is recorded so a test can show there is no token in it, and that a restart passed `-m` / `--yolo`; `hello`
 //!   reports the `-m` model (`mock` without one) and whether `--yolo` was given; the model `nope` is a door that
@@ -115,6 +118,9 @@ fn main() {
     // A door prints two lines and nothing else on stdout, ever (§10.4: nothing a child
     // prints may carry a token). Diagnostics would go to stderr, which the perch inherits.
     let argv: Vec<String> = std::env::args().collect();
+    if resume(&argv) {
+        return;
+    }
     if helper(&argv) {
         return;
     }
@@ -145,6 +151,8 @@ fn main() {
 ///   `$FAKE_SESSIONS_DIR` when a `--config` was given (the Minerva home's) and from eidolon's own default
 ///   (`$XDG_DATA_HOME/eidolon/sessions`) when not, as the real one reads the dir its config names. The first message is
 ///   read from the log as eidolon's `log --json` lines (a `UserMessage` record); a log that is not that has none.
+/// - `log PATH --after N` (fork.rs's settled check) prints `head: None  settled: <bool>`: false when the file's last record is a
+///   user or assistant message or `"Cancelled"`;
 /// - `log --json PATH` prints the file as it is: a test writes the lines it wants the page to get.
 /// - `FAKE_HELPER_FAIL=1` makes both exit 1 (the perch must fall back to a name, not fail the list).
 fn helper(argv: &[String]) -> bool {
@@ -178,6 +186,18 @@ fn helper(argv: &[String]) -> bool {
         println!();
         println!("{:<40} {:<30} mock · 10k ctx · free", "mock:alpha", "Alpha");
         println!("{:<40} {:<30} mock · 20k ctx · $1/2 per M", "mock:beta", "Beta");
+        return true;
+    }
+    // `log --json` prints the log file as it is: a test writes the lines in the real shape (image blocks carry
+    // `source.data` base64, verified against eidolon 0.1.0; see `image_log` in tests/http.rs), and the fake does not interpret them.
+    if command == "log" && argv.iter().any(|a| a == "--after") {
+        // The settled check (fork.rs): `log PATH --after N` past the end prints only the `head:` line. A log is settled when its
+        // last record is not a user or assistant message or a cancel, as eidolon's `is_settled` reads the end of a branch.
+        let path = argv.iter().skip_while(|a| *a != "log").nth(1).expect("a path");
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let last = text.lines().rev().find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok());
+        let open = last.as_ref().and_then(|r| r.get("kind")).is_some_and(|k| k.get("UserMessage").is_some() || k.get("AssistantMessage").is_some() || k.as_str() == Some("Cancelled"));
+        println!("head: None  settled: {}", !open);
         return true;
     }
     if command == "log" {
@@ -262,8 +282,9 @@ impl Args {
             }
         }
         let bind = bind.ok_or("--bind is required")?;
-        if session.is_some() == cwd.is_some() {
-            return Err("exactly one of --session or --cwd is required".into());
+        // `--session` with `--cwd` is eidolon's reopen-time override: the tools run in `--cwd`, and `hello.cwd` says so.
+        if session.is_none() && cwd.is_none() {
+            return Err("--session or --cwd is required".into());
         }
         Ok(Self { bind, session, cwd, model, yolo })
     }
@@ -712,4 +733,92 @@ fn write_token(path: &Path, token: &str) {
 fn owner_only(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("setting the mode");
+}
+
+/// `eidolon [--config C] [--yolo] resume <log> --at N [--cwd D] [--image P]... [--] <text>`: the headless turn a fork from a point
+/// runs. It reads stdin to the end first (a closed stdin is what the perch gives it: an open one hangs here, and the test times out),
+/// records its argv to `$FAKE_LOG` as one `resume ...` line (with the byte count of every `--image` file), then appends to the log, as
+/// eidolon's turn would, a user message whose parent is `N`, an assistant reply and a `TurnSettled`, and prints the reply on stdout.
+/// Knobs: `FAKE_RESUME_SLEEP_MS` (works that long first; the timeout test), `FAKE_RESUME_FAIL=<code>` (an error line on stderr, that
+/// exit code, nothing appended), `FAKE_RESUME_UNSETTLED` (leaves the turn without its `TurnSettled`).
+/// Returns whether argv was a `resume`.
+fn resume(argv: &[String]) -> bool {
+    use std::io::Read as _;
+    let mut rest = argv.iter().skip(1).peekable();
+    let (mut config, mut yolo) = (false, false);
+    loop {
+        match rest.peek().map(|arg| arg.as_str()) {
+            Some("--config") => {
+                rest.next();
+                rest.next();
+                config = true;
+            }
+            Some("--yolo") => {
+                rest.next();
+                yolo = true;
+            }
+            _ => break,
+        }
+    }
+    if rest.next().map(String::as_str) != Some("resume") {
+        return false;
+    }
+    let log = PathBuf::from(rest.next().expect("a log"));
+    let (mut at, mut cwd, mut images, mut text) = (None, None, Vec::new(), Vec::new());
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--at" => at = rest.next().and_then(|n| n.parse::<u64>().ok()),
+            "--cwd" => cwd = rest.next().cloned(),
+            "--image" => images.push(rest.next().cloned().expect("an image path")),
+            "--" => {
+                text.extend(rest.by_ref().cloned());
+            }
+            other => {
+                eprintln!("fake_eidolon: resume: unknown argument {other:?}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let text = text.join(" ");
+    let sizes: Vec<String> = images.iter().map(|path| std::fs::read(path).map(|b| b.len().to_string()).unwrap_or_else(|_| "missing".into())).collect();
+    if let Some(path) = std::env::var_os("FAKE_LOG").map(PathBuf::from)
+        && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(file, "resume pid={} config={config} yolo={yolo} log={} at={} cwd={} images={} text={text}", std::process::id(), log.display(), at.map(|n| n.to_string()).unwrap_or_default(), cwd.clone().unwrap_or_default(), sizes.join(","));
+    }
+    let mut sink = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut sink);
+    if let Some(ms) = std::env::var("FAKE_RESUME_SLEEP_MS").ok().and_then(|ms| ms.parse().ok()) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+    if let Some(code) = std::env::var("FAKE_RESUME_FAIL").ok().and_then(|code| code.parse::<i32>().ok()) {
+        eprintln!("[error] the provider refused the request");
+        std::process::exit(code);
+    }
+    if cwd.as_deref().is_some_and(|dir| !Path::new(dir).is_dir()) {
+        eprintln!("fake_eidolon: resume: --cwd is not a directory");
+        std::process::exit(1);
+    }
+    let old = std::fs::read_to_string(&log).unwrap_or_default();
+    let next = old.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).filter_map(|r| r["id"].as_u64()).max().unwrap_or(0) + 1;
+    let at = at.unwrap_or(next - 1);
+    // Writes that may fail: a perch that died takes the pipes with it, and a run that outlives it must still finish.
+    let _ = writeln!(std::io::stderr(), "[forked at #{at}]");
+    let reply = format!("echo: {text}");
+    let user = serde_json::json!({ "id": next, "parent": at, "ts_ms": next, "kind": { "UserMessage": { "role": "user", "content": [{ "type": "text", "text": text }] } } });
+    let bot = serde_json::json!({ "id": next + 1, "parent": next, "ts_ms": next + 1, "kind": { "AssistantMessage": { "role": "assistant", "content": [{ "type": "text", "text": reply }] } } });
+    let end = serde_json::json!({ "id": next + 2, "parent": next + 1, "ts_ms": next + 2, "kind": { "TurnSettled": { "stop_reason": "EndTurn", "usage": {} } } });
+    let mut add = String::new();
+    if !old.is_empty() && !old.ends_with('\n') {
+        add.push('\n');
+    }
+    for record in [&user, &bot] {
+        add.push_str(&format!("{record}\n"));
+    }
+    if std::env::var_os("FAKE_RESUME_UNSETTLED").is_none() {
+        add.push_str(&format!("{end}\n"));
+    }
+    std::fs::OpenOptions::new().append(true).open(&log).and_then(|mut file| file.write_all(add.as_bytes())).expect("appending to the log");
+    let _ = writeln!(std::io::stdout(), "{reply}");
+    true
 }

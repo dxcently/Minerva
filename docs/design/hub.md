@@ -77,15 +77,23 @@ Static serving: the door's rules, ported (not depended on): one percent-decode, 
 | POST | `/hub/redeem` | **no** (host, fetch-metadata and a 1 KiB body cap still apply) | trade a code `{code}` for the session cookie (section 10.5) | 204 + `Set-Cookie` / 403 |
 | GET | `/hub/sessions` | yes | list kept + live (section 4) | 200 `[{id, state, title, origin?, cwd?, busy?, panes, mtime}]` |
 | GET | `/hub/sessions/<id>/log` | yes | a saved chat as eidolon's `log --json` lines, read-only (section 4, "Titles and saved chats") | 200 `application/x-ndjson` / 404 / 413 over 16 MiB / 504 / 502 |
+| GET | `/hub/sessions/<id>/images` | yes | the images in a chat (`[{record, n, media_type, where, bytes, tool_call?, alt?}]`), from `eidolon log --json`; the door never carries image bytes | 200 / 404 / 413 over 128 MiB / 504 / 502 |
+| GET | `/hub/sessions/<id>/image/<record>/<n>` | yes | one image's bytes, only png/jpeg/gif/webp (`nosniff`, `private, max-age=3600`) | 200 / 415 other type / 404 / 413 / 504 / 502 |
+| GET | `/hub/sessions/<id>/transcript` | yes | the `log` lines with every image's `data` emptied, so a chat with pictures still fits 16 MiB | 200 `application/x-ndjson` / 404 / 413 / 504 / 502 |
 | POST | `/hub/sessions` | yes | spawn a new session `{cwd, model?}` | 201 `{id}` / 422 cwd outside roots / 503 spawn failed |
 | POST | `/hub/sessions/<id>/resume` | yes | spawn a door on a kept log | 200 / 409 live here or elsewhere / 404 |
 | POST | `/hub/sessions/<id>/stop` | yes | SIGTERM that door | 202 / 409 not live |
 | POST | `/hub/sessions/<id>/restart` | yes | `{model?, yolo?}`: stop the door, resume the same log with `-m` / `--yolo`, only between turns (section "Model and mode") | 200 `{id, model, yolo, restarted}` / 400 / 404 / 409 turn running, starting, not running here / 503 `{error, reverted}` |
+| POST | `/hub/sessions/<id>/fork` | yes | `{}`: copy the log byte for byte to a new id and bring a door up on the copy (section 7c). `{at}`: a PENDING copy with no door (section 7c) | 201 `{id, from}` or `{id, from, at, pending:true}` / 400 / 404 / 409 mid-turn / 422 not a forkable reply / 503 |
+| GET, POST | `/hub/sessions/<id>/first` | yes | GET: state of a pending fork's first message `{state: none/running/failed/done, elapsed_ms, out, error?}`. POST `{text, images?, yolo?}`: run stock `eidolon resume <copy> --at N` once (section 7c) | 202 `{id, state:"running"}` / 400 / 404 / 409 running, held or moving |
 | GET | `/hub/models` | yes | the models `eidolon [--config C] models` lists, cached 10 min | 200 `[{key, name?, note?}]` / 504 / 502 |
 | GET | `/hub/events` | yes | SSE: `session-state {id, state}` whenever the list changes | stream |
-| GET | `/hub/tree?session=<id>&path=<rel>` | yes | one directory under the live session's cwd (section 7) | 200 / 404 / 409 not live |
+| GET | `/hub/tree?session=<id>&path=<rel>` | yes | one directory under the live (or saved, read-only) session's cwd (section 7) | 200 / 404 / 409 not live or folder unknown |
+| GET | `/hub/file?session=<id>&path=<rel>` | yes | the bytes of one png/jpeg/gif/webp file under the live session's cwd, the tree's path rules (section 7b; svg refused) | 200 / 404 / 409 not live or folder unknown / 413 over 20 MiB / 415 / 503 |
 | GET, POST | `/hub/projects` | yes | the named folders in `<home>/projects.json`; POST `{path, name?}` adds one (section "Projects and the folder picker") | 200 `[{name, path, created}]` / 201 new, 200 existing / 400 name / 422 path outside the roots / 503 no home |
-| DELETE | `/hub/projects/<n>` | yes | forget entry `n`; never the folder | 204 / 404 |
+| DELETE | `/hub/projects` | yes | `{path}`: forget the project at that path; never the folder | 204 / 400 / 404 |
+| POST | `/hub/sessions/<id>/{archive,unarchive,pin,unpin,trash}` | yes | other / pinned / trash marks of a chat of the Minerva home (section "Archive, pin and trash") | 204 / 403 / 404 / 409 |
+| GET, POST | `/hub/trash`, `/hub/trash/<id>/restore`, `/hub/trash/empty` | yes | the trash: list, put back, remove for good (`{confirm: true}`) | 200 / 204 / 400 / 404 / 409 |
 | GET | `/hub/dirs?path=<abs>` | yes | the subfolders of one folder under the roots; no path is the roots | 200 `{path, label, parent, crumbs, dirs, truncated}` / 404 / 503 |
 | POST | `/hub/dirs` | yes | `{parent, name}`: make one folder inside a root | 201 `{path, name}` / 400 name / 409 exists / 422 outside |
 | GET | `/hub/mesh` | yes | Aoide snapshot (section 8) | 200 `{available, nodes, mesh, cache, graph}` |
@@ -135,7 +143,7 @@ The token gate covers the bare `/hub`, `/s` and everything under them, before pa
 | 6 | the token path must be `<runtime>/eidolon/web-<port>.token` with the port from line 1; open `O_NOFOLLOW`, check owner uid and `& 077 == 0`, read, hold in memory | never trust a path a child printed without checking it |
 | 7 | open the watcher stream; `live` after `hello` | also gives `hello.session` (the log path, hence the id for a new session) and `hello.cwd` (stream.rs:59-72) |
 
-**Resume can spend.** A door that opens a log whose last message is unanswered starts a turn by itself (lib.rs:225 `finish_unsettled`; driver.rs:478 test `..._registers_a_running_turn_for_an_orphaned_message`; observed). So the perch **never auto-restarts** a door, and the page must label Resume as "may continue the last turn".
+**Resume can spend.** A door that opens a log whose last message is unanswered starts a turn by itself (lib.rs:225 `finish_unsettled`; driver.rs:478 test `..._registers_a_running_turn_for_an_orphaned_message`; observed). So the perch **never auto-restarts** a door, and the page must label Resume as "may continue the last turn". The same holds for every stop-then-reopen the perch does on its own account: a folder move (`relocate`, the tidy loop, promote, a shared folder's rename) and a model or mode switch (`restart`) first ask eidolon's own `log` whether each door's log is settled, and refuse when it is not (or eidolon cannot say): the tidy loop skips that chat quietly and looks again in ten seconds, a route answers 409 "that chat ended mid-turn; continue it first". A door that is idle on an unsettled log is what a provider error or a cancel leaves behind.
 
 **Stop.** SIGTERM (the door drains, removes its token, main.rs:660) -> 10 s -> SIGKILL and the perch deletes the token file. `eidolon door quiesce` was considered and rejected: it journals a `quiesced` marker naming a destination (main.rs:396-417) that reads as a hop to another machine, which an idle stop is not.
 
@@ -208,7 +216,7 @@ Several panes on one session = several proxied `/api/events` streams to one door
 
 ## 7. Project tree: `GET /hub/tree?session=<id>&path=<rel>`
 
-Live sessions only (the root is `hello.cwd` from the watcher, the reopen-time cwd, main.rs:1536-1543); kept -> 409.
+Live sessions (the root is `hello.cwd` from the watcher, the reopen-time cwd, main.rs:1536-1543) and, since 2026-10-06 (operator ruling), **saved (kept) chats whose folder the perch knows** (`chat-cwds.json`, else what it learned from eidolon), read-only, through every check below. The folder is re-judged against `--root` and for existence on every request: a saved chat whose folder moved, vanished or left the roots is a 404 with `{"error": "..."}` (a sentence the page shows); a kept chat with no known folder (the shared dir, whose start record the perch does not decode) is a 409 `{"state":"kept","error":"this chat's folder isn't known"}`; a trashed id is no row, so 404; live-elsewhere and the between-states keep their 409 `{"state"}`.
 
 | Step | Rule | Refusal |
 |---|---|---|
@@ -224,6 +232,25 @@ Deny list (case-insensitive, whole name): `.git` (hidden entirely), `.env`, `.en
 Response: `{"path":"src","entries":[{"name":"main.rs","kind":"file","size":1234},{"name":"lib","kind":"dir"},{"name":"out","kind":"link"}],"skipped":0,"truncated":false}`. Links show no target (a target string can name paths outside the root). Non-UTF-8 names are counted in `skipped`. **No file contents, ever.** File viewing belongs to the door or `/api/launch` (editor window).
 
 Accepted: a TOCTOU swap between canonicalize and `read_dir` needs write access as the operator's own user, which is out of scope (the door's files.rs:14-16 accepts the same).
+
+### 7b. `GET /hub/file?session=<id>&path=<rel>`: one image under the cwd (2026-10-06)
+
+Operator ruling (option A): images **produced** by eidolon must be viewable. eidolon's tool results are text-only, so "produced" means an image file a tool wrote into the chat's folder (`shot.png`). This route returns its bytes, and nothing else.
+
+Steps 1-4 of section 7 apply unchanged, because it is the same function (`tree::resolve`): the deny list and the 8.3 shape on every segment (of the path, of the cwd below its `--root`, and of what a link resolved to), the canonical path under the cwd, no link out, empty 404 for all of it; the session is a live door or a saved chat with a known folder (section 7; the same refusals, 409 otherwise), a full house of the listing slots is 503. Then:
+
+| Rule | Refusal |
+|---|---|
+| a regular file (not a directory, not a FIFO) | 404 |
+| extension is `png`, `jpg`, `jpeg`, `gif` or `webp`, any case | 415 |
+| at most 20 MiB (read bounded one byte past, so a file that grew is still capped) | 413 |
+| leading bytes are that format's magic and agree with the extension (of the asked name and of the name a link led to) | 415 |
+
+Answer headers: the right `Content-Type`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`, `Cache-Control: private, no-cache` (a file is rewritten under the same name), `Content-Disposition: inline`. Token or cookie like every `/hub` route.
+
+**Why no svg.** An svg is a document: it can carry `<script>` and event handlers. Served from the page's own origin and opened in a tab (the viewer has `open in new tab`), the script would run with the origin's cookie. The `sandbox` CSP and `nosniff` already close that for the four bitmap formats, which a browser only ever draws; svg is the one format where "only draw" is not true, so it is a 415 and not an allow-list entry to be argued later. **Why magic bytes.** The extension is a name the model chose; a text or HTML file called `x.png` must not leave with an `image/png` label from a route that a person then opens.
+
+The page uses it from the files panel (an image row opens the viewer) and from assistant text (a path ending in an image extension that resolves inside the chat's cwd is a click target; nothing is fetched until the click). The page's guess about the cwd is only a guess: this route is the check.
 
 ---
 
@@ -349,6 +376,7 @@ Minerva/perch/                own Cargo.toml + Cargo.lock; not an eidolon worksp
   src/watch.rs                watcher streams, running/parked inference, idle reaper
   src/proxy.rs                /s/<id>/api/*, rewrite tables, hub-stream-end
   src/tree.rs                 /hub/tree
+  src/rawfile.rs              /hub/file
   src/mesh.rs                 snapshot + aoided subscribe / events.jsonl tail
   src/bin/fake_eidolon.rs     test double, required-features = ["test-bins"]
   tests/http.rs               real HTTP against a perch on 127.0.0.1:0
@@ -428,17 +456,19 @@ Run in WSL2 (ext4 target dir), like the door's reported numbers.
 | Q6 | `--root` default for new sessions | `$HOME` |
 | Q7 | Mesh event classes: `audit` + `gate`, or also `secret` (names only)? | `audit`, `gate` |
 | Q8 | Accept `Host: localhost:<port>` as well as the IP? A Windows browser over WSL forwarding may send it; the door refuses it (serve.rs:118-132 compares the IP string) | accept `localhost` literally; no other names |
-| Q9 | Should `/hub/tree` also serve kept sessions (root from the log's start record)? | no, live only |
+| Q9 | Should `/hub/tree` also serve kept sessions (root from the log's start record)? | live and, since 2026-10-06, saved chats whose folder the perch already knows (not decoded from the log); unknown folder stays 409 |
 
 ## Minerva home (2026-10-05)
 
-UI sessions live in `~/Minerva` (`MINERVA_HOME`), not eidolon's shared sessions dir, so the page lists only its own chats and a new chat gets a real default model instead of `mock`. `bin/perch-open.sh` creates `sessions/`, `scratch/`, `projects.json` and `minerva.toml` (`default_model`) when missing and starts the perch with `--home`. **The perch generates `<home>/config.toml` at every start**: eidolon's `--config` replaces `~/.config/eidolon/config.toml` outright (`Config::load` reads that one file), so the member's own config is parsed (a TOML parser; every key and table kept, an empty table when there is none), `sessions_dir` is forced to the absolute `<home>/sessions` (eidolon does not expand `~` in that key, and a relative one is read from each door's cwd), `default_model` is set only when absent (from `<home>/minerva.toml`, else `chatgpt:gpt-5.6-luna`), and the file is written atomically, mode `0600`, under a "generated, edit the other files" comment. The files beside the config (`providers/`, `policy.rn`, `secrets`) are `config_dir()`-relative and shared as before. Every door is `eidolon --config <home>/config.toml web ...`, new or resumed, and the perch lists the same `<home>/sessions`. `--home` conflicts with `--eidolon-config` and `--sessions-dir`; an explicit `--eidolon-config` alone has its `sessions_dir` read with the same parser and a relative or `~` value refuses the start. A new session with no `cwd` works in a fresh `<home>/scratch/<YYYYMMDD-HHMMSS>/` made per chat (`-2`, `-3` on a collision), so two chats never share files. The old shared `~/.local/share/eidolon/sessions` chats are listed read-only (see "Titles, saved chats and the second source" below). The perch lives in WSL: it dies if WSL idles out, and the fix is `vmIdleTimeout=-1` under `[wsl2]` in `%UserProfile%\.wslconfig` (a `systemd --user` unit is the unbuilt alternative).
+UI sessions live in `~/Minerva` (`MINERVA_HOME`), not eidolon's shared sessions dir, so the page lists only its own chats and a new chat gets a real default model instead of `mock`. `bin/perch-open.sh` creates `sessions/`, `scratch/`, `projects.json` and `minerva.toml` (`default_model`) when missing and starts the perch with `--home`. **The perch generates `<home>/config.toml` at every start**: eidolon's `--config` replaces `~/.config/eidolon/config.toml` outright (`Config::load` reads that one file), so the member's own config is parsed (a TOML parser; every key and table kept, an empty table when there is none), `sessions_dir` is forced to the absolute `<home>/sessions` (eidolon does not expand `~` in that key, and a relative one is read from each door's cwd), `default_model` is `<home>/minerva.toml`'s when it names one (operator ruling 2026-10-06), else the member's own, else `chatgpt:gpt-5.6-luna`, and the file is written atomically, mode `0600`, under a "generated, edit the other files" comment. The files beside the config (`providers/`, `policy.rn`, `secrets`) are `config_dir()`-relative and shared as before. Every door is `eidolon --config <home>/config.toml web ...`, new or resumed, and the perch lists the same `<home>/sessions`. `--home` conflicts with `--eidolon-config` and `--sessions-dir`; an explicit `--eidolon-config` alone has its `sessions_dir` read with the same parser and a relative or `~` value refuses the start. A new session with no `cwd` works in a fresh `<home>/scratch/<YYYYMMDD-HHMMSS>/` made per chat (`-2`, `-3` on a collision), so two chats never share files. The old shared `~/.local/share/eidolon/sessions` chats are listed read-only (see "Titles, saved chats and the second source" below). The perch lives in WSL: it dies if WSL idles out, and the fix is `vmIdleTimeout=-1` under `[wsl2]` in `%UserProfile%\.wslconfig` (a `systemd --user` unit is the unbuilt alternative).
 
 ## Titles, saved chats and the second source (2026-10-05)
 
 **Titles (D4 reversed).** The perch names every row, from eidolon's outputs only (it never decodes the `EIDO` log): the roster `meta.json` `title` for a door that is live, else the last column of `eidolon [--config <home config>] sessions` (`first_asked`, the first message flattened, cut to 60 characters by that command), else `<project folder> · HH:MM` (`scratch · HH:MM` under `<home>/scratch`, `chat · HH:MM` when the perch never saw the cwd, which is inside the journal). Cached by log path: a titled log is final, an untitled one is asked about again only when its mtime moved, and a listing that changes nothing runs nothing (a failed run is not retried for 30 s). Bounded: 10 s, 4 MiB. Cold list over 245 logs, two sources: 47 ms; warm: 2 ms.
 
 **Saved chats are readable.** `GET /hub/sessions/<id>/log` runs `eidolon [--config C] log --json <path>` (15 s, 16 MiB) and returns its lines, one record each (`{id, parent, ts_ms, kind}`; `kind` is a variant name or a one-key object). It starts nothing; the page maps the records onto the same row model a live stream feeds (`webui/term/core/saved.js`), draws them without a composer, and offers `[ continue this chat ]`, which is the resume route of section 3 and the only thing that spends. Over the cap is a 413 and the page says so; continue still works.
+
+**Images are read from the log, not the stream.** `eidolon web`'s frames carry only an image count (`wire.rs`: bytes never cross), and `eidolon log --json` prints every block with its base64, so the perch asks it, once per change of a log (kept per path and `(mtime, length)`), and serves `images`, `image/<record>/<n>` and `transcript` from that one parse (`perch/src/images.rs`). The page draws thumbnails with a plain `<img src>` (same origin, cookie), a full-size viewer on click, and for an image this tab just sent, the local picture until the route answers. A tool result is text in eidolon's log, so tool-made images do not exist yet; a block of that shape is listed as `where: "tool"` and drawn under its call, folded. No eidolon change was needed.
 
 **Two sources.** The Minerva home's `sessions/` is the one the UI owns. Under `--home` the perch also lists eidolon's own sessions dir as it resolves without the Minerva config (the member's `sessions_dir`, else `~/.local/share/eidolon/sessions`) as read-only rows `origin: "other"`, state `kept`; an id both have is the home's. Their `log` runs without `--config`; resuming one is allowed and starts a door with the home's config on that log in place (the page says so under the action). While running it is an ordinary live row (no `origin`), and after it stops it is `other` again. The page folds these under `older chats (N)` at the bottom of the sidebar and shows them nowhere else. Nothing in that dir is ever written, moved or deleted by the perch. This closes the "old shared dir behind a fold" deferral in "Minerva home" above.
 
@@ -460,6 +490,74 @@ transcribes audio. The perch's routes after this slice: `/hub/models`, `/hub/ses
 
 **Model.** A project is a folder with a name: `<home>/projects.json`, `[{name, path, created}]`, written atomically with mode `0600`, one entry per path. A chat is in a project when its cwd is the project's path or inside it (the deepest project wins). The perch also keeps `<home>/chat-cwds.json` (`{id: cwd}`), because a saved chat's cwd is inside the journal the perch never decodes; saved rows of `GET /hub/sessions` carry `cwd` when this perch started or resumed the chat. A folderless chat is a fresh `<home>/scratch/<stamp>/` each time; the stamp is a directory name and is never shown (the title fallback is `new chat · HH:MM` for scratch and `<project> · HH:MM` in a project; the pane frame shows the title and the project's name only).
 
-**Routes.** `GET /hub/projects`; `POST /hub/projects {path, name?}` (path a directory under a root and passing the picker's rules, else 422; name trimmed, at most 100 characters, no control characters; the same path twice returns the existing entry); `DELETE /hub/projects/<n>` forgets entry `n` (0-based) and touches no file. `DELETE` is allowed for that one prefix only; every other gated method but GET and POST stays 405.
+**Names and the inbox (2026-10-06).** Chats have no id in view: a new chat is born in `scratch/<three-word-name>/`; once its first turn settles the folder is renamed to the title's slug between turns and the door is re-brought with `--cwd`. `POST /hub/sessions/<id>/rename {title}` sets a custom title (`names.json`), and the inbox folder follows. `POST /hub/sessions/<id>/promote {parent, name}` moves an inbox folder under a chosen parent and registers it as a project. `POST /hub/projects/rename {path, name}` relabels a project. Full rules in perch/README.md.
+
+**Routes.** `GET /hub/projects`; `POST /hub/projects {path, name?}` (path a directory under a root and passing the picker's rules, else 422; name trimmed, at most 100 characters, no control characters; the same path twice returns the existing entry); `DELETE /hub/projects {path}` forgets the project at that path (by path, not position) and touches no file. `DELETE` is allowed for that one prefix only; every other gated method but GET and POST stays 405.
 
 **The picker (D8: in-page).** `GET /hub/dirs?path=<abs>` lists subdirectories only; with no path it lists the roots, labelled (the Windows profile as `C:\Users\<you>`). `POST /hub/dirs {parent, name}` makes one folder. Safety is section 7's, applied to a path rather than a session cwd: absolute, no `.`, `..`, NUL or backslash (the page converts a pasted `C:\...` or `\\wsl.localhost\...` path first); canonicalized and under a root, so a link that leaves them is refused; every segment below the root against the deny list and the 8.3 `~digit` shape, on the canonical remainder and on the spelling asked; entries are real directories (`d_type`, never followed: a link is not offered), and dot-folders, denied names and aliases are left out; the scan stops at 100 000 entries and 2 000 are answered (`truncated`); at most 4 listings run at once (503). Every refusal is the same empty 404, so a denied folder cannot be told from a missing one. A new folder's name has no `/`, `\`, `..`, control character or leading dot, is at most 100 characters, and is not a denied or 8.3-shaped name; `create_dir` (one level) never reuses anything (409 on an existing name); the parent is re-checked on every call (422).
+
+## Archive, pin and trash (2026-10-06)
+
+Decided with the operator ("an option to delete/archive chats, or inactive chats for 7 days sorted into other"; then "pin chats").
+
+- **One `other` group.** A chat of the Minerva home whose log has not been written for 7 days drops into `other` **at listing time**
+  (`auto_other`; nothing is moved); a live chat never does. `archive` puts one there now, `unarchive` brings it back and it stays out
+  until it is idle 7 days *from the unarchive* (`unarchived_at`). eidolon's shared-dir chats stay there read-only: archive, pin and trash
+  on them are 403. State: `<home>/archive.json` `{id: {archived, at, unarchived_at?, pinned?}}`, atomic `0600`, pruned of missing ids.
+- **Pin.** `pinned` is a mark in the same file. A pinned chat never auto-moves; archive and trash unpin; restore does not re-pin.
+- **Delete is a move.** `trash` renames the log into `<home>/trash/` (same filesystem, atomic, same name). 409 if a door holds it, unless
+  `{"stop": true}` (stopped through the ordinary clean stop, then moved). `restore` moves it back (409 on a name clash). `empty` needs
+  `{"confirm": true}` and removes only regular `.eid` files directly in the trash, plus those chats' entries in `chat-cwds.json`.
+- **Never touched:** anything outside `<home>/sessions` and `<home>/trash`; ids are `id_ok` first, so no path piece reaches the fs.
+- **Projects** are now removed by path (`DELETE /hub/projects {path}`), not by list position.
+
+## 7c. Fork (2026-10-06)
+
+Fork = a NEW chat copied from an existing one; the original keeps going. Hub work only: copy the log, open the copy as a door. No PR.
+
+```text
+POST /hub/sessions/<id>/fork {}  ->  find_log(id) (home or shared dir, read only)
+   -> eidolon `log PATH --after 9999999999` says "settled: true"?   (no: 409; cannot say: 503)
+   -> copy bytes to <home>/sessions/<unix ms>.eid  (create_new; -1, -2 on a clash)
+   -> restart::bring_up(new id, copy)  (Minerva config; cwd comes from the log's start record)
+   -> 201 {id, from}      door failed: remove the copy and its dead row, 503
+```
+
+Facts checked in eidolon (`0194f2b` + this tree):
+
+| question | answer |
+|---|---|
+| does `web` take `--at`? | no: `web` has `--session --model --provider --cwd --persona --bind --ui-dir` |
+| what does `resume --at N` do? | `Session::open`, `fork_at(N)`, then builds a runtime and drives it (a model turn with a prompt; with none it only finishes an unsettled branch, a turn again when the point is mid-turn, then exits having written nothing that keeps the head). `fork_at` is `set_head`, in memory only: nothing is written, the parent pointer on the *next appended record* is what persists the fork. A resume of a copy without a new record opens at the last record again |
+| is a mid-write copy safe? | yes: `SessionLog::open` drops a torn tail and truncates *its own* file (the copy); `open_readonly` never writes. The log is append-only |
+| what is unsafe? | opening a log that ends mid-turn: the door continues the turn by itself (section 4). Hence the 409 |
+
+**Fork from here, with stock commands only (2026-10-06).** The head is not in the file, so a fork at a point is made by running ONE `resume --at N` with the user's first message; until then the fork is *pending*:
+
+```text
+  fork {at}  -> copy the log (fork::copy_log), no door, forks.json {from, at, pending, model, yolo}      201 pending:true
+  page       -> read-only history up to `at` (transcript route filters the chain of records ending at `at`) + a composer
+  first {text, images?}  -> eidolon [--config C] [--yolo] resume <copy> --at N [--cwd D] [--image P]... -- <text>
+                            argv, no shell, stdin closed, stdout+stderr tailed into the page, bounded ~10 min
+                            exit 0 + settled -> forks.settle, restart::bring_up (model/yolo kept) -> the pane goes live
+                            failure/timeout  -> error sentence, still pending: retry or trash
+```
+
+Offered only after an assistant reply that ended its turn (no tool_use, every earlier tool call answered): `resume --at` on a user message or
+a tool_use reply makes eidolon finish the turn first, a paid turn nobody asked for. The perch reads that from eidolon's own `log --json`
+lines (`pending::check_at`), never from the EIDO bytes; anything else is a 422 with the reason. `resume` has no `-m` (the copy's model is
+whatever the config names; the model of the source is remembered and passed to the door afterwards), asks read stdin (EOF = declined unless
+`--yolo`), images go as `--image <file>` (files 0600 under `<home>/first-<id>/`, removed after). `forks.json` holds the marks; the running
+state of a run is written to `forks.json` while it goes (`running {pid, started_ms, base}`; `base` is the highest record the copy had before the run). When a perch starts it finds those marks: a run whose pid is still an `eidolon ... resume <that log>` (checked in `/proc/<pid>/cmdline`, not just a live pid) holds the first message off (state `running`, a new first message is a 409) until it ends; a run that is gone is judged by the log: no record above `base` on a chain through `at` means it wrote nothing (state `none`, the fork is pending and can be tried again); records written and eidolon says the log is settled means the fork is an ordinary saved chat (the person opens it; **no door is brought up by the perch, and nothing is continued**); records written but not settled is state `failed` with a sentence and the fork stays pending. The run is its own process group, killed as a group on a timeout or when the perch is dropped, so the tools it started do not outlive it; if the perch is `kill -9`ed the run goes on until it ends or its pipes close. Trash of a running fork is a 409.
+
+**Ask for eidolon (Noah):** `eidolon fork <log> --out <file> [--at <record>]`: write a new log holding the chain of records up to `<record>`
+(default the head), and exit; no provider, no turn, no live-door check beyond `open_readonly`. Alternative: `eidolon web --session <log> --at <record>`
+that writes a journal record at the fork point so the head survives a reopen, and does not auto-finish a turn. With either, the perch's
+`fork` route takes `{at}` with one more argv call and the transcript row menu gets `fork from here` back.
+
+Ids: a copy's id is the file stem, the same shape as eidolon's (`<ms>` or `<ms>-<n>`). The title shows the first message, like the source;
+the page adds a `forked from <title>` line in the new pane. A fork from here is titled `<title> (fork)`.
+
+**A fork's folder never follows its title, and a shared folder is shared files.** A fork works in the folder its source works in (the copy's log names it, and the perch passes it as `--cwd`); the tidy loop never renames a folder two chats use, so the fork's `(fork)` title does not rename anything, and a rename or promote by hand moves the one folder for all of them. Two live chats in one folder can overwrite each other's files: eidolon has no per-chat sandbox, and the perch does not lock a folder. Fork to compare ideas, not to run two edits side by side in the same tree.
+
+**Forks share a folder** with their source, so a rename or promote of that folder moves it for every chat that uses it: all are judged first (any one mid-turn, or with a first message running, is a 409 naming it: "wait for ... to finish"), idle live doors are stopped and brought back with `--cwd <new>` (own model/yolo), saved chats just get `chat-cwds.json` updated. The tidy loop still skips shared folders (two titles would fight over the name).
