@@ -745,12 +745,12 @@ fn owner_only(path: &Path, mode: u32) {
 fn resume(argv: &[String]) -> bool {
     use std::io::Read as _;
     let mut rest = argv.iter().skip(1).peekable();
-    let (mut config, mut yolo) = (false, false);
+    let (mut config, mut yolo, mut cfg) = (false, false, String::new());
     loop {
         match rest.peek().map(|arg| arg.as_str()) {
             Some("--config") => {
                 rest.next();
-                rest.next();
+                cfg = rest.next().map(|path| Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).unwrap_or_default();
                 config = true;
             }
             Some("--yolo") => {
@@ -784,7 +784,7 @@ fn resume(argv: &[String]) -> bool {
     if let Some(path) = std::env::var_os("FAKE_LOG").map(PathBuf::from)
         && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path)
     {
-        let _ = writeln!(file, "resume pid={} config={config} yolo={yolo} log={} at={} cwd={} images={} text={text}", std::process::id(), log.display(), at.map(|n| n.to_string()).unwrap_or_default(), cwd.clone().unwrap_or_default(), sizes.join(","));
+        let _ = writeln!(file, "resume pid={} cfg={cfg} config={config} yolo={yolo} log={} at={} cwd={} images={} text={text}", std::process::id(), log.display(), at.map(|n| n.to_string()).unwrap_or_default(), cwd.clone().unwrap_or_default(), sizes.join(","));
     }
     let mut sink = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut sink);

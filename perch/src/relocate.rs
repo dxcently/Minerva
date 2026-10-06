@@ -73,11 +73,11 @@ pub(crate) struct Moved {
     pub lost: Option<String>,
 }
 
-/// One chat that goes along with a folder move: its log, and the model and `--yolo` of its door when it has one.
+/// One chat that goes along with a folder move: its log, and the model and mode of its door when it has one.
 struct Along {
     id: String,
     log: PathBuf,
-    door: Option<(String, bool)>,
+    door: Option<(String, crate::mode::Mode)>,
 }
 
 /// The name a chat wears in a sentence for the person.
@@ -89,7 +89,7 @@ fn called(ctx: &Ctx, id: &str) -> String {
 /// doors back with `--cwd`. `op` is given the folder now and answers the folder after, canonical; it runs off the reactor.
 ///
 /// **A folder is moved for every chat that works in it** (a fork shares its source's): a chat with a door is stopped and brought back with
-/// its own model and `--yolo`; a saved one has only its remembered folder changed. If any of them is mid-turn nothing is touched, and the
+/// its own model and mode; a saved one has only its remembered folder changed. If any of them is mid-turn nothing is touched, and the
 /// answer names it ([`Refused::Busy`]).
 pub(crate) async fn relocate<F>(ctx: &Ctx, id: &str, op: F) -> std::result::Result<Moved, Refused>
 where
@@ -115,13 +115,13 @@ where
             return Err(Refused::Busy((one != id).then(|| called(ctx, one))));
         }
         let door = match ctx.registry.restartable(one) {
-            Restart::Ready { model, yolo, .. } => {
+            Restart::Ready { model, mode, .. } => {
                 // Stopping a door and bringing it back reopens the log, and a door that opens a log ending mid-turn carries the turn on by
                 // itself (hub.md section 4): only a settled log is stopped. eidolon's own `log` says; no answer is a no.
                 if crate::fork::settled(ctx, &log, false).await != Some(true) {
                     return Err(Refused::Unsettled((one != id).then(|| called(ctx, one))));
                 }
-                Some((model, yolo))
+                Some((model, mode))
             }
             Restart::Running => return Err(Refused::Busy((one != id).then(|| called(ctx, one)))),
             Restart::Between(_) => return Err(Refused::Between),
@@ -141,10 +141,10 @@ where
     let changed = changed.unwrap_or_else(|e| Err(anyhow::anyhow!("the folder change did not finish: {e}")));
     // The flags each door had, as the page would want them back: `-m` only when it told us a model.
     let bring = |ctx: &Ctx, chat: &Along| {
-        let (model, yolo) = chat.door.clone().unwrap_or_default();
+        let (model, mode) = chat.door.clone().unwrap_or((String::new(), crate::mode::Mode::Auto));
         let ctx = ctx.clone();
         let (id, log) = (chat.id.clone(), chat.log.clone());
-        async move { crate::restart::bring_up(&ctx, &id, &log, Some(model.as_str()).filter(|m| !m.is_empty()), yolo).await }
+        async move { crate::restart::bring_up(&ctx, &id, &log, Some(model.as_str()).filter(|m| !m.is_empty()), mode).await }
     };
     match changed {
         Ok(new) => {

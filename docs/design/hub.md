@@ -83,9 +83,9 @@ Static serving: the door's rules, ported (not depended on): one percent-decode, 
 | POST | `/hub/sessions` | yes | spawn a new session `{cwd, model?}` | 201 `{id}` / 422 cwd outside roots / 503 spawn failed |
 | POST | `/hub/sessions/<id>/resume` | yes | spawn a door on a kept log | 200 / 409 live here or elsewhere / 404 |
 | POST | `/hub/sessions/<id>/stop` | yes | SIGTERM that door | 202 / 409 not live |
-| POST | `/hub/sessions/<id>/restart` | yes | `{model?, yolo?}`: stop the door, resume the same log with `-m` / `--yolo`, only between turns (section "Model and mode") | 200 `{id, model, yolo, restarted}` / 400 / 404 / 409 turn running, starting, not running here / 503 `{error, reverted}` |
+| POST | `/hub/sessions/<id>/restart` | yes | `{model?, mode?}` (or the old `{yolo}`): stop the door, resume the same log with `-m` and the mode's `--config` / `--yolo`, only between turns (sections "Model and mode", "Approval modes") | 200 `{id, model, mode, yolo, restarted}` / 400 / 404 / 409 turn running, starting, not running here / 503 `{error, reverted}` |
 | POST | `/hub/sessions/<id>/fork` | yes | `{}`: copy the log byte for byte to a new id and bring a door up on the copy (section 7c). `{at}`: a PENDING copy with no door (section 7c) | 201 `{id, from}` or `{id, from, at, pending:true}` / 400 / 404 / 409 mid-turn / 422 not a forkable reply / 503 |
-| GET, POST | `/hub/sessions/<id>/first` | yes | GET: state of a pending fork's first message `{state: none/running/failed/done, elapsed_ms, out, error?}`. POST `{text, images?, yolo?}`: run stock `eidolon resume <copy> --at N` once (section 7c) | 202 `{id, state:"running"}` / 400 / 404 / 409 running, held or moving |
+| GET, POST | `/hub/sessions/<id>/first` | yes | GET: state of a pending fork's first message `{state: none/running/failed/done, elapsed_ms, out, error?}`. POST `{text, images?, mode?}`: run stock `eidolon resume <copy> --at N` once (section 7c) | 202 `{id, state:"running"}` / 400 / 404 / 409 running, held or moving |
 | GET | `/hub/models` | yes | the models `eidolon [--config C] models` lists, cached 10 min | 200 `[{key, name?, note?}]` / 504 / 502 |
 | GET | `/hub/events` | yes | SSE: `session-state {id, state}` whenever the list changes | stream |
 | GET | `/hub/tree?session=<id>&path=<rel>` | yes | one directory under the live (or saved, read-only) session's cwd (section 7) | 200 / 404 / 409 not live or folder unknown |
@@ -486,6 +486,20 @@ is started again on the old ones and the 503 says `reverted`. A request for the 
 process. **Effort and mic are not offered**: `web` has no effort flag, and nothing in the page or perch records or
 transcribes audio. The perch's routes after this slice: `/hub/models`, `/hub/sessions/<id>/restart`.
 
+## Approval modes (2026-10-06)
+
+Three per-chat modes replace the yolo flag: **manual** (reads run; everything else asks), **auto** (eidolon's stock rules) and **yolo**
+(`--yolo`). The default for a new chat is yolo, read from `default_mode` in `<home>/minerva.toml`. Manual is a second generated
+config, `<home>/config-manual.toml` (the home's `config.toml` plus `[policy] path = <home>/policy-manual.rn`; `enabled` forced on,
+`yolo` off, `judge` dropped), and a generated policy: the policy auto runs under, with its four entry points renamed `minerva_stock_*`
+and four wrappers appended (Rune has no `import`, so a wrapper has to share the source). A deny stays a deny; a tool call the table
+allows and marks `read_only` stays silent except `fetch`; everything else asks; every shell leaf asks, because eidolon's shell
+algebra gives the table no say over an in-workspace redirect. Nothing of eidolon's table is copied; an update is picked up at the
+next perch start, and one that renames an entry point makes manual unavailable in words rather than weaker. Which `--config` a door
+gets is the mode; the door's `hello` still says only `yolo`, so manual versus auto is what the perch passed, remembered per chat
+in `chat-modes.json` and listed as `mode` on every row. There is no "allow for the rest of this chat": the door's approval ask offers
+only yes and no, and eidolon's one standing grant (the permits file) is global. Details and tests: `perch/README.md`, "Approval modes".
+
 ## Projects and the folder picker (2026-10-06)
 
 **Model.** A project is a folder with a name: `<home>/projects.json`, `[{name, path, created}]`, written atomically with mode `0600`, one entry per path. A chat is in a project when its cwd is the project's path or inside it (the deepest project wins). The perch also keeps `<home>/chat-cwds.json` (`{id: cwd}`), because a saved chat's cwd is inside the journal the perch never decodes; saved rows of `GET /hub/sessions` carry `cwd` when this perch started or resumed the chat. A folderless chat is a fresh `<home>/scratch/<stamp>/` each time; the stamp is a directory name and is never shown (the title fallback is `new chat · HH:MM` for scratch and `<project> · HH:MM` in a project; the pane frame shows the title and the project's name only).
@@ -535,11 +549,11 @@ Facts checked in eidolon (`0194f2b` + this tree):
 **Fork from here, with stock commands only (2026-10-06).** The head is not in the file, so a fork at a point is made by running ONE `resume --at N` with the user's first message; until then the fork is *pending*:
 
 ```text
-  fork {at}  -> copy the log (fork::copy_log), no door, forks.json {from, at, pending, model, yolo}      201 pending:true
+  fork {at}  -> copy the log (fork::copy_log), no door, forks.json {from, at, pending, model, mode}      201 pending:true
   page       -> read-only history up to `at` (transcript route filters the chain of records ending at `at`) + a composer
-  first {text, images?}  -> eidolon [--config C] [--yolo] resume <copy> --at N [--cwd D] [--image P]... -- <text>
+  first {text, images?}  -> eidolon [--config C|C-manual] [--yolo] resume <copy> --at N [--cwd D] [--image P]... -- <text>
                             argv, no shell, stdin closed, stdout+stderr tailed into the page, bounded ~10 min
-                            exit 0 + settled -> forks.settle, restart::bring_up (model/yolo kept) -> the pane goes live
+                            exit 0 + settled -> forks.settle, restart::bring_up (model/mode kept) -> the pane goes live
                             failure/timeout  -> error sentence, still pending: retry or trash
 ```
 

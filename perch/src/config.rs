@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::mode::Mode;
+
 /// The model a fresh Minerva home starts with when neither `<home>/minerva.toml` nor the member's config names one.
 pub const FALLBACK_MODEL: &str = "chatgpt:gpt-5.6-luna";
 
@@ -111,8 +113,8 @@ pub fn generate(home: &Path, member: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// `default_model` from `<home>/minerva.toml`, or `None` when the file or the key is absent.
-fn minerva_default_model(home: &Path) -> Result<Option<String>> {
+/// `<home>/minerva.toml` parsed, or `None` when the file is absent; a file that cannot be read or parsed is an error.
+fn minerva_toml(home: &Path) -> Result<Option<(PathBuf, toml::Table)>> {
     let path = home.join("minerva.toml");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -120,10 +122,30 @@ fn minerva_default_model(home: &Path) -> Result<Option<String>> {
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     let table = text.parse::<toml::Table>().with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some((path, table)))
+}
+
+/// `default_model` from `<home>/minerva.toml`, or `None` when the file or the key is absent.
+fn minerva_default_model(home: &Path) -> Result<Option<String>> {
+    let Some((path, table)) = minerva_toml(home)? else { return Ok(None) };
     match table.get("default_model") {
         None => Ok(None),
         Some(toml::Value::String(model)) if !model.trim().is_empty() => Ok(Some(model.clone())),
         Some(_) => bail!("{}: default_model must be a non-empty string", path.display()),
+    }
+}
+
+/// `default_mode` from `<home>/minerva.toml` (`"manual"`, `"auto"` or `"yolo"`): the mode a new chat starts in. `None` when the file or
+/// the key is absent, which the caller reads as yolo. Anything else is an error, not a silent fallback to a looser mode.
+pub fn minerva_default_mode(home: &Path) -> Result<Option<Mode>> {
+    let Some((path, table)) = minerva_toml(home)? else { return Ok(None) };
+    match table.get("default_mode") {
+        None => Ok(None),
+        Some(toml::Value::String(word)) => match Mode::parse(word) {
+            Some(mode) => Ok(Some(mode)),
+            None => bail!("{}: default_mode must be \"manual\", \"auto\" or \"yolo\", not {word:?}", path.display()),
+        },
+        Some(_) => bail!("{}: default_mode must be \"manual\", \"auto\" or \"yolo\"", path.display()),
     }
 }
 

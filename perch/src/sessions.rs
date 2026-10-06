@@ -56,6 +56,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::mode::{ChatModes, Mode, ModeSetup};
 use crate::spawn;
 use crate::titles::{self, mtime_secs};
 use crate::watch::Watcher;
@@ -147,6 +148,9 @@ pub struct Entry {
     /// The chat a fork-from-here was taken from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fork_of: Option<String>,
+    /// `manual`, `auto` or `yolo`: what the chat runs in now, or last ran in. Absent for a chat whose mode nobody here knows (another process's door, an old saved chat).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'static str>,
 }
 
 /// The channel a door's reaper publishes its exit on: `None` while the child is alive. One
@@ -272,9 +276,9 @@ pub struct Door {
     pub state: State,
     pub pid: u32,
     pub port: u16,
-    /// The model and `--yolo` the door was started with, as its own `hello` says: what the next restart keeps.
+    /// The model and mode the door was started with (the mode is the door's own `yolo` word, else what the perch passed): what the next restart keeps.
     model: String,
-    yolo: bool,
+    mode: Mode,
     token: Arc<str>,
     watcher: Option<Watcher>,
     exit: ExitWatch,
@@ -358,8 +362,16 @@ pub struct Registry {
     pub forks: crate::pending::Forks,
     /// The ids whose folder is being renamed or moved right now (relocate.rs): one at a time per chat.
     moving: Mutex<HashSet<String>>,
-    /// The model and `--yolo` each chat last ran with, by id, for this run: what a fork of a saved chat starts with.
-    flags_seen: Mutex<HashMap<String, (String, bool)>>,
+    /// The model and mode each chat last ran with, by id, for this run: what a fork of a saved chat starts with.
+    flags_seen: Mutex<HashMap<String, (String, Mode)>>,
+    /// The mode each chat last ran in, across restarts (`<home>/chat-modes.json`): a reopened chat is never looser than it was.
+    pub modes: ChatModes,
+    /// `<home>/config-manual.toml`, when it could be made: what a manual door is given as `--config`.
+    pub manual_config: Option<PathBuf>,
+    /// Why there is no manual config, in words for the person.
+    pub manual_error: Option<String>,
+    /// The mode a new chat starts in when nothing says (`<home>/minerva.toml` `default_mode`, else yolo).
+    pub default_mode: Mode,
     doors: Mutex<Vec<Door>>,
 }
 
@@ -397,8 +409,8 @@ impl Drop for MoveGuard {
 /// Whether a live door can be restarted right now, for `POST /hub/sessions/<id>/restart`.
 #[derive(Debug)]
 pub enum Restart {
-    /// Ours, live and between turns: its log, and the model and `--yolo` it runs with now.
-    Ready { log: PathBuf, model: String, yolo: bool },
+    /// Ours, live and between turns: its log, and the model and mode it runs with now.
+    Ready { log: PathBuf, model: String, mode: Mode },
     /// Ours and live, and a turn is running: a restart now would cut it off.
     Running,
     /// Ours, and starting or stopping.
@@ -424,11 +436,12 @@ impl Registry {
     /// canonical paths, and a `--root` that does not exist refuses the start rather than
     /// failing every spawn with a 422 nobody can act on.
     pub fn new(sessions_dir: PathBuf, runtime_dir: PathBuf, eidolon: PathBuf, roots: Vec<PathBuf>) -> Result<Arc<Self>> {
-        Self::with_home(sessions_dir, runtime_dir, eidolon, roots, None, None, None)
+        Self::with_home(sessions_dir, runtime_dir, eidolon, roots, None, None, None, ModeSetup::default())
     }
 
     /// [`Registry::new`] plus the Minerva home's two settings: the config every door is given
     /// and the scratch directory a cwd-less new session works in.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_home(
         sessions_dir: PathBuf,
         runtime_dir: PathBuf,
@@ -437,6 +450,7 @@ impl Registry {
         eidolon_config: Option<PathBuf>,
         scratch: Option<PathBuf>,
         other: Option<PathBuf>,
+        modes: ModeSetup,
     ) -> Result<Arc<Self>> {
         let mut checked = Vec::new();
         for root in roots {
@@ -469,6 +483,10 @@ impl Registry {
             forks,
             moving: Mutex::new(HashSet::new()),
             flags_seen: Mutex::new(HashMap::new()),
+            modes: ChatModes::open(home.as_ref().map(|h| h.join("chat-modes.json"))),
+            manual_config: modes.manual_config,
+            manual_error: modes.manual_error,
+            default_mode: modes.default_mode,
             doors: Mutex::new(Vec::new()),
         }))
     }
@@ -560,10 +578,34 @@ impl Registry {
         self.moving.lock().unwrap().contains(id)
     }
 
-    /// The model and `--yolo` this chat last ran with: the live door's own, else what this run remembered. `None` is unknown.
-    pub fn flags_of(&self, id: &str) -> Option<(String, bool)> {
-        let live = self.doors.lock().unwrap().iter().find(|door| door.id == id && door.state == State::Live && !door.model.is_empty()).map(|door| (door.model.clone(), door.yolo));
-        live.or_else(|| self.flags_seen.lock().unwrap().get(id).cloned()).or_else(|| self.titles.lock().unwrap().model(id).map(|model| (model.to_string(), false)))
+    /// The model and mode this chat last ran with: the live door's own, else what this run remembered, else the model eidolon listed
+    /// and the remembered (or default) mode. `None` is an unknown model.
+    pub fn flags_of(&self, id: &str) -> Option<(String, Mode)> {
+        let live = self.doors.lock().unwrap().iter().find(|door| door.id == id && door.state == State::Live && !door.model.is_empty()).map(|door| (door.model.clone(), door.mode));
+        live.or_else(|| self.flags_seen.lock().unwrap().get(id).cloned()).or_else(|| self.titles.lock().unwrap().model(id).map(|model| (model.to_string(), self.mode_of(id))))
+    }
+
+    /// The mode this chat runs in or last ran in, if anything here knows: the live door's, else this run's, else `chat-modes.json`.
+    pub fn known_mode(&self, id: &str) -> Option<Mode> {
+        let live = self.doors.lock().unwrap().iter().find(|door| door.id == id && door.state == State::Live && door.pid != 0).map(|door| door.mode);
+        live.or_else(|| self.flags_seen.lock().unwrap().get(id).map(|(_, mode)| *mode)).or_else(|| self.modes.get(id))
+    }
+
+    /// [`Registry::known_mode`], else the mode a new chat starts in. What a reopen, a fork and a first message use.
+    pub fn mode_of(&self, id: &str) -> Mode {
+        self.known_mode(id).unwrap_or(self.default_mode)
+    }
+
+    /// The `--config` and whether `--yolo` for a door in `mode`; `Err` is the sentence for the person when manual cannot be made.
+    pub fn door_flags(&self, mode: Mode) -> std::result::Result<(Option<&Path>, bool), String> {
+        match mode {
+            Mode::Auto => Ok((self.eidolon_config.as_deref(), false)),
+            Mode::Yolo => Ok((self.eidolon_config.as_deref(), true)),
+            Mode::Manual => match &self.manual_config {
+                Some(config) => Ok((Some(config.as_path()), false)),
+                None => Err(format!("manual mode is not available: {}", self.manual_error.as_deref().unwrap_or("no manual config was made"))),
+            },
+        }
     }
 
     /// Every live door whose folder is a chat folder of the inbox, with the name its folder should follow (a name given by hand,
@@ -770,7 +812,7 @@ impl Registry {
         for (path, mtime) in titles::logs_in(&self.sessions_dir).unwrap_or_default() {
             let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| id_ok(id)) else { continue };
             let title = self.title_of(id, &path, None, None, mtime);
-            by_id.insert(id.to_string(), Entry { id: id.to_string(), state: State::Kept, cwd: self.known_cwd(id).map(|p| p.display().to_string()), panes: 0, mtime, title: Some(title), origin: None, archived: false, auto_other: false, pinned: false, inbox: false, pending: false, fork_of: None });
+            by_id.insert(id.to_string(), Entry { id: id.to_string(), state: State::Kept, cwd: self.known_cwd(id).map(|p| p.display().to_string()), panes: 0, mtime, title: Some(title), origin: None, archived: false, auto_other: false, pinned: false, inbox: false, pending: false, fork_of: None, mode: None });
         }
         // Eidolon's own dir (source 1b): read-only, and only ids this UI does not have.
         if let Some(other) = &self.other {
@@ -780,7 +822,7 @@ impl Registry {
                     continue;
                 }
                 let title = self.title_of(id, &path, None, None, mtime);
-                by_id.insert(id.to_string(), Entry { id: id.to_string(), state: State::Kept, cwd: self.known_cwd(id).map(|p| p.display().to_string()), panes: 0, mtime, title: Some(title), origin: Some("other"), archived: false, auto_other: false, pinned: false, inbox: false, pending: false, fork_of: None });
+                by_id.insert(id.to_string(), Entry { id: id.to_string(), state: State::Kept, cwd: self.known_cwd(id).map(|p| p.display().to_string()), panes: 0, mtime, title: Some(title), origin: Some("other"), archived: false, auto_other: false, pinned: false, inbox: false, pending: false, fork_of: None, mode: None });
             }
         }
 
@@ -806,6 +848,7 @@ impl Registry {
                 inbox: false,
                 pending: false,
                 fork_of: None,
+                mode: None,
             };
             by_id.insert(door.id.clone(), row);
         }
@@ -833,6 +876,7 @@ impl Registry {
                 inbox: false,
                 pending: false,
                 fork_of: None,
+                mode: None,
             };
             by_id.insert(id.clone(), row);
         }
@@ -840,10 +884,14 @@ impl Registry {
         let mut rows: Vec<Entry> = by_id.into_values().collect();
         let scratch_real = self.scratch_real();
         for row in &mut rows {
+            row.mode = if row.state == State::LiveElsewhere { None } else { self.known_mode(&row.id).map(Mode::as_str) };
             row.inbox = scratch_real.as_deref().zip(row.cwd.as_deref()).is_some_and(|(scratch, cwd)| Path::new(cwd).parent() == Some(scratch));
             if let Some(fork) = self.forks.get(&row.id) {
                 row.pending = fork.pending;
-                row.fork_of = Some(fork.from);
+                row.fork_of = Some(fork.from.clone());
+                if row.mode.is_none() {
+                    row.mode = Some(fork.mode().as_str());
+                }
             }
             // A shared-dir chat is `other` by its origin and read-only: no mark applies to it.
             if row.origin.is_some() {
@@ -916,7 +964,7 @@ impl Registry {
             pid: 0,
             port: 0,
             model: String::new(),
-            yolo: false,
+            mode: Mode::Auto,
             token: Arc::from(""),
             watcher: None,
             exit: watch::channel(None).1,
@@ -964,14 +1012,16 @@ impl Registry {
         self.cwds.remember(id, cwd);
     }
 
-    /// What the door said about itself in `hello`: the model it runs and whether it answers every ask with yes. A restart
-    /// keeps both unless the request changes them.
-    pub fn set_flags(&self, id: &str, model: &str, yolo: bool) {
+    /// What the door said about itself in `hello`: the model it runs; and its mode, which is the door's own `yolo` word or else the
+    /// mode the perch started it in ([`Mode::reported`]). A restart keeps both unless the request changes them, and the mode is
+    /// remembered across perch restarts.
+    pub fn set_flags(&self, id: &str, model: &str, mode: Mode) {
         if let Some(door) = self.doors.lock().unwrap().iter_mut().find(|door| door.id == id) {
             door.model = model.to_string();
-            door.yolo = yolo;
+            door.mode = mode;
         }
-        self.flags_seen.lock().unwrap().insert(id.to_string(), (model.to_string(), yolo));
+        self.flags_seen.lock().unwrap().insert(id.to_string(), (model.to_string(), mode));
+        self.modes.set(id, mode);
     }
 
     /// A resumed door's own stream, held from `hello` on like a new session's: it is what tells the perch whether a turn is
@@ -993,7 +1043,7 @@ impl Registry {
         if door.watcher.as_ref().is_some_and(Watcher::running) {
             return Restart::Running;
         }
-        Restart::Ready { log, model: door.model.clone(), yolo: door.yolo }
+        Restart::Ready { log, model: door.model.clone(), mode: door.mode }
     }
 
     /// A new session's door, whole: it reached `live` inside the spawn request, so there is
@@ -1011,7 +1061,7 @@ impl Registry {
             pid,
             port,
             model: String::new(),
-            yolo: false,
+            mode: Mode::Auto,
             token,
             watcher: Some(watcher),
             exit,
@@ -1038,6 +1088,7 @@ impl Registry {
     pub fn forget_dead(&self, id: &str) {
         self.doors.lock().unwrap().retain(|door| door.id != id || door.state != State::Dead);
         self.cwds.forget(id);
+        self.modes.forget(id);
     }
 
     /// Every id we are holding, for the shutdown path. Only live-ish doors have a stream to

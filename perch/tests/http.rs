@@ -68,6 +68,14 @@ struct Perch {
     stderr: Arc<Mutex<String>>,
 }
 
+/// What the harness puts at `<xdg>/eidolon/policy.rn`: the shape of the stock table, which the manual wrapper renames and wraps.
+const STOCK_POLICY_STUB: &str = "pub fn shell_arg(tool) { \"\" }
+pub fn classify_tool(tool, approval, input) { #{decision: \"allow\", reason: \"stub\", read_only: true} }
+pub fn classify_program(argv, ctx) { #{decision: \"allow\", reason: \"stub\", read_only: true} }
+pub fn fs_verb_tier(prog) { \"allow\" }
+pub fn bash_default(posture) { posture }
+";
+
 impl Perch {
     /// The child's stdout, as it stands.
     fn out(&self) -> String {
@@ -173,6 +181,9 @@ impl Perch {
         let sessions = tempfile::tempdir().unwrap();
         let xdg_config = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
+        // A stock policy table for the manual wrapper to take over (the fake has no tables to unpack): the four entry points, nothing more.
+        std::fs::create_dir_all(xdg_config.path().join("eidolon")).unwrap();
+        std::fs::write(xdg_config.path().join("eidolon/policy.rn"), STOCK_POLICY_STUB).unwrap();
         if let Some(text) = member_config {
             std::fs::create_dir_all(xdg_config.path().join("eidolon")).unwrap();
             std::fs::write(xdg_config.path().join("eidolon/config.toml"), text).unwrap();
@@ -1377,7 +1388,7 @@ fn the_minerva_home_gives_every_door_its_config_and_a_cwd_less_session_its_scrat
     let base = tempfile::tempdir().unwrap();
     let home = base.path().join("Minerva");
     std::fs::create_dir(&home).unwrap();
-    std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"\n").unwrap();
+    std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"\ndefault_mode = \"auto\"\n").unwrap();
     let home = home.canonicalize().unwrap();
     let config = home.join("config.toml");
     // A stale hand-written config.toml is regenerated away, not honoured.
@@ -1481,7 +1492,7 @@ fn without_a_home_the_door_argv_has_no_config_and_a_cwd_is_required() {
     let answer = perch.post_json("/hub/sessions", serde_json::json!({ "cwd": perch.work.display().to_string() }));
     assert_eq!(answer.status, 201, "{}{}", answer.head, answer.body);
     let argv = perch.fake_argv();
-    assert!(argv.starts_with("argv web "), "no --config: {argv}");
+    assert!(argv.starts_with("argv --yolo web "), "no --config, and a new chat is yolo unless it says otherwise: {argv}");
     let id = body_id(&answer);
     assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
 }
@@ -3191,7 +3202,7 @@ fn start_home(member: &str) -> (tempfile::TempDir, PathBuf, Perch) {
     let base = tempfile::tempdir().unwrap();
     let home = base.path().join("Minerva");
     std::fs::create_dir(&home).unwrap();
-    std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"\n").unwrap();
+    std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"\ndefault_mode = \"auto\"\n").unwrap();
     let home = home.canonicalize().unwrap();
     let perch = Perch::start_hub_member(&["--root".into(), base.path().canonicalize().unwrap().into(), "--home".into(), home.clone().into()], member);
     (base, home, perch)
@@ -3613,7 +3624,7 @@ fn a_restart_resumes_the_same_log_with_the_new_flags_and_keeps_the_rest() {
     let first = restart(serde_json::json!({ "model": "mock:alpha", "yolo": true }));
     assert_eq!(first.status, 200, "{}{}", first.head, first.body);
     let said: serde_json::Value = serde_json::from_str(&first.body).unwrap();
-    assert_eq!(said, serde_json::json!({ "id": id, "model": "mock:alpha", "yolo": true, "restarted": true }));
+    assert_eq!(said, serde_json::json!({ "id": id, "model": "mock:alpha", "mode": "yolo", "yolo": true, "restarted": true }));
     let argv = perch.fake_argv();
     assert!(argv.starts_with(&format!("argv --config {} --yolo web ", config.display())), "{argv}");
     // The same log (not a new chat), and the folder the perch remembers for it as eidolon's reopen-time `--cwd`.
@@ -3683,7 +3694,7 @@ fn a_restart_waits_for_the_turn_to_end() {
     assert_eq!(said.status, 202, "{}{}", said.head, said.body);
     assert!(wait_record(&perch, Duration::from_secs(3), |lines| lines.iter().any(|line| line == "turn-state true")), "the door announced the turn");
     std::thread::sleep(Duration::from_millis(300));
-    let busy = perch.post_json(&format!("/hub/sessions/{id}/restart"), serde_json::json!({ "yolo": true }));
+    let busy = perch.post_json(&format!("/hub/sessions/{id}/restart"), serde_json::json!({ "mode": "auto" }));
     assert_eq!(busy.status, 409, "{}{}", busy.head, busy.body);
     assert!(busy.body.contains("wait for the turn to end"), "{}", busy.body);
     assert_eq!(starts(), 2, "a refused restart stops nothing");
@@ -3692,14 +3703,14 @@ fn a_restart_waits_for_the_turn_to_end() {
     assert_eq!(perch.post(&format!("/s/{id}/api/cancel")).status, 204);
     let deadline = Instant::now() + Duration::from_secs(3);
     let done = loop {
-        let answer = perch.post_json(&format!("/hub/sessions/{id}/restart"), serde_json::json!({ "yolo": true }));
+        let answer = perch.post_json(&format!("/hub/sessions/{id}/restart"), serde_json::json!({ "mode": "auto" }));
         if answer.status != 409 || Instant::now() > deadline {
             break answer;
         }
         std::thread::sleep(Duration::from_millis(50));
     };
     assert_eq!(done.status, 200, "{}{}", done.head, done.body);
-    assert!(perch.fake_argv().contains("--yolo"), "{}", perch.fake_argv());
+    assert!(!perch.fake_argv().contains("--yolo"), "a new chat is yolo; the restart made it auto: {}", perch.fake_argv());
     assert_eq!(starts(), 3);
     assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
 }
@@ -4146,6 +4157,7 @@ fn a_fork_whose_door_does_not_start_leaves_no_copy() {
     let home = base.path().join("Minerva");
     std::fs::create_dir(&home).unwrap();
     std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"
+default_mode = \"auto\"
 ").unwrap();
     let home = home.canonicalize().unwrap();
     let extra: Vec<std::ffi::OsString> = vec!["--root".into(), base.path().canonicalize().unwrap().into(), "--home".into(), home.clone().into()];
@@ -4254,7 +4266,7 @@ fn a_fork_when_eidolon_cannot_say_is_503_and_copies_nothing() {
     let base = tempfile::tempdir().unwrap();
     let home = base.path().join("Minerva");
     std::fs::create_dir(&home).unwrap();
-    std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"\n").unwrap();
+    std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"\ndefault_mode = \"auto\"\n").unwrap();
     let home = home.canonicalize().unwrap();
     let extra: Vec<std::ffi::OsString> = vec!["--root".into(), base.path().canonicalize().unwrap().into(), "--home".into(), home.clone().into()];
     let perch = Perch::launch_with_member(true, Some(vec![("FAKE_HELPER_FAIL".into(), "1".into())]), &extra, Some(""));
@@ -4273,7 +4285,7 @@ fn start_home_with(knobs: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Perch
     let base = tempfile::tempdir().unwrap();
     let home = base.path().join("Minerva");
     std::fs::create_dir(&home).unwrap();
-    std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"\n").unwrap();
+    std::fs::write(home.join("minerva.toml"), "default_model = \"mock\"\ndefault_mode = \"auto\"\n").unwrap();
     let home = home.canonicalize().unwrap();
     let extra: Vec<std::ffi::OsString> = vec!["--root".into(), base.path().canonicalize().unwrap().into(), "--home".into(), home.clone().into()];
     let knobs = knobs.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect();
@@ -5203,4 +5215,241 @@ fn a_run_that_wrote_nothing_leaves_the_fork_pending_and_free_to_try_again() {
     assert_eq!(perch.row(&new).unwrap()["pending"], true);
     assert_eq!(perch.post_json(&format!("/hub/sessions/{new}/first"), serde_json::json!({ "text": "again" })).status, 202);
     wait_first(&perch, &new, "done", Duration::from_secs(10));
+}
+
+// ---------------------------------------------------------------------------
+// Approval modes: manual, auto, yolo (mode.rs)
+// ---------------------------------------------------------------------------
+
+/// A home whose `minerva.toml` is exactly `minerva` (plus the mock model), over a member config of `member`.
+#[cfg(feature = "test-bins")]
+fn start_modes(minerva: &str, member: &str) -> (tempfile::TempDir, PathBuf, Perch) {
+    let base = tempfile::tempdir().unwrap();
+    let home = base.path().join("Minerva");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("minerva.toml"), format!("default_model = \"mock\"\n{minerva}")).unwrap();
+    let home = home.canonicalize().unwrap();
+    let perch = Perch::start_hub_member(&["--root".into(), base.path().canonicalize().unwrap().into(), "--home".into(), home.clone().into()], member);
+    (base, home, perch)
+}
+
+/// A new chat in `mode` (`None`: the request says nothing), and the argv its door got.
+#[cfg(feature = "test-bins")]
+fn new_in(perch: &Perch, mode: Option<&str>) -> (String, String) {
+    let mut body = serde_json::json!({ "cwd": perch.work.display().to_string(), "model": "mock" });
+    if let Some(mode) = mode {
+        body["mode"] = mode.into();
+    }
+    let made = perch.post_json("/hub/sessions", body);
+    assert_eq!(made.status, 201, "{}{}", made.head, made.body);
+    (body_id(&made), perch.fake_argv())
+}
+
+/// The three modes are three argvs: manual is the generated `config-manual.toml` and no `--yolo`; auto is `config.toml` and no
+/// `--yolo`; yolo is `config.toml` and `--yolo`. A request that says nothing gets `default_mode` from `<home>/minerva.toml`, and with
+/// no such key that is yolo. The list says which mode each chat is in. Mutations: manual passes `--yolo` or `config.toml`; auto
+/// passes `--yolo`; the default is auto; the list leaves the mode out; a bad word is accepted.
+#[cfg(feature = "test-bins")]
+#[test]
+fn each_mode_is_its_own_config_and_yolo_flag_and_the_default_is_yolo() {
+    let (_base, home, perch) = start_modes("", "");
+    let (config, manual) = (home.join("config.toml"), home.join("config-manual.toml"));
+    let (yolo_id, argv) = new_in(&perch, None);
+    assert!(argv.starts_with(&format!("argv --config {} --yolo web ", config.display())), "no mode and no default_mode is yolo: {argv}");
+    let (auto_id, argv) = new_in(&perch, Some("auto"));
+    assert!(argv.starts_with(&format!("argv --config {} web ", config.display())), "auto is eidolon's own rules: {argv}");
+    let (manual_id, argv) = new_in(&perch, Some("manual"));
+    assert!(argv.starts_with(&format!("argv --config {} web ", manual.display())), "manual is the generated config, no --yolo: {argv}");
+    assert!(!argv.contains("--yolo"), "{argv}");
+    let modes: Vec<String> = [&yolo_id, &auto_id, &manual_id].iter().map(|id| perch.row(id).unwrap()["mode"].as_str().unwrap().to_string()).collect();
+    assert_eq!(modes, ["yolo", "auto", "manual"]);
+    let bad = perch.post_json("/hub/sessions", serde_json::json!({ "cwd": perch.work.display().to_string(), "mode": "loud" }));
+    assert_eq!(bad.status, 400, "{}{}", bad.head, bad.body);
+    assert_eq!(starts_of(&perch), 3, "a refused request starts nothing");
+    for id in [yolo_id, auto_id, manual_id] {
+        assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    }
+}
+
+/// `default_mode` in `<home>/minerva.toml` is what a new chat gets when it names no mode; a value that is not one of the three
+/// refuses the start rather than falling back to something looser. Mutations: ignore the key; fall back on a bad value.
+#[cfg(feature = "test-bins")]
+#[test]
+fn default_mode_in_minerva_toml_decides_and_a_bad_one_refuses_the_start() {
+    let (_base, home, perch) = start_modes("default_mode = \"manual\"\n", "");
+    let (id, argv) = new_in(&perch, None);
+    assert!(argv.starts_with(&format!("argv --config {} web ", home.join("config-manual.toml").display())), "{argv}");
+    assert_eq!(perch.row(&id).unwrap()["mode"], "manual");
+    let (id2, argv) = new_in(&perch, Some("yolo"));
+    assert!(argv.contains(" --yolo web "), "a request beats the default: {argv}");
+    for id in [id, id2] {
+        assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    }
+    for bad in ["default_mode = \"loud\"\n", "default_mode = true\n"] {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("Minerva");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("minerva.toml"), bad).unwrap();
+        let out = Perch::refused_start(&["--home".into(), home.clone().into(), "--root".into(), base.path().into()]);
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("default_mode"), "{bad}: {out:?}");
+    }
+}
+
+/// The restart route takes `{mode}`; `{yolo: true}` is yolo and `{yolo: false}` is auto (the old spelling); `mode` wins when both are
+/// there; the answer carries `mode` and `yolo`; the same mode again is no restart; a word that is not a mode is a 400. The model is
+/// kept across a mode change. Mutations: `{yolo:false}` meaning manual; manual restarted with `config.toml`; no-op restarted.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_restart_moves_a_chat_between_the_three_modes() {
+    let (_base, home, perch) = start_modes("default_mode = \"auto\"\n", "");
+    let (id, _) = new_in(&perch, None);
+    let restart = |body: serde_json::Value| perch.post_json(&format!("/hub/sessions/{id}/restart"), body);
+    let (config, manual) = (home.join("config.toml"), home.join("config-manual.toml"));
+    let step = |body: serde_json::Value, mode: &str, argv_start: String| {
+        let answer = restart(body.clone());
+        assert_eq!(answer.status, 200, "{body}: {}{}", answer.head, answer.body);
+        let said = json_of(&answer);
+        assert_eq!((said["mode"].as_str(), said["yolo"].as_bool(), said["restarted"].as_bool()), (Some(mode), Some(mode == "yolo"), Some(true)), "{said}");
+        let argv = perch.fake_argv();
+        assert!(argv.starts_with(&argv_start) && argv.ends_with(" -m mock"), "{body}: {argv}");
+        assert_eq!(perch.row(&id).unwrap()["mode"], mode);
+    };
+    step(serde_json::json!({ "mode": "manual" }), "manual", format!("argv --config {} web ", manual.display()));
+    step(serde_json::json!({ "mode": "yolo" }), "yolo", format!("argv --config {} --yolo web ", config.display()));
+    step(serde_json::json!({ "yolo": false }), "auto", format!("argv --config {} web ", config.display()));
+    step(serde_json::json!({ "yolo": true }), "yolo", format!("argv --config {} --yolo web ", config.display()));
+    step(serde_json::json!({ "mode": "manual", "yolo": true }), "manual", format!("argv --config {} web ", manual.display()));
+    let starts = starts_of(&perch);
+    let same = restart(serde_json::json!({ "mode": "manual" }));
+    assert!(same.status == 200 && same.body.contains("\"restarted\":false"), "{}{}", same.head, same.body);
+    assert_eq!(starts_of(&perch), starts, "the mode it already has restarts nothing");
+    for bad in [serde_json::json!({ "mode": "gated" }), serde_json::json!({}), serde_json::json!({ "mode": 3 })] {
+        assert_eq!(restart(bad.clone()).status, 400, "{bad}");
+    }
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+}
+
+/// A reopened chat comes back in the mode it had (kept in `<home>/chat-modes.json`, 0600, so a perch restart does not loosen it),
+/// a whole fork starts in its source's mode, and a chat with no remembered mode gets `default_mode`. Mutations: resume with the
+/// default; fork with the default; do not write the file.
+#[cfg(feature = "test-bins")]
+#[test]
+fn a_reopened_chat_and_a_fork_keep_the_mode_they_had() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_base, home, perch) = start_modes("default_mode = \"yolo\"\n", "");
+    let manual = home.join("config-manual.toml");
+    let (id, _) = new_in(&perch, Some("manual"));
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    assert!(perch.wait_state(&id, "kept", Duration::from_secs(5)));
+    assert_eq!(perch.row(&id).unwrap()["mode"], "manual", "a saved chat says the mode it last had");
+    let file = home.join("chat-modes.json");
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(kept[&id], "manual");
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/resume")).status, 200);
+    let argv = perch.fake_argv();
+    assert!(argv.starts_with(&format!("argv --config {} web ", manual.display())) && !argv.contains("--yolo"), "reopened in manual, not the default: {argv}");
+    // A whole fork of a settled chat.
+    std::fs::write(home.join("sessions").join(format!("{id}.eid")), settled_log("hello")).unwrap();
+    let forked = body_id(&perch.post(&format!("/hub/sessions/{id}/fork")));
+    let argv = perch.fake_records().into_iter().rev().find(|l| l.starts_with("argv ") && l.contains(&format!("{forked}.eid"))).expect("the fork's argv");
+    assert!(argv.starts_with(&format!("argv --config {} web ", manual.display())), "the fork is manual too: {argv}");
+    assert_eq!(perch.row(&forked).unwrap()["mode"], "manual");
+    // A chat nobody remembers a mode for is the default: a log dropped into the sessions dir.
+    std::fs::write(home.join("sessions").join("stranger.eid"), settled_log("hi")).unwrap();
+    assert_eq!(perch.post("/hub/sessions/stranger/resume").status, 200);
+    assert!(perch.fake_argv().contains(" --yolo web "), "{}", perch.fake_argv());
+    for id in [id, forked, "stranger".to_string()] {
+        assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    }
+}
+
+/// A fork from a point runs its first message with the source's mode: manual and auto get no `--yolo` and their own `--config` (the
+/// headless run has nobody to answer an ask, so a call that needs a yes is declined), yolo gets `--yolo`; `{mode}` in the first
+/// message's body overrides it, and the door that comes up afterwards has the mode the message ran with. `GET .../first` says the mode.
+/// Mutations: the run uses config.toml for manual; the override is ignored; the door comes up in the source's mode instead.
+#[cfg(feature = "test-bins")]
+#[test]
+fn the_first_message_of_a_fork_runs_under_the_sources_mode_or_the_one_it_names() {
+    let (_base, home, perch) = start_modes("", "");
+    let manual = home.join("config-manual.toml");
+    let (id, _) = new_in(&perch, Some("manual"));
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
+    assert!(perch.wait_state(&id, "kept", Duration::from_secs(5)));
+    std::fs::write(home.join("sessions").join(format!("{id}.eid")), branchy_log()).unwrap();
+    let fork = |at: u64| body_id(&perch.post_json(&format!("/hub/sessions/{id}/fork"), serde_json::json!({ "at": at })));
+    let (one, two) = (fork(2), fork(2));
+    assert_eq!(first_state(&perch, &one)["mode"], "manual");
+    assert_eq!(perch.row(&one).unwrap()["mode"], "manual", "a pending fork says its mode too");
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{one}/first"), serde_json::json!({ "text": "go" })).status, 202);
+    wait_first(&perch, &one, "done", Duration::from_secs(10));
+    let line = resumes(&perch).into_iter().find(|l| l.contains(&format!("{one}.eid"))).expect("the first run");
+    assert!(line.contains("cfg=config-manual.toml") && line.contains("yolo=false"), "{line}");
+    let door = perch.fake_records().into_iter().find(|l| l.starts_with("argv ") && l.contains(&format!("{one}.eid"))).expect("a door");
+    assert!(door.starts_with(&format!("argv --config {} web ", manual.display())), "{door}");
+    // The override: this one first message in yolo, and the door is yolo.
+    let said = perch.post_json(&format!("/hub/sessions/{two}/first"), serde_json::json!({ "text": "go", "mode": "yolo" }));
+    assert_eq!(said.status, 202, "{}{}", said.head, said.body);
+    wait_first(&perch, &two, "done", Duration::from_secs(10));
+    let line = resumes(&perch).into_iter().find(|l| l.contains(&format!("{two}.eid"))).expect("the second run");
+    assert!(line.contains("cfg=config.toml") && line.contains("yolo=true"), "{line}");
+    let door = perch.fake_records().into_iter().find(|l| l.starts_with("argv ") && l.contains(&format!("{two}.eid"))).expect("a door");
+    assert!(door.contains(" --yolo web "), "{door}");
+    assert_eq!(perch.row(&two).unwrap()["mode"], "yolo");
+    let three = fork(2);
+    assert_eq!(perch.post_json(&format!("/hub/sessions/{three}/first"), serde_json::json!({ "text": "x", "mode": "loud" })).status, 400);
+}
+
+/// `config-manual.toml` is the home's `config.toml` plus a `[policy]` naming `<home>/policy-manual.rn`, and nothing else: same
+/// `sessions_dir`, same `default_model`, same everything. A member's `[policy] enabled = false`, `yolo = true` or `judge` must not
+/// make manual looser, so the manual file forces the first two and drops the third while `config.toml` keeps them. The policy is the
+/// member's table with its four entry points renamed and the wrappers appended, 0600. Mutations: the policy path missing; `enabled`
+/// not forced; a judge left in; the manual file readable by others; the member's other `[policy]` keys dropped.
+#[cfg(feature = "test-bins")]
+#[test]
+fn the_manual_config_is_the_home_config_plus_a_policy_that_cannot_be_loosened() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let member = "thinking_budget = 4000\n\n[policy]\nenabled = false\nyolo = true\njudge = \"fau:cheap\"\ndefault = \"flag\"\n\n[swarm]\nenabled = false\n";
+    let (_base, home, _perch) = start_modes("", member);
+    let read = |name: &str| std::fs::read_to_string(home.join(name)).unwrap().parse::<toml::Table>().unwrap();
+    let (auto, manual) = (read("config.toml"), read("config-manual.toml"));
+    assert_eq!(auto["policy"]["yolo"].as_bool(), Some(true), "auto is the member's own, untouched");
+    assert_eq!(auto["policy"]["judge"].as_str(), Some("fau:cheap"));
+    let policy = manual["policy"].as_table().unwrap();
+    assert_eq!(policy["path"].as_str(), Some(home.join("policy-manual.rn").to_str().unwrap()));
+    assert_eq!((policy["enabled"].as_bool(), policy["yolo"].as_bool(), policy.get("judge")), (Some(true), Some(false), None));
+    assert_eq!(policy["default"].as_str(), Some("flag"), "the member's other policy keys stay");
+    let (mut a, mut m) = (auto.clone(), manual.clone());
+    a.remove("policy");
+    m.remove("policy");
+    assert_eq!(a, m, "everything outside [policy] is identical, sessions_dir and default_model included");
+    assert_eq!(manual["sessions_dir"], auto["sessions_dir"]);
+    for name in ["config-manual.toml", "policy-manual.rn", "config.toml"] {
+        assert_eq!(std::fs::metadata(home.join(name)).unwrap().permissions().mode() & 0o777, 0o600, "{name}");
+    }
+    let rn = std::fs::read_to_string(home.join("policy-manual.rn")).unwrap();
+    assert!(rn.contains("fn minerva_stock_classify_tool(") && rn.contains("pub fn classify_tool(tool, approval, input) {\n    let r = minerva_stock_classify_tool"), "{rn}");
+    assert!(rn.contains("pub fn shell_arg(tool)"), "the rest of the member's table is untouched: {rn}");
+}
+
+/// Manual that cannot be made says so in words and takes nothing down with it: a new chat in manual is a 503 with the reason (and no
+/// door), auto and yolo are unaffected, and a restart into manual is refused before the chat is stopped. Here the table named by the
+/// member's `[policy] path` is missing and eidolon has none to unpack (the stand-in has no `policy` command), so there is nothing to wrap.
+/// Mutations: manual falls back to `config.toml`; the restart stops the chat first.
+#[cfg(feature = "test-bins")]
+#[test]
+fn manual_without_a_table_to_wrap_is_refused_in_words_and_changes_nothing() {
+    let (_base, _home, perch) = start_modes("", "[policy]\npath = \"/nonexistent/policy.rn\"\n");
+    let refused = perch.post_json("/hub/sessions", serde_json::json!({ "cwd": perch.work.display().to_string(), "mode": "manual" }));
+    assert_eq!(refused.status, 503, "{}{}", refused.head, refused.body);
+    assert!(refused.body.contains("manual mode is not available"), "{}", refused.body);
+    assert_eq!(starts_of(&perch), 0, "no door was started for it");
+    let (id, argv) = new_in(&perch, Some("auto"));
+    assert!(!argv.contains("manual") && !argv.contains("--yolo"), "{argv}");
+    let starts = starts_of(&perch);
+    let restart = perch.post_json(&format!("/hub/sessions/{id}/restart"), serde_json::json!({ "mode": "manual" }));
+    assert_eq!(restart.status, 503, "{}{}", restart.head, restart.body);
+    assert_eq!(starts_of(&perch), starts, "nothing was stopped or started");
+    assert_eq!(perch.state_of(&id).as_deref(), Some("live"));
+    assert_eq!(perch.post(&format!("/hub/sessions/{id}/stop")).status, 202);
 }

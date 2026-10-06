@@ -587,14 +587,27 @@ async fn new_session(ctx: &Ctx, body: &Bytes) -> Response<BoxBody> {
     struct Asked {
         cwd: Option<String>,
         model: Option<String>,
+        mode: Option<String>,
     }
-    const SHAPE: &str = "expected a JSON body of {\"cwd\": \"<dir>\", \"model\": \"<m>\"?}";
+    const SHAPE: &str = "expected a JSON body of {\"cwd\": \"<dir>\", \"model\": \"<m>\"?, \"mode\": \"manual\"|\"auto\"|\"yolo\"?}";
     let Ok(asked) = serde_json::from_slice::<Asked>(body) else {
         return problem(StatusCode::BAD_REQUEST, SHAPE);
     };
     if asked.model.as_deref().is_some_and(|model| !crate::models::key_ok(model)) {
         return problem(StatusCode::BAD_REQUEST, "that is not a model name (letters, digits and : . _ - / @ + only)");
     }
+    // No mode is the home's `default_mode` (yolo when it names none); a word that is not one of the three is a 400, not a guess.
+    let mode = match asked.mode.as_deref() {
+        Some(word) => match crate::mode::Mode::parse(word) {
+            Some(mode) => mode,
+            None => return problem(StatusCode::BAD_REQUEST, SHAPE),
+        },
+        None => ctx.registry.default_mode,
+    };
+    let (config, yolo) = match ctx.registry.door_flags(mode) {
+        Ok(flags) => flags,
+        Err(why) => return problem(StatusCode::SERVICE_UNAVAILABLE, &why),
+    };
     // No cwd is the Minerva home's scratch dir, when the perch has a home; without one it is the
     // refusal it always was: a body that names no cwd is a 400.
     let wanted = match (&asked.cwd, &ctx.registry.scratch) {
@@ -614,7 +627,7 @@ async fn new_session(ctx: &Ctx, body: &Bytes) -> Response<BoxBody> {
         Err(_) => return problem(StatusCode::UNPROCESSABLE_ENTITY, "cwd is not a directory under a --root"),
     };
     // §4 step 3: the door's own argv, with no token in it and no `--ui-dir`.
-    let argv = spawn::argv(&ctx.registry.eidolon, ctx.registry.eidolon_config.as_deref(), spawn::Target::New(&cwd), asked.model.as_deref(), false);
+    let argv = spawn::argv(&ctx.registry.eidolon, config, spawn::Target::New(&cwd), asked.model.as_deref(), yolo);
     let up = match door_up(ctx, argv, None).await {
         Ok(up) => up,
         Err(why) => return problem(StatusCode::SERVICE_UNAVAILABLE, &why),
@@ -632,10 +645,10 @@ async fn new_session(ctx: &Ctx, body: &Bytes) -> Response<BoxBody> {
     };
     // The cwd that was checked against `--root` at step 1, not the one `hello` names: they are the
     // same directory from an honest door, and the row must hold the checked one.
-    let (model, yolo) = (hello.model.clone(), hello.yolo);
+    let (model, actual) = (hello.model.clone(), mode.reported(hello.yolo));
     ctx.registry.insert(id.clone(), hello.session, cwd, pid, port, token, watcher, exit);
-    ctx.registry.set_flags(&id, &model, yolo);
-    json(StatusCode::CREATED, &serde_json::json!({ "id": id }))
+    ctx.registry.set_flags(&id, &model, actual);
+    json(StatusCode::CREATED, &serde_json::json!({ "id": id, "mode": actual }))
 }
 
 /// `GET /hub/sessions/<id>/log`: a saved chat as eidolon's own `log --json` lines (one record per line), so the page
@@ -692,7 +705,8 @@ async fn resume(ctx: &Ctx, id: &str) -> Response<BoxBody> {
         return problem(StatusCode::CONFLICT, "that log is already held by a live session");
     }
     // Reserve, fork, check it opened this log, go live: restart.rs, which a model switch shares.
-    match crate::restart::bring_up(ctx, id, &log, None, false).await {
+    // The mode it last ran in, else the default: a chat that was manual is never reopened looser.
+    match crate::restart::bring_up(ctx, id, &log, None, ctx.registry.mode_of(id)).await {
         Ok(_) => {
             // Continuing a chat is activity: an archived one is back among the active (with a fresh week).
             crate::trash::continued(ctx, id);

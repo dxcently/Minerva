@@ -14,7 +14,7 @@
 //!   /hub/sessions/<id>/resume, /stop                              (H1b)
 //!   /hub/sessions/<id>/log  a saved chat as eidolon's JSON lines                (titles slice)
 //!   /hub/models          GET the models eidolon lists (cached 10 min)           (composer)
-//!   /hub/sessions/<id>/restart  stop + resume the same log with -m / --yolo, between turns   (composer)
+//!   /hub/sessions/<id>/restart  stop + resume the same log with -m / a mode (manual, auto, yolo), between turns   (composer)
 //!   /s/<id>/api/<route>  GET|POST to that session's door, its Bearer injected,
 //!                        SSE passed through, `hub-stream-end` appended   (H1c, this slice)
 //!   /hub/tree?session=<id>&path=<rel>  one directory under a live cwd   (H2)
@@ -71,6 +71,7 @@ pub mod folders;
 pub mod gate;
 pub mod images;
 pub mod login;
+pub mod mode;
 pub mod models;
 pub mod pending;
 pub mod names;
@@ -119,6 +120,8 @@ pub struct Options {
     pub scratch: Option<PathBuf>,
     /// With `--home`: eidolon's own sessions dir, listed read-only as `origin: "other"` ([`sessions::Registry::other`]).
     pub other_sessions: Option<PathBuf>,
+    /// The manual config (or why there is none) and the default mode of a new chat ([`mode::prepare`]).
+    pub modes: mode::ModeSetup,
     /// How long a login code (`POST /hub/code`) can be redeemed. [`login::CODE_TTL`] outside tests.
     pub code_ttl: std::time::Duration,
 }
@@ -144,7 +147,7 @@ pub async fn run(opts: Options, cancel: CancellationToken) -> Result<()> {
     // The registry and the thread that forks doors, before the bind for the same reason the
     // token's directory is: a `--root` that does not exist, or a spawn thread that cannot be
     // started, must refuse the start rather than the first spawn.
-    let registry = sessions::Registry::with_home(opts.sessions_dir, runtime.clone(), opts.eidolon, opts.roots, opts.eidolon_config, opts.scratch, opts.other_sessions)?;
+    let registry = sessions::Registry::with_home(opts.sessions_dir, runtime.clone(), opts.eidolon, opts.roots, opts.eidolon_config, opts.scratch, opts.other_sessions, opts.modes)?;
     let spawner = Arc::new(spawn::Spawner::new()?);
     let listener = TcpListener::bind(opts.bind).await.with_context(|| format!("bind {}", opts.bind))?;
     let bound = listener.local_addr().context("read the bound address")?;

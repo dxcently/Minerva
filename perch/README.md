@@ -71,7 +71,7 @@ none), sets `sessions_dir` to the absolute `<home>/sessions` (always overridden:
 expand `~` in that key, and a relative one is read from each door's cwd), sets `default_model` from
 `<home>/minerva.toml` when it names one, else keeps the member's own, else `chatgpt:gpt-5.6-luna` (operator ruling 2026-10-06: the Minerva
 home says first, then the member's config, then the constant), and writes the result atomically with mode `0600` under a header comment.
-Edit `~/.config/eidolon/config.toml` or `~/Minerva/minerva.toml`, not the generated file. A new chat sends no `-m` unless the person typed a model for it (`:new <folder> <model>`), so the door runs this default; a bad `model` value in `POST /hub/sessions` is a 400.
+Edit `~/.config/eidolon/config.toml` or `~/Minerva/minerva.toml`, not the generated file. A new chat sends no `-m` unless the person typed a model for it (`:new <folder> <model>`), so the door runs this default; a bad `model` value in `POST /hub/sessions` is a 400. `default_mode = "manual" | "auto" | "yolo"` in the same file is the approval mode of a new chat that names none (absent: yolo; anything else refuses the start); see "Approval modes".
 
 A corrupt state file (`names.json`, `archive.json`, `forks.json`, `chat-cwds.json`, `projects.json`) is renamed to `<name>.bad-<unix seconds>` with a warning and the store starts empty; it is never overwritten. The Minerva home itself is a root so the inbox works, but its own folders (`sessions/`, `trash/`, the state files, `scratch/` itself) are refused as a chat folder, a project, a promote target or somewhere to make a folder, and are not listed by the picker; only `scratch/<chat>` is a chat's place. Doors and fork runs are each their own process group, signalled as a group. The
 files *beside* the member's config (`providers/`, `policy.rn`, `secrets`) are shared as they were.
@@ -139,9 +139,9 @@ What is **not** here, on purpose: the idle reaper, `/hub/events` (H2) and
   /hub/sessions/<id>/transcript GET: the same lines with every image's bytes emptied
   /hub/sessions/<id>/images     GET: the images in a chat, as JSON
   /hub/sessions/<id>/image/<record>/<n>   GET: one image's bytes
-  /hub/sessions/<id>/restart    POST {model?, yolo?}: stop + resume the same log with -m / --yolo, between turns
+  /hub/sessions/<id>/restart    POST {model?, mode?} (or the old {yolo}): stop + resume the same log with -m / a mode (manual, auto, yolo), between turns
   /hub/sessions/<id>/fork       POST {} (whole, live) or {at} (a pending copy, no door): a NEW chat (201 {id, from})
-  /hub/sessions/<id>/first      GET state | POST {text, images?}: run `resume --at` once for a pending fork, then its door comes up
+  /hub/sessions/<id>/first      GET state | POST {text, images?, mode?}: run `resume --at` once for a pending fork, then its door comes up
   /hub/models                   GET: the models `eidolon models` lists, cached 10 min
   /s/<id>/api/<route>           GET|POST, proxied to that session's door     (H1c)
   /hub/tree?session=<id>&path=<rel>   GET one directory of a live or saved cwd    (H2)
@@ -322,7 +322,7 @@ the perch started or resumed them (older logs have none; the page files those un
 new chat -> scratch/<three-word-name>/            (title before a first message: the birth name)
 first turn settles -> title = first message
    BETWEEN TURNS: scratch folder renamed to slug(title) (lowercase ascii [a-z0-9-], <= 48, -2/-3 on a clash),
-                  chat-cwds.json updated, door re-brought: eidolon web --session <log> --cwd <new> -m <model> [--yolo]
+                  chat-cwds.json updated, door re-brought in the mode it had: eidolon [--config C|C-manual] [--yolo] web --session <log> --cwd <new> -m <model>
 rename -> custom title (names.json) beats the auto title everywhere; an inbox chat's folder follows (between turns)
 promote -> folder MOVED under a chosen parent (inside the roots), registered as a project, chat reopened there
 ```
@@ -372,7 +372,7 @@ promote -> folder MOVED under a chosen parent (inside the roots), registered as 
 
 ## Model and mode: `GET /hub/models`, `POST /hub/sessions/<id>/restart`
 
-A running door cannot change its model or its `--yolo`: both are flags of `eidolon web`, and the door has no route that moves
+A running door cannot change its model or its mode (`--yolo`, or the manual `--config`): all are start-up flags of `eidolon web`, and the door has no route that moves
 either. So a switch is **stop the door cleanly, resume the same log with the new flags**; the chat keeps its id, its folder and
 the Minerva `--config`, the log is the transcript, and the page's pane reconnects to the same id and replays it.
 
@@ -380,16 +380,86 @@ the Minerva `--config`, the log is the transcript, and the page's pane reconnect
   tests) and answers `[{"key", "name"?, "note"?}]`: the rows whose first word is `provider:model`, in eidolon's order (the
   provider table and the notices above them are skipped). One answer is kept ten minutes for the whole process; a failure is
   never kept. 504 on time, 502 otherwise.
-- **`POST /hub/sessions/<id>/restart`** with `{"model": "<m>"?, "yolo": <bool>?}` (at least one; a model is letters, digits and
+- **`POST /hub/sessions/<id>/restart`** with `{"model": "<m>"?, "mode": "manual"|"auto"|"yolo"?, "yolo": <bool>?}` (at least one; `yolo` is the old spelling: true is yolo, false is auto; a model is letters, digits and
   `: . _ - / @ +`, never a leading `-`): **400** bad body or model, **404** no such chat, **409** with a sentence when a turn is
   running (`wait for the turn to end`; read off the door's `turn-state` frames on the perch's own stream), the chat is
-  starting or stopping, or it is saved and not running (continue it first), **200** `{"id","model","yolo","restarted"}`
+  starting or stopping, or it is saved and not running (continue it first), **200** `{"id","model","mode","yolo","restarted"}`
   (`restarted: false` when the flags were already the door's: nothing is stopped), **503** `{"error","reverted"}` when the new
   flags did not come up: the perch then starts the chat again with the flags it had, and `reverted` says whether that worked.
-  What is not named is kept: a mode change passes the model the door reported, a model change keeps `--yolo` as it was. The
-  argv is `eidolon --config C [--yolo] web --bind 127.0.0.1:0 --session <log> -m <model>`.
+  What is not named is kept: a mode change passes the model the door reported, a model change keeps the mode as it was. The
+  argv is `eidolon --config C [--yolo] web --bind 127.0.0.1:0 --session <log> -m <model>`, `C` being `config-manual.toml` for manual
+  (see "Approval modes" below). Manual that cannot be made is a 503 before anything is stopped.
 - **Effort** has no route: eidolon's `web` takes no effort flag, so there is nothing to restart with. The composer shows none.
 - A resumed door's stream is now held like a new session's (it is how the perch knows a turn is running).
+
+## Approval modes: manual, auto, yolo (2026-10-06)
+
+Every chat runs in one of three modes. The mode is a per-chat property, shown in the page's status line and composer menu, and it
+is the only thing that decides whether a tool call that needs a yes reaches the person.
+
+```text
+  manual   eidolon --config <home>/config-manual.toml web ...        reads run; everything else asks
+  auto     eidolon --config <home>/config.toml        web ...        eidolon's own rules, unchanged
+  yolo     eidolon --config <home>/config.toml --yolo web ...        every question is a yes (as before)
+```
+
+**Default for a new chat is yolo** (operator ruling 2026-10-06). It is `default_mode = "manual" | "auto" | "yolo"` in
+`<home>/minerva.toml`; the key absent means yolo, and any other value refuses the perch's start (it never falls back to a looser
+mode). `POST /hub/sessions {cwd?, model?, mode?}` takes the mode too; a word that is not one of the three is a 400. The page's
+`:new <folder> [model] [manual|auto|yolo]` sends it; without one the default applies. `setup/` does not write the key.
+
+**How manual works, and why it survives an eidolon update.** eidolon has no "ask about everything" switch, and its policy hook is
+the one seam where a gate can be tightened without touching eidolon: `[policy] path` names a Rune file whose four entry points
+(`classify_tool`, `classify_program`, `fs_verb_tier`, `bash_default`) answer allow / flag / deny. Rune has no `import`, so a file
+cannot call another file's `classify_tool`. At every perch start `mode.rs` therefore reads **the policy auto mode runs under** (the
+member's `[policy] path`, else `~/.config/eidolon/policy.rn`, else eidolon's shipped copy under `~/.config/eidolon/system/`, and
+if eidolon has never run on the machine it runs `eidolon policy true` once, which unpacks its tables), renames those four entry
+points to `minerva_stock_*` (a line-start edit, refused unless each name is found exactly once) and appends four wrappers
+that call them. The result is `<home>/policy-manual.rn` (0600). Nothing of eidolon's table is copied into this repository, so an
+eidolon update (or an operator edit of `policy.rn`) is picked up at the next perch start; an update that renames an entry point
+makes manual unavailable with a sentence (`manual mode is not available: ...`, a 503 on the request that needed it, and a restart
+into manual is refused before the chat is stopped), never silently weaker. The permission store (`policy.permits.rn`, plugin
+vouches) sits beside the policy file, so manual has none: a vouched plugin tool still asks.
+
+What the wrapper does, in order: a `deny` stays a `deny` (`sudo`, `shutdown`, `mkfs`, `gh repo delete`); a tool call the table
+allows **and marks `read_only`** stays silent (`read`, `grep`, `Glob`, `LS`, `search`, `ask_user`, `choices_user`, `tool_search`,
+`peers`, `wait_for`, `BashOutput`, `WebSearch`, a Melete read), except `fetch` and `WebFetch`, which reach the network and ask;
+everything else asks (`write`, `edit`, `mneme_rpc`, `vv`, `send`, `TodoWrite`, plugin tools such as `subagent`, `browser` and `jev`,
+any tool the table does not know). **Every shell leaf asks, reads included** (`ls`, `cat`, `git status`): eidolon's shell
+decomposition scope-checks an in-workspace redirect (`cat > f`, `echo x >> f`) but gives the table no say in it, so a table that
+leaves any leaf silent leaves that redirect silent too; the only sound table asks about every leaf. `fs_verb_tier` is `flag` for every
+verb (`mkdir`, `cp`, `mv`, `touch`, `tee`, `ln`) and `bash_default` is `flag` unless it was `deny`. The models should reach
+for `read` and `grep`, which do not ask. A path outside the working directory is still the algebra's refusal turned into a question.
+
+`<home>/config-manual.toml` (0600) is the generated `config.toml` plus `[policy] path`, and nothing else differs, so `sessions_dir`,
+`default_model` and every other key are identical and manual chats appear in the same list. Three `[policy]` keys of the member's are
+forced because they would otherwise make manual looser: `enabled = true` (a member's `enabled = false` is no gate at all),
+`yolo = false` (`[policy] yolo = true` is yolo for every launch) and `judge` removed (a judge answers questions on the operator's
+behalf). `config.toml` keeps the member's own values: auto is exactly what it was. If the member's own `[policy] yolo = true` is set,
+an `auto` door reports yolo in `hello` and the perch calls it yolo (`mode = reported`).
+
+**The mode through the perch.** One value replaces the old yolo flag everywhere: the registry (a door's mode is the door's own
+`yolo` word from `hello`, else the mode the perch passed; for a door this perch did not start there is no mode, and the list row
+simply has none), `POST .../restart {mode}` (`{yolo: true}` is yolo and `{yolo: false}` is auto, as before; `mode` wins when both
+are given; the answer is `{id, model, mode, yolo, restarted}`), a whole fork (inherits the source's mode), a fork from a point
+(`forks.json` keeps `mode`; an old file's `yolo` is read as yolo or auto), `POST .../first {text, images?, mode?}` (the headless
+`eidolon resume` gets that mode's `--config` and `--yolo`; with nobody to answer, a call that needs a yes is declined, which the page says),
+a folder rename or move (the door comes back in the mode it had), and a reopen of a saved chat. The mode of every chat is kept in
+`<home>/chat-modes.json` (0600), so a reopen after a perch restart is never looser than the chat was; a chat nobody remembers a
+mode for (a log dropped in the sessions dir) gets the default. The list rows carry `mode` (`manual`, `auto`, `yolo`, or absent when
+nothing here knows).
+
+**"Allow for the rest of this chat" does not exist in stock eidolon**, so the page has plain yes / no only. The door's approval ask
+offers exactly `["yes", "no"]` (`crates/web/src/user.rs`: `answers: [&'static str; 2]`, and `POST /api/answer` rejects any other
+label with 422). The only standing grants eidolon has are the permits file (`policy.permits.rn`, vouches for plugin verbs and secret
+sources, written by `eidolon plugins trust`): global to every chat and to plain eidolon, not per chat, and not a general tool
+approval. The perch does not write it. A per-chat grant would need an upstream feature (an `always` answer scoped to a session).
+
+Tests: `tests/manual_policy.rs` compiles eidolon's own `policy.rn` with the wrapper through Rune (a dev-dependency, version of
+eidolon's) and checks every tool and shell leaf; with `eidolon` on `PATH` it runs `eidolon policy '<command>'` (the real shell
+algebra, no model) under the generated config and runs a headless **mock turn** (`-m mock`, whose script is a `bash` call and a `grep`)
+under manual and auto: manual puts the `bash` to the user and the declined call is journaled, the `grep` read runs; auto runs both.
+`tests/http.rs` pins the argv and routes with the stand-in door.
 
 ## Archive, pin and trash (2026-10-06)
 

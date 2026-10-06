@@ -90,6 +90,7 @@ async fn main() -> Result<()> {
     });
     // Under `--home`, eidolon's own dir is a second, read-only source (hub.md section 4); nothing in it is ever written.
     let other_sessions = resolved.home.as_ref().map(|_| perch::config::other_sessions_dir(&member));
+    let modes = perch::mode::prepare(resolved.home.as_deref(), &member, &cli.eidolon)?;
     let options = perch::Options {
         bind: cli.bind,
         ui_dir: cli.ui_dir,
@@ -99,6 +100,7 @@ async fn main() -> Result<()> {
         eidolon_config: resolved.config,
         scratch,
         other_sessions,
+        modes,
         code_ttl: std::time::Duration::from_millis(cli.code_ttl_ms),
     };
     perch::run(options, cancel).await

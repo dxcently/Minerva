@@ -11,8 +11,8 @@
 //!                             remember {from, at, pending} in <home>/forks.json          -> 201 {id, from, at, pending: true}
 //!        (a PENDING fork has no door: nothing may append to its copy, so it is never resumed, restarted or forked)
 //!   GET  .../<fork>/transcript  the lines of the branch that ends at `at` (not the whole copy)
-//!   POST .../<fork>/first {text, images?, yolo?}
-//!                             eidolon [--config C] [--yolo] resume <copy> --at <at> --cwd <dir> [--image P]... -- "<text>"
+//!   POST .../<fork>/first {text, images?, mode?}   (`yolo` is the old spelling; no mode: the fork's, which is its source's)
+//!                             eidolon [--config C|C-manual] [--yolo] resume <copy> --at <at> --cwd <dir> [--image P]... -- "<text>"
 //!                             stdin closed, bounded time, output kept (tail)                          -> 202 {id, state: "running"}
 //!   GET  .../<fork>/first     {state: none|running|failed|done, elapsed_ms, out, error?}
 //!                             exit 0 and the log settled: the fork is no longer pending, a door comes up on the copy (it heads on
@@ -24,7 +24,7 @@
 //! model call the person did not ask for; the check refuses those points with a sentence, before anything is copied.
 //!
 //! **Headless asks.** `resume` reads approvals from stdin (`StdinUser`); with stdin closed it reads end-of-file and the ask is declined,
-//! never waited on. With `--yolo` the gate answers yes by itself. The page says so beside the composer.
+//! never waited on. With `--yolo` the gate answers yes by itself; manual and auto decline what needs a yes. The page says so beside the composer.
 //!
 //! **The records are what the run left.** A pending fork shows the chain of records ending at `at`; a fork whose first message has
 //! run shows the chain ending at the log's last record, which is where a door opens it.
@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 
+use crate::mode::Mode;
 use crate::serve::{BoxBody, Ctx, json, problem, status};
 use crate::sessions::{id_ok, log_path};
 
@@ -68,14 +69,24 @@ pub struct Fork {
     pub at: u64,
     /// No first message has run: the copy has no door and its head is `at`.
     pub pending: bool,
-    /// The model and `--yolo` the source ran with when it was forked, which the door comes up with.
+    /// The model and mode the source ran with when it was forked, which the first message and the door come up with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default)]
-    pub yolo: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
+    /// What a `forks.json` written before modes said (`--yolo` or not); read, never written.
+    #[serde(default, skip_serializing)]
+    yolo: bool,
     /// The first message's run while it is in flight, so a perch that restarts mid-run still knows ([`recover`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running: Option<Running>,
+}
+
+impl Fork {
+    /// The mode this fork's first message and door run in: its own, else what an old file's `yolo` meant.
+    pub fn mode(&self) -> Mode {
+        self.mode.unwrap_or(Mode::from_yolo(self.yolo))
+    }
 }
 
 /// The `eidolon resume` of a first message, as `forks.json` remembers it while it runs.
@@ -347,9 +358,8 @@ pub(crate) async fn fork_at(ctx: &Ctx, id: &str, at: u64) -> Response<BoxBody> {
         ctx.registry.set_cwd(&new_id, &cwd);
     }
     ctx.registry.refresh_titles().await;
-    let (model, yolo) = ctx.registry.flags_of(id).unzip();
-    let model = model.filter(|m| crate::models::key_ok(m));
-    let fork = Fork { from: id.to_string(), at, pending: true, model, yolo: yolo.unwrap_or(false), running: None };
+    let model = ctx.registry.flags_of(id).map(|(model, _)| model).filter(|m| crate::models::key_ok(m));
+    let fork = Fork { from: id.to_string(), at, pending: true, model, mode: Some(ctx.registry.mode_of(id)), yolo: false, running: None };
     if let Err(e) = ctx.registry.forks.put(&new_id, Some(fork)) {
         tracing::warn!(error = %format!("{e:#}"), "perch: forks.json could not be written");
         let _ = std::fs::remove_file(log_path(&dir, &new_id));
@@ -382,6 +392,7 @@ struct First {
     #[serde(default)]
     images: Vec<Pic>,
     yolo: Option<bool>,
+    mode: Option<String>,
 }
 
 fn extension(media_type: &str) -> Option<&'static str> {
@@ -460,7 +471,19 @@ pub(crate) async fn first(ctx: &Ctx, id: &str, body: &Bytes) -> Response<BoxBody
     }
     let Some(home) = ctx.registry.home().map(Path::to_path_buf) else { return problem(StatusCode::SERVICE_UNAVAILABLE, "this server has no Minerva home to keep that in") };
     let cwd = ctx.registry.reopen_cwd(id).or_else(|| ctx.registry.known_cwd(id).filter(|cwd| cwd.is_dir()));
-    let yolo = asked.yolo.unwrap_or(fork.yolo);
+    // `mode` wins over the old `yolo` spelling; neither: the source's, which the copy was made with.
+    let mode = match (asked.mode.as_deref(), asked.yolo) {
+        (Some(word), _) => match Mode::parse(word) {
+            Some(mode) => mode,
+            None => return problem(StatusCode::BAD_REQUEST, "mode must be \"manual\", \"auto\" or \"yolo\""),
+        },
+        (None, Some(yolo)) => Mode::from_yolo(yolo),
+        (None, None) => fork.mode(),
+    };
+    let (config, yolo) = match ctx.registry.door_flags(mode) {
+        Ok((config, yolo)) => (config.map(Path::to_path_buf), yolo),
+        Err(why) => return problem(StatusCode::SERVICE_UNAVAILABLE, &why),
+    };
     // The highest record the copy has before the run, which is how a perch that restarts mid-run tells whether the run wrote anything.
     let base = match crate::images::lean(ctx, id).await {
         Ok(lean) => highest_id(&lean),
@@ -474,7 +497,7 @@ pub(crate) async fn first(ctx: &Ctx, id: &str, body: &Bytes) -> Response<BoxBody
         return problem(StatusCode::CONFLICT, "that fork is being changed or held by a session; try again in a moment");
     }
     let (ctx, id_owned) = (ctx.clone(), id.to_string());
-    tokio::spawn(async move { execute(ctx, id_owned, fork, log, home, cwd, yolo, base, pictures, asked.text, run).await });
+    tokio::spawn(async move { execute(ctx, id_owned, fork, log, home, cwd, (mode, config, yolo), base, pictures, asked.text, run).await });
     json(StatusCode::ACCEPTED, &serde_json::json!({ "id": id, "state": "running" }))
 }
 
@@ -572,8 +595,8 @@ fn tail_words(out: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute(ctx: Ctx, id: String, fork: Fork, log: PathBuf, home: PathBuf, cwd: Option<PathBuf>, yolo: bool, base: u64, pictures: Vec<(&'static str, Vec<u8>)>, text: String, run: Arc<Run>) {
-    let outcome = ran(&ctx, &id, &fork, &log, &home, cwd.as_deref(), yolo, base, &pictures, &text, &run).await;
+async fn execute(ctx: Ctx, id: String, fork: Fork, log: PathBuf, home: PathBuf, cwd: Option<PathBuf>, how: (Mode, Option<PathBuf>, bool), base: u64, pictures: Vec<(&'static str, Vec<u8>)>, text: String, run: Arc<Run>) {
+    let outcome = ran(&ctx, &id, &fork, &log, &home, cwd.as_deref(), &how, base, &pictures, &text, &run).await;
     if let Err(why) = &outcome {
         tracing::warn!(%why, id, "perch: the first message of a fork did not finish");
     }
@@ -585,9 +608,10 @@ async fn execute(ctx: Ctx, id: String, fork: Fork, log: PathBuf, home: PathBuf, 
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn ran(ctx: &Ctx, id: &str, fork: &Fork, log: &Path, home: &Path, cwd: Option<&Path>, yolo: bool, base: u64, pictures: &[(&'static str, Vec<u8>)], text: &str, run: &Arc<Run>) -> std::result::Result<(), String> {
+async fn ran(ctx: &Ctx, id: &str, fork: &Fork, log: &Path, home: &Path, cwd: Option<&Path>, how: &(Mode, Option<PathBuf>, bool), base: u64, pictures: &[(&'static str, Vec<u8>)], text: &str, run: &Arc<Run>) -> std::result::Result<(), String> {
+    let (mode, config, yolo) = (how.0, how.1.as_deref(), how.2);
     let pics = Pics::write(home, id, pictures).map_err(|e| format!("{e:#}"))?;
-    let all = argv(ctx.registry.eidolon_config.as_deref(), yolo, log, fork.at, cwd, &pics.files, text);
+    let all = argv(config, yolo, log, fork.at, cwd, &pics.files, text);
     let mut command = Command::new(&ctx.registry.eidolon);
     // Its own process group, killed as a group (below, and when this future is dropped): the tools a turn starts die with it.
     command.args(&all).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
@@ -634,7 +658,7 @@ async fn ran(ctx: &Ctx, id: &str, fork: &Fork, log: &Path, home: &Path, cwd: Opt
     // From here the message has been spent: a retry would be a second one. The fork is an ordinary chat even if its door does not come up.
     ctx.registry.forks.settle(id).map_err(|e| format!("{e:#}"))?;
     let model = fork.model.clone().filter(|m| crate::models::key_ok(m));
-    match crate::restart::bring_up(ctx, id, log, model.as_deref(), yolo || fork.yolo).await {
+    match crate::restart::bring_up(ctx, id, log, model.as_deref(), mode).await {
         Ok(_) => Ok(()),
         Err(crate::restart::Failed::Held) => Err("the reply is saved, but the copy was taken by another session; continue it from the list".to_string()),
         Err(crate::restart::Failed::Spawn(why)) => Err(format!("the reply is saved, but the chat did not come back ({why}); continue it from the list")),
@@ -767,7 +791,8 @@ pub(crate) fn state(ctx: &Ctx, id: &str) -> Response<BoxBody> {
         }
     };
     let mut said = said;
-    said["yolo"] = fork.yolo.into();
+    said["yolo"] = (fork.mode() == Mode::Yolo).into();
+    said["mode"] = fork.mode().as_str().into();
     said["model"] = fork.model.into();
     said["at"] = fork.at.into();
     json(StatusCode::OK, &said)

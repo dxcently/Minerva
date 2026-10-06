@@ -4,7 +4,7 @@
 // by mouse; keys and the `:` line are shortcuts to the same functions.
 import { html, render, K, HUB, signal, computed, effect, batch, useRef, useLayoutEffect, useMemo } from './core/ui.js';
 import { takeToken, takeCode, redeem, DOOR, detect, mode, rows, hubPost } from './core/api.js';
-import { list, stale, known, refresh, startPolling, live, keptRows, older, elsewhere, age, label, otherTag, trash, slugOf } from './core/hub.js';
+import { list, stale, known, refresh, startPolling, modeOf, live, keptRows, older, elsewhere, age, label, otherTag, trash, slugOf } from './core/hub.js';
 import { Session, tildify, kfmt, stateOf, STATE_CLS, backoffMs, connWord } from './core/state.js';
 import * as tile from './core/tile.js';
 import { menu, openMenu, closeMenu, outside, atPointer, under, Menus } from './core/menu.js';
@@ -515,7 +515,7 @@ const COMMANDS = {
   submit: ['send every answered ask (all must be answered)', () => submitAsks() || toast(queue.peek().length ? 'answer every ask to submit' : 'nothing to submit')],
   queue: ['queue text (or the composer) behind the turn', (arg) => withPane((p) => p.s.submit('queue', arg || ''))()],
   reconnect: ['drop the stream and replay', withPane((p) => p.s.reconnect())],
-  new: ["start a chat: :new <folder> [model] (no folder: a chat in the inbox)", (arg) => newCmd(arg)],
+  new: ["start a chat: :new <folder> [model] [manual|auto|yolo] (no folder: a chat in the inbox; no mode: the home's default_mode, else yolo)", (arg) => newCmd(arg)],
   rename: ['rename this chat: :rename <name> (none: clear it)', (arg) => withPane((p) => renameChat(p.sid, arg))()],
   resume: ['resume a stopped, dead or kept session (perch); may continue its last turn', () => resumeFocused()],
   sidebar: ['toggle the left sidebar', () => toggle('lrail')],
@@ -604,7 +604,7 @@ const focusedCwd = () => (focusedHello() || {}).cwd || '';
 // when a session started. No model is sent unless the person asked for one for
 // THIS chat (`:new <folder> <model>`): the default is the Minerva config's
 // (minerva.toml, then the member's, then the built-in), never the focused pane's.
-async function newSession(raw, model, how) {
+async function newSession(raw, model, how, chosen) {
   if (mode() !== 'perch') { toast(HUB, true); return false; }
   const bare = raw == null, cwd = bare ? null : absCwd(raw);
   if (!bare && !cwd) return false;
@@ -618,7 +618,7 @@ async function newSession(raw, model, how) {
   ui.hint.value = mine;
   home.busy.value = true;
   home.msg.value = '';
-  const body = { ...(cwd ? { cwd } : {}), ...(model ? { model } : {}) };
+  const body = { ...(cwd ? { cwd } : {}), ...(model ? { model } : {}), ...(chosen ? { mode: chosen } : {}) };
   const r = await hubPost('sessions', body);
   starting.delete(key);
   home.busy.value = false;
@@ -754,8 +754,10 @@ function newCmd(arg) {
   const w = words(arg);
   if (mode() !== 'perch') { toast(HUB, true); return; }
   if (!w.length) { newSession(null, undefined); return; }
-  if (w.length > 2) { toast('too many words: quote a folder that has a space, :new "/my dir" [model]', true); return; }
-  newSession(w[0], w[1]); // a model only when typed
+  // A last word that is a mode is the mode (never the first word: that is the folder); no mode word is the home's default_mode.
+  const chosen = w.length > 1 && ['manual', 'auto', 'yolo'].includes(w[w.length - 1]) ? w.pop() : undefined;
+  if (w.length > 2) { toast('too many words: quote a folder that has a space, :new "/my dir" [model] [manual|auto|yolo]', true); return; }
+  newSession(w[0], w[1], undefined, chosen); // a model only when typed
 }
 
 // `new session ▸`: the folders of open and live sessions (max 8), then any folder.
@@ -1038,21 +1040,17 @@ const act = {
 // The activity rail: always on screen at the far edge of its side, one icon per
 // tab (RAIL_ICONS); the open tab's icon is lit. Click: open on that tab, or
 // close if it is the open one. Both rails alone is compact mode.
-// The collapse / expand glyph: at the outer end of an open panel's title (the only collapse control), and on the rail's top cell only
-// while the panel is closed (the way back in); an open panel leaves that cell an empty spacer so the icons below do not move.
-// The arrow points the way the panel goes: toward its edge when it folds away, away from it when it opens.
+// The collapse glyph: only at the outer end of an open panel's title, never in the rail; a closed panel comes back through its rail icons or ctrl+b / ctrl+i.
+// The arrow points toward the panel's own edge, the way it folds away.
 function Fold({ side, cls }) {
-  const left = side === 'l', closed = (left ? ui.lrail : ui.rrail).value;
-  const glyph = left === closed ? '»' : '«';
-  const what = closed ? 'expand' : 'collapse';
-  return html`<${K} cls=${cls} title=${what + (left ? ' sidebar' : ' inspector') + ' · ' + (left ? 'ctrl+b' : 'ctrl+i')} on=${() => toggle(left ? 'lrail' : 'rrail')}>${glyph}</${K}>`;
+  const left = side === 'l';
+  return html`<${K} cls=${cls} title=${'collapse' + (left ? ' sidebar' : ' inspector') + ' · ' + (left ? 'ctrl+b' : 'ctrl+i')} on=${() => toggle(left ? 'lrail' : 'rrail')}>${left ? '«' : '»'}</${K}>`;
 }
 function Rail({ side }) {
   const left = side === 'l', names = left ? LEFT_TABS : RIGHT_TABS;
   const cur = (left ? ui.left : ui.right).value, closed = (left ? ui.lrail : ui.rrail).value;
   const keys = left ? 'ctrl+b' : 'ctrl+i, [ ]';
   return html`<nav class=${'col arail ' + (left ? 'ral' : 'rar')} aria-label=${left ? 'sidebar tabs' : 'inspector tabs'}>
-    ${closed ? html`<${Fold} side=${side} cls="ri rt" />` : html`<div class="ri rt" aria-hidden="true"></div>`}
     ${names.map((n) => html`<${K} cls=${'ri' + (!closed && n === cur ? ' on' : '')} title=${n + ' · ' + keys} on=${() => railPick(side, n)}>${RAIL_ICONS[n]}</${K}>`)}
   </nav>`;
 }
@@ -1333,6 +1331,9 @@ function RunTab({ s }) {
     <div class="hdr">parked</div><${Needs}>live park samples need the park-tick frame (gap 7)</${Needs}>`;
 }
 
+// The status line's mode badge: what each approval mode means, for its tooltip.
+const MODE_TIPS = { yolo: 'yolo: the gate is answering for you', manual: 'manual: it asks before anything that changes things', auto: "auto: eidolon's rules, it asks only for risky commands" };
+
 // What this door has loaded, as far as it says: the hello frame names the
 // model and the gate (yolo); the tools are the ones called so far (no door
 // route lists them), MCP tools grouped by server when named `mcp__<server>__<tool>`.
@@ -1359,7 +1360,7 @@ function LoadedTab({ s }) {
     ${at > 0 ? html`<${Kv} k="provider " v=${m.slice(0, at)} />` : html`<${Needs}>provider: not in the model key</${Needs}>`}
     <${Soon} what="effort" door="effort needs the hub" />
     <div class="hdr">gate</div>
-    <${Kv} k="mode     " v=${hl.yolo ? 'YOLO: the gate answers for you' : 'gated: it asks when policy says'} cls=${hl.yolo ? 'r' : ''} />
+    <${Kv} k="mode     " v=${({ yolo: 'yolo: the gate answers for you', manual: 'manual: it asks before anything that changes things', auto: 'auto: the stock rules, it asks for risky commands' })[modeOf(s.sid, hl)] || 'gated: it asks when policy says'} cls=${modeOf(s.sid, hl) === 'yolo' ? 'r' : modeOf(s.sid, hl) === 'manual' ? 'o' : ''} />
     <${Kv} k="verdicts " v=${s.verdicts.value.length} />
     <${Soon} what="the policy" door="the policy itself needs the hub" />
     <div class="hdr">tools used</div>
@@ -1587,7 +1588,7 @@ function Status() {
   });
   if (ui.cmd.value != null) return html`<footer id="status" class="cmd"><${CmdLine} /></footer>`;
   const dot = html`<span class="faint"> · </span>`;
-  const ctx = s && s.ctx.value, limit = hl && hl.context_limit;
+  const ctx = s && s.ctx.value, limit = hl && hl.context_limit, chat = p && hl ? modeOf(p.sid, hl) : '';
   const gauges = s ? [
     lvl < 4 && `ctx ${ctx != null ? kfmt(ctx) : '-'}/${limit ? kfmt(limit) : '-'}`,
     lvl < 3 && `in ${kfmt(s.usedIn.value)} out ${kfmt(s.usedOut.value)}`,
@@ -1598,7 +1599,7 @@ function Status() {
       ${p && html`<span class=${'badge st-' + STATE_CLS[st]} title=${st === '?' ? 'this page connected after the turn began or before any turn event' : ''}>${st}</span>`}
       ${hl && html`<${K} cls="model b" title="the model the door reports: what is loaded" on=${openLoaded}>${hl.model || '?'}</${K}>`}
       ${hl && hl.persona && html`${dot}<${K} cls="persona b" title="the persona: what is loaded" on=${openLoaded}>${hl.persona.name || hl.persona}</${K}>`}
-      ${hl && hl.yolo && html`${dot}<${K} cls="yolo b" title="the gate is answering for you" on=${openLoaded}>YOLO</${K}>`}
+      ${hl && chat && html`${dot}<${K} cls=${'mode b ' + chat} title=${MODE_TIPS[chat]} on=${openLoaded}>${chat === 'yolo' ? 'YOLO' : chat}</${K}>`}
       ${place > 0 && html`${dot}<span class="o">ask ${place}/${t.length}</span>`}
       ${p && queuedN(p) > 0 && html`${dot}<span class="hi qn" title="held here, sent in order when the turn ends">${queuedN(p)} queued</span>`}
       ${waiting > 0 && html`${dot}<${K} cls="o waitn" title=${ui.held.value ? 'the oldest ask takes focus when you pause typing; click to go now' : queue.value.length ? 'focus the oldest ask' : 'every ask is answered: submit sends them'}

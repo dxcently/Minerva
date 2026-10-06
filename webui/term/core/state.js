@@ -379,7 +379,7 @@ export class Session {
 
   // Switch the model or the mode of a running chat (perch only): the perch stops the door and resumes the same log with the new
   // flags, between turns, so the pane stays on this id and reconnects (the log replays; nothing is lost). `change` is
-  // { model?, yolo? }; `said` is the one line that goes into the transcript when it worked.
+  // { model?, mode? } (mode: manual, auto or yolo); `said` is the one line that goes into the transcript when it worked.
   async restart(change, said) {
     if (this.closed || this.restarting || mode() !== 'perch') return false;
     if (this.running.value === true) { this.hooks.toast('a turn is running: wait for it to end, then switch', true); return false; }

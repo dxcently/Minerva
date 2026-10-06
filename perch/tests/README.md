@@ -1,5 +1,7 @@
 # tests/ — a real perch over a real socket
 
+`manual_policy.rs` checks the manual mode's policy: eidolon's own `policy.rn` plus the wrapper, compiled through Rune and asked about every tool and shell leaf, then (when `eidolon` is on `PATH`, with `XDG_CONFIG_HOME`, `HOME` and `XDG_RUNTIME_DIR` in temp dirs) the real `eidolon policy` and a headless `-m mock` turn under each config.
+
 `http.rs` is cargo's integration test for this crate, and it is the only test that proves
 the parts a unit test cannot reach: the argv, the two boot lines, the `0600` token file a
 supervisor actually gets, and every gate as it is met by a request.

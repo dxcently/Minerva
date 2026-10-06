@@ -69,7 +69,6 @@ html, body {
 .ri { overflow: hidden; font-size: var(--fs); line-height: var(--ch); display: flex; align-items: center; justify-content: center; height: calc(2 * var(--ch)); flex: none; color: var(--faint); }
 .ri:hover { color: var(--brightest); background: var(--panel); text-decoration: none; }
 .ri.on, .ri.on:hover { color: var(--bg); background: var(--bright); }
-.ri.rt { border-bottom: 1px solid var(--line); height: calc(1.5 * var(--ch)); margin-bottom: calc(var(--ch) / 2); }
 .tab.fold { color: var(--faint); margin: 0 var(--cw); }
 .tab.fold:hover { color: var(--brightest); }
 .ri:focus-visible { outline-offset: -2px; }
@@ -472,7 +471,9 @@ pre, .pre {
 #status .badge.st-off { background: var(--red); }
 #status .model { color: var(--cyan); }
 #status .persona { color: var(--magenta); }
-#status .yolo { color: var(--red); }
+#status .mode.yolo { color: var(--red); }
+#status .mode.manual { color: var(--orange); }
+#status .mode.auto { color: var(--faint); }
 #status .warn { color: var(--red); }
 #status .qk .kk { color: var(--cyan); }
 #cmd { display: flex; flex: 1; }

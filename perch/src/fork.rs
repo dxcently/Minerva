@@ -133,13 +133,13 @@ pub(crate) async fn fork(ctx: &Ctx, id: &str, body: &Bytes) -> Response<BoxBody>
     if let Some(cwd) = ctx.registry.known_cwd(id).filter(|cwd| cwd.is_dir()) {
         ctx.registry.set_cwd(&new_id, &cwd);
     }
-    // The copy starts as the source is: its model and `--yolo`, when the perch knows them (a live door says; a saved chat is what
+    // The copy starts as the source is: its model and mode, when the perch knows them (a live door says; a saved chat is what
     // this run remembered, else what `eidolon sessions` listed), else the config's default.
     ctx.registry.refresh_titles().await;
-    let (model, yolo) = ctx.registry.flags_of(id).unzip();
-    let model = model.filter(|m| crate::models::key_ok(m));
+    let model = ctx.registry.flags_of(id).map(|(model, _)| model).filter(|m| crate::models::key_ok(m));
+    let mode = ctx.registry.mode_of(id);
     let source_title = ctx.registry.titled_list().await.into_iter().find(|row| row.id == id).and_then(|row| row.title);
-    match crate::restart::bring_up(ctx, &new_id, &log, model.as_deref(), yolo.unwrap_or(false)).await {
+    match crate::restart::bring_up(ctx, &new_id, &log, model.as_deref(), mode).await {
         Ok(_) => {
             if let Some(title) = source_title {
                 let kept: String = title.chars().take(names::MAX_TITLE - " (fork)".len()).collect();

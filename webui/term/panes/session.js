@@ -11,7 +11,7 @@ import { render as rend, renderCall } from '../renderers/index.js';
 import { icon, word, shade, CELLS } from '../core/life.js';
 import { tildify, kfmt, hhmm, stateOf, STATE_CLS, connWord } from '../core/state.js';
 import { mode, hubGet, hubPost } from '../core/api.js';
-import { list, refresh } from '../core/hub.js';
+import { list, refresh, modeOf } from '../core/hub.js';
 import { openMenu, closeMenu, menu, atPointer, under } from '../core/menu.js';
 import { AskPanel, AskMark, Settled, quoted } from './asks.js';
 import { Strip, items as imageItems, linkPaths } from './imgs.js';
@@ -160,7 +160,7 @@ function ForkComposer({ s, p, act }) {
   };
   const r = run.value, secs = Math.round((r.elapsed_ms || 0) / 1000);
   const tail = String(r.out || '').split('\n').filter((l) => l.trim()).slice(-OUT_LINES).join('\n');
-  const gate = r.yolo ? 'tool approvals in this turn are answered yes (the chat was in yolo mode)' : 'tool approvals in this turn are declined (the chat was not in yolo mode): it runs with no terminal to ask you in';
+  const gate = r.mode === 'yolo' || (!r.mode && r.yolo) ? 'tool approvals in this turn are answered yes (the chat was in yolo mode)' : `tool calls that need a yes in this turn are declined (the chat is in ${r.mode || 'auto'} mode): it runs with no terminal to ask you in`;
   return html`<div class=${'composer st-' + (working ? 'run' : 'idle') + (working ? ' running' : '')}
       onDragOver=${(e) => { if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) e.preventDefault(); }}
       onDrop=${(e) => { if (e.dataTransfer && e.dataTransfer.files.length) { e.preventDefault(); take([...e.dataTransfer.files]); } }}>
@@ -212,6 +212,9 @@ function Transcript({ s, v }) {
 // A session nobody has spoken in opens on the start screen, as the TUI's
 // does (default.rn:253-285): the owl, what the session runs on (read live),
 // and enough keys to begin; `?` has the rest.
+// What the gate is, in the words of the start screen and the loaded tab.
+const gateWords = (chat) => (chat === 'yolo' ? html`<span class="r b">YOLO</span>` : chat === 'manual' ? html`<span class="o b">manual</span> asks before anything that changes things` : chat === 'auto' ? html`<span class="b">auto</span> asks only for risky commands` : 'asks');
+
 function Start({ s, v }) {
   const hl = s.hello.value;
   if (!hl) return null;
@@ -222,7 +225,7 @@ function Start({ s, v }) {
     ${line('session ', v.act.name(s))}
     ${line('model   ', html`<span class="c b">${hl.model || '?'}</span>`)}
     ${line('persona ', hl.persona ? html`<span class="m b">${hl.persona}</span>` : 'none')}
-    ${line('gate    ', hl.yolo ? html`<span class="r b">YOLO</span>` : 'asks')}
+    ${line('gate    ', gateWords(modeOf(s.sid, hl)))}
     ${line('cwd     ', tildify(hl.cwd))}
     <div class="gap"></div>
     ${key('i', 'write a message · ⏎ sends · ⇧⏎ is a newline · esc leaves the composer')}
@@ -515,8 +518,9 @@ async function loadModels() {
   return null;
 }
 const MODE_ROWS = [
-  ['gated', 'asks before risky tools'],
-  ['yolo', 'answers yes to every ask'],
+  ['manual', 'asks before anything that changes things'],
+  ['auto', "eidolon's rules: asks only for risky commands"],
+  ['yolo', 'never asks'],
 ];
 
 function Composer({ s, p, act }) {
@@ -625,8 +629,8 @@ function Composer({ s, p, act }) {
     ro.observe(root.current);
     return () => ro.disconnect();
   }, []);
-  const hl = s.hello.value, yolo = !!(hl && hl.yolo), model = (hl && hl.model) || '?';
-  useLayoutEffect(() => { setFit(0); }, [cw, model, yolo, run, !!p.editing.value]);
+  const hl = s.hello.value, chat = modeOf(s.sid, hl), model = (hl && hl.model) || '?';
+  useLayoutEffect(() => { setFit(0); }, [cw, model, chat, run, !!p.editing.value]);
   useLayoutEffect(() => {
     const el = bar.current;
     if (el && fit < 4 && el.scrollWidth > el.clientWidth + 1) setFit(fit + 1);
@@ -673,7 +677,7 @@ function Composer({ s, p, act }) {
   const busy = run === true ? 'wait for the turn to end' : null;
   const switchTo = (change, said) => s.restart(change, said);
   const pickModel = (key) => key !== model && switchTo({ model: key }, `switched to ${key} — the chat restarted between turns, nothing lost`);
-  const pickMode = (name) => switchTo({ yolo: name === 'yolo' }, `mode is now ${name} — the chat restarted between turns, nothing lost`);
+  const pickMode = async (name) => { if (await switchTo({ mode: name }, `mode is now ${name} — the chat restarted between turns, nothing lost`)) refresh(); };
   if (mode() === 'perch') {
     menus.push({ id: 'model', full: `model ${model}`, short: model.split(/[/:]/).pop(), open: true, items: (rows, loading) => [
       ...(loading ? [{ label: 'loading models…', off: 'one moment' }] : []),
@@ -682,8 +686,8 @@ function Composer({ s, p, act }) {
       ...(rows || loading ? [{ sep: true }] : []),
       { label: 'other…', hint: rows ? 'type a model name' : `${modelsErr || 'no list'}; type a model name`, off: busy, on: () => { other.value = ''; setTimeout(() => p.focusOther && p.focusOther(), 0); } },
     ] });
-    menus.push({ id: 'mode', full: `mode ${yolo ? 'yolo' : 'gated'}`, short: yolo ? 'yolo' : '⚑', items: () => MODE_ROWS.map(([name, hint]) =>
-      ({ label: name, hint, tick: (name === 'yolo') === yolo, off: busy, on: () => { if ((name === 'yolo') !== yolo) pickMode(name); } })) });
+    menus.push({ id: 'mode', full: `mode ${chat || 'gated'}`, short: chat || '⚑', items: () => MODE_ROWS.map(([name, hint]) =>
+      ({ label: name, hint, tick: name === chat, off: busy, on: () => { if (name !== chat) pickMode(name); } })) });
   }
   // The model menu is filled from the perch's list: fetched when it is opened (a menu cannot wait on a promise).
   const menuAt = (m) => async (e) => {

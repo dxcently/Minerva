@@ -85,3 +85,6 @@ required-features = ["test-bins"]
 # Under `/tmp` (not the 9p mount Minerva lives on), because the 0600 checks need a
 # filesystem that keeps permissions.
 tempfile = "3"
+# Only the manual-mode test: it compiles eidolon's own shipped `policy.rn` with the generated wrapper and asks the wrapped table
+# what it says about every tool, which eidolon offers no command for. The same version eidolon builds with; nothing ships it.
+rune = { version = "0.14.2", features = ["std", "alloc"] }

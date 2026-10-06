@@ -1,6 +1,6 @@
 //! What the composer's `model` and `mode` menus call: `GET /hub/models` and `POST /hub/sessions/<id>/restart`.
 //!
-//! **A running door cannot change its model or its `--yolo`.** eidolon's `web` command takes both at start and the door has no
+//! **A running door cannot change its model or its mode** (`--yolo`, or the manual `--config`, see `mode.rs`). eidolon's `web` command takes them at start and the door has no
 //! route that moves either (its routes are `events`, `say`, `answer`, `launch`, `cancel`), so "switch model" is **stop the
 //! door cleanly, then resume the same log with the new flags**. The chat keeps its id, its folder and the Minerva config
 //! (`--config` is the perch's, passed again by [`spawn::argv`]); the log is the transcript, so nothing is lost; the page's pane
@@ -23,6 +23,7 @@ use std::path::Path;
 use bytes::Bytes;
 use hyper::{Response, StatusCode};
 
+use crate::mode::Mode;
 use crate::models;
 use crate::serve::{BoxBody, Ctx, Up, door_up, json, problem};
 use crate::sessions::{self, Restart};
@@ -37,10 +38,12 @@ pub(crate) enum Failed {
     Spawn(String),
 }
 
-/// Spawn a door on an existing log with the Minerva config and the given `-m` / `--yolo`, check it opened *that* log, and make
+/// Spawn a door on an existing log with the Minerva config for `mode` (and `-m`), check it opened *that* log, and make
 /// the row live, holding the perch's stream to it. This is what a resume is, and what the second half of a restart is. The
-/// caller has already judged the id, the log, and whether anything holds it. Returns the model and yolo the door reports.
-pub(crate) async fn bring_up(ctx: &Ctx, id: &str, log: &Path, model: Option<&str>, yolo: bool) -> Result<(String, bool), Failed> {
+/// caller has already judged the id, the log, and whether anything holds it. Returns the model the door reports and its mode ([`Mode::reported`]).
+pub(crate) async fn bring_up(ctx: &Ctx, id: &str, log: &Path, model: Option<&str>, mode: Mode) -> Result<(String, Mode), Failed> {
+    // Before the reservation: a manual door that cannot be made leaves nothing behind.
+    let (config, yolo) = ctx.registry.door_flags(mode).map_err(Failed::Spawn)?;
     // Reserved before the fork, so a second resume in flight cannot pass the caller's check too.
     if !ctx.registry.reserve(id, log) {
         return Err(Failed::Held);
@@ -53,7 +56,7 @@ pub(crate) async fn bring_up(ctx: &Ctx, id: &str, log: &Path, model: Option<&str
         Some(cwd) => spawn::Target::KeptIn(log, cwd),
         None => spawn::Target::Kept(log),
     };
-    let argv = spawn::argv(&ctx.registry.eidolon, ctx.registry.eidolon_config.as_deref(), target, model, yolo);
+    let argv = spawn::argv(&ctx.registry.eidolon, config, target, model, yolo);
     let up = door_up(ctx, argv, Some(id)).await.map_err(Failed::Spawn)?;
     let Up { pid, port, token, exit, watcher, hello } = up;
     // The door must have opened the log we asked it to. A door that opened another one is exactly the two-writers case, wearing a hat.
@@ -67,9 +70,10 @@ pub(crate) async fn bring_up(ctx: &Ctx, id: &str, log: &Path, model: Option<&str
     // list still shows it) and `/hub/tree` refuses it, because the tree re-checks its root against `--root` on every request.
     let cwd = ctx.registry.cwd_under_a_root(&hello.cwd).unwrap_or_else(|_| hello.cwd.clone());
     ctx.registry.mark_live(id, &hello.session, &cwd);
-    ctx.registry.set_flags(id, &hello.model, hello.yolo);
+    let actual = mode.reported(hello.yolo);
+    ctx.registry.set_flags(id, &hello.model, actual);
     ctx.registry.keep_watcher(id, watcher);
-    Ok((hello.model, hello.yolo))
+    Ok((hello.model, actual))
 }
 
 /// `GET /hub/models`: `[{"key","name"?,"note"?}]`, eidolon's own listing, cached ten minutes.
@@ -85,33 +89,42 @@ pub(crate) async fn models(ctx: &Ctx) -> Response<BoxBody> {
     }
 }
 
-/// `POST /hub/sessions/<id>/restart` with `{"model": "<m>"?, "yolo": <bool>?}` (at least one): see the module doc.
+/// `POST /hub/sessions/<id>/restart` with `{"model": "<m>"?, "mode": "manual"|"auto"|"yolo"?, "yolo": <bool>?}` (at least one; `yolo` is the old
+/// spelling of `mode`, true is yolo and false is auto, and loses to `mode` when both are there): see the module doc.
 ///
 /// ```text
 ///   400  not that shape, or a model that cannot be a `-m` value     404  no such chat
 ///   409  a turn is running ("wait for the turn to end") | starting or stopping | not running here | something holds the log
-///   200  {"id", "model", "yolo", "restarted"}   restarted is false when the asked flags were already the door's
+///   200  {"id", "model", "mode", "yolo", "restarted"}   restarted is false when the asked flags were already the door's
 ///   503  {"error", "reverted"}   the new flags did not come up; reverted says whether the old ones did
 /// ```
 pub(crate) async fn restart(ctx: &Ctx, id: &str, body: &Bytes) -> Response<BoxBody> {
     #[derive(serde::Deserialize)]
     struct Asked {
         model: Option<String>,
+        mode: Option<String>,
         yolo: Option<bool>,
     }
-    const SHAPE: &str = "expected a JSON body of {\"model\": \"<m>\"?, \"yolo\": <true|false>?}, at least one";
+    const SHAPE: &str = "expected a JSON body of {\"model\": \"<m>\"?, \"mode\": \"manual\"|\"auto\"|\"yolo\"?}, at least one";
     if !sessions::id_ok(id) {
         return crate::serve::status(StatusCode::NOT_FOUND);
     }
     let Ok(asked) = serde_json::from_slice::<Asked>(body) else { return problem(StatusCode::BAD_REQUEST, SHAPE) };
-    if asked.model.is_none() && asked.yolo.is_none() {
+    if asked.model.is_none() && asked.yolo.is_none() && asked.mode.is_none() {
         return problem(StatusCode::BAD_REQUEST, SHAPE);
     }
+    let asked_mode = match asked.mode.as_deref() {
+        Some(word) => match Mode::parse(word) {
+            Some(mode) => Some(mode),
+            None => return problem(StatusCode::BAD_REQUEST, SHAPE),
+        },
+        None => asked.yolo.map(Mode::from_yolo),
+    };
     if asked.model.as_deref().is_some_and(|model| !models::key_ok(model)) {
         return problem(StatusCode::BAD_REQUEST, "that is not a model name (letters, digits and : . _ - / @ + only)");
     }
-    let (log, model, yolo) = match ctx.registry.restartable(id) {
-        Restart::Ready { log, model, yolo } => (log, model, yolo),
+    let (log, model, mode) = match ctx.registry.restartable(id) {
+        Restart::Ready { log, model, mode } => (log, model, mode),
         Restart::Running => return problem(StatusCode::CONFLICT, "a turn is running: wait for the turn to end, then switch (a restart now would cut it off)"),
         Restart::Between(_) => return problem(StatusCode::CONFLICT, "that chat is starting or stopping; try again in a moment"),
         Restart::NotOurs if ctx.registry.find_log(id).is_some() => {
@@ -119,9 +132,13 @@ pub(crate) async fn restart(ctx: &Ctx, id: &str, body: &Bytes) -> Response<BoxBo
         }
         Restart::NotOurs => return crate::serve::status(StatusCode::NOT_FOUND),
     };
-    let (want_model, want_yolo) = (asked.model.clone().unwrap_or_else(|| model.clone()), asked.yolo.unwrap_or(yolo));
-    if want_model == model && want_yolo == yolo {
-        return json(StatusCode::OK, &serde_json::json!({ "id": id, "model": model, "yolo": yolo, "restarted": false }));
+    let (want_model, want_mode) = (asked.model.clone().unwrap_or_else(|| model.clone()), asked_mode.unwrap_or(mode));
+    if want_model == model && want_mode == mode {
+        return json(StatusCode::OK, &serde_json::json!({ "id": id, "model": model, "mode": mode, "yolo": mode == Mode::Yolo, "restarted": false }));
+    }
+    // Said before anything is stopped: a chat is not taken down for a mode that cannot come up.
+    if let Err(why) = ctx.registry.door_flags(want_mode) {
+        return problem(StatusCode::SERVICE_UNAVAILABLE, &why);
     }
     // Stopping and reopening a log that ends mid-turn would carry the turn on by itself (hub.md section 4): a paid turn nobody asked for.
     if crate::fork::settled(ctx, &log, false).await != Some(true) {
@@ -134,13 +151,13 @@ pub(crate) async fn restart(ctx: &Ctx, id: &str, body: &Bytes) -> Response<BoxBo
     if ctx.registry.stop(id).await == sessions::Stop::NotLive {
         return problem(StatusCode::CONFLICT, "that chat stopped before it could be restarted");
     }
-    match bring_up(ctx, id, &log, new, want_yolo).await {
-        Ok((model, yolo)) => json(StatusCode::OK, &serde_json::json!({ "id": id, "model": model, "yolo": yolo, "restarted": true })),
+    match bring_up(ctx, id, &log, new, want_mode).await {
+        Ok((model, mode)) => json(StatusCode::OK, &serde_json::json!({ "id": id, "model": model, "mode": mode, "yolo": mode == Mode::Yolo, "restarted": true })),
         Err(Failed::Held) => problem(StatusCode::CONFLICT, "that chat's log was taken by another session while it restarted"),
         Err(Failed::Spawn(why)) => {
             tracing::warn!(%why, id, "perch: a restart did not come up");
             // Back to what it was, so a typo in a model name costs a message, not the chat.
-            let reverted = bring_up(ctx, id, &log, keep, yolo).await.is_ok();
+            let reverted = bring_up(ctx, id, &log, keep, mode).await.is_ok();
             let words = if reverted {
                 format!("{want_model} did not start, so the chat is back on {model}")
             } else {

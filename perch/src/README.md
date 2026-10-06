@@ -14,6 +14,7 @@ sessions.rs  the doors we own, the list (kept + ours + roster), the pane count, 
 spawn.rs     the argv, the fork, the boot lines, the door's token file, PDEATHSIG
 watch.rs     the perch's own /api/events stream to a door, and closing it before SIGTERM; reads only until `hello` (capped at 1 MiB), holds no transcript
 proxy.rs     GET|POST /s/<id>/api/<route> to that session's door, panes, the hub-stream-end frame
+mode.rs      the three approval modes: Mode, the manual policy wrapper over eidolon's own table, config-manual.toml, chat-modes.json
 bin/fake_eidolon.rs   the stand-in door, built only with `--features test-bins`
 ```
 

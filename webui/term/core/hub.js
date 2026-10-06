@@ -31,6 +31,14 @@ export function refresh() {
   return busy;
 }
 
+// The approval mode of a chat: 'yolo' when its door says so (the door's own word), else what the perch reports for it ('manual' or
+// 'auto': the perch chose the config the door runs with), else '' (a door another process started: nobody here knows).
+export function modeOf(sid, hello) {
+  if (hello && hello.yolo) return 'yolo';
+  const row = list.value.find((r) => r.id === sid);
+  return row && (row.mode === 'manual' || row.mode === 'auto') ? row.mode : '';
+}
+
 export function startPolling() {
   if (started || mode() !== 'perch') return;
   started = true;
