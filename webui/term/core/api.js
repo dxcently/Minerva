@@ -100,8 +100,8 @@ export const rows = () => hubRows;
 // network failure. The list poll and the boot probe set it; spawn, resume and stop do not
 // (a door can take ~20 s to come up).
 export const POLL_TIMEOUT_MS = 5000;
-async function hubCall(method, path, body, timeout) {
-  if (typeof path !== 'string' || !(path.startsWith('sessions') || path.startsWith('tree?'))) throw new Error('hub path must start with sessions or tree?');
+async function hubCall(method, path, body, timeout, raw = false) {
+  if (typeof path !== 'string' || !/^(sessions|tree\?|projects|dirs|models)/.test(path)) throw new Error('hub path must start with sessions, tree?, projects, dirs or models');
   const init = { method, cache: 'no-store', headers: auth() };
   if (body !== undefined) {
     init.headers['content-type'] = 'application/json';
@@ -113,6 +113,7 @@ async function hubCall(method, path, body, timeout) {
   try {
     const r = await fetch(`/hub/${path}`, init);
     const t = await r.text();
+    if (raw && r.status === 200) return { status: 200, data: t }; // the log route: eidolon's JSON lines as text
     let data = null;
     if (t) { try { data = JSON.parse(t); } catch { data = { error: t.slice(0, 200) }; } }
     return { status: r.status, data };
@@ -123,7 +124,10 @@ async function hubCall(method, path, body, timeout) {
   }
 }
 export const hubGet = (path, timeout) => hubCall('GET', path, undefined, timeout);
+// The same, answered as the text the perch sent (a 200 only: any other status comes back parsed, as an error body).
+export const hubText = (path, timeout) => hubCall('GET', path, undefined, timeout, true);
 export const hubPost = (path, body) => hubCall('POST', path, body);
+export const hubDelete = (path) => hubCall('DELETE', path);
 // GET /hub/tree?session=<id>&path=<rel> (hub.md section 7): the query is built
 // from parts with encodeURIComponent, never by joining a raw path.
 export const hubTree = (sid, rel) => hubGet(`tree?session=${encodeURIComponent(sid)}&path=${encodeURIComponent(rel || '')}`);

@@ -116,6 +116,8 @@ html, body {
 .pane.focus > .ftitle .faint, .pane.focus > .ftitle .hi, .pane.focus > .ftitle .y, .pane.focus > .ftitle .proj { color: var(--bg); }
 .ptitle .proj { color: var(--fg); }
 .ptitle { cursor: pointer; max-width: calc(100% - 12 * var(--cw)); }
+/* a chat is named by its first message: long, so the name is cut before the project chip and the dot are */
+.ptitle .b { display: inline-block; vertical-align: top; max-width: calc(34 * var(--cw)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* split and close glyphs, cut into the top border on the right */
 .fglyphs {
   position: absolute; right: var(--cw); z-index: 2; top: calc(var(--ch) / -2 - 0.5px);
@@ -319,6 +321,11 @@ pre, .pre {
   background: var(--panel); color: var(--yellow); white-space: pre-wrap;
 }
 .banner.err { color: var(--red); }
+/* where the composer would be, for a chat that is not running: a visible action, never automatic */
+.cont { flex: none; margin: calc(var(--ch) * 0.6) var(--cw); padding: 0 var(--cw); white-space: pre-wrap; }
+.cont .act { color: var(--bright); }
+.cont .act:hover, .cont .act:focus-visible { background: var(--sel); color: var(--brightest); text-decoration: none; outline: none; }
+.cont .dis.act { color: var(--faint); }
 /* where an ask arose: one line until it settles */
 .askmark { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .askmark .askl { color: var(--faint); margin-left: var(--cw); }
@@ -482,3 +489,43 @@ pre, .pre {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ---- composer: the `other…` model line, and long menus (the model list is ~30 rows) ---- */
+.composer .cother { padding: 0 var(--cw); color: var(--fg); }
+.composer .cother input { background: var(--bg); color: var(--brightest); border: 0; border-bottom: 1px solid var(--faint); font: inherit; width: calc(34 * var(--cw)); outline: none; }
+.pop { max-height: 70vh; overflow-y: auto; }
+
+/* ---- the chat list: search, groups, rows (2026-10-06 project model) ---- */
+.chats .sq { display: flex; align-items: center; gap: var(--cw); margin-bottom: var(--ch); }
+.chats .sq input, .picker input { flex: 1; min-width: 0; background: transparent; color: var(--fg); border: 0; border-bottom: 1px solid var(--line); font: inherit; padding: 0; border-radius: 0; outline: none; }
+.chats .sq input:focus, .picker input:focus { border-bottom-color: var(--bright); }
+.chats .newrow { margin: calc(var(--ch) * 0.3) 0; }
+.chats .newchat, .side .newrow .newchat { color: var(--bright); }
+.chats .grp + .grp, .chats .newrow + .grp { margin-top: calc(var(--ch) * 0.5); }
+.chats .gh2 { display: flex; gap: var(--cw); white-space: pre; }
+.chats .gh2 .gname { flex: 1; min-width: 0; color: var(--bright); font-weight: bold; overflow: hidden; text-overflow: ellipsis; }
+.chats .gh2 .plus, .newrow + .plus { color: var(--bright); }
+.chats .grp > .list { padding-left: 0; }
+.chats .list .it + .it { margin-top: 0; }
+.chats .it.chat { display: block; }
+.chats .crow { display: flex; gap: var(--cw); width: 100%; white-space: pre; }
+.chats .crow:hover { text-decoration: none; background: var(--sel); }
+.chats .it.cur { background: var(--sel); }
+.chats .it.cur .ct { color: var(--brightest); }
+.chats .ct { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.chats .ca { text-align: right; }
+.chats .pad { padding-left: var(--cw); }
+
+/* ---- the folder picker, over the tiles ---- */
+.picker { position: absolute; z-index: 30; background: var(--bg); }
+.picker .pk { padding: var(--ch) var(--cw); white-space: pre-wrap; }
+.picker .row { display: flex; align-items: center; gap: var(--cw); margin-bottom: var(--ch); }
+.picker .crumbs { margin-bottom: var(--ch); }
+.picker .dirs { margin-bottom: var(--ch); max-height: 60%; overflow: auto; }
+.picker .drow { display: inline-block; color: var(--fg); }
+.picker .drow:hover, .picker .drow:focus-visible { background: var(--sel); color: var(--brightest); text-decoration: none; outline: none; }
+.picker .acts { display: flex; gap: calc(3 * var(--cw)); margin: var(--ch) 0; }
+.picker .act { color: var(--bright); }
+.picker .act:hover, .picker .act:focus-visible { background: var(--sel); color: var(--brightest); text-decoration: none; outline: none; }
+.picker .dis.act { color: var(--faint); }
+.picker .msg { min-height: var(--ch); color: var(--yellow); }

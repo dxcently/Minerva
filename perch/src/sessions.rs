@@ -49,7 +49,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::spawn;
+use crate::titles::{self, mtime_secs};
 use crate::watch::Watcher;
 
 /// §4's id regex, spelled out rather than pulled in as a dependency: the id is a log's stem
@@ -126,8 +127,13 @@ pub struct Entry {
     pub panes: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtime: Option<u64>,
+    /// Every row has one: the first message (eidolon's own words for it), else `<project> · HH:MM`. See [`titles`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// `"other"` for a saved chat from eidolon's own shared sessions dir (a read-only source; hub.md section 4).
+    /// Absent for the Minerva home's own, and for any chat that is running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<&'static str>,
 }
 
 /// The channel a door's reaper publishes its exit on: `None` while the child is alive. One
@@ -253,6 +259,9 @@ pub struct Door {
     pub state: State,
     pub pid: u32,
     pub port: u16,
+    /// The model and `--yolo` the door was started with, as its own `hello` says: what the next restart keeps.
+    model: String,
+    yolo: bool,
     token: Arc<str>,
     watcher: Option<Watcher>,
     exit: ExitWatch,
@@ -317,8 +326,17 @@ pub struct Registry {
     pub eidolon_config: Option<PathBuf>,
     /// `--home`'s `scratch/`: where a new session with no `cwd` works. `None` refuses it.
     pub scratch: Option<PathBuf>,
+    /// With `--home`: eidolon's own sessions dir (the member's, not the Minerva home's), listed as a second, read-only
+    /// source of saved chats flagged `origin: "other"`. The perch never writes, moves or deletes anything in it.
+    pub other: Option<PathBuf>,
+    /// What the perch has learned about titles ([`titles::Cache`]); never held across an await.
+    titles: Mutex<titles::Cache>,
     /// `--root`, canonicalized once at start: a new session's cwd must sit under one.
     roots: Vec<PathBuf>,
+    /// `<home>/projects.json`: the named folders; refuses a change without `--home`.
+    pub projects: crate::projects::Projects,
+    /// `<home>/chat-cwds.json`: the folder each chat was started in, kept across restarts (a saved row has no door to ask).
+    cwds: crate::projects::Cwds,
     doors: Mutex<Vec<Door>>,
 }
 
@@ -329,6 +347,19 @@ const SETTLE: Duration = Duration::from_secs(2);
 /// How long a stop waits for the panes it cancelled to finish closing (H1c). A pane ends in
 /// the time it takes to drop a socket; this only bounds a pane that has wedged.
 const PANE_DRAIN: Duration = Duration::from_secs(2);
+
+/// Whether a live door can be restarted right now, for `POST /hub/sessions/<id>/restart`.
+#[derive(Debug)]
+pub enum Restart {
+    /// Ours, live and between turns: its log, and the model and `--yolo` it runs with now.
+    Ready { log: PathBuf, model: String, yolo: bool },
+    /// Ours and live, and a turn is running: a restart now would cut it off.
+    Running,
+    /// Ours, and starting or stopping.
+    Between(State),
+    /// Not a door of ours that is alive (kept, running elsewhere, dead, or nothing).
+    NotOurs,
+}
 
 /// What a stop did, for the route's 202/409.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,7 +378,7 @@ impl Registry {
     /// canonical paths, and a `--root` that does not exist refuses the start rather than
     /// failing every spawn with a 422 nobody can act on.
     pub fn new(sessions_dir: PathBuf, runtime_dir: PathBuf, eidolon: PathBuf, roots: Vec<PathBuf>) -> Result<Arc<Self>> {
-        Self::with_home(sessions_dir, runtime_dir, eidolon, roots, None, None)
+        Self::with_home(sessions_dir, runtime_dir, eidolon, roots, None, None, None)
     }
 
     /// [`Registry::new`] plus the Minerva home's two settings: the config every door is given
@@ -359,6 +390,7 @@ impl Registry {
         roots: Vec<PathBuf>,
         eidolon_config: Option<PathBuf>,
         scratch: Option<PathBuf>,
+        other: Option<PathBuf>,
     ) -> Result<Arc<Self>> {
         let mut checked = Vec::new();
         for root in roots {
@@ -367,7 +399,24 @@ impl Registry {
             checked.push(path);
         }
         anyhow::ensure!(!checked.is_empty(), "no --root and no $HOME: a new session's cwd could not be checked against anything");
-        Ok(Arc::new(Self { sessions_dir, runtime_dir, eidolon, eidolon_config, scratch, roots: checked, doors: Mutex::new(Vec::new()) }))
+        // The other source is a second directory only when it is another one.
+        let other = other.filter(|dir| !same_dir(dir, &sessions_dir));
+        let home = scratch.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+        let projects = crate::projects::Projects::open(home.as_ref().map(|h| h.join("projects.json")));
+        let cwds = crate::projects::Cwds::open(home.as_ref().map(|h| h.join("chat-cwds.json")));
+        Ok(Arc::new(Self {
+            sessions_dir,
+            runtime_dir,
+            eidolon,
+            eidolon_config,
+            scratch,
+            other,
+            titles: Mutex::new(titles::Cache::default()),
+            roots: checked,
+            projects,
+            cwds,
+            doors: Mutex::new(Vec::new()),
+        }))
     }
 
     /// §4 step 1, for a new session: the cwd as the kernel spells it, and only if some
@@ -382,6 +431,21 @@ impl Registry {
             path.display()
         );
         Ok(path)
+    }
+
+    /// The canonical `--root`s, in the order they were given: the picker's first screen.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    /// The Minerva home (the parent of the scratch dir), when there is one.
+    pub fn home(&self) -> Option<&Path> {
+        self.scratch.as_deref().and_then(Path::parent)
+    }
+
+    /// The folder a chat was started in, as far as this perch knows (a door it holds, or one it remembered).
+    fn known_cwd(&self, id: &str) -> Option<PathBuf> {
+        self.titles.lock().unwrap().cwd(id).map(Path::to_path_buf).or_else(|| self.cwds.get(id))
     }
 
     /// `GET /hub/tree`'s root check, run on every request: the cwd canonicalized, and the
@@ -448,34 +512,123 @@ impl Registry {
         }
     }
 
+    /// `GET /hub/sessions`, with the titles eidolon has to be asked for: [`Registry::refresh_titles`] first
+    /// (at most one `eidolon sessions` per source, and none when nothing changed), then [`Registry::list`].
+    pub async fn titled_list(&self) -> Vec<Entry> {
+        self.refresh_titles().await;
+        self.list()
+    }
+
+    /// The sources a title can be asked of: (dir, the `--config` that makes `eidolon sessions` read it). The
+    /// Minerva home's own dir runs with the door's config; the other dir runs with none, so eidolon reads the
+    /// member's own (which is where that dir was resolved from).
+    fn sources(&self) -> Vec<(PathBuf, Option<PathBuf>)> {
+        let mut sources = vec![(self.sessions_dir.clone(), self.eidolon_config.clone())];
+        if let Some(other) = &self.other {
+            sources.push((other.clone(), None));
+        }
+        sources
+    }
+
+    /// Ask eidolon (never the log) for the title of every saved chat the cache cannot answer. A failure keeps what
+    /// was known and is not retried for a while; the rows then wear the fallback name.
+    pub async fn refresh_titles(&self) {
+        for (dir, config) in self.sources() {
+            let Ok(logs) = titles::logs_in(&dir) else { continue };
+            if !self.titles.lock().unwrap().stale(&dir, &logs) {
+                continue;
+            }
+            match titles::run(&self.eidolon, config.as_deref(), &["sessions".into()], titles::SESSIONS_CAP, titles::SESSIONS_TIMEOUT).await {
+                Ok(out) => self.titles.lock().unwrap().learn(&dir, &logs, &titles::parse_sessions(&out)),
+                Err(e) => {
+                    tracing::debug!(dir = %dir.display(), error = %e, "perch: eidolon sessions gave no titles");
+                    self.titles.lock().unwrap().failed(&dir);
+                }
+            }
+        }
+    }
+
+    /// The saved chat `id` names, and which source it is in: the Minerva home's own first, so an id that exists in
+    /// both resolves to the chat this UI started. The id must already be [`id_ok`].
+    pub fn find_log(&self, id: &str) -> Option<(PathBuf, Option<&'static str>)> {
+        let own = log_path(&self.sessions_dir, id);
+        if own.is_file() {
+            return Some((own, None));
+        }
+        let other = log_path(self.other.as_deref()?, id);
+        other.is_file().then_some((other, Some("other")))
+    }
+
+    /// [`id_from_log`] over both sources: the id a door's `hello.session` names, when that log is in either.
+    pub fn id_of_log(&self, log: &Path) -> Option<String> {
+        id_from_log(&self.sessions_dir, log).or_else(|| id_from_log(self.other.as_deref()?, log))
+    }
+
+    /// `GET /hub/sessions/<id>/log`: eidolon's own JSON lines for one saved chat (`eidolon log --json`), bounded in
+    /// size and time. A chat from the other source runs without `--config`: it is read-only, so no door's config is
+    /// involved, and eidolon's default is where the log is.
+    pub async fn read_log(&self, path: &Path, other: bool) -> std::result::Result<Vec<u8>, titles::RunError> {
+        let config = if other { None } else { self.eidolon_config.as_deref() };
+        titles::run(&self.eidolon, config, &["log".into(), "--json".into(), path.into()], titles::LOG_CAP, titles::LOG_TIMEOUT).await
+    }
+
+    /// The title of a row: the roster's (eidolon's own, while a door is live), else what `eidolon sessions` said
+    /// of the log, else the fallback name.
+    fn title_of(&self, id: &str, log: &Path, roster: Option<&str>, cwd: Option<&Path>, mtime: Option<u64>) -> String {
+        if let Some(title) = roster.map(str::trim).filter(|t| !t.is_empty()) {
+            return title.to_string();
+        }
+        let cache = self.titles.lock().unwrap();
+        if let Some(title) = cache.title(log) {
+            return title.to_string();
+        }
+        let cwd = cwd.or_else(|| cache.cwd(id)).map(Path::to_path_buf).or_else(|| self.cwds.get(id));
+        let project = cwd.as_deref().and_then(|c| self.projects.name_of(c));
+        titles::fallback(cwd.as_deref(), self.scratch.as_deref(), project.as_deref(), mtime)
+    }
+
     /// `GET /hub/sessions`: kept + ours + `live-elsewhere`, one row per id — a door of ours
-    /// wins over a roster entry, which wins over the kept log.
+    /// wins over a roster entry, which wins over the kept log. The second source (`other`) adds only ids
+    /// the first does not have, flagged read-only.
     pub fn list(&self) -> Vec<Entry> {
         let mut by_id: BTreeMap<String, Entry> = BTreeMap::new();
+        let roster = self.roster();
+        let roster_title = |id: &str| roster.iter().find(|(rid, _)| rid == id).and_then(|(_, row)| row.title.as_deref());
 
         // Kept sessions: every `*.eid` in the sessions dir, by stem and mtime (§4 source 1).
-        if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("eid") {
+        for (path, mtime) in titles::logs_in(&self.sessions_dir).unwrap_or_default() {
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| id_ok(id)) else { continue };
+            let title = self.title_of(id, &path, None, None, mtime);
+            by_id.insert(id.to_string(), Entry { id: id.to_string(), state: State::Kept, cwd: self.known_cwd(id).map(|p| p.display().to_string()), panes: 0, mtime, title: Some(title), origin: None });
+        }
+        // Eidolon's own dir (source 1b): read-only, and only ids this UI does not have.
+        if let Some(other) = &self.other {
+            for (path, mtime) in titles::logs_in(other).unwrap_or_default() {
+                let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| id_ok(id)) else { continue };
+                if by_id.contains_key(id) {
                     continue;
                 }
-                let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| id_ok(id)) else { continue };
-                let row = Entry { id: id.to_string(), state: State::Kept, cwd: None, panes: 0, mtime: mtime_secs(&path), title: None };
-                by_id.insert(id.to_string(), row);
+                let title = self.title_of(id, &path, None, None, mtime);
+                by_id.insert(id.to_string(), Entry { id: id.to_string(), state: State::Kept, cwd: self.known_cwd(id).map(|p| p.display().to_string()), panes: 0, mtime, title: Some(title), origin: Some("other") });
             }
         }
 
         // Our own doors (source 2), which override the kept row while we hold them.
         let ours = self.ours();
         for door in &ours {
+            let mtime = door.log.as_deref().and_then(mtime_secs);
+            let title = match door.log.as_deref() {
+                Some(log) => self.title_of(&door.id, log, roster_title(&door.id), door.cwd.as_deref(), mtime),
+                None => titles::fallback(door.cwd.as_deref(), self.scratch.as_deref(), door.cwd.as_deref().and_then(|c| self.projects.name_of(c)).as_deref(), None),
+            };
             let row = Entry {
                 id: door.id.clone(),
                 state: door.state,
                 cwd: door.cwd.as_ref().map(|p| p.display().to_string()),
                 panes: door.panes,
-                mtime: door.log.as_deref().and_then(mtime_secs),
-                title: None,
+                mtime,
+                title: Some(title),
+                origin: None,
             };
             by_id.insert(door.id.clone(), row);
         }
@@ -483,19 +636,22 @@ impl Registry {
         // The roster (source 3): a kept log another consumer holds, whose pid is not one of
         // our children. Read-only, never adopted (Q5). H2 is what infers running/parked.
         let our_pids: Vec<u32> = ours.iter().map(|door| door.pid).collect();
-        for (id, peer) in self.roster() {
-            if ours.iter().any(|door| door.id == id) || !by_id.contains_key(&id) || our_pids.contains(&peer.pid) {
+        for (id, peer) in &roster {
+            if ours.iter().any(|door| door.id == *id) || !by_id.contains_key(id) || our_pids.contains(&peer.pid) {
                 continue;
             }
+            let log = log_path(&self.sessions_dir, id);
+            let mtime = mtime_secs(&log);
             let row = Entry {
                 id: id.clone(),
                 state: State::LiveElsewhere,
                 cwd: peer.cwd.as_ref().map(|p| p.display().to_string()),
                 panes: 0,
-                mtime: mtime_secs(&log_path(&self.sessions_dir, &id)),
-                title: peer.title.filter(|t| !t.trim().is_empty()),
+                mtime,
+                title: Some(self.title_of(id, &log, peer.title.as_deref(), peer.cwd.as_deref(), mtime)),
+                origin: None,
             };
-            by_id.insert(id, row);
+            by_id.insert(id.clone(), row);
         }
 
         by_id.into_values().collect()
@@ -561,6 +717,8 @@ impl Registry {
             state: State::Starting,
             pid: 0,
             port: 0,
+            model: String::new(),
+            yolo: false,
             token: Arc::from(""),
             watcher: None,
             exit: watch::channel(None).1,
@@ -603,11 +761,47 @@ impl Registry {
             door.cwd = Some(cwd.to_path_buf());
             door.state = State::Live;
         }
+        // For the fallback name of this chat once its door is gone (the log's own cwd is not decoded here).
+        self.titles.lock().unwrap().remember_cwd(id, cwd);
+        self.cwds.remember(id, cwd);
+    }
+
+    /// What the door said about itself in `hello`: the model it runs and whether it answers every ask with yes. A restart
+    /// keeps both unless the request changes them.
+    pub fn set_flags(&self, id: &str, model: &str, yolo: bool) {
+        if let Some(door) = self.doors.lock().unwrap().iter_mut().find(|door| door.id == id) {
+            door.model = model.to_string();
+            door.yolo = yolo;
+        }
+    }
+
+    /// A resumed door's own stream, held from `hello` on like a new session's: it is what tells the perch whether a turn is
+    /// running, and a stop closes it first. Without a row to hold it the stream is closed (dropped) here.
+    pub fn keep_watcher(&self, id: &str, watcher: Watcher) {
+        if let Some(door) = self.doors.lock().unwrap().iter_mut().find(|door| door.id == id) {
+            door.watcher = Some(watcher);
+        }
+    }
+
+    /// What a restart needs to know about an id, read in one lock: see [`Restart`].
+    pub fn restartable(&self, id: &str) -> Restart {
+        let doors = self.doors.lock().unwrap();
+        let Some(door) = doors.iter().find(|door| door.id == id && door.state != State::Dead) else { return Restart::NotOurs };
+        if door.state != State::Live || door.pid == 0 {
+            return Restart::Between(door.state);
+        }
+        let Some(log) = door.log.clone() else { return Restart::Between(door.state) };
+        if door.watcher.as_ref().is_some_and(Watcher::running) {
+            return Restart::Running;
+        }
+        Restart::Ready { log, model: door.model.clone(), yolo: door.yolo }
     }
 
     /// A new session's door, whole: it reached `live` inside the spawn request, so there is
     /// no window in which anyone else could have known an id to reserve.
     pub fn insert(&self, id: String, log: PathBuf, cwd: PathBuf, pid: u32, port: u16, token: Arc<str>, watcher: Watcher, exit: ExitWatch) {
+        self.titles.lock().unwrap().remember_cwd(&id, &cwd);
+        self.cwds.remember(&id, &cwd);
         let mut doors = self.doors.lock().unwrap();
         doors.retain(|door| door.id != id && (door.pid != pid || door.state == State::Dead));
         doors.push(Door {
@@ -617,6 +811,8 @@ impl Registry {
             state: State::Live,
             pid,
             port,
+            model: String::new(),
+            yolo: false,
             token,
             watcher: Some(watcher),
             exit,
@@ -846,11 +1042,6 @@ pub(crate) fn drop_token_file(path: &Path, token: &str) {
         Ok(_) => tracing::debug!(path = %path.display(), "perch: a token file is not ours; left in place"),
         Err(e) => tracing::debug!(error = %e, path = %path.display(), "perch: a token file did not read; left in place"),
     }
-}
-
-fn mtime_secs(path: &Path) -> Option<u64> {
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    modified.duration_since(SystemTime::UNIX_EPOCH).ok().map(|since| since.as_secs())
 }
 
 #[cfg(test)]

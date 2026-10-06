@@ -54,6 +54,17 @@ pub fn default_sessions_dir() -> PathBuf {
     data.join("eidolon").join("sessions")
 }
 
+/// eidolon's own sessions dir as it resolves **without** the Minerva config: the `sessions_dir` the member's
+/// config names, else [`default_sessions_dir`]. This is the second, read-only source of saved chats under
+/// `--home` (the old shared dir, `~/.local/share/eidolon/sessions` unless the member moved it). A member config
+/// that cannot be read the way eidolon reads it is the default, which is where eidolon would look too.
+pub fn other_sessions_dir(member: &Path) -> PathBuf {
+    match sessions_dir_of(member) {
+        Ok(Some(dir)) => dir,
+        _ => default_sessions_dir(),
+    }
+}
+
 /// Settles `--home`, `--eidolon-config` and `--sessions-dir` (clap already refuses `--home` with
 /// either of the other two). `member` is the member's own config path, read only.
 pub fn resolve(home: Option<&Path>, sessions_dir: Option<PathBuf>, eidolon_config: Option<PathBuf>, member: &Path) -> Result<Resolved> {

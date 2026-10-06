@@ -135,7 +135,7 @@ pub async fn handle(ctx: &Ctx, req: Request<hyper::body::Incoming>) -> Response<
         // same for a log some other consumer holds, which is never adopted: Q5); anything else
         // is not a session at all.
         Lookup::NotOurs => {
-            let kept = tokio::fs::metadata(sessions::log_path(&ctx.registry.sessions_dir, id)).await.is_ok_and(|meta| meta.is_file());
+            let kept = ctx.registry.find_log(id).is_some(); // either source: the other one is readable and resumable too
             return if kept { json(StatusCode::CONFLICT, &serde_json::json!({ "state": "kept" })) } else { status(StatusCode::NOT_FOUND) };
         }
     };

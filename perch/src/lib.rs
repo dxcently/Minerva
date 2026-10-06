@@ -12,6 +12,9 @@
 //!   /                    the UI bundle from --ui-dir, no token, `Host` checked
 //!   /hub/sessions        GET the list, POST to spawn one          (H1b)
 //!   /hub/sessions/<id>/resume, /stop                              (H1b)
+//!   /hub/sessions/<id>/log  a saved chat as eidolon's JSON lines                (titles slice)
+//!   /hub/models          GET the models eidolon lists (cached 10 min)           (composer)
+//!   /hub/sessions/<id>/restart  stop + resume the same log with -m / --yolo, between turns   (composer)
 //!   /s/<id>/api/<route>  GET|POST to that session's door, its Bearer injected,
 //!                        SSE passed through, `hub-stream-end` appended   (H1c, this slice)
 //!   /hub/tree?session=<id>&path=<rel>  one directory under a live cwd   (H2)
@@ -58,13 +61,19 @@
 compile_error!("the perch is Unix only: it needs a 0600 token file, $XDG_RUNTIME_DIR and SIGTERM");
 
 pub mod config;
+pub mod dirs;
 pub mod files;
+pub mod folders;
 pub mod gate;
 pub mod login;
+pub mod models;
+pub mod projects;
 pub mod proxy;
+pub mod restart;
 pub mod serve;
 pub mod sessions;
 pub mod spawn;
+pub mod titles;
 pub mod tree;
 pub mod watch;
 
@@ -97,6 +106,8 @@ pub struct Options {
     pub eidolon_config: Option<PathBuf>,
     /// `--home`'s `scratch/`: the cwd of a new session that names none.
     pub scratch: Option<PathBuf>,
+    /// With `--home`: eidolon's own sessions dir, listed read-only as `origin: "other"` ([`sessions::Registry::other`]).
+    pub other_sessions: Option<PathBuf>,
     /// How long a login code (`POST /hub/code`) can be redeemed. [`login::CODE_TTL`] outside tests.
     pub code_ttl: std::time::Duration,
 }
@@ -122,7 +133,7 @@ pub async fn run(opts: Options, cancel: CancellationToken) -> Result<()> {
     // The registry and the thread that forks doors, before the bind for the same reason the
     // token's directory is: a `--root` that does not exist, or a spawn thread that cannot be
     // started, must refuse the start rather than the first spawn.
-    let registry = sessions::Registry::with_home(opts.sessions_dir, runtime.clone(), opts.eidolon, opts.roots, opts.eidolon_config, opts.scratch)?;
+    let registry = sessions::Registry::with_home(opts.sessions_dir, runtime.clone(), opts.eidolon, opts.roots, opts.eidolon_config, opts.scratch, opts.other_sessions)?;
     let spawner = Arc::new(spawn::Spawner::new()?);
     let listener = TcpListener::bind(opts.bind).await.with_context(|| format!("bind {}", opts.bind))?;
     let bound = listener.local_addr().context("read the bound address")?;

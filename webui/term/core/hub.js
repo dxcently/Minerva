@@ -40,10 +40,12 @@ export function startPolling() {
 
 // ---------------------------------------------------------------- views of the list
 export const live = (rs) => rs.filter((r) => r.state === 'live');
-// Kept logs, and doors of ours that exited, newest first.
-export const keptRows = (rs) => rs.filter((r) => r.state === 'kept' || r.state === 'dead')
+// Saved chats of this app, and doors of ours that exited, newest first. The old shared ones (`origin: "other"`) are `older`.
+export const keptRows = (rs) => rs.filter((r) => (r.state === 'kept' && !r.origin) || r.state === 'dead')
   .sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
 export const elsewhere = (rs) => rs.filter((r) => r.state === 'live-elsewhere');
+// eidolon's own sessions folder: read-only chats, listed only under the collapsed `older chats` group, newest first.
+export const older = (rs) => rs.filter((r) => r.state === 'kept' && r.origin === 'other').sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
 
 // 5m, 3h, 2d from a unix mtime in seconds.
 export function age(mtime, now = Date.now() / 1000) {

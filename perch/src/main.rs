@@ -88,6 +88,8 @@ async fn main() -> Result<()> {
         roots.push(home.clone());
         home.join("scratch")
     });
+    // Under `--home`, eidolon's own dir is a second, read-only source (hub.md section 4); nothing in it is ever written.
+    let other_sessions = resolved.home.as_ref().map(|_| perch::config::other_sessions_dir(&member));
     let options = perch::Options {
         bind: cli.bind,
         ui_dir: cli.ui_dir,
@@ -96,6 +98,7 @@ async fn main() -> Result<()> {
         sessions_dir: resolved.sessions_dir,
         eidolon_config: resolved.config,
         scratch,
+        other_sessions,
         code_ttl: std::time::Duration::from_millis(cli.code_ttl_ms),
     };
     perch::run(options, cancel).await

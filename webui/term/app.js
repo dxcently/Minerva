@@ -4,7 +4,7 @@
 // by mouse; keys and the `:` line are shortcuts to the same functions.
 import { html, render, K, HUB, signal, computed, effect, batch, useRef, useLayoutEffect, useMemo } from './core/ui.js';
 import { takeToken, takeCode, redeem, DOOR, detect, mode, rows, hubPost } from './core/api.js';
-import { list, stale, known, refresh, startPolling, live, keptRows, elsewhere, age, label } from './core/hub.js';
+import { list, stale, known, refresh, startPolling, live, keptRows, older, elsewhere, age, label } from './core/hub.js';
 import { Session, tildify, kfmt, stateOf, STATE_CLS, backoffMs, connWord } from './core/state.js';
 import * as tile from './core/tile.js';
 import { menu, openMenu, closeMenu, outside, atPointer, under, Menus } from './core/menu.js';
@@ -12,7 +12,8 @@ import { Pane } from './panes/session.js';
 import { panel } from './panes/asks.js';
 import { FilesTab } from './panes/files.js';
 import { Home, home } from './panes/home.js';
-import { toWslPath } from './core/path.js';
+import { projects, projectFor, sorted, isScratch, loadProjects, addProject, forgetProject } from './core/projects.js';
+import { Picker, picker as pickerOpen, openPicker } from './panes/picker.js';
 import { FONTS, DEFAULT_FONT, theme, themes, font, cell, setTheme, setFont, resolve, startLook } from './core/look.js';
 
 const LEFT_TABS = ['sessions', 'projects', 'mesh'];
@@ -212,12 +213,20 @@ const toComposer = withPane((p) => p.focusComposer && p.focusComposer());
 
 // Every open session once, as [sid, Session].
 const sessions = () => [...new Map(ui.panes.value.map((p) => [p.sid, p.s]))];
+// A chat is named by the title the perch gives it (its first message, else folder and time); the id is on hover.
 const sessionName = (s) => {
+  const r = list.value.find((x) => x.id === s.sid);
+  if (r && r.title) return r.title;
   const hl = s.hello.value;
   return hl ? hl.session.split('/').pop().replace(/\.[^.]+$/, '') || 'session' : s.sid;
 };
 // A session's project is its working directory, named by its last part.
-const project = (cwd) => String(cwd || '').split('/').filter(Boolean).pop() || cwd || '?';
+// Its project's name; a scratch folder has none (its name is a time stamp); another folder is named by its last part.
+const project = (cwd) => {
+  const p = projectFor(cwd);
+  if (p) return p.name;
+  return isScratch(cwd) ? '' : String(cwd || '').split('/').filter(Boolean).pop() || cwd || '?';
+};
 
 // ---------------------------------------------------------------- the ask queue
 // Every pending ask on the page is a tab of the one ask panel (panes/asks.js),
@@ -592,14 +601,42 @@ async function newSession(raw, model, how) {
 
 // The start screen's actions (panes/home.js). A folder may be pasted from Windows.
 const homeAct = {
-  chat: () => newSession(null, undefined),
-  folder: (raw) => newSession(toWslPath(raw), undefined),
+  chat: () => newSession(null, undefined),          // always a fresh scratch folder, never the focused pane's
+  project: (p) => newSession(p.path, undefined),
+  newProject: () => newProject(),
+  forget: (e, p) => forgetMenu(e, p),
   open: (r, beside) => openSession(r.id, { beside }),
 };
 
+// `[ new project… ]`: the folder picker, then a name (prefilled), then the project is saved and a chat starts in it.
+function newProject() {
+  if (mode() !== 'perch') { toast(HUB, true); return; }
+  closeMenu();
+  openPicker({
+    title: 'new project',
+    naming: true,
+    onDone: async ({ path, name }) => {
+      const r = await addProject(path, name);
+      if (!r.ok) return r.why;
+      newSession(r.project.path, undefined);
+      return '';
+    },
+  });
+}
+
+// A project leaves the list; its folder and its chats stay.
+function forgetMenu(e, p) {
+  e.preventDefault();
+  openMenu([
+    { label: 'new chat here', on: () => newSession(p.path, focusedModel()) },
+    { label: 'remove from the list', hint: 'the folder is not touched', on: async () => { toast((await forgetProject(p)) ? `removed ${p.name}; its folder is untouched` : 'could not remove it', false); } },
+  ], atPointer(e), { title: p.name });
+}
+
 // A folder with a space goes in double (or single) quotes: `:new "/home/u/My Project" model`.
 const quoteArg = (s) => (/[\s"']/.test(s) ? '"' + s.replace(/"/g, '') + '"' : s);
-const newLine = () => 'new ' + quoteArg(focusedCwd()) + (focusedCwd() ? ' ' : '');
+const projectCwd = () => (isScratch(focusedCwd()) ? '' : focusedCwd());
+const newLine = () => 'new ' + quoteArg(projectCwd()) + (projectCwd() ? ' ' : '');
 function words(s) {
   const out = [], re = /"([^"]*)"|'([^']*)'|(\S+)/g;
   let m;
@@ -617,11 +654,9 @@ function newCmd(arg) {
 // `new session ▸`: the folders of open and live sessions (max 8), then any folder.
 function newPick(how) {
   const model = focusedModel(), shows = model || 'default model';
-  const seen = new Set();
-  for (const x of ui.panes.peek()) { const h = x.s.hello.value; if (h && h.cwd) seen.add(h.cwd); }
-  for (const r of live(list.peek())) if (r.cwd) seen.add(r.cwd);
-  const dirs = [...seen].slice(0, 8).map((c) => ({ label: tildify(c), hint: shows, on: () => newSession(c, model, how) }));
-  return { label: 'new session', hint: shows, sub: [...dirs, ...(dirs.length ? [{ sep: true }] : []), { label: 'other folder…', hint: ':new <dir> [model]', on: () => openCmd(newLine()) }] };
+  // A fresh scratch folder, then the projects: a scratch folder of another chat is never offered again.
+  const dirs = sorted(projects.peek()).slice(0, 12).map((p) => ({ label: p.name, hint: shows, on: () => newSession(p.path, model, how) }));
+  return { label: 'new session', hint: shows, sub: [{ label: 'new chat', hint: shows, on: () => newSession(null, model, how) }, ...(dirs.length ? [{ sep: true }, ...dirs] : []), { sep: true }, { label: 'new project…', on: () => newProject() }] };
 }
 
 function splitItems(p, dir) {
@@ -738,6 +773,16 @@ function idleMenu(e, r) {
   ], at, { title: label(r) });
 }
 
+// An older chat (eidolon's own folder): to read here or beside; continuing is the action in its pane.
+function olderMenu(e, r) {
+  e.preventDefault();
+  openMenu([
+    { label: 'open here (read-only)', on: () => openSession(r.id) },
+    { label: 'open beside', hint: 'new pane', on: () => openPane(r.id) },
+    { label: 'copy id', on: () => copyId(r.id) },
+  ], atPointer(e), { title: label(r) });
+}
+
 function keptMenu(e, r) {
   e.preventDefault();
   openMenu([
@@ -775,6 +820,7 @@ function statusMenu(e) {
 // ---------------------------------------------------------------- views
 const act = {
   name: sessionName,
+  resume: (p) => { Promise.resolve(p.s.resume()).then(refresh); },
   project,
   focus: focusPane,
   paneMenu,
@@ -861,7 +907,9 @@ function Sessions() {
   if (!groups.size) return html`<div class="faint">no live session</div>`;
   const more = idleRest > 0 && html`<div class="it" key="more-idle"><${K} cls="faint" on=${() => { idleShown.value += 50; }}>more… (${idleRest})</${K}></div>`;
   const out = [...groups].map(([cwd, { ps, idle }]) => {
-    const open = !ui.folded.value.has(cwd), name = cwd ? project(cwd) : 'connecting…';
+    // A chat with no door has no folder to name it by: a saved one is grouped as such, a live one is still connecting.
+    const gone = ps.length > 0 && ps.every((x) => ['kept', 'stopped', 'dead', 'gone'].includes(x.s.conn.value));
+    const open = !ui.folded.value.has(cwd), name = cwd ? project(cwd) : gone ? 'saved' : 'connecting…';
     const unread = ps.reduce((n, x, i) => n + (ps.findIndex((y) => y.s === x.s) === i ? x.s.unread.value : 0), 0);
     return html`<div class="grp" key=${cwd}>
       <div class="gh"><${K} cls="gname" title=${(cwd ? tildify(cwd) + '\n' : '') + (open ? 'fold' : 'open')} on=${() => fold(cwd)}>${open ? '▾' : '▸'} ${name}</${K}>
@@ -885,19 +933,6 @@ function IdleItem({ r }) {
   </div>`;
 }
 
-// Kept logs and doors of ours that exited, newest first: 15, then `more…` in steps of 50.
-const keptShown = signal(KEPT_PICK);
-function Kept() {
-  const all = keptRows(list.value), n = keptShown.value, shown = all.slice(0, n), rest = all.length - shown.length;
-  if (!all.length) return html`<div class="faint">none</div>`;
-  return html`<div class="list">${shown.map((r) => html`<div class="it" key=${r.id} onContextMenu=${(e) => keptMenu(e, r)} onMouseDown=${noMiddle} onAuxClick=${(e) => beside(e, r.id)}>
-      <div class="l1"><${K} cls="grow nm faint" title=${r.id + '\n' + (r.state === 'dead' ? 'exited' : 'saved, not running') + '\nctrl-click or middle-click: open beside'}
-        on=${(e) => openSession(r.id, { beside: e.ctrlKey || e.metaKey })}>${label(r)}</${K}>
-        ${r.state === 'dead' && html`<span class="faint">exited</span>`}<span class="faint">${ageOf(r)}</span></div>
-    </div>`)}
-    ${rest > 0 && html`<div class="it"><${K} cls="faint" on=${() => { keptShown.value = n + 50; }}>more… (${rest})</${K}></div>`}</div>`;
-}
-
 // Live sessions held by another client: shown, never touched.
 function Elsewhere() {
   const all = elsewhere(list.value), n = elseShown.value, rs = all.slice(0, n), rest = all.length - rs.length;
@@ -906,6 +941,69 @@ function Elsewhere() {
     <div class="list">${rs.map((r) => html`<div class="it" key=${r.id} onContextMenu=${(e) => elsewhereMenu(e, r)}>
       <div class="l1"><span class="faint">◌</span><span class="grow nm faint" title=${ELSEWHERE}>${label(r)}</span></div></div>`)}
     ${rest > 0 && html`<div class="it"><${K} cls="faint" on=${() => { elseShown.value = n + 50; }}>more… (${rest})</${K}></div>`}</div>`;
+}
+
+// ---- the chat list under the perch: search, `+ new chat`, one group per project (alphabetical), `no folder`, `other`.
+// Date ordering inside a group is the only sort: newest first. A chat is in a project when its folder is the project's
+// or inside it. A group shows 8, then `more… (N)` for 50 more.
+const query = signal(''), shownBy = signal({}), otherOpen = signal(false);
+const GROUP_CAP = 8;
+const byNew = (a, b) => (b.mtime || 0) - (a.mtime || 0);
+
+// A live chat is ●, a saved one ○; a pane's own state adds the busy bold, `?` for an ask waiting and `[n]` unread.
+function ChatRow({ r }) {
+  const p = ui.panes.value.find((x) => x.sid === r.id), f = focused.value, s = p && p.s;
+  const isLive = r.state === 'live', busy = isLive && s && s.running.value === true;
+  const asks = s ? s.asks.value.length : 0, n = s ? s.unread.value : 0;
+  const cur = !!f && f.sid === r.id;
+  const menu = (e) => (p ? sessionMenu(e, p) : isLive ? idleMenu(e, r) : r.origin === 'other' ? olderMenu(e, r) : keptMenu(e, r));
+  const what = isLive ? (busy ? 'running' : 'live') : r.state === 'dead' ? 'exited' : r.origin === 'other' ? "saved, from eidolon's own folder (opens read-only)" : 'saved';
+  return html`<div class=${'it chat' + (cur ? ' cur' : '')} onContextMenu=${menu} onMouseDown=${noMiddle} onAuxClick=${(e) => beside(e, r.id)}>
+    <${K} cls="crow" title=${label(r) + '\n' + what + '\nctrl-click or middle-click: open beside\nright-click: more'}
+      on=${(e) => openSession(r.id, { beside: e.ctrlKey || e.metaKey })}>
+      <span class=${'cd ' + (isLive ? (busy ? 'hi b' : 'hi') : 'faint')}>${isLive ? '●' : '○'}</span><span class="ct">${label(r)}</span>
+      ${asks > 0 && html`<span class="y" title="a question is waiting">?</span>`}${n > 0 && html`<span class="o" title=${n + ' new'}>[${n}]</span>`}
+      <span class="faint ca">${ageOf(r)}</span></${K}>
+  </div>`;
+}
+
+// A group's rows: the first GROUP_CAP (or the count asked for), then `more…`.
+function Rows({ gk, rows }) {
+  const n = shownBy.value[gk] || GROUP_CAP, shown = rows.slice(0, n), rest = rows.length - shown.length;
+  return html`<div class="list">${shown.map((r) => html`<${ChatRow} key=${r.id} r=${r} />`)}
+    ${rest > 0 && html`<div class="it"><${K} cls="faint" on=${() => { shownBy.value = { ...shownBy.value, [gk]: n + 50 }; }}>more… (${rest})</${K}></div>`}</div>`;
+}
+
+function Head({ name, title, plus, plusTitle, on, menu }) {
+  return html`<div class="gh2" onContextMenu=${menu}><span class="gname" title=${title}>${name}</span>
+    <${K} cls="plus" title=${plusTitle} on=${on}>+</${K}></div>`;
+}
+
+function Chats() {
+  const rs = list.value, q = query.value.trim().toLowerCase(), ps = sorted(projects.value);
+  const match = (r) => !q || label(r).toLowerCase().includes(q);
+  const chats = [...live(rs), ...keptRows(rs)].filter(match).sort(byNew);
+  const byP = new Map(ps.map((p) => [p.path, []])), loose = [];
+  for (const r of chats) { const p = projectFor(r.cwd, ps); if (p) byP.get(p.path).push(r); else loose.push(r); }
+  const oth = older(rs).filter(match);
+  const model = focusedModel();
+  const shownProjects = ps.filter((p) => !q || byP.get(p.path).length);
+  return html`<div class="chats">
+    <div class="sq"><span class="faint">search </span><input type="text" spellcheck="false" autocomplete="off" aria-label="search chats" placeholder="title" value=${query.value}
+      onInput=${(e) => { query.value = e.currentTarget.value; }} onKeyDown=${(e) => { if (e.key === 'Escape') { query.value = ''; e.currentTarget.blur(); } }} /></div>
+    <div class="newrow"><${K} cls="newchat" title="a chat in a fresh scratch folder" on=${() => newSession(null, model)}>+ new chat</${K}></div>
+    ${shownProjects.map((p) => html`<div class="grp" key=${p.path}>
+      <${Head} name=${p.name} title=${p.path + '\nright-click: remove from the list'} plusTitle=${'new chat in ' + p.name} on=${() => newSession(p.path, model)} menu=${(e) => forgetMenu(e, p)} />
+      <${Rows} gk=${'p:' + p.path} rows=${byP.get(p.path)} /></div>`)}
+    ${!q && html`<div class="newrow"><${K} cls="newchat" title="pick a folder and name it" on=${newProject}>+ new project</${K}></div>`}
+    ${(!q || loose.length > 0) && html`<div class="grp">
+      <${Head} name="no folder" title="chats that are not in a project" plusTitle="new chat in a fresh scratch folder" on=${() => newSession(null, model)} />
+      ${loose.length ? html`<${Rows} gk="loose" rows=${loose} />` : html`<div class="faint pad">none</div>`}</div>`}
+    <${Elsewhere} />
+    ${oth.length > 0 && html`<div class="grp">
+      <div class="gh2"><${K} cls="gname" title=${otherOpen.value ? 'fold' : "chats from eidolon's own sessions folder, outside this app"} on=${() => { otherOpen.value = !otherOpen.value; }}>${otherOpen.value || q ? '▾' : '▸'} other (${oth.length})</${K}></div>
+      ${(otherOpen.value || q) && html`<${Rows} gk="other" rows=${oth} />`}</div>`}
+  </div>`;
 }
 
 // The inner border of a sidebar: drag it, or focus it and press ←/→
@@ -948,28 +1046,19 @@ function Left() {
   if (tab === 'sessions') {
     body = mode() === 'perch' ? html`<${Owl} />
       ${stale.value && html`<div class="faint">list stale</div>`}
-      <${Sessions} />
-      <div class="hdr">peers</div><${Soon} what="the peer list" />
-      <div class="hdr">saved</div><${Kept} />
-      <${Elsewhere} />`
+      <${Chats} />`
       : html`<${Owl} />
       ${panes.length ? html`<${Sessions} />` : html`<div class="faint">no pane. <${K} on=${() => openPane()}>open one</${K}></div>`}
       <div class="hdr">peers</div><${Needs}>peer list needs the hub</${Needs}>
       <div class="hdr">kept</div><${Needs}>other sessions need the hub (M2)</${Needs}>`;
   } else if (tab === 'projects') {
     const perch = mode() === 'perch';
-    const cwds = perch ? [...new Set(live(list.value).map((r) => r.cwd).filter(Boolean))] : [];
-    const goTo = (c) => {
-      const r = live(list.peek()).find((x) => x.cwd === c);
-      if (r) openSession(r.id);
-    };
-    body = perch ? html`<div class="hdr">sessions here</div>
-      ${hl ? html`<div class="list"><div class="it"><div class="l1"><span class="faint">▸</span><span class="grow c" title=${hl.cwd}>${tildify(hl.cwd)}</span></div></div></div>` : html`<div class="faint">—</div>`}
-      <div class="hdr">others</div>
-      ${cwds.length ? html`<div class="list">${cwds.map((c) => html`<div class="it" key=${c}><div class="l1"><span class="faint">▸</span>
-        <${K} cls="grow c" title=${c + '\nopen the first live session here'} on=${() => goTo(c)}>${tildify(c)}</${K}></div></div>`)}</div>`
-        : html`<div class="faint">no live sessions</div>`}
-      <div class="faint">saved chats do not show a folder</div>`
+    body = perch ? html`<div class="hdr">projects</div>
+      ${projects.value.length ? html`<div class="list">${sorted(projects.value).map((p) => html`<div class="it" key=${p.path} onContextMenu=${(e) => forgetMenu(e, p)}>
+        <div class="l1"><${K} cls="grow nm" title=${p.path + '\nnew chat here\nright-click: remove from the list'} on=${() => newSession(p.path, focusedModel())}>${p.name}</${K}></div>
+        <div class="pv" title=${p.path}>${tildify(p.path)}</div></div>`)}</div>`
+        : html`<div class="faint">none yet</div>`}
+      <div class="newrow"><${K} cls="newchat" on=${newProject}>+ new project</${K}></div>`
       : html`<div class="hdr">this door</div>
       ${hl ? html`<div class="list"><div class="it"><div class="l1"><span class="faint">▸</span><span class="grow c" title=${hl.cwd}>${tildify(hl.cwd)}</span></div></div></div>` : html`<div class="faint">—</div>`}
       <div class="hdr">others</div><${Needs}>project list needs the hub</${Needs}>`;
@@ -1119,6 +1208,7 @@ function Tiles() {
     addEventListener('resize', size);
     return () => { ro.disconnect(); removeEventListener('resize', size); };
   }, []);
+  known.value; // redraw once the mode is known: the start screen is the perch's, and the first render can come before detect() says so
   const panes = ui.panes.value, tree = ui.tree.value, box = ui.box.value, f = ui.focus.value;
   const lay = tile.layout(tree, box);
   const rect = new Map(lay.panes.map((r) => [r.id, r]));
@@ -1148,7 +1238,7 @@ function Tiles() {
       ...lay.dividers.map((d) => html`<${Divider} key=${d.path} d=${d} />`),
     ];
   }
-  return html`<div id="tiles" class="col" ref=${ref}>${body}</div>`;
+  return html`<div id="tiles" class="col" ref=${ref}>${body}${pickerOpen.value && html`<${Picker} />`}</div>`;
 }
 
 function Hint() {
@@ -1367,6 +1457,7 @@ async function boot(n = 0) {
   if (m === 'perch') {
     ui.gate.value = null;
     startPolling();
+    loadProjects();
     // One pane, on the newest live chat; with none live the start screen shows.
     const newest = rows().filter((x) => x.state === 'live').sort((a, b) => (b.mtime || 0) - (a.mtime || 0))[0];
     if (newest) openPane(newest.id);

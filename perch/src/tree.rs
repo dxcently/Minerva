@@ -107,7 +107,7 @@ fn short_name(name: &str) -> bool {
 }
 
 /// A name the tree will not open or pass through.
-fn refused(name: &str) -> bool {
+pub fn refused(name: &str) -> bool {
     denied(name) || short_name(name)
 }
 

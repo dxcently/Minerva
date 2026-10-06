@@ -20,7 +20,8 @@ export const backoffMs = (n, cap = 15000) => {
   return Math.round(ms / 2 + Math.random() * (ms / 2));
 };
 export const kfmt = (n) => (n >= 10000 ? (n / 1000).toFixed(0) + 'k' : n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
-export const tildify = (p) => String(p || '').replace(/^\/home\/[^/]+(?=\/|$)|^\/root(?=\/|$)/, '~');
+// A scratch folder's name is a time stamp, never something to show: it reads as `scratch`.
+export const tildify = (p) => String(p || '').replace(/\/scratch\/\d{8}-\d{6}(-\d+)?$/, '/scratch').replace(/^\/home\/[^/]+(?=\/|$)|^\/root(?=\/|$)/, '~');
 export const MODES = ['yolo', 'accept edits', 'manual', 'auto'];
 
 // A connection state as a person reads it (the state names are the code's own).
@@ -240,6 +241,16 @@ export class Session {
     this.banner.value = { text, resume: conn !== 'gone' && mode() === 'perch' };
   }
 
+  // A saved chat is drawn read-only from eidolon's own log lines (core/saved.js, GET /hub/sessions/<id>/log).
+  // It only reads: nothing here starts the chat, which is `resume()` and a person's click. Loaded on demand
+  // (a page with no saved chat open never fetches the module). A resume that began meanwhile wins.
+  async loadSaved() {
+    const saved = await import('./saved.js');
+    const why = await saved.load(this);
+    if (why === null || this.closed || this.conn.value !== 'kept') return;
+    this.banner.value = { text: 'saved chat · ' + (why || 'read-only'), resume: true, err: !!why };
+  }
+
   async loop(ep) {
     let fails = 0, quick = 0;
     while (!this.closed && !this.bye && ep === this.epoch) {
@@ -273,9 +284,10 @@ export class Session {
         // How the perch says a stream ended (hub.md section 5), and what it
         // answers at connect when there is no stream to open.
         const e = this.ended, st = res.data && res.data.state;
-        if (e && e.door === 'stopping') { this.finish('stopped', 'stopped'); return; }
+        // A restart (model or mode switch) stops the door on purpose: restart() below decides what the pane shows next.
+        if (e && e.door === 'stopping') { if (!this.restarting) this.finish('stopped', 'stopped'); return; }
         if (e && e.door === 'dead') { this.finish('dead', deadText(e.exit)); return; }
-        if (res.status === 409 && st === 'kept') { this.finish('kept', 'saved, not running'); return; }
+        if (res.status === 409 && st === 'kept') { this.finish('kept', 'saved chat · loading…'); this.loadSaved(); return; }
         if (res.status === 503 && st === 'dead') { this.finish('dead', deadText(null)); return; }
         if (res.status === 404) { this.finish('gone', `no chat ${this.sid} here`); return; }
         // `live`, 409 starting|stopping, 502 and anything else: try again
@@ -348,6 +360,41 @@ export class Session {
       : r.status === 0 ? 'the server is not answering'
       : `resume failed: ${r.status}`;
     this.hooks.toast(t, true);
+    return false;
+  }
+
+  // Switch the model or the mode of a running chat (perch only): the perch stops the door and resumes the same log with the new
+  // flags, between turns, so the pane stays on this id and reconnects (the log replays; nothing is lost). `change` is
+  // { model?, yolo? }; `said` is the one line that goes into the transcript when it worked.
+  async restart(change, said) {
+    if (this.closed || this.restarting || mode() !== 'perch') return false;
+    if (this.running.value === true) { this.hooks.toast('a turn is running: wait for it to end, then switch', true); return false; }
+    if (this.running.value == null && this.conn.value !== 'live') { this.hooks.toast('this chat is not running', true); return false; }
+    this.restarting = true;
+    this.hooks.toast('restarting the chat between turns…');
+    const r = await hubPost(`sessions/${encodeURIComponent(this.sid)}/restart`, change);
+    this.restarting = false;
+    if (this.closed) return false;
+    const back = r.status === 200 || (r.status === 503 && r.data && r.data.reverted);
+    if (back) {
+      this.epoch++;
+      if (this.abort) this.abort.abort();
+      if (r.status === 200 && r.data && r.data.restarted !== false) this.notes = [said];
+      batch(() => {
+        this.bye = false;
+        this.ended = null;
+        this.banner.value = null;
+        this.conn.value = 'connecting';
+      });
+      this.run();
+    }
+    const why = (r.data && r.data.error) || '';
+    if (r.status === 200) return true;
+    this.hooks.toast(r.status === 0 ? 'the server is not answering; the chat was not changed'
+      : r.status === 401 ? 'the server refused the login for this page (it restarted?). Run `hoot` again.'
+      : why || `the chat was not restarted (${r.status})`, true);
+    // The door was stopped but nothing came back: this is a chat that can be continued, like any stopped one.
+    if (!back && this.looping == null && !this.closed) this.finish('stopped', why || 'stopped');
     return false;
   }
 
@@ -468,6 +515,8 @@ export class Session {
         this.live = true;
         this.openWindow();
         this.conn.value = 'live';
+        // What a restart said it did, after the log it replays (the replay is rebuilt from the log, which has no such line).
+        if (this.notes && this.notes.length) { for (const n of this.notes) this.sys(n); this.notes = null; }
         const hl = this.hello.value;
         if (hl && this.asks.value.length !== hl.pending) {
           console.warn(`hello.pending=${hl.pending} but ${this.asks.value.length} asks arrived`);

@@ -4,8 +4,10 @@
 //! one. This binary is the door's **contract** and nothing else (hub.md §12), modelled on
 //! eidolon at `0194f2b` (see `README.md` beside this file for what that means):
 //!
-//! - the argv `eidolon web --bind ADDR (--cwd DIR | --session PATH) [-m MODEL]`, and the
-//!   argv is recorded so a test can show there is no token in it;
+//! - the argv `eidolon [--config C] [--yolo] web --bind ADDR (--cwd DIR | --session PATH) [-m MODEL]`, and the
+//!   argv is recorded so a test can show there is no token in it, and that a restart passed `-m` / `--yolo`; `hello`
+//!   reports the `-m` model (`mock` without one) and whether `--yolo` was given; the model `nope` is a door that
+//!   exits 3 before it says anything (an unknown model);
 //! - the two boot lines, exactly: `listening on http://<addr>/` then `token file: <path>`;
 //! - its own token, minted here, written `0600` to `$XDG_RUNTIME_DIR/eidolon/web-<port>.token`
 //!   and never printed (`crates/web/src/lib.rs:120-137`);
@@ -15,7 +17,8 @@
 //!   `GET /api/events` (`hello`, then every frame broadcast to the door's streams),
 //!   `POST /api/say` (202 `{"queued":false}`; a body with a `documents` key is a 422),
 //!   `POST /api/answer` (204, and an `ask-settled` frame, with the `note` if one came, goes to
-//!   every open stream), `POST /api/cancel` (409), `POST /api/launch` (200 `{"opened":..}`),
+//!   every open stream), `POST /api/cancel` (409; with `FAKE_SAY_RUNS` a turn is running after a `say`, `turn-state` frames go
+//!   to every stream, and cancel ends it), `POST /api/launch` (200 `{"opened":..}`),
 //!   and a 404 for any other path;
 //! - request bodies, read by `Content-Length` or `Transfer-Encoding: chunked` (hyper sends
 //!   either), refused with a 413 past 8 MiB as the door's `MAX_BODY` does, and never parsed
@@ -33,7 +36,11 @@
 //! `FAKE_MODE=0644`, `FAKE_TOKEN_ELSEWHERE`, `FAKE_EXIT_AFTER_MS`, `FAKE_IGNORE_SIGTERM`,
 //! `FAKE_LATE_PANE_MS`, `FAKE_EXIT_CODE` (the code `FAKE_EXIT_AFTER_MS` exits with, default 1),
 //! `FAKE_EXIT_BEFORE_BOOT=<code>` (exit before any boot line), and
-//! `FAKE_REFUSE=<path>` (a 401 on that path even with the right token).
+//! `FAKE_REFUSE=<path>` (a 401 on that path even with the right token), `FAKE_SAY_RUNS` (see above) and
+//! `FAKE_MODELS_SLEEP_MS` (`models` takes that long to answer).
+//!
+//! It also answers the two read-only commands the perch runs on eidolon (not doors): `[--config C] sessions` and
+//! `[--config C] log --json PATH` (see `helper` below); `FAKE_HELPER_FAIL=1` makes both exit 1.
 //!
 //! Built only with `--features test-bins` (`required-features` in Cargo.toml), so a normal
 //! `cargo build` ships no test double.
@@ -77,6 +84,11 @@ struct Fake {
     ignore_sigterm: bool,
     /// `FAKE_REFUSE`: a path that answers 401 whatever token it is given.
     refuse: Option<String>,
+    /// What `-m` said (`mock` when nothing did), and whether `--yolo` was given: `hello` reports both.
+    model: String,
+    yolo: bool,
+    /// `FAKE_SAY_RUNS`: a `say` starts a turn, and `cancel` ends it, both told to every stream as `turn-state`.
+    turns: bool,
     /// Every frame a route broadcasts goes out to every open `/api/events` stream, as the
     /// door's own broadcast does. Raw bytes, so a half frame can be sent as one.
     frames: broadcast::Sender<Vec<u8>>,
@@ -103,6 +115,9 @@ fn main() {
     // A door prints two lines and nothing else on stdout, ever (§10.4: nothing a child
     // prints may carry a token). Diagnostics would go to stderr, which the perch inherits.
     let argv: Vec<String> = std::env::args().collect();
+    if helper(&argv) {
+        return;
+    }
     let args = match Args::parse(&argv) {
         Ok(args) => args,
         Err(why) => {
@@ -113,8 +128,91 @@ fn main() {
 
     // A tiny runtime: the door serves a few connections at a time in tests, and nothing here
     // needs more than net + signal + time.
+    // An unknown model is a door that never comes up: eidolon refuses it while building the agent, before it serves anything.
+    if args.model.as_deref() == Some("nope") {
+        eprintln!("fake_eidolon: unknown model nope");
+        std::process::exit(3);
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("a tokio runtime");
     runtime.block_on(serve(args, argv));
+}
+
+/// The two read-only commands the perch runs (not doors): `[--config C] sessions` and `[--config C] log --json PATH`.
+/// Returns whether argv was one of them (and it has been answered). Each call is recorded to `$FAKE_LOG` as a `helper`
+/// line, which no test of a door reads, so a test can count how often the perch asked.
+///
+/// - `sessions` prints `<path>\t<model>\t<records>\t<first user message, 60 chars>` per log, newest first, from
+///   `$FAKE_SESSIONS_DIR` when a `--config` was given (the Minerva home's) and from eidolon's own default
+///   (`$XDG_DATA_HOME/eidolon/sessions`) when not, as the real one reads the dir its config names. The first message is
+///   read from the log as eidolon's `log --json` lines (a `UserMessage` record); a log that is not that has none.
+/// - `log --json PATH` prints the file as it is: a test writes the lines it wants the page to get.
+/// - `FAKE_HELPER_FAIL=1` makes both exit 1 (the perch must fall back to a name, not fail the list).
+fn helper(argv: &[String]) -> bool {
+    let mut rest = argv.iter().skip(1).peekable();
+    let mut config = false;
+    if rest.peek().map(|arg| arg.as_str()) == Some("--config") {
+        rest.next();
+        rest.next();
+        config = true;
+    }
+    let command = rest.next().cloned().unwrap_or_default();
+    if command != "sessions" && command != "log" && command != "models" {
+        return false;
+    }
+    let rest_args = argv[1..].iter().skip_while(|a| *a != &command).skip(1).cloned().collect::<Vec<_>>().join(" ");
+    if let Some(path) = std::env::var_os("FAKE_LOG").map(PathBuf::from)
+        && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(file, "helper {command} {rest_args} config={config}");
+    }
+    if std::env::var_os("FAKE_HELPER_FAIL").is_some() {
+        std::process::exit(1);
+    }
+    if command == "models" {
+        // eidolon's own shape: the provider table, a notice, a blank line, then `<key>  <name>  <note>` rows.
+        if let Some(ms) = std::env::var("FAKE_MODELS_SLEEP_MS").ok().and_then(|ms| ms.parse().ok()) {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+        println!("mock	Fixture	http://localhost/	(built-in)");
+        println!("nothing cached for mock -- declared floor only");
+        println!();
+        println!("{:<40} {:<30} mock · 10k ctx · free", "mock:alpha", "Alpha");
+        println!("{:<40} {:<30} mock · 20k ctx · $1/2 per M", "mock:beta", "Beta");
+        return true;
+    }
+    if command == "log" {
+        let path = argv.last().expect("a path");
+        match std::fs::read(path) {
+            Ok(bytes) => std::io::stdout().write_all(&bytes).expect("writing the log"),
+            Err(e) => {
+                eprintln!("fake_eidolon: {path}: {e}");
+                std::process::exit(1);
+            }
+        }
+        return true;
+    }
+    let dir = if config {
+        std::env::var_os("FAKE_SESSIONS_DIR").map(PathBuf::from).expect("FAKE_SESSIONS_DIR")
+    } else {
+        let data = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).expect("XDG_DATA_HOME");
+        data.join("eidolon").join("sessions")
+    };
+    let mut logs: Vec<_> = std::fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "eid")).collect();
+    logs.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    for path in logs.iter().rev() {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let first = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find_map(|record| {
+                let message = record.get("kind")?.get("UserMessage")?;
+                message["content"].as_array()?.iter().find_map(|block| block["text"].as_str().map(str::to_string))
+            })
+            .unwrap_or_default();
+        let first: String = first.chars().take(60).collect();
+        println!("{}\tmock\t{}\t{}", path.display(), text.lines().count(), first.replace('\n', " "));
+    }
+    true
 }
 
 /// The door's argv, as much of it as this stand-in must understand. An unknown flag is a
@@ -124,6 +222,7 @@ struct Args {
     session: Option<PathBuf>,
     cwd: Option<PathBuf>,
     model: Option<String>,
+    yolo: bool,
 }
 
 impl Args {
@@ -132,9 +231,20 @@ impl Args {
         // eidolon's global `--config <file>`, which the perch puts before the subcommand when it
         // was given `--eidolon-config`. Understood and ignored: the argv line the fake records
         // already carries it, which is what a test reads.
-        if rest.peek().map(|arg| arg.as_str()) == Some("--config") {
-            rest.next();
-            rest.next().ok_or("--config needs a value")?;
+        // eidolon's other global flag, `--yolo`, comes after it when both are given.
+        let mut yolo = false;
+        loop {
+            match rest.peek().map(|arg| arg.as_str()) {
+                Some("--config") => {
+                    rest.next();
+                    rest.next().ok_or("--config needs a value")?;
+                }
+                Some("--yolo") => {
+                    rest.next();
+                    yolo = true;
+                }
+                _ => break,
+            }
         }
         match rest.next().map(String::as_str) {
             Some("web") => {}
@@ -155,7 +265,7 @@ impl Args {
         if session.is_some() == cwd.is_some() {
             return Err("exactly one of --session or --cwd is required".into());
         }
-        Ok(Self { bind, session, cwd, model })
+        Ok(Self { bind, session, cwd, model, yolo })
     }
 }
 
@@ -213,6 +323,9 @@ async fn serve(args: Args, argv: Vec<String>) {
         late_pane: std::env::var("FAKE_LATE_PANE_MS").ok().and_then(|ms| ms.parse().ok()).map(Duration::from_millis),
         ignore_sigterm: std::env::var_os("FAKE_IGNORE_SIGTERM").is_some(),
         refuse: std::env::var("FAKE_REFUSE").ok().filter(|path| !path.is_empty()),
+        model: args.model.clone().unwrap_or_else(|| "mock".into()),
+        yolo: args.yolo,
+        turns: std::env::var_os("FAKE_SAY_RUNS").is_some(),
         frames: broadcast::channel(64).0,
     });
 
@@ -481,6 +594,12 @@ async fn connection(mut sock: TcpStream, fake: Arc<Fake>) -> std::io::Result<()>
                 let error = "{\"error\":\"this door takes images only: documents are not accepted\"}";
                 reply(&mut sock, "422 Unprocessable Entity", error, "application/json").await
             } else {
+                if fake.turns {
+                    fake.record("turn-state true");
+                    let _ = fake.frames.send(b"data: {\"type\":\"turn-state\",\"running\":true}
+
+".to_vec());
+                }
                 reply(&mut sock, "202 Accepted", "{\"queued\":false}", "application/json").await
             }
         }
@@ -496,6 +615,13 @@ async fn connection(mut sock: TcpStream, fake: Arc<Fake>) -> std::io::Result<()>
                 settled["note"] = serde_json::Value::String(note.to_string());
             }
             let _ = fake.frames.send(format!("data: {settled}\n\n").into_bytes());
+            reply(&mut sock, "204 No Content", "", "text/plain").await
+        }
+        ("POST", "/api/cancel") if fake.turns => {
+            fake.record("turn-state false");
+            let _ = fake.frames.send(b"data: {\"type\":\"turn-state\",\"running\":false}
+
+".to_vec());
             reply(&mut sock, "204 No Content", "", "text/plain").await
         }
         ("POST", "/api/cancel") => reply(&mut sock, "409 Conflict", "{\"error\":\"no turn is running\"}", "application/json").await,
@@ -526,8 +652,8 @@ async fn events(sock: &mut TcpStream, fake: &Arc<Fake>) -> std::io::Result<()> {
         "type": "hello",
         "session": fake.session.display().to_string(),
         "cwd": fake.cwd.display().to_string(),
-        "model": "mock",
-        "yolo": false,
+        "model": fake.model,
+        "yolo": fake.yolo,
         "pending": 0,
         "protocol": 1,
     });

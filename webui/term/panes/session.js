@@ -9,9 +9,10 @@ import { markdown } from '../core/markdown.js';
 import { resolveIn } from '../core/path.js';
 import { render as rend, renderCall } from '../renderers/index.js';
 import { icon, word, shade, CELLS } from '../core/life.js';
-import { tildify, kfmt, hhmm, stateOf, STATE_CLS, MODES, connWord } from '../core/state.js';
-import { mode } from '../core/api.js';
-import { openMenu, atPointer, under } from '../core/menu.js';
+import { tildify, kfmt, hhmm, stateOf, STATE_CLS, connWord } from '../core/state.js';
+import { mode, hubGet } from '../core/api.js';
+import { list } from '../core/hub.js';
+import { openMenu, closeMenu, menu, atPointer, under } from '../core/menu.js';
 import { AskPanel, AskMark, Settled, quoted } from './asks.js';
 
 const AGENT = icon();
@@ -30,16 +31,18 @@ export function Pane({ p, rect, focused, mirror, act }) {
   const style = `left:${rect.x - (rect.x > 0 ? 1 : 0)}px;top:${rect.y - (rect.y > 0 ? 1 : 0)}px;` +
     `width:${rect.w + (rect.x > 0 ? 1 : 0)}px;height:${rect.h + (rect.y > 0 ? 1 : 0)}px`;
   const banner = s.banner.value;
+  // A chat that is not running and can be continued (saved, stopped, exited): no composer, a visible action instead.
+  const away = !!banner && (!!banner.resume || !!s.resuming);
   v.act = act;
   return html`<section class=${'pane frame' + (focused ? ' focus' : '')} style=${style} tabindex="-1"
       data-pane=${p.id} onMouseDown=${() => act.focus(p.id)}>
     <${Title} p=${p} mirror=${mirror} act=${act} />
     <${Glyphs} p=${p} act=${act} />
     <${Transcript} s=${s} v=${v} />
-    ${banner && html`<div class=${'banner' + (banner.err ? ' err' : '')}>${banner.text}${banner.resume && s.canResume() && html` <${K} cls="b" title="resume this session (or r, twice)" on=${() => s.resume()}>resume</${K}> <span class="faint">may continue the last turn</span>`}</div>`}
+    ${banner && html`<div class=${'banner' + (banner.err ? ' err' : '')}>${banner.text}</div>`}
     ${act.panelPane.value === p.id && html`<${AskPanel} p=${p} act=${act} />`}
     <${Outbox} p=${p} />
-    <${Composer} s=${s} p=${p} act=${act} />
+    ${away ? html`<${Continue} s=${s} p=${p} act=${act} />` : html`<${Composer} s=${s} p=${p} act=${act} />`}
   </section>`;
 }
 
@@ -48,11 +51,11 @@ function Title({ p, mirror, act }) {
   const s = p.s, conn = s.conn.value, hl = s.hello.value;
   const dot = { live: 'hi', replaying: 'y', connecting: 'y', reconnecting: 'y', goodbye: 'faint', stopped: 'faint', kept: 'faint', gone: 'faint' }[conn] || 'r';
   const open = (e, at) => { e.preventDefault(); e.stopPropagation(); act.paneMenu(p, at); };
-  return html`<div class="ftitle k ptitle" role="button" tabindex="0" title=${'pane menu (click or right-click)' + (hl ? '\n' + hl.cwd : '')} data-owner=${'pane-' + p.id}
+  return html`<div class="ftitle k ptitle" role="button" tabindex="0" title=${'pane menu (click or right-click)\nid ' + s.sid + (hl ? '\n' + tildify(hl.cwd) : '')} data-owner=${'pane-' + p.id}
       onClick=${(e) => open(e, under(e.currentTarget))} onContextMenu=${(e) => open(e, atPointer(e))}
       onKeyDown=${(e) => !e.repeat && (e.key === 'Enter' || e.key === ' ') && open(e, under(e.currentTarget))}>
     <span class="b">${act.name(s)}</span>${mirror && html` <span class="faint">(mirror)</span>`} <span class="faint">▾</span>
-    ${hl && html` <span class="proj">[${act.project(hl.cwd)}]</span>`} <span class=${dot}>●</span>
+    ${hl && act.project(hl.cwd) && html` <span class="proj">[${act.project(hl.cwd)}]</span>`} <span class=${dot}>●</span>
     ${conn !== 'live' && html` <span class="faint">${connWord(conn)}</span>`}
   </div>`;
 }
@@ -66,6 +69,26 @@ function Glyphs({ p, act }) {
     ${g('⇥', 'split right', `split-row-${p.id}`, (el) => act.splitMenu(p, 'row', under(el)))}
     ${g('⇩', 'split down', `split-col-${p.id}`, (el) => act.splitMenu(p, 'col', under(el)))}
     ${g('×', 'close the pane (⌥w  :q)', `close-${p.id}`, () => act.close(p.id))}
+  </div>`;
+}
+
+// ---------------------------------------------------------------- a chat that is not running
+// Where the composer would be, for a saved, stopped or exited chat: the way back in is a visible text
+// action, never a side effect of opening it (a resume can start a paid turn: hub.md section 4).
+// A chat from eidolon's own sessions folder says what continuing it means.
+function Continue({ s, p, act }) {
+  const ref = useRef(null);
+  const row = list.value.find((r) => r.id === s.sid);
+  const other = !!row && row.origin === 'other', busy = !!s.resuming;
+  useEffect(() => {
+    p.focusComposer = () => { const el = ref.current && ref.current.querySelector('.k'); if (el) el.focus({ preventScroll: true }); };
+    p.prefill = () => {};
+    return () => { p.focusComposer = null; };
+  }, [p]);
+  return html`<div class="cont" ref=${ref}>
+    <${K} cls="act" off=${busy} title="continue this chat: it may carry on the last turn" on=${() => act.resume(p)}>${busy ? '[ continuing… ]' : '[ continue this chat ]'}</${K}>
+    <span class="faint"> read-only until then</span>
+    ${other && html`<div class="faint note">from eidolon's own sessions folder · continuing resumes it with your normal config and writes to the same log</div>`}
   </div>`;
 }
 
@@ -376,19 +399,34 @@ function Outbox({ p }) {
   </div>`;
 }
 
-// The composer's bottom border: a line of menus (switching what is loaded
-// needs the hub: the door restarts between turns) and the verbs. It fits the
-// frame as the status line does: the verbs drop their keys, the labels drop
-// to glyphs, every menu goes into one `⋯`, then only send and stop stay.
-const restart = () => (mode() === 'perch' ? 'not available yet (it restarts the chat between turns)' : 'needs the hub (restarts the door between turns)');
-const MIC = 'needs local dictation (hub + whisper.cpp)';
+// The composer's bottom border: a line of menus and the verbs. Every menu works or is not drawn: `+ attach` always; `model`
+// and `mode` under the perch only (a bare door cannot change either: the perch stops the door between turns and resumes the same
+// log with the new flags, POST /hub/sessions/<id>/restart). There is no effort menu (eidolon's `web` has no such flag) and no
+// mic (nothing here records or transcribes). It fits the frame as the status line does: the verbs drop their keys, the labels
+// drop to glyphs, every menu goes into one `⋯`, then only send and stop stay.
 let attSeq = 0;
+
+// The models eidolon lists (GET /hub/models, cached by the perch for ten minutes), kept here for one minute so reopening the
+// menu is instant. `null` when the perch could not say; the menu then offers the current model and `other…` only.
+let modelRows = null, modelsAt = 0, modelsErr = '';
+async function loadModels() {
+  if (modelRows && Date.now() - modelsAt < 60000) return modelRows;
+  const r = await hubGet('models', 30000);
+  if (r.status === 200 && Array.isArray(r.data)) { modelRows = r.data; modelsAt = Date.now(); modelsErr = ''; return modelRows; }
+  modelsErr = (r.data && r.data.error) || 'the model list could not be read';
+  return null;
+}
+const MODE_ROWS = [
+  ['gated', 'asks before risky tools'],
+  ['yolo', 'answers yes to every ask'],
+];
 
 function Composer({ s, p, act }) {
   const ta = useRef(null), root = useRef(null), bar = useRef(null), fileIn = useRef(null);
   const text = useMemo(() => signal(''), []);
   const atts = useMemo(() => signal([]), []); // images going with the next message
   const [fit, setFit] = useState(0), [cw, setCw] = useState(0);
+  const other = useMemo(() => signal(null), []); // the `other…` model: null, or what is typed
   const run = s.running.value, bye = s.bye || s.conn.value === 'goodbye';
   useEffect(() => {
     // A blurred textarea keeps its selection, so focus() puts the caret back where it was.
@@ -531,20 +569,39 @@ function Composer({ s, p, act }) {
     { id: 'attach', full: '+ attach', short: '+', items: () => [
       { label: 'image…', hint: 'png jpeg gif webp · 4 MiB', on: () => pick('image') },
       { label: 'file…', hint: 'text, inlined', on: () => pick('text') },
-      { label: 'folder…', off: `${hubOff()}: a chat's folder is fixed when it starts` },
     ] },
-    { id: 'model', full: `model ${model}`, short: model.split(/[/:]/).pop(), items: () => [
-      { label: model, tick: true, off: restart() }, { label: 'another model…', off: restart() }] },
-    { id: 'effort', full: 'effort ?', short: '◔', items: () => ['low', 'medium', 'high'].map((l) => ({ label: l, off: restart() })) },
-    { id: 'mode', full: `mode ${yolo ? 'YOLO' : 'gated'}`, short: yolo ? 'YOLO' : '⚑', items: () => MODES.map((m) => ({ label: m, tick: m === 'yolo' && yolo, off: restart() })) },
-    { id: 'mic', full: '◉ mic', short: '◉', off: MIC },
   ];
-  const menuAt = (m) => (e) => openMenu(m.items(), under(e.currentTarget), { title: m.full, owner: `cm-${m.id}-${p.id}` });
+  // model and mode are the perch's: it restarts the chat between turns (the transcript is its log, so nothing is lost).
+  const busy = run === true ? 'wait for the turn to end' : null;
+  const switchTo = (change, said) => s.restart(change, said);
+  const pickModel = (key) => key !== model && switchTo({ model: key }, `switched to ${key} — the chat restarted between turns, nothing lost`);
+  const pickMode = (name) => switchTo({ yolo: name === 'yolo' }, `mode is now ${name} — the chat restarted between turns, nothing lost`);
+  if (mode() === 'perch') {
+    menus.push({ id: 'model', full: `model ${model}`, short: model.split(/[/:]/).pop(), open: true, items: (rows, loading) => [
+      ...(loading ? [{ label: 'loading models…', off: 'one moment' }] : []),
+      ...(rows || []).map((m) => ({ label: m.key, tick: m.key === model, hint: m.note || m.name || '', off: busy, on: () => pickModel(m.key) })),
+      ...(rows && rows.some((m) => m.key === model) ? [] : [{ label: model, tick: true, off: busy, on: () => {} }]),
+      ...(rows || loading ? [{ sep: true }] : []),
+      { label: 'other…', hint: rows ? 'type a model name' : `${modelsErr || 'no list'}; type a model name`, off: busy, on: () => { other.value = ''; setTimeout(() => p.focusOther && p.focusOther(), 0); } },
+    ] });
+    menus.push({ id: 'mode', full: `mode ${yolo ? 'yolo' : 'gated'}`, short: yolo ? 'yolo' : '⚑', items: () => MODE_ROWS.map(([name, hint]) =>
+      ({ label: name, hint, tick: (name === 'yolo') === yolo, off: busy, on: () => { if ((name === 'yolo') !== yolo) pickMode(name); } })) });
+  }
+  // The model menu is filled from the perch's list: fetched when it is opened (a menu cannot wait on a promise).
+  const menuAt = (m) => async (e) => {
+    const at = under(e.currentTarget), opts = { title: m.full, owner: `cm-${m.id}-${p.id}` };
+    const fresh = !!(modelRows && Date.now() - modelsAt < 60000);
+    openMenu(m.items(m.open ? modelRows : undefined, m.open && !fresh), at, opts);
+    if (m.open && !fresh) {
+      const rows = await loadModels();
+      const open = menu.peek();
+      if (open && open.owner === opts.owner) { closeMenu(); openMenu(m.items(rows), at, opts); }
+    }
+  };
   const cmenus = fit >= 3
-    ? html`<${K} cls="cm cm-all" title="attach, model, effort, mode, mic" on=${(e) => openMenu(menus.map((m) => (m.off ? { label: m.full, off: m.off } : { label: m.full, sub: m.items() })),
+    ? html`<${K} cls="cm cm-all" title=${menus.map((m) => m.id).join(', ')} on=${(e) => openMenu(menus.map((m) => ({ label: m.full, sub: m.items(m.open ? modelRows : undefined) })),
         under(e.currentTarget), { title: 'composer', owner: `cm-all-${p.id}` })}>⋯ ▾</${K}>`
-    : menus.map((m, i) => html`${i > 0 && sep}${m.off ? html`<span class=${'dis cm cm-' + m.id} title=${m.off}>${fit >= 2 ? m.short : m.full}</span>`
-      : html`<${K} cls=${'cm cm-' + m.id} title=${m.full} on=${menuAt(m)}>${fit >= 2 ? m.short : m.full} ▾</${K}>`}`);
+    : menus.map((m, i) => html`${i > 0 && sep}<${K} cls=${'cm cm-' + m.id} title=${m.full} on=${menuAt(m)}>${fit >= 2 ? m.short : m.full} ▾</${K}>`);
   const st = stateOf(s), ed = p.editing.value;
   const edN = ed ? p.queue.value.findIndex((m) => m.id === ed.id) + 1 : 0;
   return html`<div class=${'composer st-' + STATE_CLS[st] + (run === true ? ' running' : '') + (ed ? ' editing' : '')} ref=${root}
@@ -558,6 +615,12 @@ function Composer({ s, p, act }) {
       onInput=${autosize} onKeyDown=${onKey} onPaste=${onPaste} onFocus=${() => act.focus(p.id)}></textarea>
     <input type="file" ref=${fileIn} multiple hidden aria-hidden="true" tabindex="-1" onChange=${(e) => take([...e.currentTarget.files], e.currentTarget.dataset.kind)} />
     ${text.value.startsWith(':') && html`<div class="cwarn">: goes to the model; commands live in the status line</div>`}
+    ${other.value !== null && html`<div class="cother"><span class="faint">model </span><input ref=${(el) => { p.focusOther = () => el && el.focus(); }} value=${other.value} spellcheck="false" aria-label="model name"
+      placeholder="provider:model" onInput=${(e) => { other.value = e.currentTarget.value; }} onKeyDown=${(e) => {
+        if (e.key === 'Enter') { e.preventDefault(); const v = other.value.trim(); other.value = null; if (v) pickModel(v); ta.current.focus(); }
+        else if (e.key === 'Escape') { e.preventDefault(); other.value = null; ta.current.focus(); }
+        e.stopPropagation();
+      }} /><span class="faint"> ⏎ switch · esc cancel</span></div>`}
     <div class=${'fbar fit' + fit} ref=${bar}><span class="cmenus">${cmenus}</span><span class="grow"></span>
       <span class="verbs">${ed ? html`<${K} cls="verb" on=${() => endEdit(true)}><span class="kh">⏎ </span>save</${K}>${sep}<${K} cls="verb" on=${() => endEdit(false)}><span class="kh">esc </span>cancel</${K}>`
         : html`${s.queued.value > 0 && html`<span class="hi">${s.queued.value} queued</span>${sep}`}${verbs.map(([how, kh, narrow], i) => html`<span class=${narrow ? '' : 'wide'}>${i > 0 && sep}<${K} off=${bye} on=${() => go(how)} cls="verb">${kh && html`<span class="kh">${kh} </span>`}${how}</${K}></span>`)}`}</span>

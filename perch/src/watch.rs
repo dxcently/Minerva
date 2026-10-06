@@ -27,6 +27,7 @@
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -53,6 +54,8 @@ pub struct Hello {
     pub session: PathBuf,
     pub cwd: PathBuf,
     pub model: String,
+    /// Whether the door answers every ask with yes (`--yolo`), as the door itself reports it.
+    pub yolo: bool,
 }
 
 /// A held stream, and the handle that closes it. Dropping it cancels the stream too, so no
@@ -61,9 +64,17 @@ pub struct Hello {
 pub struct Watcher {
     close: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether a turn is running, from the door's own `turn-state` frames. A door starts idle, so this starts `false`.
+    running: Arc<AtomicBool>,
 }
 
 impl Watcher {
+    /// Whether the door said a turn is running, as of the last `turn-state` it sent. This is what a restart refuses on:
+    /// a restart between turns loses nothing, one in the middle of a turn loses the turn.
+    pub fn running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
     /// Close the perch's stream to this door and wait until the socket is gone. After this
     /// returns, the door has no SSE connection left from the perch — which is the whole
     /// precondition of the SIGTERM that [`sessions::Registry::stop`] sends next.
@@ -86,9 +97,10 @@ impl Drop for Watcher {
 pub async fn open(port: u16, token: Arc<str>, within: Duration) -> Result<(Watcher, Hello)> {
     let close = CancellationToken::new();
     let (hello_tx, hello_rx) = oneshot::channel();
-    let task = tokio::spawn(watch(port, token, close.clone(), hello_tx));
+    let running = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn(watch(port, token, close.clone(), hello_tx, running.clone()));
     match tokio::time::timeout(within, hello_rx).await {
-        Ok(Ok(Ok(found))) => Ok((Watcher { close, task: Some(task) }, found)),
+        Ok(Ok(Ok(found))) => Ok((Watcher { close, task: Some(task), running }, found)),
         // Every failure closes the stream before it returns: the caller's next move is a
         // SIGTERM, and a door with an open stream ignores one.
         Ok(Ok(Err(e))) => {
@@ -111,7 +123,7 @@ pub async fn open(port: u16, token: Arc<str>, within: Duration) -> Result<(Watch
 
 /// Connect, ask for `/api/events` with the door's Bearer, read until `hello`, then hold the
 /// stream open until `close` is cancelled or the door ends it.
-async fn watch(port: u16, token: Arc<str>, close: CancellationToken, hello_tx: oneshot::Sender<Result<Hello>>) {
+async fn watch(port: u16, token: Arc<str>, close: CancellationToken, hello_tx: oneshot::Sender<Result<Hello>>, running: Arc<AtomicBool>) {
     let mut hello_tx = Some(hello_tx);
     let stream = match tokio::time::timeout(CONNECT, TcpStream::connect((Ipv4Addr::LOCALHOST, port))).await {
         Ok(Ok(stream)) => stream,
@@ -154,6 +166,7 @@ async fn watch(port: u16, token: Arc<str>, close: CancellationToken, hello_tx: o
     };
 
     let mut scan = HelloScan::default();
+    let mut turns = TurnScan::default();
     let mut told = false;
     loop {
         tokio::select! {
@@ -161,6 +174,9 @@ async fn watch(port: u16, token: Arc<str>, close: CancellationToken, hello_tx: o
             frame = body.frame() => match frame {
                 Some(Ok(frame)) => {
                     if let Some(data) = frame.data_ref() {
+                        if let Some(now) = turns.feed(data) {
+                            running.store(now, Ordering::SeqCst);
+                        }
                         match scan.feed(data) {
                             Ok(Some(found)) => {
                                 // A caller that timed out is gone; there is nothing to hold open.
@@ -235,6 +251,57 @@ impl HelloScan {
     }
 }
 
+/// The longest line [`TurnScan`] looks at. A `turn-state` frame is a few dozen bytes; a text delta or a transcript replay line
+/// can be much larger and is skipped without being held, so the perch still keeps no transcript.
+const LINE_MAX: usize = 4096;
+
+/// The door's `turn-state` frames, found in a stream the perch otherwise throws away: lines are assembled up to [`LINE_MAX`],
+/// and only a `data:` line of that size is parsed. A longer line is dropped as it goes by and costs no memory.
+#[derive(Default)]
+struct TurnScan {
+    line: Vec<u8>,
+    /// The current line already passed [`LINE_MAX`]: its remainder is ignored up to the newline.
+    over: bool,
+}
+
+impl TurnScan {
+    /// One more read. `Some(running)` for the last `turn-state` completed in it, if any.
+    fn feed(&mut self, data: &[u8]) -> Option<bool> {
+        let mut last = None;
+        for &byte in data {
+            if byte == b'\n' {
+                if !self.over && let Some(now) = turn_state(&self.line) {
+                    last = Some(now);
+                }
+                self.line.clear();
+                self.over = false;
+            } else if !self.over {
+                if self.line.len() < LINE_MAX {
+                    self.line.push(byte);
+                } else {
+                    self.over = true;
+                    self.line = Vec::new();
+                }
+            }
+        }
+        last
+    }
+}
+
+/// `data: {"type":"turn-state","running":<bool>}` -> the bool; anything else is `None`.
+fn turn_state(line: &[u8]) -> Option<bool> {
+    let text = std::str::from_utf8(line).ok()?;
+    let payload = text.strip_prefix("data:")?.trim_start();
+    if !payload.contains("turn-state") {
+        return None;
+    }
+    let frame: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if frame.get("type")?.as_str()? != "turn-state" {
+        return None;
+    }
+    frame.get("running")?.as_bool()
+}
+
 /// The first `hello` frame in what has been read so far. Frames the perch does not know are
 /// ignored — the door's protocol is additive, and a field this slice does not read (a
 /// `turn-state` in H2, an `ask` in H1c) must not make the perch treat a live door as dead.
@@ -250,7 +317,8 @@ fn hello_from(seen: &[u8]) -> Option<Hello> {
         let session = frame.get("session").and_then(|s| s.as_str())?;
         let cwd = frame.get("cwd").and_then(|s| s.as_str())?;
         let model = frame.get("model").and_then(|m| m.as_str()).unwrap_or_default().to_string();
-        return Some(Hello { session: PathBuf::from(session), cwd: PathBuf::from(cwd), model });
+        let yolo = frame.get("yolo").and_then(|y| y.as_bool()).unwrap_or(false);
+        return Some(Hello { session: PathBuf::from(session), cwd: PathBuf::from(cwd), model, yolo });
     }
     None
 }
@@ -284,6 +352,28 @@ mod tests {
         assert!(hello_from(half).is_none());
         assert!(hello_from(&frame(serde_json::json!({"type": "hello", "cwd": "/work"}))).is_none());
         assert!(hello_from(b"data: not json\n\n").is_none());
+    }
+
+    /// `turn-state` is the one frame the perch reads after `hello`, whole lines only and whatever the read boundaries are; a
+    /// line past the cap, and a text delta that merely says the words, change nothing. Mutation: parse every `data:` line
+    /// whatever its type, or hold a line past the cap, and this goes red.
+    #[test]
+    fn a_turn_state_is_found_across_reads_and_nothing_else_moves_it() {
+        let mut scan = TurnScan::default();
+        let on = frame(serde_json::json!({"type": "turn-state", "running": true}));
+        let (head, tail) = on.split_at(11);
+        assert_eq!(scan.feed(head), None, "half a frame says nothing");
+        assert_eq!(scan.feed(tail), Some(true));
+        let said = frame(serde_json::json!({"type": "text-delta", "text": "\"type\":\"turn-state\",\"running\":false"}));
+        assert_eq!(scan.feed(&said), None, "a delta that quotes the words is not a turn-state");
+        let big = frame(serde_json::json!({"type": "text-delta", "text": "x".repeat(3 * LINE_MAX)}));
+        assert_eq!(scan.feed(&big), None);
+        assert!(scan.line.capacity() < 2 * LINE_MAX, "an oversized line is not held");
+        let off = frame(serde_json::json!({"type": "turn-state", "running": false}));
+        assert_eq!(scan.feed(&off), Some(false), "the line after a skipped one is read");
+        let mut both = on.clone();
+        both.extend(&off);
+        assert_eq!(scan.feed(&both), Some(false), "two in one read: the later one");
     }
 
     fn hello_frame() -> Vec<u8> {

@@ -80,6 +80,8 @@ the list cannot disagree.
   DIR/config.toml web ...` (new and resumed), list `DIR/sessions`, and add `DIR` to the allowed
   roots. A `POST /hub/sessions` body with no `cwd` starts in a fresh `DIR/scratch/<YYYYMMDD-HHMMSS>/`
   (one per chat, `-2`, `-3`, ... on a collision). Without `--home` a body with no `cwd` is a 400.
+  Under `--home` eidolon's own sessions dir (the member's `sessions_dir`, else `~/.local/share/eidolon/sessions`) is a
+  second, read-only source: its chats are listed `origin: "other"`, never written, moved or deleted.
   Conflicts with `--eidolon-config` and `--sessions-dir`.
 - `--eidolon-config FILE` (no `--home`): every door is `eidolon --config FILE web ...`. Unless
   `--sessions-dir` is given, the perch lists the file's top-level `sessions_dir` (parsed with a TOML
@@ -131,8 +133,15 @@ What is **not** here, on purpose: the idle reaper, `/hub/events` (H2) and
   /hub/sessions                 GET the list, POST to spawn a new session   (H1b)
   /hub/sessions/<id>/resume     POST: a door on that kept log                (H1b)
   /hub/sessions/<id>/stop       POST: cancel panes, close watcher, SIGTERM   (H1b, H1c)
+  /hub/sessions/<id>/log        GET: a saved chat as eidolon's `log --json` lines (titles slice)
+  /hub/sessions/<id>/restart    POST {model?, yolo?}: stop + resume the same log with -m / --yolo, between turns
+  /hub/models                   GET: the models `eidolon models` lists, cached 10 min
   /s/<id>/api/<route>           GET|POST, proxied to that session's door     (H1c)
   /hub/tree?session=<id>&path=<rel>   GET one directory of a live cwd     (H2)
+  /hub/projects                 GET the named folders, POST {path, name?} adds one
+  /hub/projects/<n>             DELETE forgets entry n (never the folder)
+  /hub/dirs?path=<abs>          GET the subfolders of one folder under the roots (none: the roots)
+  /hub/dirs                     POST {parent, name}: make ONE folder inside a root
   /hub/events, /hub/mesh                   ->  404                           (H2/H3)
   any other /s/...              token-gated  ->  404
 ```
@@ -210,9 +219,14 @@ src/login.rs    login codes and session cookies: mint, redeem (single use, 30 s)
 src/serve.rs    accept loop, the gate order, the route match, the session routes, shutdown
 src/files.rs    the static rules, ported from eidolon/crates/web/src/files.rs
 src/tree.rs     GET /hub/tree: one directory under a live cwd, names and kinds only
+src/dirs.rs     GET/POST /hub/dirs: the folder picker's listing and mkdir, with tree.rs's deny list and 8.3 test
+src/projects.rs <home>/projects.json (the named folders) and <home>/chat-cwds.json (the folder each chat started in)
+src/folders.rs  the handlers of /hub/projects and /hub/dirs
 src/sessions.rs the door table, the list, the id regex, the roster scan, the pane count, the ordered stop
 src/spawn.rs    argv, the fork (one long-lived thread, PDEATHSIG), the boot lines, the token file
-src/watch.rs    the perch's own /api/events stream to a door, and the handle that closes it
+src/watch.rs    the perch's own /api/events stream to a door, the handle that closes it, and `turn-state` (is a turn running)
+src/models.rs   `eidolon models` parsed, cached 10 min, bounded; the rule for what may be a `-m` value
+src/restart.rs  GET /hub/models, POST .../restart, and `bring_up` (a door on an existing log) that resume shares
 src/proxy.rs    /s/<id>/api/<route>: the path shape, the rebuilt request, panes, hub-stream-end
 src/bin/fake_eidolon.rs   the stand-in door the tests drive, `--features test-bins` only
 tests/http.rs   a real perch on 127.0.0.1:0, over a real socket, against a real child door
@@ -234,3 +248,64 @@ reached a log line would fail the suite.
   already reads (a bounded line reader: the watcher itself keeps nothing after `hello`), `/hub/events`, and classifying a door that says `goodbye` and
   exits as `stopping` rather than `dead` (the frame is not parsed today).
 - **H3** — `/hub/mesh`, `/hub/mesh/events`.
+
+## Projects and the folder picker (2026-10-06)
+
+A **project** is a folder with a name, remembered in `<home>/projects.json` (`[{name, path, created}]`, atomic, `0600`). A chat
+belongs to a project when its cwd is the project's path or inside it. A chat's cwd is also kept in `<home>/chat-cwds.json`
+(`{id: cwd}`) so a saved chat still has its folder after a restart: rows of saved chats in `GET /hub/sessions` carry `cwd` when
+the perch started or resumed them (older logs have none; the page files those under `no folder`).
+
+- `GET /hub/projects`: the list, in the order added. `POST /hub/projects {"path", "name"?}`: the path must be a directory under a
+  `--root` and pass the picker's rules (below), else 422; the name is trimmed, at most 100 characters, no control characters (400),
+  and defaults to the folder's name; the same path twice is the existing entry (200; 201 when new); 503 without `--home`.
+  `DELETE /hub/projects/<n>` forgets entry `n` (0-based, as listed; 204, 404 when there is none). **No file is ever touched.**
+- `GET /hub/dirs?path=<abs>`: the **subfolders** of one folder, `{path, label, parent, crumbs[], dirs[{name, path}], truncated}`.
+  With no path it is the roots, labelled for a person (`/mnt/c/Users/me` is `C:\Users\me`, `$HOME` is `~`); `parent` is `null`
+  there and `""` above a root. The safety is [tree.rs](src/tree.rs)'s: an absolute path with no `.`/`..`/NUL/backslash,
+  canonicalized and under a root (a link out dies), every segment below the root against the deny list and the 8.3 `~digit`
+  shape (on the canonical remainder and on the spelling asked), real directories only (a link, a dot-folder, a denied or aliased
+  name is not offered), `read_dir` bounded at 100 000 entries and 2 000 answered (`truncated`), at most 4 listings at once (503).
+  Every refusal is the same empty 404.
+- `POST /hub/dirs {"parent", "name"}`: makes **one** folder (`create_dir`, never `create_dir_all`) inside a folder the listing
+  would allow: 201 `{path, name}`; 400 a bad name (no `/`, `\`, `..`, control characters or leading dot, no leading or trailing
+  space, at most 100 characters, not a denied or 8.3-shaped name); 422 a parent outside the roots (or denied, or missing); 409 it
+  exists.
+- A chat with no `cwd` is still a fresh scratch folder each time (`POST /hub/sessions {}`); the page never reuses the focused
+  pane's. Its title fallback is `new chat · HH:MM`, never the stamp.
+
+## Titles, saved chats and the second source
+
+- **Titles.** Every row of `GET /hub/sessions` has a `title`, from eidolon's own outputs and never by decoding the
+  binary `EIDO` log: the roster `meta.json` title while a door is live, else the fourth column of `eidolon [--config C]
+  sessions` (the first message, flattened, 60 characters), else `<project> · HH:MM` (the project's name, else the folder's; `new chat · HH:MM` for a scratch
+  chat, `chat · HH:MM` when the perch has not seen the chat's cwd; the time is the log's mtime, local). `eidolon sessions`
+  runs at most once per source per listing, and only when a log is new or an untitled one changed; a chat that has a title
+  is never asked about again. It is bounded (10 s, 4 MiB); a failure keeps the fallback names and is not retried for 30 s.
+- **`GET /hub/sessions/<id>/log`** runs `eidolon [--config C] log --json <path>` (15 s, 16 MiB) and returns eidolon's lines
+  as `application/x-ndjson`: 404 for an id that is not a saved chat (or a query string, or POST), 413 over the cap, 504 on
+  time, 502 on any other failure. It reads only: nothing is started, and a chat that is running is readable too.
+- **The second source** (`origin: "other"`, state `kept`) is under `--home` only. An id both dirs have is the home's. Its
+  `log` runs without `--config`; `POST .../resume` on it starts a door with the home's config on that log in place
+  (it then lists as a live chat without `origin`, and as `other` again once it stops).
+
+## Model and mode: `GET /hub/models`, `POST /hub/sessions/<id>/restart`
+
+A running door cannot change its model or its `--yolo`: both are flags of `eidolon web`, and the door has no route that moves
+either. So a switch is **stop the door cleanly, resume the same log with the new flags**; the chat keeps its id, its folder and
+the Minerva `--config`, the log is the transcript, and the page's pane reconnects to the same id and replays it.
+
+- **`GET /hub/models`** runs `eidolon [--config C] models` (20 s, 1 MiB; `PERCH_MODELS_TIMEOUT_MS` shortens the bound for
+  tests) and answers `[{"key", "name"?, "note"?}]`: the rows whose first word is `provider:model`, in eidolon's order (the
+  provider table and the notices above them are skipped). One answer is kept ten minutes for the whole process; a failure is
+  never kept. 504 on time, 502 otherwise.
+- **`POST /hub/sessions/<id>/restart`** with `{"model": "<m>"?, "yolo": <bool>?}` (at least one; a model is letters, digits and
+  `: . _ - / @ +`, never a leading `-`): **400** bad body or model, **404** no such chat, **409** with a sentence when a turn is
+  running (`wait for the turn to end`; read off the door's `turn-state` frames on the perch's own stream), the chat is
+  starting or stopping, or it is saved and not running (continue it first), **200** `{"id","model","yolo","restarted"}`
+  (`restarted: false` when the flags were already the door's: nothing is stopped), **503** `{"error","reverted"}` when the new
+  flags did not come up: the perch then starts the chat again with the flags it had, and `reverted` says whether that worked.
+  What is not named is kept: a mode change passes the model the door reported, a model change keeps `--yolo` as it was. The
+  argv is `eidolon --config C [--yolo] web --bind 127.0.0.1:0 --session <log> -m <model>`.
+- **Effort** has no route: eidolon's `web` takes no effort flag, so there is nothing to restart with. The composer shows none.
+- A resumed door's stream is now held like a new session's (it is how the perch knows a turn is running).

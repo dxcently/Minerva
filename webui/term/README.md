@@ -36,13 +36,15 @@ Under the perch a pane does not retry for ever. The perch's last frame (`hub-str
 |---|---|---|---|
 | stopped | the perch stopped the door (a stop) | `stopped` | yes |
 | dead | the door exited, or 503 `dead` at connect | `the door exited (<exit>)` | yes |
-| kept | 409 `kept` at connect: a log, no process | `saved, not running` | yes |
+| kept | 409 `kept` at connect: a log, no process | `saved chat · read-only`, the transcript drawn from `GET /hub/sessions/<id>/log`, and `[ continue this chat ]` where the composer would be | yes (the action) |
 | gone | 404 at connect: not a session of this perch | `no chat <id> here` | no |
 | goodbye | the session ended itself | its own text | yes (perch only; door mode says `resume needs the hub`) |
 
 A door that ended the stream and is still there (`live`), 409 `starting` or `stopping`, and 502 reconnect with a backoff: 250 ms doubled for each reconnect that follows too soon (a stream that held 5 s resets it), up to 15 s, jittered; a `lagged` frame and a `context-invalidated` redraw wait the same way. A resume that lands while the old stream is still draining supersedes it: the old connection's frames, `hub-stream-end` included, are dropped, so a freshly resumed session never shows `stopped`. A `context-invalidated` frame from the door (shed what was cached) makes the page replay the log through a quiet reconnect at the next point no turn is running; a session whose state is still unknown (just connected, no `turn-state` yet) counts as idle for this, and only a live frame counts (a replayed one is ignored, so it cannot loop).
 
 ### The sidebar under the perch
+
+(The `sessions` tab rows below predate 2026-10-06: its layout is now search, projects, `no folder`, `other`; see "The folder picker and projects". The list source, polling and menus are unchanged.)
 
 The list comes from `GET /hub/sessions` (`core/hub.js`), polled every 5 s (a poll that gets no answer in 5 s counts as failed) while the tab is visible, at once when the tab becomes visible, and after every resume or stop this page makes. There is no `/hub/events` stream (it would take one of the browser's six connections to the perch). A failed poll keeps the last list and draws a dim `list stale`; it never toasts.
 
@@ -72,14 +74,17 @@ core/menu.js         right-click / title menus: one open at a time, submenus, ke
 core/look.js         theme + font: base16 parser, --base0X on <html>, per-font size, cell measured, localStorage
 core/path.js         resolveIn(cwd, path): a tool-input path resolved against the session's folder, for the tool-row open items; toWslPath(raw): a pasted Windows path as a WSL one
 core/api.js          apiBase(sessionId): the ONE place URLs are built. Hub = `/s/${sid}/api/`; hubGet/hubPost/hubTree (`/hub/sessions...`, `/hub/tree?...`) and detect() (perch or door)
-core/hub.js          the perch's session list as signals: polled GET /hub/sessions, stale flag, kept/live/elsewhere views, age()
+core/hub.js          the perch's session list as signals: polled GET /hub/sessions, stale flag, kept/live/elsewhere/older views, age(), label() (the title)
+core/saved.js        a saved chat: eidolon's `log --json` lines mapped to the frames a live door sends, drawn by the Session's own handlers (an unknown record kind is one plain line)
 core/sse.js          fetch-based SSE (Bearer header, never ?token=)
 core/state.js        one session stream as signals: frames -> rows, calls, asks, running; the reconnect backoff, resume, launch
 (core/ and panes/ each have a README with one line per file)
 core/life.js         port of eidolon crates/tui/src/life.rs (the Life strip)
 core/markdown.js     safe subset as vnodes: fences, headings, `code`, **bold**, http(s) links
 core/tile.js         split tree: dwindle at 0.618, per-split ratio, drag, promote on close
-panes/home.js        the start screen: [ new chat ], [ open folder… ], recent chats, the hint row
+panes/home.js        the start screen: [ new chat ], [ new project… ], the saved projects, recent chats, the hint row
+panes/picker.js      the folder picker panel (GET/POST /hub/dirs) and the project-name step
+core/projects.js     the project list (GET/POST /hub/projects, DELETE /hub/projects/<n>), which project a folder is in, scratch folders
 panes/session.js     one pane: frame glyphs, transcript, start screen, row menus, draft, the outbox (queued messages), composer and its menus
 panes/asks.js        the tabbed ask panel (batch submit) and the transcript's ask markers
 panes/files.js       the inspector's files tab: `folder` (the session's directory, lazily, through GET /hub/tree) and `touched` (files edit/write calls touched), one / filter
@@ -98,7 +103,7 @@ Every action is clickable; keys are shortcuts for the same functions.
 
 | Where | Click does |
 |---|---|
-| composer bottom border, left | menus: `+ attach ▾` (image… / file…; folder… needs the hub), `model ▾`, `effort ▾`, `mode ▾` (switching needs the hub: the door restarts between turns), `◉ mic` (needs local dictation). Narrow, they drop to glyphs, then into one `⋯ ▾` |
+| composer bottom border, left | menus: `+ attach ▾` (image… / file…), and under the perch `model <key> ▾` (the list from `GET /hub/models`, the current one ticked, `other…` for a typed name) and `mode gated|yolo ▾` (`gated` asks before risky tools, `yolo` answers yes to every ask). A switch is `POST /hub/sessions/<id>/restart`: the perch stops the door and resumes the same log with the new `-m` / `--yolo`, only between turns (while a turn runs the items say `wait for the turn to end`); the pane stays on its id, reconnects and replays, and the transcript gets one line, `switched to <model> - the chat restarted between turns, nothing lost`. The composer shows what the door's `hello` reports, so the labels are the real current values. There is no effort menu (`eidolon web` has no such flag) and no mic (nothing here records audio); a bare door, which cannot restart itself, shows `+ attach` only. Narrow, they drop to glyphs, then into one `⋯ ▾` |
 | composer bottom border, right | `send · steer · queue · stop` |
 | an image chip's `×` | drop that image from the next message |
 | `? keys` in the status line | the key reference; every entry is clickable |
@@ -123,11 +128,18 @@ Shown whenever no pane is open, and on boot when no chat is live (`panes/home.js
 
 | action | does |
 |---|---|
-| `[ new chat ]` | `POST /hub/sessions` with no folder (the perch answers 201 with its scratch folder, or 400 when it has no Minerva home: the page says so in a sentence). No model is sent: the default is the Minerva config's. A bare `:new` does the same |
-| `[ open folder… ]` | a path field (placeholder for the later folder picker): a WSL path, or a pasted Windows path (a drive path becomes its `/mnt/c/...` form, `core/path.js toWslPath`); Enter or `[ start ]` starts a chat there, Esc closes it |
+| `[ new chat ]` | `POST /hub/sessions` with no folder, never the focused pane's (the perch answers 201 with a fresh scratch folder, or 400 when it has no Minerva home: the page says so in a sentence). No model is sent: the default is the Minerva config's. A bare `:new` does the same |
+| `[ new project… ]` | the folder picker (below), then a name field prefilled with the folder's name; `[ create project ]` saves it (`POST /hub/projects`) and starts a chat in it |
+| a saved project | `+ <name>` starts a chat in it; `latest <age>` opens its newest chat; right-click removes it from the list (the folder is untouched) |
 | recent chats | up to 8 running or saved chats, newest first; a click shows it in the pane, ctrl-click or middle-click opens it beside |
 
 A hint row names `ctrl+enter` (the new-pane picker), `?` and `:`.
+
+### The folder picker and projects (2026-10-06)
+
+A panel over the tiles, drawn like the rest (frame, bracketed text actions, Tab and Enter work, Esc closes): a path bar (it takes a WSL path, a pasted `C:\Users\you\work` or `\\wsl.localhost\...` path, converted by `core/path.js`, and `~`), a breadcrumb, `↑ up`, one clickable row per subfolder, `[ new folder ]` (an inline name field, `POST /hub/dirs`, then it opens the new folder), `[ use this folder ]` and `[ cancel ]`. It starts at the folders the server may open and cannot leave them (the server decides; a refusal is said in a sentence).
+
+The sidebar's `sessions` tab, top to bottom: a `search` field (filters by title); `+ new chat` (a fresh scratch folder); one group per project, **alphabetical**, its header the name with `+` at the right end (a new chat in it), its chats newest first (8, then `more… (N)`); `+ new project`; `no folder` (scratch and unplaced chats, with its own `+`); `in other apps`; and `other (N)` (eidolon's own sessions folder, collapsed). A row is a glyph (● live, ○ saved; bold while a turn runs, `?` for an ask waiting, `[n]` unread), the title clipped with …, and the age at the right; the focused chat's row has a full-row tint. A project header's right-click menu: `new chat here`, `remove from the list`. Scratch folder names (time stamps) are never shown: the pane frame shows the title and, in a project, `[<project>]`; `new chat · HH:MM` is a scratch chat with no message yet.
 
 ### Starting a session (perch only)
 
@@ -252,3 +264,9 @@ The fonts are pinned the same way by hand in `fonts/VERSIONS`: source URL, tag o
 - **A submenu on a narrow screen covers its parent.** With no room on either side it is pushed back on screen over the parent menu; the keys (left backs out) still reach both.
 - **Text in a settled ask's fold cannot be drag-selected**: a click there must not take focus from the composer. Right-click the row: copy.
 - **Some glyphs are off the cell in VT323 and Departure Mono.** Neither has braille or `▸ ▾ ● ⇥ ⏎ ✓`, and VT323 has no arrows or box-drawing either; those fall back to the system font, whose advance differs, so the Life strip and a few glyphs (`▸ ⇥ ⏎`) are not exactly one cell wide.
+
+## Chat names, saved chats and older chats (2026-10-05)
+
+- **Names.** A chat is shown by the `title` the perch gives it (its first message, else `<folder> · HH:MM`) in the sidebar, the start screen's recent chats, the pane frame and the menus; the id is on hover. Door mode (no perch) keeps the id.
+- **A saved chat is read, not resumed.** Opening one (a click, a recent chat, `:open`) fetches `GET /hub/sessions/<id>/log`, maps the records to rows (`core/saved.js`; the day row, times and tool rows are the live ones) and draws them without a composer. In its place is the visible action `[ continue this chat ]`, which is the resume route and swaps the pane to the live chat; nothing opens a chat by itself. A stopped or exited chat shows the same action. Too large (413), unreadable or slow logs say so in the banner; the action still works.
+- **Older chats.** The perch's second source (eidolon's own sessions folder, `origin: "other"`) is listed only under a collapsed `older chats (N)` group at the bottom of the sessions tab (15 at a time, `more…`), and nowhere else: not in `saved`, the start screen or the resume pickers. A click opens one read-only; its `[ continue this chat ]` carries a one-line note that continuing resumes it with your normal config and writes to the same log.

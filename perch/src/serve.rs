@@ -43,10 +43,12 @@ use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
 
 use crate::files::{self, Static};
+use crate::folders;
 use crate::gate;
 use crate::proxy;
 use crate::sessions::{self, ExitWatch, Registry, TreeRoot};
 use crate::spawn::{self, Spawner};
+use crate::titles;
 use crate::tree;
 use crate::watch::{self, Watcher};
 
@@ -346,7 +348,7 @@ async fn route(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, In
     //    method with no route must not be answered as though its body had been read, and
     //    an unbounded PUT must not be read at all. The proxy is what reads a POST's body,
     //    as a stream.
-    if gated && method != Method::GET && method != Method::POST {
+    if gated && method != Method::GET && method != Method::POST && !(method == Method::DELETE && path.starts_with("/hub/projects/")) {
         return Ok(status(StatusCode::METHOD_NOT_ALLOWED));
     }
 
@@ -428,7 +430,7 @@ async fn capped(body: Incoming, cap: usize) -> std::result::Result<Bytes, Status
 /// is a 404: `/hub/events` and `/hub/mesh` are H2/H3.
 async fn hub(ctx: &Ctx, method: &Method, path: &str, query: &str, body: &Bytes, bearer: bool) -> Response<BoxBody> {
     match (method.as_str(), path) {
-        ("GET", "/hub/sessions") => json(StatusCode::OK, &ctx.registry.list()),
+        ("GET", "/hub/sessions") => json(StatusCode::OK, &ctx.registry.titled_list().await),
         ("POST", "/hub/sessions") => new_session(ctx, body).await,
         // Token only: a script in the page's origin cannot read the HttpOnly cookie, and must not be
         // able to turn it into a code that a second client redeems for a session of its own.
@@ -436,10 +438,21 @@ async fn hub(ctx: &Ctx, method: &Method, path: &str, query: &str, body: &Bytes, 
         ("POST", "/hub/code") => json(StatusCode::OK, &serde_json::json!({ "code": ctx.logins.mint_code() })),
         ("POST", REDEEM) => redeem(ctx, body),
         ("GET", "/hub/tree") => tree(ctx, query).await,
+        ("GET", "/hub/models") => crate::restart::models(ctx).await,
+        ("GET", "/hub/projects") => folders::projects_get(ctx),
+        ("POST", "/hub/projects") => folders::projects_post(ctx, body).await,
+        ("DELETE", _) if path.starts_with("/hub/projects/") => folders::projects_delete(ctx, &path["/hub/projects/".len()..]),
+        ("GET", "/hub/dirs") => folders::dirs_get(ctx, query).await,
+        ("POST", "/hub/dirs") => folders::dirs_post(ctx, body).await,
+        ("GET", _) => match session_verb(path, query) {
+            Some((id, Verb::Log)) => log(ctx, id).await,
+            _ => status(StatusCode::NOT_FOUND),
+        },
         ("POST", _) => match session_verb(path, query) {
             Some((id, Verb::Resume)) => resume(ctx, id).await,
             Some((id, Verb::Stop)) => stop(ctx, id).await,
-            None => status(StatusCode::NOT_FOUND),
+            Some((id, Verb::Restart)) => crate::restart::restart(ctx, id, body).await,
+            Some((_, Verb::Log)) | None => status(StatusCode::NOT_FOUND),
         },
         _ => status(StatusCode::NOT_FOUND),
     }
@@ -490,6 +503,10 @@ async fn tree(ctx: &Ctx, query: &str) -> Response<BoxBody> {
 enum Verb {
     Resume,
     Stop,
+    /// `{"model"?, "yolo"?}`: stop the door and resume the same log with the new flags, between turns (restart.rs).
+    Restart,
+    /// `GET` only; a `POST` to it is the 404 of a route that is not there.
+    Log,
 }
 
 /// `<id>/resume` and `<id>/stop`, and the id is handed back exactly as it was spelled: it is
@@ -507,6 +524,8 @@ fn session_verb<'a>(path: &'a str, query: &str) -> Option<(&'a str, Verb)> {
         match verb {
             "resume" => Verb::Resume,
             "stop" => Verb::Stop,
+            "restart" => Verb::Restart,
+            "log" => Verb::Log,
             _ => return None,
         },
     ))
@@ -546,7 +565,7 @@ async fn new_session(ctx: &Ctx, body: &Bytes) -> Response<BoxBody> {
         Err(_) => return problem(StatusCode::UNPROCESSABLE_ENTITY, "cwd is not a directory under a --root"),
     };
     // §4 step 3: the door's own argv, with no token in it and no `--ui-dir`.
-    let argv = spawn::argv(&ctx.registry.eidolon, ctx.registry.eidolon_config.as_deref(), spawn::Target::New(&cwd), asked.model.as_deref());
+    let argv = spawn::argv(&ctx.registry.eidolon, ctx.registry.eidolon_config.as_deref(), spawn::Target::New(&cwd), asked.model.as_deref(), false);
     let up = match door_up(ctx, argv, None).await {
         Ok(up) => up,
         Err(why) => return problem(StatusCode::SERVICE_UNAVAILABLE, &why),
@@ -564,7 +583,9 @@ async fn new_session(ctx: &Ctx, body: &Bytes) -> Response<BoxBody> {
     };
     // The cwd that was checked against `--root` at step 1, not the one `hello` names: they are the
     // same directory from an honest door, and the row must hold the checked one.
+    let (model, yolo) = (hello.model.clone(), hello.yolo);
     ctx.registry.insert(id.clone(), hello.session, cwd, pid, port, token, watcher, exit);
+    ctx.registry.set_flags(&id, &model, yolo);
     json(StatusCode::CREATED, &serde_json::json!({ "id": id }))
 }
 
@@ -601,6 +622,35 @@ fn utc_stamp(at: std::time::SystemTime) -> String {
     format!("{year:04}{month:02}{day:02}-{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
+/// `GET /hub/sessions/<id>/log`: a saved chat as eidolon's own `log --json` lines (one record per line), so the page
+/// can draw it read-only without a door and without the perch ever decoding the journal. The id is [`sessions::id_ok`]
+/// and resolves only to `<dir>/<id>.eid` in one of the two sources (404 otherwise, as for every unknown id); the child
+/// is bounded in time and output ([`titles`]): over the size is a 413, too slow a 504, a failure a 502. A chat that is
+/// running here is still readable (eidolon opens it read-only), and nothing is started or resumed.
+async fn log(ctx: &Ctx, id: &str) -> Response<BoxBody> {
+    if !sessions::id_ok(id) {
+        return status(StatusCode::NOT_FOUND);
+    }
+    let Some((path, origin)) = ctx.registry.find_log(id) else { return status(StatusCode::NOT_FOUND) };
+    // As for a resume: a symlink at `<id>.eid` must not name a file somewhere else.
+    if ctx.registry.id_of_log(&path).as_deref() != Some(id) {
+        return status(StatusCode::NOT_FOUND);
+    }
+    match ctx.registry.read_log(&path, origin.is_some()).await {
+        Ok(lines) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", HeaderValue::from_static("application/x-ndjson"))
+            .body(full(lines))
+            .unwrap(),
+        Err(titles::RunError::TooBig) => problem(StatusCode::PAYLOAD_TOO_LARGE, "that chat's log is too large to show here"),
+        Err(titles::RunError::Timeout) => problem(StatusCode::GATEWAY_TIMEOUT, "eidolon did not read that log in time"),
+        Err(e) => {
+            tracing::debug!(error = %e, "perch: eidolon log failed");
+            problem(StatusCode::BAD_GATEWAY, &format!("eidolon could not read that log: {e}"))
+        }
+    }
+}
+
 /// §4 step 2's "Resume can spend" is a UI concern and not this route's: the perch never
 /// auto-restarts a door, so a door opens this log only because someone asked for exactly
 /// that, here.
@@ -608,10 +658,12 @@ async fn resume(ctx: &Ctx, id: &str) -> Response<BoxBody> {
     if !sessions::id_ok(id) {
         return status(StatusCode::NOT_FOUND);
     }
-    let log = sessions::log_path(&ctx.registry.sessions_dir, id);
-    // The log has to be a real log *inside* the sessions dir: the id was already checked, and
-    // this is what keeps a symlink at `<id>.eid` from naming a file somewhere else.
-    if !log.is_file() || sessions::id_from_log(&ctx.registry.sessions_dir, &log).as_deref() != Some(id) {
+    // The log has to be a real log *inside* one of the two sources (the Minerva home's sessions dir, or eidolon's own
+    // under `--home`; the first wins an id both have): the id was already checked, and this is what keeps a symlink at
+    // `<id>.eid` from naming a file somewhere else. A chat from the other source is resumed with the member's normal
+    // config like any other, and the door then writes to that log in place.
+    let Some((log, _)) = ctx.registry.find_log(id) else { return status(StatusCode::NOT_FOUND) };
+    if ctx.registry.id_of_log(&log).as_deref() != Some(id) {
         return status(StatusCode::NOT_FOUND);
     }
     // §4 step 2, both halves: our own children, and the roster — upstream has no `flock`, so
@@ -619,30 +671,12 @@ async fn resume(ctx: &Ctx, id: &str) -> Response<BoxBody> {
     if ctx.registry.held(&log) || ctx.registry.roster_holds(&log) {
         return problem(StatusCode::CONFLICT, "that log is already held by a live session");
     }
-    // Reserved before the fork, so a second resume in flight cannot pass the check above too.
-    if !ctx.registry.reserve(id, &log) {
-        return problem(StatusCode::CONFLICT, "that log is already held by a live session");
+    // Reserve, fork, check it opened this log, go live: restart.rs, which a model switch shares.
+    match crate::restart::bring_up(ctx, id, &log, None, false).await {
+        Ok(_) => json(StatusCode::OK, &serde_json::json!({ "id": id })),
+        Err(crate::restart::Failed::Held) => problem(StatusCode::CONFLICT, "that log is already held by a live session"),
+        Err(crate::restart::Failed::Spawn(why)) => problem(StatusCode::SERVICE_UNAVAILABLE, &why),
     }
-    let argv = spawn::argv(&ctx.registry.eidolon, ctx.registry.eidolon_config.as_deref(), spawn::Target::Kept(&log), None);
-    let up = match door_up(ctx, argv, Some(id)).await {
-        Ok(up) => up,
-        Err(why) => return problem(StatusCode::SERVICE_UNAVAILABLE, &why),
-    };
-    // The door must have opened the log we asked it to. A door that opened another one is
-    // exactly the two-writers case above, wearing a hat.
-    if sessions::id_from_log(&ctx.registry.sessions_dir, &up.hello.session).as_deref() != Some(id) {
-        let why = format!("the door opened {}, not the log we asked for", up.hello.session.display());
-        let Up { pid, port, token, exit, watcher, .. } = up;
-        ctx.registry.dead(id, pid);
-        give_up(&ctx.registry, watcher, pid, port, &token, exit).await;
-        return problem(StatusCode::SERVICE_UNAVAILABLE, &why);
-    }
-    // The cwd the log named is kept as the checked path when it is under a `--root`; when it is
-    // not, it is kept as given (the list still shows it) and `/hub/tree` refuses it, because the
-    // tree re-checks its root against `--root` on every request.
-    let cwd = ctx.registry.cwd_under_a_root(&up.hello.cwd).unwrap_or_else(|_| up.hello.cwd.clone());
-    ctx.registry.mark_live(id, &up.hello.session, &cwd);
-    json(StatusCode::OK, &serde_json::json!({ "id": id }))
 }
 
 /// `/hub/sessions/<id>/stop`: 202 once the door has been signalled, and the signals are
@@ -661,20 +695,20 @@ async fn stop(ctx: &Ctx, id: &str) -> Response<BoxBody> {
 /// A door that reached `live` inside a spawn request, whole. [`Ctx::registry`] takes these
 /// one at a time: see the two callers for why a new session's row is written last and a
 /// resume's as soon as each fact is known.
-struct Up {
-    pid: u32,
-    port: u16,
-    token: Arc<str>,
-    exit: ExitWatch,
-    watcher: Watcher,
-    hello: watch::Hello,
+pub(crate) struct Up {
+    pub(crate) pid: u32,
+    pub(crate) port: u16,
+    pub(crate) token: Arc<str>,
+    pub(crate) exit: ExitWatch,
+    pub(crate) watcher: Watcher,
+    pub(crate) hello: watch::Hello,
 }
 
 /// §4 steps 3-7 for one door, new or resumed — the two differ only in the argv they are
 /// given. `id` is `Some` for a resume, which is the only case where the perch knows the
 /// session before the door says it; every failure leaves that row `dead` rather than
 /// half-`starting`.
-async fn door_up(ctx: &Ctx, argv: Vec<OsString>, id: Option<&str>) -> std::result::Result<Up, String> {
+pub(crate) async fn door_up(ctx: &Ctx, argv: Vec<OsString>, id: Option<&str>) -> std::result::Result<Up, String> {
     let mut forked = match spawn::fork_door(&ctx.spawner, &ctx.registry, argv).await {
         Ok(forked) => forked,
         Err(e) => {
@@ -719,7 +753,7 @@ async fn door_up(ctx: &Ctx, argv: Vec<OsString>, id: Option<&str>) -> std::resul
 /// review findings 1 and 2): a door that ignores SIGTERM is SIGKILLed here and never runs its
 /// own `remove_file`, and on the new-session path there is no registry row for the reap task to
 /// find it by. Only a file still holding this door's token is removed.
-async fn give_up(registry: &Registry, watcher: Watcher, pid: u32, port: u16, token: &str, exit: ExitWatch) {
+pub(crate) async fn give_up(registry: &Registry, watcher: Watcher, pid: u32, port: u16, token: &str, exit: ExitWatch) {
     watcher.close().await;
     sessions::signal_and_wait(pid, exit, spawn::GIVE_UP_GRACE).await;
     sessions::drop_token_file(&spawn::door_token_path(&registry.runtime_dir, port), token);

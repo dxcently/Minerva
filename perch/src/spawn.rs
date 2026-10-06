@@ -3,7 +3,7 @@
 //! hub.md §4's spawn sequence, steps 3-6, is the spec:
 //!
 //! ```text
-//!   3  eidolon web --bind 127.0.0.1:0 --cwd <dir> | --session <path> [-m <model>]
+//!   3  eidolon [--config <cfg>] [--yolo] web --bind 127.0.0.1:0 --cwd <dir> | --session <path> [-m <model>]
 //!   4  env inherited, stdin /dev/null, stdout piped, stderr to the perch's log
 //!   5  read stdout until both boot lines, 20 s, else kill and `dead`
 //!   6  the token path must be <runtime>/eidolon/web-<port>.token, opened O_NOFOLLOW,
@@ -56,12 +56,16 @@ pub enum Target<'a> {
 /// statics under the perch) and no element is ever a token. `config` is the perch's
 /// `--eidolon-config`: eidolon's global `--config <file>`, placed before the subcommand, so
 /// every door a perch spawns (new or resumed) reads the same config and writes the same
-/// sessions dir. A path, never a secret.
-pub fn argv(eidolon: &Path, config: Option<&Path>, target: Target<'_>, model: Option<&str>) -> Vec<OsString> {
+/// sessions dir. A path, never a secret. `yolo` is eidolon's other global flag, `--yolo` (answer every ask with yes), placed
+/// the same way, before the subcommand; a restart that keeps a chat in yolo mode passes it again.
+pub fn argv(eidolon: &Path, config: Option<&Path>, target: Target<'_>, model: Option<&str>, yolo: bool) -> Vec<OsString> {
     let mut argv = vec![eidolon.as_os_str().to_os_string()];
     if let Some(config) = config {
         argv.push("--config".into());
         argv.push(config.as_os_str().to_os_string());
+    }
+    if yolo {
+        argv.push("--yolo".into());
     }
     argv.extend(["web".into(), "--bind".into(), "127.0.0.1:0".into()]);
     match target {
@@ -311,20 +315,26 @@ mod tests {
     #[test]
     fn the_argv_is_the_doors_and_carries_no_token_and_no_ui_dir() {
         let eidolon = Path::new("/usr/bin/eidolon");
-        let fresh = argv(eidolon, None, Target::New(Path::new("/home/me/work")), None);
+        let fresh = argv(eidolon, None, Target::New(Path::new("/home/me/work")), None, false);
         assert_eq!(words(&fresh), ["/usr/bin/eidolon", "web", "--bind", "127.0.0.1:0", "--cwd", "/home/me/work"]);
         // `--eidolon-config`: the global flag, before the subcommand, on a new session and a resume alike.
-        let configured = argv(eidolon, Some(Path::new("/h/Minerva/config.toml")), Target::New(Path::new("/h/Minerva/scratch")), None);
+        let configured = argv(eidolon, Some(Path::new("/h/Minerva/config.toml")), Target::New(Path::new("/h/Minerva/scratch")), None, false);
         assert_eq!(
             words(&configured),
             ["/usr/bin/eidolon", "--config", "/h/Minerva/config.toml", "web", "--bind", "127.0.0.1:0", "--cwd", "/h/Minerva/scratch"]
         );
-        let reopened = argv(eidolon, Some(Path::new("/h/Minerva/config.toml")), Target::Kept(Path::new("/l/a.eid")), None);
+        let reopened = argv(eidolon, Some(Path::new("/h/Minerva/config.toml")), Target::Kept(Path::new("/l/a.eid")), None, false);
         assert_eq!(words(&reopened)[..4], ["/usr/bin/eidolon", "--config", "/h/Minerva/config.toml", "web"]);
-        let resumed = argv(eidolon, None, Target::Kept(Path::new("/logs/ctf-pwn-3.eid")), Some("sonnet"));
+        let resumed = argv(eidolon, None, Target::Kept(Path::new("/logs/ctf-pwn-3.eid")), Some("sonnet"), false);
         assert_eq!(
             words(&resumed),
             ["/usr/bin/eidolon", "web", "--bind", "127.0.0.1:0", "--session", "/logs/ctf-pwn-3.eid", "-m", "sonnet"]
+        );
+        // A restart that keeps yolo says so before the subcommand, after the config, and `-m` still trails the target.
+        let yolo = argv(eidolon, Some(Path::new("/h/Minerva/config.toml")), Target::Kept(Path::new("/l/a.eid")), Some("mock"), true);
+        assert_eq!(
+            words(&yolo),
+            ["/usr/bin/eidolon", "--config", "/h/Minerva/config.toml", "--yolo", "web", "--bind", "127.0.0.1:0", "--session", "/l/a.eid", "-m", "mock"]
         );
         // §10.4 row 1: there is no token to pass, and this is where that would show. The
         // door mints its own; `--ui-dir` is the perch's statics, not the door's.
