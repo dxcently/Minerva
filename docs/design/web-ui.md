@@ -111,8 +111,8 @@ Switch from the status line's right-click menu (`theme ▸`, `font ▸`, the cur
 | Keys | global and per-pane bindings (section 4.2) | everywhere |
 | `:` command line | opens in the status row; completion list, the match highlighted in `--sel` | status line |
 | Key reference (decided 2026-09-25, replaces the key bar and the which-key line) | `?` (outside a text field) or `? keys` at the right of the status line opens a centred panel, as the TUI's `space ?`: sections *here* (what the keys do where focus is now), *anywhere*, *composer*, *asks*, *panes*; **every entry is clickable** and does what its key does; Esc or an outside click closes it | popup |
-| Frame-title tabs | `[rec] tree diff graph run` cut into a frame's top border; click or `[`/`]` | sidebars, inspector |
-| Rail | a collapsed sidebar leaves a 1-cell-wide rail; click it to reopen | left and right edges |
+| Frame title | the open tab's name, with the collapse glyph (`«` left, `»` right) at its outer end; `[`/`]` cycle the inspector tabs | sidebars, inspector |
+| Activity rail (decided 2026-10-06, replaces the tab strip) | a 3-cell column on each outer edge, always shown: a top cell that holds the expand glyph (`»` on the left, `«` on the right) only while that side's panel is CLOSED and is an empty spacer while it is open (the open panel's title carries the one collapse `«`/`»`; the icons below never move), a line, then one icon per tab (left `≡ ▦ ⋈`; right `◉ ▣ ▤ ± ⋔ ▶`; one table, `RAIL_ICONS`). The open tab's icon is lit; click an icon to open that tab, the lit one to close. Both closed is compact mode. State kept in `localStorage`; under 110 cells wide a panel overlays the tiles. Operator ruling: the strips were cut off with no way to reach the hidden tabs, and there was no clear way to collapse | left and right edges |
 | Clickable text | ask tabs and rows, key-reference entries, status-line pieces: underlined on hover, `<span role="button" tabindex="0">`, so "no buttons" is visual only, not a screen-reader loss (reasoned) | inline |
 | Frame glyphs (decided) | `⇥` split right, `⇩` split down, `×` close, cut into each pane's top border on the right; each has a tooltip | pane frames |
 | Menus (decided) | a square frame of lines, opened by right-click (at the pointer) or a click on a title or glyph (under it); keys: up/down, Enter or right into a submenu, left or Esc out; closes on an outside click; flips to the other side of its anchor rather than run off screen. Greyed lines say why (`needs the hub`) | pane titles, glyphs, chat rows, sidebar sessions, status line |
@@ -542,6 +542,27 @@ Old gap 2 (session switching) is now the hub's job; old gap 11 (token in argv) i
 
 A chat is named by the perch's `title` (first message, else `<folder> · HH:MM`) wherever the page showed an id; the id stays in the hover. A saved chat opens read-only from `GET /hub/sessions/<id>/log` (eidolon's `log --json`), drawn with the live transcript's rows, and the composer is replaced by `[ continue this chat ]`; opening never resumes. Chats from eidolon's own sessions folder (`origin: "other"`) sit under a collapsed `older chats (N)` group at the bottom of the sidebar, read-only until continued (hub.md "Titles, saved chats and the second source").
 
+### 2.2f Pin, archive, delete (decided 2026-10-06)
+
+Operator: "an option to delete/archive chats (or inactive chats for 7 days automatically get sorted into other)", then pinning.
+
+- **Sidebar, top to bottom:** search, `+ new chat`, `pinned` (only when it has rows; newest first; a pinned chat is in no other group, and its row shows the project name faintly), the project groups, `no folder`, `other (N)`, and, only when there is something in it, a collapsed `trash (N)` at the very bottom.
+- **`other (N)`** is one group: chats archived by hand, chats idle for 7 days (the perch decides, at listing time), and eidolon's own shared sessions folder; newest first, with a faint `archived` / `idle` tag. Live chats are never in it. The start screen's recent chats leave out `other` and the trash, and lead with pinned chats.
+- **Row actions are mouse-first:** right-click a chat row, or the `⋯` at its right edge (visible on hover or focus), opens the same menu: the existing items, then `pin`/`unpin`, `archive`/`unarchive` (greyed while running), `delete` (to the trash, no confirm: it can be restored) or, while running, `stop and delete` (one confirm). A chat of eidolon's own folder shows only open/continue.
+- **Trash:** `restore` on each row puts it back; `empty trash` asks once ("permanently delete N chats? this can't be undone") and removes only what is in the trash.
+- Removing a project is by path (`DELETE /hub/projects {path}`).
+
 ### 2.2e Projects and the folder picker (decided 2026-10-06)
+
+Update 2026-10-06 (names, the inbox, promote): no ids on screen; folderless chats are the `inbox`.
+
+```
+[ new chat ] -> scratch/quiet-owl-lantern/            sidebar: pinned . projects . inbox . other . trash
+   first turn settles -> title (first message)
+      between turns: scratch folder renamed to the title slug (scratch/juice-shop-recon/); the chat restarts there, nothing lost
+   ⋯ rename…            custom title beats the auto title; an inbox chat's folder follows
+   ⋯ make it a project… folder picker (choose a parent) + name -> folder MOVED there, registered, chat restarts in it
+   project header ⋯ rename…   relabels the project (the folder stays)
+```
 
 Operator feedback: random scratch-stamp folder names told nothing, how a new project is made was unclear, and unsorted chats should be sorted by date; "it should open up the file manager to select folders, we should really move away from relying on commands over ui". Ruling: **a project is a folder with a name** (`<home>/projects.json`); a chat is in a project when its folder is the project's or inside it. The start screen has `[ new chat ]` (always a fresh scratch folder), `[ new project… ]` (the in-page folder picker, D8, with `[ new folder ]`, then a name prefilled with the folder's) and the saved projects. The sidebar follows the Claude desktop app's session list in our look: a search field, `+ new chat`, one group per project (alphabetical, `+` in the header, chats newest first), `+ new project`, `no folder`, and `other` (the older-chats fold); there are no date sub-headers, the order within a group is the sort. A scratch stamp is never shown anywhere: titles fall back to `new chat · HH:MM` or `<project> · HH:MM`, and the pane frame shows the title and the project's name. The typed folder path survives only as the picker's path bar. Details: hub.md "Projects and the folder picker", webui/term/README.md.

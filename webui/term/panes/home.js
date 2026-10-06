@@ -14,15 +14,16 @@ import { projects, projectFor, sorted } from '../core/projects.js';
 export const home = { msg: signal(''), busy: signal(false) };
 
 const RECENT = 8;
-// Running and saved chats of this server, newest first (the ones held by another app are not ours to open).
+// Running and saved chats of this server, pinned ones first, then newest first (`other`, the trash and the ones held by
+// another app are not ours to list).
 export function recent(rs = list.value) {
-  return [...live(rs), ...keptRows(rs)].sort((a, b) => (b.mtime || 0) - (a.mtime || 0)).slice(0, RECENT);
+  return [...live(rs), ...keptRows(rs)].sort((a, b) => (!!b.pinned - !!a.pinned) || (b.mtime || 0) - (a.mtime || 0)).slice(0, RECENT);
 }
 
 // The newest chat of a project, if it has one.
 const latestOf = (p, rs) => [...live(rs), ...keptRows(rs)].filter((r) => projectFor(r.cwd, [p])).sort((a, b) => (b.mtime || 0) - (a.mtime || 0))[0] || null;
 
-// `chat` starts a chat in a fresh scratch folder, `newProject` opens the folder picker, `project(p)` starts a chat in
+// `chat` starts a chat in the inbox (a folder of its own), `newProject` opens the folder picker, `project(p)` starts a chat in
 // a project, `open(row, beside)` shows a chat, `forget(p)` asks to drop a project from the list.
 export function Home({ act }) {
   const ref = useRef(null);
@@ -34,7 +35,7 @@ export function Home({ act }) {
   return html`<div class="home" ref=${ref}>
     <div class="owl big">${'   ,___,\n   ['}<span class="eyes">O.o</span>${']    '}<span class="name">minerva</span>${'\n   /)__)    '}<span class="faint">Make it, Break it, Hack it.</span>${'\n  ---"-"---'}</div>
     <div class="acts">
-      <${K} cls="act" off=${busy} title="start a chat (it works in a fresh scratch folder)" on=${() => act.chat()}>[ new chat ]</${K}>
+      <${K} cls="act" off=${busy} title="start a chat (it goes in the inbox; its folder is named after its title)" on=${() => act.chat()}>[ new chat ]</${K}>
       <${K} cls="act" off=${busy} title="pick a folder and make it a project" on=${() => act.newProject()}>[ new project… ]</${K}>
     </div>
     <div class=${'msg' + (busy ? ' faint' : '')} aria-live="polite">${busy ? 'starting…' : msg}</div>
@@ -51,7 +52,7 @@ export function Home({ act }) {
         onAuxClick=${(e) => { if (e.button === 1) { e.preventDefault(); act.open(r, true); } }}>
       <${K} cls="rn" title=${r.id + '\n' + (r.state === 'live' ? 'running' : 'saved') + '\nctrl-click or middle-click: open beside'}
         on=${(e) => act.open(r, !!(e.ctrlKey || e.metaKey))}><span class=${r.state === 'live' ? 'hi' : 'faint'}>${r.state === 'live' ? '●' : '○'}</span> ${label(r)}</${K}>
-      <span class="faint ra">${age(r.mtime)}</span></div>`)}</div>`
+      <span class="faint ra">${r.pinned ? 'pinned · ' : ''}${age(r.mtime)}</span></div>`)}</div>`
       : html`<div class="faint">none yet</div>`}
     <div class="faint hintrow">ctrl+enter new-pane picker · ? keys · : commands</div>
   </div>`;

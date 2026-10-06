@@ -145,6 +145,7 @@ export class Session {
       this.jumpToEnd = this.jumpToEnd || signal(0); // a counter; each bump puts every view at the bottom
     });
     this.records = new Set();
+    this.sent = [];          // previews of images this tab sent, oldest first: [{ name, media_type, data }...] per message
     this.byId = new Map();   // call id -> call
     this.pending = [];       // rows waiting for the next flush
     this.lastWho = null;
@@ -285,7 +286,15 @@ export class Session {
         // answers at connect when there is no stream to open.
         const e = this.ended, st = res.data && res.data.state;
         // A restart (model or mode switch) stops the door on purpose: restart() below decides what the pane shows next.
-        if (e && e.door === 'stopping') { if (!this.restarting) this.finish('stopped', 'stopped'); return; }
+        // Any other stop of the door (a stop asked, or the perch moving the chat's folder after a title or a rename) is told apart by
+        // asking again once: a chat that comes back live is drawn again, one that was stopped answers `kept`.
+        if (e && e.door === 'stopping') {
+          if (this.restarting) return;
+          if (this.reopened) { this.finish('stopped', 'stopped'); return; }
+          this.reopened = true; this.conn.value = 'reconnecting';
+          await sleep(3000);
+          continue;
+        }
         if (e && e.door === 'dead') { this.finish('dead', deadText(e.exit)); return; }
         if (res.status === 409 && st === 'kept') { this.finish('kept', 'saved chat · loading…'); this.loadSaved(); return; }
         if (res.status === 503 && st === 'dead') { this.finish('dead', deadText(null)); return; }
@@ -325,6 +334,22 @@ export class Session {
   // no resume is already out.
   canResume() { const b = this.banner.value; return mode() === 'perch' && !!(b && b.resume) && !this.resuming; }
 
+  // The perch has a door on this chat now (a resume answered 200, or a fork's first message finished): draw it live.
+  adopt() {
+    // The old loop may still be waiting on the stream of the session that
+    // ended (the goodbye window): supersede it, so its stream-end cannot
+    // paint `stopped` over the session just opened.
+    this.epoch++;
+    if (this.abort) this.abort.abort();
+    batch(() => {
+      this.bye = false;
+      this.ended = null;
+      this.banner.value = null;
+      this.conn.value = 'connecting';
+    });
+    this.run();
+  }
+
   // Resume a stopped, dead or kept session (perch only). It can take ~20 s
   // (a door has to come up) and can start a turn by itself; only ever called
   // from a click or a key, never automatically.
@@ -338,18 +363,7 @@ export class Session {
     this.resuming = false;
     if (this.closed) return false;
     if (r.status === 200) {
-      // The old loop may still be waiting on the stream of the session that
-      // ended (the goodbye window): supersede it, so its stream-end cannot
-      // paint `stopped` over the session just resumed.
-      this.epoch++;
-      if (this.abort) this.abort.abort();
-      batch(() => {
-        this.bye = false;
-        this.ended = null;
-        this.banner.value = null;
-        this.conn.value = 'connecting';
-      });
-      this.run();
+      this.adopt();
       return true;
     }
     this.banner.value = prev;
@@ -505,7 +519,7 @@ export class Session {
     switch (f.type) {
       case 'hello':
         this.reset();
-        this.gotHello = true;
+        this.gotHello = true; this.reopened = false;
         this.hello.value = f;
         this.conn.value = 'replaying';
         if (f.protocol !== 1) this.hooks.toast(`door speaks protocol ${f.protocol}; this page knows 1`, true);
@@ -571,6 +585,7 @@ export class Session {
       }
       case 'assistant-message': this.draft.value = null; this.assistant(f); break;
       case 'user-message': this.user(f); break;
+      case 'tool-images': this.toolImages(f); break;
       case 'tool-call-started': this.callStarted(f); break;
       case 'tool-call-finished': this.callFinished(f); break;
       case 'policy-verdict': this.verdict(f); break;
@@ -656,20 +671,35 @@ export class Session {
     // coming (core sends none after a failed stream, agent.rs:1611-1613).
     this.partial = null;
     this.queued.value = 0;
-    this.addRow({ kind: 'you', who: this.who('you'), text: f.text || '', images: f.images || 0 });
+    // Images: the bytes are in the log (perch GET image/<record>/<n>); a message this tab just sent also has
+    // the picture itself, which shows until the route answers (panes/imgs.js).
+    const row = { kind: 'you', who: this.who('you'), text: f.text || '', images: f.images || 0, record: f.record, names: f.names || null, local: null };
+    if (row.images > 0 && this.sent.length && this.sent[0].length === row.images) row.local = this.sent.shift();
+    this.addRow(row);
+  }
+
+  // Images a saved chat's tool call came back with: shown under that call's row (never in a live stream today:
+  // a tool result is text in eidolon's log, so this fires only for a log that has such a block).
+  toolImages(f) {
+    const c = this.byId.get(f.id);
+    if (!c) { this.sys(`[${f.images} image${f.images === 1 ? '' : 's'} from tool call ${f.id}]`, f.record, 'faint'); return; }
+    c.imgs.value = c.imgs.peek().concat(Array.from({ length: f.images }, (_, n) => ({ record: f.record, n, alt: f.names && f.names[n], drop() {} })));
   }
 
   assistant(f) {
     if (this.records.has(f.record)) return;
     this.records.add(f.record);
+    // The record of the latest reply: the one point `fork from here` is not offered at (it is a fork of the whole chat).
+    if (f.record != null) this.lastReply = f.record;
     if (!f.text && !f.thinking && !f.redacted) { this.who('bot'); return; }
     if (this.partial) {
       this.partial.full.value = { text: f.text || '', thinking: f.thinking || '', redacted: f.redacted || 0 };
+      this.partial.record = f.record;
       this.partial = null;
       this.lastWho = 'bot';
       return;
     }
-    this.addRow({ kind: 'bot', who: this.who('bot'), text: f.text || '', thinking: f.thinking || '', redacted: f.redacted || 0 });
+    this.addRow({ kind: 'bot', who: this.who('bot'), text: f.text || '', thinking: f.thinking || '', redacted: f.redacted || 0, record: f.record });
   }
 
   // ---------------------------------------------------------------- tools
@@ -681,7 +711,7 @@ export class Session {
       id: f.id, name: f.name || '?', input: f.input, origin: f.origin || 'model',
       t0: this.live ? performance.now() : null, done: false, isError: false,
       st: signal('run'), time: signal(''), out: signal(null),
-      verdict: signal(null), ask: signal(null), settled: signal(null), fired: signal(null),
+      verdict: signal(null), ask: signal(null), settled: signal(null), fired: signal(null), imgs: signal([]),
     };
     this.byId.set(f.id, c);
     this.calls.value++;
@@ -865,9 +895,17 @@ export class Session {
     const mode = how === 'steer' && this.running.value !== false ? 'steer' : 'send';
     this.sending = true;
     const body = { text, mode };
-    if (images.length) body.images = images.map(({ name, media_type, data }) => ({ name, media_type, data }));
+    // The preview goes in before the post: the user-message frame can beat the 202 to the page.
+    let mine = null;
+    if (images.length) {
+      body.images = images.map(({ name, media_type, data }) => ({ name, media_type, data }));
+      mine = body.images.map((i) => ({ ...i }));
+      this.sent.push(mine);
+      if (this.sent.length > 16) this.sent.shift();
+    }
     const r = await post(this.sid, 'say', body);
     this.sending = false;
+    if (mine && r.status !== 202) this.sent = this.sent.filter((m) => m !== mine);
     if (r.status === 202) {
       if (r.data && r.data.queued) this.hooks.toast('queued behind the running turn');
       else if (mode === 'steer') this.hooks.toast('steer sent; it lands at the next safe point');

@@ -4,7 +4,7 @@
 // by mouse; keys and the `:` line are shortcuts to the same functions.
 import { html, render, K, HUB, signal, computed, effect, batch, useRef, useLayoutEffect, useMemo } from './core/ui.js';
 import { takeToken, takeCode, redeem, DOOR, detect, mode, rows, hubPost } from './core/api.js';
-import { list, stale, known, refresh, startPolling, live, keptRows, older, elsewhere, age, label } from './core/hub.js';
+import { list, stale, known, refresh, startPolling, live, keptRows, older, elsewhere, age, label, otherTag, trash, slugOf } from './core/hub.js';
 import { Session, tildify, kfmt, stateOf, STATE_CLS, backoffMs, connWord } from './core/state.js';
 import * as tile from './core/tile.js';
 import { menu, openMenu, closeMenu, outside, atPointer, under, Menus } from './core/menu.js';
@@ -12,24 +12,42 @@ import { Pane } from './panes/session.js';
 import { panel } from './panes/asks.js';
 import { FilesTab } from './panes/files.js';
 import { Home, home } from './panes/home.js';
-import { projects, projectFor, sorted, isScratch, loadProjects, addProject, forgetProject } from './core/projects.js';
+import { projects, projectFor, sorted, isScratch, loadProjects, addProject, forgetProject, renameProject } from './core/projects.js';
 import { Picker, picker as pickerOpen, openPicker } from './panes/picker.js';
 import { FONTS, DEFAULT_FONT, theme, themes, font, cell, setTheme, setFont, resolve, startLook } from './core/look.js';
 
 const LEFT_TABS = ['sessions', 'projects', 'mesh'];
 const RIGHT_TABS = ['rec', 'loaded', 'files', 'diff', 'graph', 'run']; // components: INSPECTOR below
+// The activity rails: one icon per sidebar tab, the only table to edit to swap them (Unicode symbols, not emoji).
+const RAIL_ICONS = {
+  sessions: '≡', projects: '▦', mesh: '⋈',
+  rec: '◉', loaded: '▣', files: '▤', diff: '±', graph: '⋔', run: '▶',
+};
+const RAILS_KEY = 'minerva.rails', NARROW_CELLS = 110; // under this many cells wide, an open panel overlays the tiles
 // Sidebar widths in cells: the defaults a double-click on the border goes back to, and the bounds.
 const SIDES = { l: 30, r: 34 }, SIDE_MIN = 16, SIDE_MAX = 72, SIDES_KEY = 'minerva.sidebars';
 
 // ---------------------------------------------------------------- screen state
+// Per side: open or closed, and the chosen tab, kept in localStorage (no storage: defaults, this tab only).
+const RAILS0 = (() => {
+  let v = null;
+  try { v = JSON.parse(localStorage.getItem(RAILS_KEY)); } catch { /* no storage: defaults */ }
+  const closed = (x) => (typeof x === 'boolean' ? x : innerWidth < 900); // a small screen starts compact
+  const tab = (x, names, d) => (names.includes(x) ? x : d);
+  return {
+    lc: closed(v && v.lc), rc: closed(v && v.rc),
+    lt: tab(v && v.lt, LEFT_TABS, 'sessions'), rt: tab(v && v.rt, RIGHT_TABS, 'rec'),
+  };
+})();
 const ui = {
   panes: signal([]),            // [{ id, sid, s: Session }]; panes on one sid share s; a pane's sid can change (showIn)
   tree: signal(null),           // core/tile.js split tree of pane ids
   focus: signal(null),          // pane id
-  left: signal('sessions'),
-  right: signal('rec'),
-  lrail: signal(innerWidth < 900),
-  rrail: signal(innerWidth < 900),
+  left: signal(RAILS0.lt),
+  right: signal(RAILS0.rt),
+  lrail: signal(RAILS0.lc),     // true: the left panel is closed, only its rail shows
+  rrail: signal(RAILS0.rc),
+  narrow: signal(false),        // fewer than NARROW_CELLS cells wide: an open panel overlays the tiles
   hint: signal(null),           // { mode: 'toast' | 'menu', text?, err? }
   keys: signal(false),          // the key reference is open
   cmd: signal(null),            // the `:` line's text while open, else null
@@ -57,6 +75,9 @@ function setSide(d, cells) {
   ui.sides.value = { ...ui.sides.peek(), [d]: n };
   try { localStorage.setItem(SIDES_KEY, JSON.stringify(ui.sides.peek())); } catch { /* this tab only */ }
 }
+const saveRails = () => {
+  try { localStorage.setItem(RAILS_KEY, JSON.stringify({ lc: ui.lrail.peek(), rc: ui.rrail.peek(), lt: ui.left.peek(), rt: ui.right.peek() })); } catch { /* this tab only */ }
+};
 const byId = (id) => ui.panes.value.find((p) => p.id === id);
 const focused = computed(() => byId(ui.focus.value) || null);
 const isMirror = (p) => ui.panes.value.find((x) => x.s === p.s) !== p;
@@ -213,15 +234,16 @@ const toComposer = withPane((p) => p.focusComposer && p.focusComposer());
 
 // Every open session once, as [sid, Session].
 const sessions = () => [...new Map(ui.panes.value.map((p) => [p.sid, p.s]))];
-// A chat is named by the title the perch gives it (its first message, else folder and time); the id is on hover.
+// A chat is named by the title the perch gives it (a name by hand, else its first message, else its birth name); the id is on
+// hover. Before the list has the row it is its project's name or `chat`: never the log's stem, which is a stamp.
 const sessionName = (s) => {
   const r = list.value.find((x) => x.id === s.sid);
   if (r && r.title) return r.title;
   const hl = s.hello.value;
-  return hl ? hl.session.split('/').pop().replace(/\.[^.]+$/, '') || 'session' : s.sid;
+  return (hl && project(hl.cwd)) || 'chat';
 };
 // A session's project is its working directory, named by its last part.
-// Its project's name; a scratch folder has none (its name is a time stamp); another folder is named by its last part.
+// Its project's name; an inbox folder has none (it is the chat's own); another folder is named by its last part.
 const project = (cwd) => {
   const p = projectFor(cwd);
   if (p) return p.name;
@@ -405,7 +427,22 @@ function cycleAsk(dir = 1) {
   return focusQueued(t[(at + dir + t.length) % t.length]);
 }
 
-const toggle = (rail) => { ui[rail].value = !ui[rail].value; };
+// Open or close one side's panel (on `tab`, when given); on a narrow screen opening one closes the other.
+function toggle(rail, tab) {
+  const left = rail === 'lrail';
+  batch(() => {
+    if (tab) ui[left ? 'left' : 'right'].value = tab;
+    ui[rail].value = !ui[rail].value;
+    if (ui.narrow.value && !ui[rail].value) ui[left ? 'rrail' : 'lrail'].value = true;
+  });
+}
+// A rail icon: a closed panel opens on that tab, the open tab's icon closes it, another tab's icon switches.
+function railPick(side, name) {
+  const rail = side === 'l' ? 'lrail' : 'rrail', cur = side === 'l' ? ui.left : ui.right;
+  if (ui[rail].peek()) return toggle(rail, name);
+  if (cur.peek() === name) return toggle(rail);
+  cur.value = name;
+}
 function cycleRight(d) {
   const i = RIGHT_TABS.indexOf(ui.right.value);
   ui.right.value = RIGHT_TABS[(i + d + RIGHT_TABS.length) % RIGHT_TABS.length];
@@ -457,8 +494,8 @@ const KEYREF = [
   ['panes', [
     ['⌥w  :q', 'close the pane', () => closePane()],
     [':vsplit :split', 'mirror right / down', () => mirrorPane(undefined, 'row')],
-    ['^b', 'the sessions sidebar', () => toggle('lrail')],
-    ['^i', 'the inspector', () => toggle('rrail')],
+    ['^b', 'the sessions sidebar (the left rail alone: compact)', () => toggle('lrail')],
+    ['^i', 'the inspector (the right rail alone: compact)', () => toggle('rrail')],
     ['[ ]', 'inspector tab', () => cycleRight(1)],
     [':term :edit :files', "open a terminal / editor / file manager at the session's folder (or a path)", () => openCmd()],
     ['/', 'filter files (files tab)', () => { ui.rrail.value = false; ui.right.value = 'files'; requestAnimationFrame(() => { const f = document.querySelector('#right .filter input'); if (f) f.focus(); }); }],
@@ -478,7 +515,8 @@ const COMMANDS = {
   submit: ['send every answered ask (all must be answered)', () => submitAsks() || toast(queue.peek().length ? 'answer every ask to submit' : 'nothing to submit')],
   queue: ['queue text (or the composer) behind the turn', (arg) => withPane((p) => p.s.submit('queue', arg || ''))()],
   reconnect: ['drop the stream and replay', withPane((p) => p.s.reconnect())],
-  new: ["start a chat: :new <folder> [model] (no folder: a scratch folder)", (arg) => newCmd(arg)],
+  new: ["start a chat: :new <folder> [model] (no folder: a chat in the inbox)", (arg) => newCmd(arg)],
+  rename: ['rename this chat: :rename <name> (none: clear it)', (arg) => withPane((p) => renameChat(p.sid, arg))()],
   resume: ['resume a stopped, dead or kept session (perch); may continue its last turn', () => resumeFocused()],
   sidebar: ['toggle the left sidebar', () => toggle('lrail')],
   inspector: ['toggle the inspector', () => toggle('rrail')],
@@ -557,15 +595,15 @@ function absCwd(raw) {
   return c.length > 1 ? c.replace(/\/+$/, '') || '/' : c;
 }
 const focusedHello = () => { const p = focused.peek(); return (p && p.s.hello.value) || null; };
-const focusedModel = () => (focusedHello() || {}).model || undefined;
 const focusedCwd = () => (focusedHello() || {}).cwd || '';
 
 // `how.open(id)` shows the new session (default: a new pane beside the focused
 // one); `how.except` is the pane that stops showing its session (the cap).
-// `raw` null starts a chat with no folder: the perch picks its scratch folder (201).
+// `raw` null starts a chat with no folder: the perch makes its own folder in the inbox (201).
 // A perch with no home answers 400, which gets a plain sentence. Resolves true
-// when a session started. No model is sent unless one was asked for: the
-// default is the Minerva config's, not this page's.
+// when a session started. No model is sent unless the person asked for one for
+// THIS chat (`:new <folder> <model>`): the default is the Minerva config's
+// (minerva.toml, then the member's, then the built-in), never the focused pane's.
 async function newSession(raw, model, how) {
   if (mode() !== 'perch') { toast(HUB, true); return false; }
   const bare = raw == null, cwd = bare ? null : absCwd(raw);
@@ -601,7 +639,7 @@ async function newSession(raw, model, how) {
 
 // The start screen's actions (panes/home.js). A folder may be pasted from Windows.
 const homeAct = {
-  chat: () => newSession(null, undefined),          // always a fresh scratch folder, never the focused pane's
+  chat: () => newSession(null, undefined),          // always a new inbox chat, never the focused pane's
   project: (p) => newSession(p.path, undefined),
   newProject: () => newProject(),
   forget: (e, p) => forgetMenu(e, p),
@@ -625,12 +663,81 @@ function newProject() {
 }
 
 // A project leaves the list; its folder and its chats stay.
-function forgetMenu(e, p) {
+function forgetMenu(e, p, at) {
   e.preventDefault();
   openMenu([
-    { label: 'new chat here', on: () => newSession(p.path, focusedModel()) },
+    { label: 'new chat here', on: () => newSession(p.path, undefined) },
+    { label: 'rename…', hint: 'the label; the folder keeps its name', on: () => startRename('project', p.path) },
     { label: 'remove from the list', hint: 'the folder is not touched', on: async () => { toast((await forgetProject(p)) ? `removed ${p.name}; its folder is untouched` : 'could not remove it', false); } },
-  ], atPointer(e), { title: p.name });
+  ], at || atPointer(e), { title: p.name });
+}
+
+// ---- names: a chat's, or a project's, edited in its own row. Enter saves, Esc (or leaving the field) cancels. A name by hand beats the
+// title taken from the first message; an empty one clears it. An inbox chat's folder follows the name (the perch, between turns).
+const renaming = signal(null); // { kind: 'chat' | 'project', key } of the row being edited
+function startRename(kind, key) {
+  closeMenu();
+  if (mode() !== 'perch') { toast(HUB, true); return; }
+  batch(() => { ui.lrail.value = false; if (!(kind === 'project' && ui.left.peek() === 'projects')) ui.left.value = 'sessions'; renaming.value = { kind, key }; });
+}
+const BAD_LOGIN = 'the server refused the login for this page (it restarted?). Run `hoot` again.';
+async function renameChat(sid, text) {
+  if (mode() !== 'perch') { toast(HUB, true); return; }
+  const was = list.peek().find((x) => x.id === sid), title = String(text || '').trim();
+  if (was && title === label(was)) return;
+  const res = await hubPost(`sessions/${encodeURIComponent(sid)}/rename`, { title });
+  if (res.status === 200) toast(title ? `renamed to ${title}` : 'name cleared: the chat is called by its first message again');
+  else if (res.status === 400) toast((res.data && res.data.error) || 'that name will not do', true);
+  else if (res.status === 403) toast("that chat belongs to eidolon's own folder: it cannot be renamed here", true);
+  else if (res.status === 404) toast('that chat is gone', true);
+  else if (res.status === 401) toast(BAD_LOGIN, true);
+  else toast(`rename failed: ${res.status || 'network'} ${(res.data && res.data.error) || ''}`, true);
+  refresh();
+}
+async function renameProj(p, text) {
+  const name = String(text || '').trim();
+  if (!name || name === p.name) return;
+  const r = await renameProject(p, name);
+  toast(r.ok ? `renamed to ${name}; the folder keeps its name` : r.why, !r.ok);
+}
+// The field in a row. Its text is set once, so the 5 s list poll redrawing the row never overwrites what is being typed.
+function EditName({ text, name, save }) {
+  const ref = useRef(null), done = useRef(false);
+  useLayoutEffect(() => { const el = ref.current; if (el) { el.value = text; el.focus(); el.select(); } }, []);
+  const end = (commit) => {
+    if (done.current) return;
+    done.current = true;
+    const value = ref.current ? ref.current.value : '';
+    renaming.value = null;
+    if (commit) save(value);
+  };
+  return html`<input class="ren" type="text" ref=${ref} spellcheck="false" autocomplete="off" aria-label=${name} maxlength="120"
+    onKeyDown=${(e) => { e.stopPropagation(); if (e.key === 'Enter') { e.preventDefault(); end(true); } else if (e.key === 'Escape') { e.preventDefault(); end(false); } }}
+    onClick=${(e) => e.stopPropagation()} onBlur=${() => end(false)} />`;
+}
+
+// `make it a project…`: the folder picker in "choose a parent" mode, with a name prefilled from the title. The perch MOVES the chat's
+// inbox folder to <parent>/<name>, registers it as a project, and reopens the chat in it (between turns).
+function promoteChat(r) {
+  closeMenu();
+  if (mode() !== 'perch') { toast(HUB, true); return; }
+  const prefill = slugOf(label(r)) || String(r.cwd || '').split('/').filter(Boolean).pop() || 'project';
+  openPicker({
+    title: `make "${label(r)}" a project`,
+    naming: true, parent: true, prefill, doneLabel: '[ move it here ]',
+    onDone: async ({ path, name }) => {
+      const res = await hubPost(`sessions/${encodeURIComponent(r.id)}/promote`, { parent: path, name });
+      if (res.status === 200) {
+        await loadProjects();
+        refresh();
+        toast(res.data && res.data.warning ? res.data.warning : `${label(r)} is now the project ${name}`, !!(res.data && res.data.warning));
+        return '';
+      }
+      if (res.status === 401) return BAD_LOGIN;
+      if (res.status === 0) return 'the server is not answering';
+      return (res.data && res.data.error) || `could not make it a project (${res.status})`;
+    },
+  });
 }
 
 // A folder with a space goes in double (or single) quotes: `:new "/home/u/My Project" model`.
@@ -648,15 +755,15 @@ function newCmd(arg) {
   if (mode() !== 'perch') { toast(HUB, true); return; }
   if (!w.length) { newSession(null, undefined); return; }
   if (w.length > 2) { toast('too many words: quote a folder that has a space, :new "/my dir" [model]', true); return; }
-  newSession(w[0], w[1] || focusedModel());
+  newSession(w[0], w[1]); // a model only when typed
 }
 
 // `new session ▸`: the folders of open and live sessions (max 8), then any folder.
 function newPick(how) {
-  const model = focusedModel(), shows = model || 'default model';
-  // A fresh scratch folder, then the projects: a scratch folder of another chat is never offered again.
-  const dirs = sorted(projects.peek()).slice(0, 12).map((p) => ({ label: p.name, hint: shows, on: () => newSession(p.path, model, how) }));
-  return { label: 'new session', hint: shows, sub: [{ label: 'new chat', hint: shows, on: () => newSession(null, model, how) }, ...(dirs.length ? [{ sep: true }, ...dirs] : []), { sep: true }, { label: 'new project…', on: () => newProject() }] };
+  const shows = 'default model';
+  // A new inbox chat, then the projects: the inbox folder of another chat is never offered again.
+  const dirs = sorted(projects.peek()).slice(0, 12).map((p) => ({ label: p.name, hint: shows, on: () => newSession(p.path, undefined, how) }));
+  return { label: 'new session', hint: shows, sub: [{ label: 'new chat', hint: shows, on: () => newSession(null, undefined, how) }, ...(dirs.length ? [{ sep: true }, ...dirs] : []), { sep: true }, { label: 'new project…', on: () => newProject() }] };
 }
 
 function splitItems(p, dir) {
@@ -741,6 +848,36 @@ async function stopSession(sid, name) {
   refresh();
   setTimeout(refresh, 1500); // the door takes a moment to exit
 }
+// A new chat copied from `sid`, whole (perch fork.rs); it opens in a pane beside the one showing the original, with a line saying where it came from.
+async function forkSession(sid, name) {
+  toast(`forking ${name}…`);
+  const r = await hubPost(`sessions/${encodeURIComponent(sid)}/fork`, {});
+  if (r.status === 201 && r.data && r.data.id) {
+    const from = ui.panes.peek().find((x) => x.sid === sid);
+    const p = from ? openPane(r.data.id, { at: from.id }) : openPane(r.data.id);
+    if (p) p.s.notes = [`forked from ${name}`];
+    toast(`forked ${name}`);
+  } else if (r.status === 401) toast('the server refused the login for this page (it restarted?). Run `hoot` again.', true);
+  else if (r.status === 404) toast('that chat is gone', true);
+  else toast(`fork failed: ${r.status || 'network'} ${(r.data && r.data.error) || ''}`, true);
+  refresh();
+}
+// A new chat that keeps the history of `sid` up to the reply `record` (perch pending.rs): a copy with no door yet, opened beside the
+// original, whose first message is the turn that makes the branch stay. The perch says in words why a point cannot be forked from.
+async function forkFrom(sid, record, name) {
+  toast(`forking ${name} from here…`);
+  const r = await hubPost(`sessions/${encodeURIComponent(sid)}/fork`, { at: record });
+  if (r.status === 201 && r.data && r.data.id) {
+    await refresh(); // the row says `pending` before the pane asks what to draw
+    const from = ui.panes.peek().find((x) => x.sid === sid);
+    const p = from ? openPane(r.data.id, { at: from.id }) : openPane(r.data.id);
+    if (p) { p.s.notes = [`forked from ${name}, from a reply`]; setTimeout(() => p.focusComposer && p.focusComposer(), 400); }
+    toast('forked: write its first message');
+  } else if (r.status === 401) toast('the server refused the login for this page (it restarted?). Run `hoot` again.', true);
+  else if (r.status === 404) toast('that chat is gone', true);
+  else toast(r.data && r.data.error ? r.data.error : `fork failed: ${r.status || 'network'}`, true);
+  refresh();
+}
 function copyId(id) {
   const ok = () => toast('copied ' + id), no = () => toast('could not copy; the id is ' + id, true);
   try { navigator.clipboard.writeText(id).then(ok, no); } catch { no(); }
@@ -750,48 +887,104 @@ const stopAsk = (sid, name, at) => openMenu([
   { label: 'keep it', on: () => {} },
 ], at, { title: `stop ${name}? its panes will show "stopped"` });
 
-function sessionMenu(e, p) {
+function sessionMenu(e, p, at0) {
   e.preventDefault();
-  const f = focused.value, at = atPointer(e), perch = mode() === 'perch';
+  const f = focused.value, at = at0 || atPointer(e), perch = mode() === 'perch';
   openMenu([
     { label: 'open beside', hint: 'new pane', on: () => openPane(p.sid) },
     { label: 'show in focused pane', off: !f ? 'no pane focused' : f.sid === p.sid ? 'shown there' : null, on: () => showIn(f.id, p.sid) },
-    { label: 'fork (latest)', off: perch ? 'needs the session registry' : HUB },
+    perch ? { label: 'fork (latest)', hint: 'new chat', on: () => forkSession(p.sid, sessionName(p.s)) } : { label: 'fork (latest)', off: HUB },
     perch ? { label: 'stop this chat', on: () => stopAsk(p.sid, sessionName(p.s), at) } : { label: 'stop this chat', off: HUB },
+    ...markItems(list.value.find((x) => x.id === p.sid), at),
   ], at, { title: sessionName(p.s) });
 }
 
 // A live session no pane shows: the same menu, by id.
-function idleMenu(e, r) {
+function idleMenu(e, r, at0) {
   e.preventDefault();
-  const f = focused.value, at = atPointer(e);
+  const f = focused.value, at = at0 || atPointer(e);
   openMenu([
     { label: 'open here', on: () => openSession(r.id) },
     { label: 'open beside', hint: 'new pane', on: () => openPane(r.id) },
-    { label: 'fork (latest)', off: 'needs the session registry' },
+    { label: 'fork (latest)', hint: 'new chat', on: () => forkSession(r.id, label(r)) },
     { label: 'stop this chat', on: () => stopAsk(r.id, label(r), at) },
+    ...markItems(r, at),
   ], at, { title: label(r) });
 }
 
 // An older chat (eidolon's own folder): to read here or beside; continuing is the action in its pane.
-function olderMenu(e, r) {
+function olderMenu(e, r, at0) {
   e.preventDefault();
   openMenu([
     { label: 'open here (read-only)', on: () => openSession(r.id) },
     { label: 'open beside', hint: 'new pane', on: () => openPane(r.id) },
+    { label: 'fork (latest)', hint: 'a copy in this app', on: () => forkSession(r.id, label(r)) },
     { label: 'copy id', on: () => copyId(r.id) },
-  ], atPointer(e), { title: label(r) });
+  ], at0 || atPointer(e), { title: label(r) });
 }
 
-function keptMenu(e, r) {
+function keptMenu(e, r, at0) {
   e.preventDefault();
+  const at = at0 || atPointer(e);
   openMenu([
     { label: 'open here', on: () => openSession(r.id) },
     { label: 'open beside', hint: 'new pane', on: () => openPane(r.id) },
-    { label: 'resume (may continue the last turn)', on: () => resumeSid(r.id) },
+    ...(r.pending ? [] : [
+      { label: 'resume (may continue the last turn)', on: () => resumeSid(r.id) },
+      { label: 'fork (latest)', hint: 'new chat', on: () => forkSession(r.id, label(r)) },
+    ]),
     { label: 'copy id', on: () => copyId(r.id) },
-  ], atPointer(e), { title: label(r) });
+    ...markItems(r, at),
+  ], at, { title: label(r) });
 }
+
+// pin / archive / delete for a chat of this app (never eidolon's own folder, never one running in another app). A deleted chat
+// goes to the trash group at the bottom of the sidebar, where it can be restored; a running one is stopped first.
+function markItems(r, at) {
+  if (!r || mode() !== 'perch' || r.origin || r.state === 'live-elsewhere') return [];
+  const isLive = r.state === 'live', gone = r.archived || r.auto_other;
+  return [
+    { sep: true },
+    { label: 'rename…', hint: r.inbox ? 'its folder follows the name' : 'a name by hand', on: () => startRename('chat', r.id) },
+    ...(r.inbox ? [{ label: 'make it a project…', hint: 'move its folder out of the inbox', on: () => promoteChat(r) }] : []),
+    r.pinned ? { label: 'unpin', on: () => markChat(r, 'unpin') } : { label: 'pin', hint: 'to the top', on: () => markChat(r, 'pin') },
+    isLive ? { label: 'archive', off: 'running: stop it first' }
+      : gone ? { label: 'unarchive', hint: 'back to the list', on: () => markChat(r, 'unarchive') }
+      : { label: 'archive', hint: 'to other', on: () => markChat(r, 'archive') },
+    isLive ? { label: 'stop and delete', hint: 'to the trash', on: () => openMenu([
+      { label: 'stop and delete', on: () => markChat(r, 'trash', { stop: true }) },
+      { label: 'keep it', on: () => {} },
+    ], at, { title: `stop and delete ${label(r)}? it goes to the trash` }) }
+      : { label: 'delete', hint: 'to the trash', on: () => markChat(r, 'trash') },
+  ];
+}
+const MARKED = { pin: 'pinned', unpin: 'unpinned', archive: 'moved to other', unarchive: 'moved back', trash: 'moved to the trash (restore it from trash, at the bottom)' };
+async function markChat(r, verb, body) {
+  const res = await hubPost(`sessions/${encodeURIComponent(r.id)}/${verb}`, body);
+  if (res.status === 204) {
+    if (verb === 'trash') for (const p of ui.panes.peek().filter((x) => x.sid === r.id)) closePane(p.id);
+    toast(`${label(r)}: ${MARKED[verb]}`);
+  } else if (res.status === 409) toast((res.data && res.data.error) || 'that chat is running', true);
+  else if (res.status === 401) toast('the server refused the login for this page (it restarted?). Run `hoot` again.', true);
+  else toast(`${verb} failed: ${res.status || 'network'} ${(res.data && res.data.error) || ''}`, true);
+  refresh();
+}
+async function restoreChat(t) {
+  const res = await hubPost(`trash/${encodeURIComponent(t.id)}/restore`);
+  if (res.status === 204) toast(`${t.title || t.id}: restored`);
+  else if (res.status === 409) toast('a chat with that name already exists; delete or rename that one first', true);
+  else toast(`restore failed: ${res.status || 'network'} ${(res.data && res.data.error) || ''}`, true);
+  refresh();
+}
+const emptyAsk = (n, at) => openMenu([
+  { label: `permanently delete ${n} chat${n === 1 ? '' : 's'}? this can't be undone`, off: ' ' },
+  { label: 'delete permanently', on: async () => {
+    const res = await hubPost('trash/empty', { confirm: true });
+    toast(res.status === 200 ? `${n} chat${n === 1 ? '' : 's'} deleted for good` : `could not empty the trash: ${res.status || 'network'}`, res.status !== 200);
+    refresh();
+  } },
+  { label: 'keep them', on: () => {} },
+], at, { title: 'empty the trash' });
 
 const ELSEWHERE = 'running in another app (a terminal chat or another server): view only';
 function elsewhereMenu(e, r) {
@@ -825,6 +1018,7 @@ const act = {
   focus: focusPane,
   paneMenu,
   splitMenu,
+  forkFrom,
   close: closePane,
   leaveAsk,
   bounce,
@@ -841,15 +1035,26 @@ const act = {
   toast,
 };
 
-// Frame-title tabs, plus the arrow that folds the sidebar to its rail
-// (pointing at the edge it folds to).
-function Tabs({ names, cur, pick, collapse, title, side }) {
-  const fold = html`<${K} cls="tab fold" title=${title} on=${collapse}>${side === 'left' ? '«' : '»'}</${K}>`;
-  return html`<div class="ftitle">
-    ${side === 'left' && fold}
-    ${names.map((n) => html`<${K} cls=${'tab' + (n === cur ? ' on' : '')} on=${() => pick(n)}>${n === cur ? `[${n}]` : n}</${K}>`)}
-    ${side !== 'left' && fold}
-  </div>`;
+// The activity rail: always on screen at the far edge of its side, one icon per
+// tab (RAIL_ICONS); the open tab's icon is lit. Click: open on that tab, or
+// close if it is the open one. Both rails alone is compact mode.
+// The collapse / expand glyph: at the outer end of an open panel's title (the only collapse control), and on the rail's top cell only
+// while the panel is closed (the way back in); an open panel leaves that cell an empty spacer so the icons below do not move.
+// The arrow points the way the panel goes: toward its edge when it folds away, away from it when it opens.
+function Fold({ side, cls }) {
+  const left = side === 'l', closed = (left ? ui.lrail : ui.rrail).value;
+  const glyph = left === closed ? '»' : '«';
+  const what = closed ? 'expand' : 'collapse';
+  return html`<${K} cls=${cls} title=${what + (left ? ' sidebar' : ' inspector') + ' · ' + (left ? 'ctrl+b' : 'ctrl+i')} on=${() => toggle(left ? 'lrail' : 'rrail')}>${glyph}</${K}>`;
+}
+function Rail({ side }) {
+  const left = side === 'l', names = left ? LEFT_TABS : RIGHT_TABS;
+  const cur = (left ? ui.left : ui.right).value, closed = (left ? ui.lrail : ui.rrail).value;
+  const keys = left ? 'ctrl+b' : 'ctrl+i, [ ]';
+  return html`<nav class=${'col arail ' + (left ? 'ral' : 'rar')} aria-label=${left ? 'sidebar tabs' : 'inspector tabs'}>
+    ${closed ? html`<${Fold} side=${side} cls="ri rt" />` : html`<div class="ri rt" aria-hidden="true"></div>`}
+    ${names.map((n) => html`<${K} cls=${'ri' + (!closed && n === cur ? ' on' : '')} title=${n + ' · ' + keys} on=${() => railPick(side, n)}>${RAIL_ICONS[n]}</${K}>`)}
+  </nav>`;
 }
 
 const Needs = ({ children }) => html`<div class="needs">${children}</div>`;
@@ -913,7 +1118,7 @@ function Sessions() {
     const unread = ps.reduce((n, x, i) => n + (ps.findIndex((y) => y.s === x.s) === i ? x.s.unread.value : 0), 0);
     return html`<div class="grp" key=${cwd}>
       <div class="gh"><${K} cls="gname" title=${(cwd ? tildify(cwd) + '\n' : '') + (open ? 'fold' : 'open')} on=${() => fold(cwd)}>${open ? '▾' : '▸'} ${name}</${K}>
-        <${K} off=${!(perch && cwd)} cls="plus" title=${perch && cwd ? `new session in ${name} (${focusedModel() || 'default model'})` : 'new session in ' + name + ': ' + HUB} on=${() => newSession(cwd, focusedModel())}>+</${K}>
+        <${K} off=${!(perch && cwd)} cls="plus" title=${perch && cwd ? `new session in ${name} (default model)` : 'new session in ' + name + ': ' + HUB} on=${() => newSession(cwd, undefined)}>+</${K}>
         ${!open && unread > 0 && html`<span class="o">[${unread}]</span>`}</div>
       ${open && html`<div class="list">${ps.map((x) => html`<${SessionItem} key=${x.id} p=${x} />`)}
         ${idle.map((r) => html`<${IdleItem} key=${r.id} r=${r} />`)}</div>`}
@@ -950,59 +1155,89 @@ const query = signal(''), shownBy = signal({}), otherOpen = signal(false);
 const GROUP_CAP = 8;
 const byNew = (a, b) => (b.mtime || 0) - (a.mtime || 0);
 
-// A live chat is ●, a saved one ○; a pane's own state adds the busy bold, `?` for an ask waiting and `[n]` unread.
-function ChatRow({ r }) {
+// A live chat is ●, a saved one ○; a pane's own state adds the busy bold, `?` for an ask waiting and `[n]` unread. `where` is the
+// group it is drawn in: a pinned row names its project faintly, an `other` row says why it is there (archived / idle). The `⋯`
+// at the right edge (on hover or focus) opens the same menu as a right-click.
+function ChatRow({ r, where }) {
   const p = ui.panes.value.find((x) => x.sid === r.id), f = focused.value, s = p && p.s;
   const isLive = r.state === 'live', busy = isLive && s && s.running.value === true;
   const asks = s ? s.asks.value.length : 0, n = s ? s.unread.value : 0;
   const cur = !!f && f.sid === r.id;
-  const menu = (e) => (p ? sessionMenu(e, p) : isLive ? idleMenu(e, r) : r.origin === 'other' ? olderMenu(e, r) : keptMenu(e, r));
+  const menu = (e, at) => (p ? sessionMenu(e, p, at) : isLive ? idleMenu(e, r, at) : r.origin === 'other' ? olderMenu(e, r, at) : keptMenu(e, r, at));
   const what = isLive ? (busy ? 'running' : 'live') : r.state === 'dead' ? 'exited' : r.origin === 'other' ? "saved, from eidolon's own folder (opens read-only)" : 'saved';
+  const pj = where === 'pinned' ? (projectFor(r.cwd) || {}).name : '', tag = r.pending ? 'pending' : where === 'other' ? otherTag(r) : '';
+  const ed = renaming.value;
+  if (ed && ed.kind === 'chat' && ed.key === r.id) {
+    return html`<div class="it chat ed"><span class=${'cd ' + (isLive ? 'hi' : 'faint')}>${isLive ? '●' : '○'}</span><${EditName} text=${label(r)} name="chat name" save=${(t) => renameChat(r.id, t)} /></div>`;
+  }
   return html`<div class=${'it chat' + (cur ? ' cur' : '')} onContextMenu=${menu} onMouseDown=${noMiddle} onAuxClick=${(e) => beside(e, r.id)}>
-    <${K} cls="crow" title=${label(r) + '\n' + what + '\nctrl-click or middle-click: open beside\nright-click: more'}
+    <${K} cls="crow" title=${label(r) + '\n' + what + '\nctrl-click or middle-click: open beside\nright-click or ⋯: more'}
       on=${(e) => openSession(r.id, { beside: e.ctrlKey || e.metaKey })}>
       <span class=${'cd ' + (isLive ? (busy ? 'hi b' : 'hi') : 'faint')}>${isLive ? '●' : '○'}</span><span class="ct">${label(r)}</span>
+      ${pj && html`<span class="faint pj" title="its project">${pj}</span>`}${tag && html`<span class="faint pj" title=${tag === 'pending' ? 'a fork from a reply: it opens when its first message has run' : tag === 'archived' ? 'moved here by hand' : 'idle for 7 days'}>${tag}</span>`}
       ${asks > 0 && html`<span class="y" title="a question is waiting">?</span>`}${n > 0 && html`<span class="o" title=${n + ' new'}>[${n}]</span>`}
       <span class="faint ca">${ageOf(r)}</span></${K}>
+    ${!r.origin && html`<${K} cls="mo" title="rename, pin, archive, delete, more" on=${(e) => menu(e, under(e.currentTarget))}>⋯</${K}>`}
   </div>`;
 }
 
 // A group's rows: the first GROUP_CAP (or the count asked for), then `more…`.
-function Rows({ gk, rows }) {
+function Rows({ gk, rows, where }) {
   const n = shownBy.value[gk] || GROUP_CAP, shown = rows.slice(0, n), rest = rows.length - shown.length;
-  return html`<div class="list">${shown.map((r) => html`<${ChatRow} key=${r.id} r=${r} />`)}
+  return html`<div class="list">${shown.map((r) => html`<${ChatRow} key=${r.id} r=${r} where=${where} />`)}
     ${rest > 0 && html`<div class="it"><${K} cls="faint" on=${() => { shownBy.value = { ...shownBy.value, [gk]: n + 50 }; }}>more… (${rest})</${K}></div>`}</div>`;
 }
 
-function Head({ name, title, plus, plusTitle, on, menu }) {
-  return html`<div class="gh2" onContextMenu=${menu}><span class="gname" title=${title}>${name}</span>
+// `p` (a project) makes the header renamable in place and gives it a `⋯`; the inbox's header has neither.
+function Head({ name, title, plusTitle, on, menu, p }) {
+  const ed = renaming.value, editing = !!p && !!ed && ed.kind === 'project' && ed.key === p.path;
+  return html`<div class="gh2" onContextMenu=${menu}>
+    ${editing ? html`<${EditName} text=${p.name} name="project name" save=${(t) => renameProj(p, t)} />` : html`<span class="gname" title=${title}>${name}</span>`}
+    ${p && !editing && html`<${K} cls="mo" title="rename, remove from the list" on=${(e) => menu(e, under(e.currentTarget))}>⋯</${K}>`}
     <${K} cls="plus" title=${plusTitle} on=${on}>+</${K}></div>`;
+}
+
+// Deleted chats, collapsed at the very bottom while there are any: `restore` puts one back, `empty trash` removes them for good
+// (one confirm).
+const trashOpen = signal(false);
+function TrashGroup() {
+  const t = trash.value, n = t.length;
+  if (!n) return null;
+  return html`<div class="grp trash">
+    <div class="gh2"><${K} cls="gname" title=${trashOpen.value ? 'fold' : 'chats you deleted; they can be restored'} on=${() => { trashOpen.value = !trashOpen.value; }}>${trashOpen.value ? '▾' : '▸'} trash (${n})</${K}>
+      <${K} cls="plus" title="delete them for good" on=${(e) => emptyAsk(n, under(e.currentTarget))}>empty trash</${K}></div>
+    ${trashOpen.value && html`<div class="list">${t.map((x) => html`<div class="it chat" key=${x.id}>
+      <span class="crow faint"><span class="cd">○</span><span class="ct" title=${x.id}>${x.title || x.id}</span><span class="ca">${age(x.mtime)}</span></span>
+      <${K} cls="mo on" title="put it back in the list" on=${() => restoreChat(x)}>restore</${K}></div>`)}</div>`}</div>`;
 }
 
 function Chats() {
   const rs = list.value, q = query.value.trim().toLowerCase(), ps = sorted(projects.value);
   const match = (r) => !q || label(r).toLowerCase().includes(q);
   const chats = [...live(rs), ...keptRows(rs)].filter(match).sort(byNew);
-  const byP = new Map(ps.map((p) => [p.path, []])), loose = [];
-  for (const r of chats) { const p = projectFor(r.cwd, ps); if (p) byP.get(p.path).push(r); else loose.push(r); }
+  const byP = new Map(ps.map((p) => [p.path, []])), loose = [], pinned = [];
+  // A pinned chat is in the `pinned` group and nowhere else.
+  for (const r of chats) { const p = projectFor(r.cwd, ps); if (r.pinned) pinned.push(r); else if (p) byP.get(p.path).push(r); else loose.push(r); }
   const oth = older(rs).filter(match);
-  const model = focusedModel();
   const shownProjects = ps.filter((p) => !q || byP.get(p.path).length);
   return html`<div class="chats">
     <div class="sq"><span class="faint">search </span><input type="text" spellcheck="false" autocomplete="off" aria-label="search chats" placeholder="title" value=${query.value}
       onInput=${(e) => { query.value = e.currentTarget.value; }} onKeyDown=${(e) => { if (e.key === 'Escape') { query.value = ''; e.currentTarget.blur(); } }} /></div>
-    <div class="newrow"><${K} cls="newchat" title="a chat in a fresh scratch folder" on=${() => newSession(null, model)}>+ new chat</${K}></div>
+    <div class="newrow"><${K} cls="newchat" title="a chat in the inbox (its folder is named after its title)" on=${() => newSession(null, undefined)}>+ new chat</${K}></div>
+    ${pinned.length > 0 && html`<div class="grp"><div class="gh2"><span class="gname" title="pinned chats, newest first">pinned</span></div>
+      <${Rows} gk="pinned" rows=${pinned} where="pinned" /></div>`}
     ${shownProjects.map((p) => html`<div class="grp" key=${p.path}>
-      <${Head} name=${p.name} title=${p.path + '\nright-click: remove from the list'} plusTitle=${'new chat in ' + p.name} on=${() => newSession(p.path, model)} menu=${(e) => forgetMenu(e, p)} />
+      <${Head} p=${p} name=${p.name} title=${p.path + '\nright-click or ⋯: rename, remove from the list'} plusTitle=${'new chat in ' + p.name} on=${() => newSession(p.path, undefined)} menu=${(e, at) => forgetMenu(e, p, at)} />
       <${Rows} gk=${'p:' + p.path} rows=${byP.get(p.path)} /></div>`)}
     ${!q && html`<div class="newrow"><${K} cls="newchat" title="pick a folder and name it" on=${newProject}>+ new project</${K}></div>`}
     ${(!q || loose.length > 0) && html`<div class="grp">
-      <${Head} name="no folder" title="chats that are not in a project" plusTitle="new chat in a fresh scratch folder" on=${() => newSession(null, model)} />
+      <${Head} name="inbox" title="chats that are not in a project: each has a folder of its own, named after its title. ⋯ › make it a project… moves one out" plusTitle="new chat in the inbox" on=${() => newSession(null, undefined)} />
       ${loose.length ? html`<${Rows} gk="loose" rows=${loose} />` : html`<div class="faint pad">none</div>`}</div>`}
     <${Elsewhere} />
     ${oth.length > 0 && html`<div class="grp">
-      <div class="gh2"><${K} cls="gname" title=${otherOpen.value ? 'fold' : "chats from eidolon's own sessions folder, outside this app"} on=${() => { otherOpen.value = !otherOpen.value; }}>${otherOpen.value || q ? '▾' : '▸'} other (${oth.length})</${K}></div>
-      ${(otherOpen.value || q) && html`<${Rows} gk="other" rows=${oth} />`}</div>`}
+      <div class="gh2"><${K} cls="gname" title=${otherOpen.value ? 'fold' : "archived chats, chats idle for 7 days, and eidolon's own sessions folder"} on=${() => { otherOpen.value = !otherOpen.value; }}>${otherOpen.value || q ? '▾' : '▸'} other (${oth.length})</${K}></div>
+      ${(otherOpen.value || q) && html`<${Rows} gk="other" rows=${oth} where="other" />`}</div>`}
+    <${TrashGroup} />
   </div>`;
 }
 
@@ -1055,7 +1290,9 @@ function Left() {
     const perch = mode() === 'perch';
     body = perch ? html`<div class="hdr">projects</div>
       ${projects.value.length ? html`<div class="list">${sorted(projects.value).map((p) => html`<div class="it" key=${p.path} onContextMenu=${(e) => forgetMenu(e, p)}>
-        <div class="l1"><${K} cls="grow nm" title=${p.path + '\nnew chat here\nright-click: remove from the list'} on=${() => newSession(p.path, focusedModel())}>${p.name}</${K}></div>
+        <div class="l1">${renaming.value && renaming.value.kind === 'project' && renaming.value.key === p.path
+          ? html`<${EditName} text=${p.name} name="project name" save=${(t) => renameProj(p, t)} />`
+          : html`<${K} cls="grow nm" title=${p.path + '\nnew chat here\nright-click: rename, remove from the list'} on=${() => newSession(p.path, undefined)}>${p.name}</${K}>`}</div>
         <div class="pv" title=${p.path}>${tildify(p.path)}</div></div>`)}</div>`
         : html`<div class="faint">none yet</div>`}
       <div class="newrow"><${K} cls="newchat" on=${newProject}>+ new project</${K}></div>`
@@ -1068,10 +1305,9 @@ function Left() {
       <${Soon} what="the mesh" door="mesh reads Aoide through the hub (M3)" />`;
   }
   return html`<aside id="left" class="col side frame">
-    ${!rail && html`<${Tabs} names=${LEFT_TABS} cur=${tab} pick=${(n) => { ui.left.value = n; }} side="left" collapse=${() => toggle('lrail')} title="collapse to a rail (ctrl+b)" />`}
+    ${!rail && html`<div class="ftitle"><${Fold} side="l" cls="tab fold" /><span class="tab on">${tab}</span></div>`}
     ${!rail && html`<div class="inner">${body}</div>`}
     ${!rail && html`<${Edge} d="l" />`}
-    ${rail && html`<div class="rail k" role="button" tabindex="0" title="open the sidebar (ctrl+b)" onClick=${() => toggle('lrail')}>${tab} ▾</div>`}
   </aside>`;
 }
 
@@ -1161,10 +1397,9 @@ function Right() {
   const Tab = INSPECTOR[tab];
   const body = p && !rail ? html`<${Tab} key=${tab} s=${p.s} sid=${p.sid} />` : html`<div class="faint">no pane focused</div>`;
   return html`<aside id="right" class="col side frame">
-    ${!rail && html`<${Tabs} names=${RIGHT_TABS} cur=${tab} pick=${(n) => { ui.right.value = n; }} collapse=${() => toggle('rrail')} title="collapse to a rail (ctrl+i)" />`}
+    ${!rail && html`<div class="ftitle"><span class="tab on">${tab}</span><${Fold} side="r" cls="tab fold" /></div>`}
     ${!rail && html`<div class="inner">${body}</div>`}
     ${!rail && html`<${Edge} d="r" />`}
-    ${rail && html`<div class="rail k" role="button" tabindex="0" title="open the inspector (ctrl+i)" onClick=${() => toggle('rrail')}>${tab} ▾</div>`}
   </aside>`;
 }
 
@@ -1379,9 +1614,9 @@ function Status() {
 }
 
 function App() {
-  const cls = (ui.lrail.value ? 'lrail ' : '') + (ui.rrail.value ? 'rrail' : '');
+  const cls = (ui.lrail.value ? 'lrail ' : '') + (ui.rrail.value ? 'rrail ' : '') + (ui.narrow.value ? 'narrow' : '');
   const w = ui.sides.value;
-  return html`<main id="main" class=${cls} style=${`--lc:${w.l};--rc:${w.r}`}><${Left} /><${Tiles} /><${Right} /></main><${Hint} /><${Status} />${ui.keys.value && html`<${KeyRef} />`}<${Menus} />`;
+  return html`<main id="main" class=${cls} style=${`--lc:${w.l};--rc:${w.r}`}><${Rail} side="l" />${!ui.lrail.value && html`<${Left} />`}<${Tiles} />${!ui.rrail.value && html`<${Right} />`}<${Rail} side="r" /></main><${Hint} /><${Status} />${ui.keys.value && html`<${KeyRef} />`}<${Menus} />`;
 }
 
 effect(() => { const c = cell.value; batch(() => { ui.box.value = { ...ui.box.peek(), ...c }; ui.fit.value = 0; }); });
@@ -1439,12 +1674,20 @@ ui.token = takeToken();
 addEventListener('hashchange', () => { if (/token=/.test(location.hash)) takeToken(); });
 const root = document.getElementById('root');
 render(html`<${App} />`, root);
-let wasNarrow = innerWidth < 760;
-addEventListener('resize', () => {
-  const narrow = innerWidth < 760;
-  if (narrow && !wasNarrow) batch(() => { ui.lrail.value = true; ui.rrail.value = true; });
+// Narrow: panels overlay the tiles, so crossing into narrow closes both (the rails stay).
+ui.narrow.value = innerWidth < NARROW_CELLS * cell.peek().cw;
+let wasNarrow = ui.narrow.peek();
+const checkNarrow = () => {
+  const narrow = innerWidth < NARROW_CELLS * cell.peek().cw;
+  batch(() => {
+    ui.narrow.value = narrow;
+    if (narrow && !wasNarrow) { ui.lrail.value = true; ui.rrail.value = true; }
+  });
   wasNarrow = narrow;
-});
+};
+addEventListener('resize', checkNarrow);
+effect(() => { cell.value; checkNarrow(); });
+effect(() => { ui.lrail.value; ui.rrail.value; ui.left.value; ui.right.value; saveRails(); });
 // Not in rAF: a tab opened in the background must still connect. A door is
 // opened on at once; under the perch the page opens panes on the sessions that
 // are already live (at most 4) and never starts one.

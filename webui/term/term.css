@@ -46,34 +46,43 @@ html, body {
 .tab { color: var(--faint); }
 .tab.on { color: var(--bright); }
 .tab + .tab { margin-left: var(--cw); }
-.tab.fold { color: var(--faint); }
-.ftitle > .tab.fold:last-child { margin-left: calc(2 * var(--cw)); }
-.ftitle > .tab.fold:first-child { margin-right: var(--cw); }
-.tab.fold:hover { color: var(--bright); }
-
 /* ---- the three columns ---- */
 #main {
-  display: grid;
-  grid-template-columns: var(--lw) minmax(0, 1fr) var(--rw);
-  /* --lc / --rc: the sidebars' widths in cells (app.js), never past 45% of the screen */
+  display: grid; position: relative;
+  /* rail | left panel | tiles | right panel | rail. A closed panel is not drawn (width 0). */
+  grid-template-columns: calc(3 * var(--cw)) var(--lw) minmax(0, 1fr) var(--rw) calc(3 * var(--cw));
+  /* --lc / --rc: the panels' widths in cells (app.js), never past 45% of the screen */
   --lw: min(calc(var(--lc, 30) * var(--cw)), 45vw); --rw: min(calc(var(--rc, 34) * var(--cw)), 45vw);
   padding: calc(var(--ch) / 2) 0 0;
   min-height: 0;
 }
-#main.lrail { --lw: calc(3 * var(--cw)); }
-#main.rrail { --rw: calc(3 * var(--cw)); }
+#main.lrail { --lw: 0px; }
+#main.rrail { --rw: 0px; }
 .col { min-height: 0; min-width: 0; }
 .col + .col { margin-left: -1px; }
 .side { display: flex; flex-direction: column; }
 .side .inner { flex: 1; overflow: auto; padding: calc(var(--ch) * 0.7) var(--cw) 0; }
-.rail { display: none; }
-#main.lrail #left .rail, #main.rrail #right .rail {
-  display: block; height: 100%; width: 100%;
-  writing-mode: vertical-rl; text-orientation: mixed;
-  padding: var(--ch) 0; text-align: center; color: var(--faint);
-  line-height: calc(3 * var(--cw) - 2px);
+/* the activity rails: one icon cell per tab, always shown (app.js RAIL_ICONS); the open tab's cell is lit */
+.arail { display: flex; flex-direction: column; border: 1px solid var(--line); overflow: hidden; }
+#main > .ral { grid-column: 1; } #main > #left { grid-column: 2; } #main > #tiles { grid-column: 3; }
+#main > #right { grid-column: 4; } #main > .rar { grid-column: 5; }
+.ri { overflow: hidden; font-size: var(--fs); line-height: var(--ch); display: flex; align-items: center; justify-content: center; height: calc(2 * var(--ch)); flex: none; color: var(--faint); }
+.ri:hover { color: var(--brightest); background: var(--panel); text-decoration: none; }
+.ri.on, .ri.on:hover { color: var(--bg); background: var(--bright); }
+.ri.rt { border-bottom: 1px solid var(--line); height: calc(1.5 * var(--ch)); margin-bottom: calc(var(--ch) / 2); }
+.tab.fold { color: var(--faint); margin: 0 var(--cw); }
+.tab.fold:hover { color: var(--brightest); }
+.ri:focus-visible { outline-offset: -2px; }
+/* narrow (under 110 cells, app.js): an open panel floats over the tiles instead of squeezing them; the rails stay */
+#main.narrow > #left, #main.narrow > #right {
+  position: absolute; z-index: 6; top: calc(var(--ch) / 2); bottom: 0; background: var(--bg);
+  width: min(calc(var(--lc, 30) * var(--cw)), calc(100% - 6 * var(--cw)));
 }
-.rail:hover { color: var(--bright); background: var(--panel); }
+/* an absolute child of a grid is placed in its grid area: let the overlays span the whole grid */
+#main.narrow > #left, #main.narrow > #right { grid-column: 1 / -1; }
+#main.narrow > #left { left: calc(3 * var(--cw) - 1px); }
+#main.narrow > #right { right: calc(3 * var(--cw) - 1px); width: min(calc(var(--rc, 34) * var(--cw)), calc(100% - 6 * var(--cw))); }
+#main.narrow { --lw: 0px; --rw: 0px; }
 /* a sidebar's inner border: a cell-wide handle over the line */
 .edge { position: absolute; top: 0; bottom: 0; width: var(--cw); z-index: 3; cursor: col-resize; touch-action: none; }
 .edge.l { right: calc(var(--cw) / -2 - 0.5px); }
@@ -104,7 +113,8 @@ html, body {
 .needs::before { content: "·· "; }
 
 /* ---- tiles ---- */
-#tiles { position: relative; min-height: 0; }
+/* above the sidebars: the columns overlap by a pixel, and a focused pane's bright border must win that line */
+#tiles { position: relative; z-index: 1; min-height: 0; }
 .pane {
   position: absolute; display: flex; flex-direction: column;
   border-color: var(--line);
@@ -146,6 +156,8 @@ html, body {
 .pop .mi.dis { color: var(--faint); text-decoration: none; cursor: default; }
 .pop .mi.dis .ml { text-decoration: line-through; }
 .pop .mi.dis .mh { color: var(--faint); }
+/* a line that only says something (no reason to grey it out): the empty-trash confirm sentence */
+.pop .mi.dis[title=" "] .ml { text-decoration: none; color: var(--fg); }
 .pop .msep { border-top: 1px solid var(--line); margin: calc(var(--ch) * 0.2) 0; }
 /* tile dividers: an invisible cell-wide handle over the shared border.
    Under the frame titles (z-index 2): a pane's title is cut into the same
@@ -393,6 +405,8 @@ pre, .pre {
 }
 .composer textarea::placeholder { color: var(--faint); }
 .composer .cwarn { color: var(--yellow); }
+/* a fork's first message while it runs: what eidolon printed, as plain text */
+.composer .firstout { margin: 0; white-space: pre-wrap; word-break: break-word; color: var(--faint); font: inherit; line-height: var(--ch); max-height: calc(8 * var(--ch)); overflow-y: auto; }
 @container (max-width: 480px) {
   .composer .verb .kh, .composer .verbs .wide, .composer > .ftitle .gauge { display: none; }
 }
@@ -510,8 +524,17 @@ pre, .pre {
 .chats .gh2 .plus, .newrow + .plus { color: var(--bright); }
 .chats .grp > .list { padding-left: 0; }
 .chats .list .it + .it { margin-top: 0; }
-.chats .it.chat { display: block; }
-.chats .crow { display: flex; gap: var(--cw); width: 100%; white-space: pre; }
+.chats .it.chat { display: flex; }
+.chats .crow { display: flex; gap: var(--cw); flex: 1; min-width: 0; white-space: pre; }
+/* the `⋯` at a row's right edge: there on hover or focus, so nobody needs to know right-click; `restore` is always there */
+.chats .mo { opacity: 0; padding-left: var(--cw); color: var(--faint); }
+.chats .it.chat:hover .mo, .chats .it.chat:focus-within .mo, .chats .mo:focus, .chats .mo.on { opacity: 1; }
+.chats .mo:hover { color: var(--bright); }
+/* a project header's `⋯` is the same, shown on hover; the field that renames a chat or a project in its row */
+.chats .gh2:hover .mo, .chats .gh2:focus-within .mo { opacity: 1; }
+.chats .it.ed { display: flex; gap: var(--cw); }
+.chats input.ren { flex: 1; min-width: 0; background: transparent; color: var(--brightest); border: 0; border-bottom: 1px solid var(--bright); font: inherit; padding: 0; border-radius: 0; outline: none; }
+.chats .pj { max-width: 12ch; overflow: hidden; text-overflow: ellipsis; }
 .chats .crow:hover { text-decoration: none; background: var(--sel); }
 .chats .it.cur { background: var(--sel); }
 .chats .it.cur .ct { color: var(--brightest); }
@@ -537,3 +560,18 @@ pre, .pre {
 .picker .act:hover, .picker .act:focus-visible { background: var(--sel); color: var(--brightest); text-decoration: none; outline: none; }
 .picker .dis.act { color: var(--faint); }
 .picker .msg { min-height: var(--ch); color: var(--yellow); }
+
+/* ---- images in the transcript (panes/imgs.js) ---- */
+.imgs { padding-left: calc(2 * var(--cw)); }
+.imgs .thumbs { display: flex; flex-wrap: wrap; gap: var(--cw); align-items: flex-start; margin: calc(var(--ch) / 2) 0; }
+.thumb { display: block; max-height: calc(16 * var(--ch)); max-width: 100%; height: auto; width: auto; border: 1px solid var(--line); border-radius: 0; background: var(--panel); cursor: zoom-in; }
+.thumb:hover, .thumb:focus-visible { border-color: var(--bright); outline: none; }
+.imgmiss { padding-right: var(--cw); }
+.imgtog { color: var(--cyan); }
+.imgview {
+  position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--bg) 97%, transparent); outline: none; cursor: zoom-out; padding: var(--ch) var(--cw);
+}
+.imgview .bar { display: flex; gap: calc(3 * var(--cw)); flex: none; padding-bottom: calc(var(--ch) / 2); color: var(--fg); cursor: default; }
+.imgview .bar a { color: var(--cyan); }
+.imgview img { display: block; min-height: 0; max-width: 100%; max-height: calc(100% - 2 * var(--ch)); object-fit: contain; border: 1px solid var(--line); border-radius: 0; background: var(--panel); }

@@ -7,12 +7,13 @@
 import { html } from './ui.js';
 import { Code, Diff, extOf, parseUnified } from './syntax.js';
 
-export function markdown(src) {
+// `link` (optional): text -> text or parts, applied to plain runs and code spans of a paragraph (never to fences).
+export function markdown(src, link) {
   const out = [];
   const lines = String(src || '').split('\n');
   let para = [];
   const flush = () => {
-    if (para.length) out.push(html`<div>${inline(para.join('\n'))}</div>`);
+    if (para.length) out.push(html`<div>${inline(para.join('\n'), link)}</div>`);
     para = [];
   };
   for (let i = 0; i < lines.length; i++) {
@@ -36,12 +37,13 @@ export function markdown(src) {
 
 const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\[[^\]\n]+\]\((https?:\/\/[^)\s]+)\))/g;
 
-export function inline(text) {
+export function inline(text, link) {
+  const lk = (t) => (link ? link(t) : t);
   const parts = [];
   let last = 0;
   for (const m of text.matchAll(INLINE)) {
-    if (m.index > last) parts.push(text.slice(last, m.index));
-    if (m[1]) parts.push(html`<code>${m[1].slice(1, -1)}</code>`);
+    if (m.index > last) parts.push(lk(text.slice(last, m.index)));
+    if (m[1]) parts.push(html`<code>${lk(m[1].slice(1, -1))}</code>`);
     else if (m[2]) parts.push(html`<b>${m[2].slice(2, -2)}</b>`);
     else if (m[3] && /^https?:\/\//i.test(m[4])) {
       const label = m[3].slice(1, m[3].indexOf(']('));
@@ -49,6 +51,6 @@ export function inline(text) {
     } else parts.push(m[0]);
     last = m.index + m[0].length;
   }
-  if (last < text.length) parts.push(text.slice(last));
+  if (last < text.length) parts.push(lk(text.slice(last)));
   return parts;
 }

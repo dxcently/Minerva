@@ -3,17 +3,18 @@
 // core/state.js Session and holds no session state of its own. Several panes
 // may draw one Session (mirrors share its one stream), so what is tied to the
 // DOM lives in a per-PANE view, never on the Session.
-import { html, K, HUB, hubOff, Rendered, Component, signal, effect, useRef, useLayoutEffect, useEffect, useMemo, useState } from '../core/ui.js';
+import { html, K, HUB, Rendered, Component, signal, effect, useRef, useLayoutEffect, useEffect, useMemo, useState } from '../core/ui.js';
 import { IMAGE_TYPES, MAX_IMAGES, looksImage, readImage, readText, tooBig } from '../core/attach.js';
 import { markdown } from '../core/markdown.js';
 import { resolveIn } from '../core/path.js';
 import { render as rend, renderCall } from '../renderers/index.js';
 import { icon, word, shade, CELLS } from '../core/life.js';
 import { tildify, kfmt, hhmm, stateOf, STATE_CLS, connWord } from '../core/state.js';
-import { mode, hubGet } from '../core/api.js';
-import { list } from '../core/hub.js';
+import { mode, hubGet, hubPost } from '../core/api.js';
+import { list, refresh } from '../core/hub.js';
 import { openMenu, closeMenu, menu, atPointer, under } from '../core/menu.js';
 import { AskPanel, AskMark, Settled, quoted } from './asks.js';
+import { Strip, items as imageItems, linkPaths } from './imgs.js';
 
 const AGENT = icon();
 
@@ -33,16 +34,19 @@ export function Pane({ p, rect, focused, mirror, act }) {
   const banner = s.banner.value;
   // A chat that is not running and can be continued (saved, stopped, exited): no composer, a visible action instead.
   const away = !!banner && (!!banner.resume || !!s.resuming);
+  // A fork from a point that has had no first message: history up to its reply, and a composer that runs that one turn (ForkComposer).
+  const row = list.value.find((r) => r.id === s.sid);
+  const forking = !!row && !!row.pending && s.conn.value === 'kept';
   v.act = act;
   return html`<section class=${'pane frame' + (focused ? ' focus' : '')} style=${style} tabindex="-1"
       data-pane=${p.id} onMouseDown=${() => act.focus(p.id)}>
     <${Title} p=${p} mirror=${mirror} act=${act} />
     <${Glyphs} p=${p} act=${act} />
     <${Transcript} s=${s} v=${v} />
-    ${banner && html`<div class=${'banner' + (banner.err ? ' err' : '')}>${banner.text}</div>`}
+    ${banner && !forking && html`<div class=${'banner' + (banner.err ? ' err' : '')}>${banner.text}</div>`}
     ${act.panelPane.value === p.id && html`<${AskPanel} p=${p} act=${act} />`}
     <${Outbox} p=${p} />
-    ${away ? html`<${Continue} s=${s} p=${p} act=${act} />` : html`<${Composer} s=${s} p=${p} act=${act} />`}
+    ${forking ? html`<${ForkComposer} s=${s} p=${p} act=${act} />` : away ? html`<${Continue} s=${s} p=${p} act=${act} />` : html`<${Composer} s=${s} p=${p} act=${act} />`}
   </section>`;
 }
 
@@ -89,6 +93,90 @@ function Continue({ s, p, act }) {
     <${K} cls="act" off=${busy} title="continue this chat: it may carry on the last turn" on=${() => act.resume(p)}>${busy ? '[ continuing… ]' : '[ continue this chat ]'}</${K}>
     <span class="faint"> read-only until then</span>
     ${other && html`<div class="faint note">from eidolon's own sessions folder · continuing resumes it with your normal config and writes to the same log</div>`}
+  </div>`;
+}
+
+
+// ---------------------------------------------------------------- a fork from a point, before its first message
+// The copy has no door yet (perch pending.rs): its history above ends at the reply it was forked from. The first message is run by
+// eidolon itself (`resume --at`), headless, so this pane shows its work as plain text; when it ends the perch brings the door up and
+// the pane goes live. A failure keeps the fork waiting, with the sentence, and the text stays here to try again.
+const OUT_LINES = 12;
+function ForkComposer({ s, p, act }) {
+  const ta = useRef(null), fileIn = useRef(null);
+  const run = useMemo(() => signal({ state: 'none', out: '', elapsed_ms: 0 }), []);
+  const atts = useMemo(() => signal([]), []);
+  const sending = useMemo(() => signal(false), []); // the POST is in flight: a second send would be a second run
+  useEffect(() => {
+    p.focusComposer = () => ta.current && ta.current.focus();
+    p.prefill = (text) => { const el = ta.current; if (el) { el.value = text + el.value; el.focus(); } };
+    let dead = false, timer = 0;
+    const tick = async () => {
+      const r = await hubGet(`sessions/${encodeURIComponent(s.sid)}/first`, 8000);
+      if (dead) return;
+      if (r.status === 200 && r.data) {
+        run.value = r.data;
+        if (r.data.state === 'done') { s.adopt(); refresh(); return; }
+        // A run found after a restart may have settled the fork: the list says so (the row drops `pending`), and this pane follows it.
+        if (r.data.state === 'failed') refresh();
+        if (r.data.state === 'running') timer = setTimeout(tick, 1000);
+      } else if (r.status === 0) timer = setTimeout(tick, 3000);
+    };
+    p.pollFirst = () => { clearTimeout(timer); tick(); };
+    tick();
+    return () => { dead = true; clearTimeout(timer); p.focusComposer = null; p.pollFirst = null; };
+  }, [p, s]);
+  const working = run.value.state === 'running' || sending.value;
+  const go = async () => {
+    const el = ta.current, imgs = atts.peek();
+    if (working || sending.peek()) return;
+    if (!el.value.trim()) { el.focus(); return; }
+    const big = tooBig(el.value, imgs);
+    if (big) { act.toast(big, true); return; }
+    sending.value = true;
+    let r;
+    try { r = await hubPost(`sessions/${encodeURIComponent(s.sid)}/first`, { text: el.value, images: imgs.map(({ media_type, data }) => ({ media_type, data })) }); }
+    finally { sending.value = false; }
+    if (r.status === 202) { run.value = { ...run.peek(), state: 'running', out: '', elapsed_ms: 0, error: '' }; p.pollFirst(); }
+    else act.toast(r.status === 409 ? 'that fork is already running its first message' : r.status === 0 ? 'the server is not answering' : `could not start it: ${(r.data && r.data.error) || r.status}`, true);
+  };
+  const take = async (files) => {
+    for (const f of files) {
+      try {
+        if (!looksImage(f)) throw new Error(`${f.name || 'that file'} is not an image`);
+        if (atts.peek().length >= MAX_IMAGES) throw new Error(`at most ${MAX_IMAGES} images go with one message`);
+        atts.value = [...atts.peek(), { ...(await readImage(f)), id: ++attSeq }];
+      } catch (err) { act.toast(err.message, true); }
+    }
+    ta.current.focus();
+  };
+  const onKey = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !e.ctrlKey) { e.preventDefault(); go(); }
+    else if (e.key === 'Escape') { e.preventDefault(); ta.current.blur(); ta.current.closest('.pane').focus(); }
+  };
+  const onPaste = (e) => {
+    const fs = [...((e.clipboardData && e.clipboardData.files) || [])].filter(looksImage);
+    if (fs.length) { e.preventDefault(); take(fs); }
+  };
+  const r = run.value, secs = Math.round((r.elapsed_ms || 0) / 1000);
+  const tail = String(r.out || '').split('\n').filter((l) => l.trim()).slice(-OUT_LINES).join('\n');
+  const gate = r.yolo ? 'tool approvals in this turn are answered yes (the chat was in yolo mode)' : 'tool approvals in this turn are declined (the chat was not in yolo mode): it runs with no terminal to ask you in';
+  return html`<div class=${'composer st-' + (working ? 'run' : 'idle') + (working ? ' running' : '')}
+      onDragOver=${(e) => { if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) e.preventDefault(); }}
+      onDrop=${(e) => { if (e.dataTransfer && e.dataTransfer.files.length) { e.preventDefault(); take([...e.dataTransfer.files]); } }}>
+    <div class="ftitle">first message · fork from the reply above</div>
+    ${r.state === 'failed' && html`<div class="cwarn">${r.error || 'the first message did not finish'}</div>`}
+    ${working && html`<div class="hi">working… ${secs}s <span class="faint">the first message of this fork is running; it opens by itself when it ends</span></div>`}
+    ${working && tail && html`<pre class="firstout">${tail}</pre>`}
+    ${atts.value.length > 0 && html`<div class="chips">${atts.value.map((a) => html`<span class="chip" title=${`${a.media_type}, ${kfmt(a.size)} bytes`}><span class="c">[img]</span> ${a.name} <${K}
+        cls="cx" title="remove it" on=${() => { atts.value = atts.peek().filter((x) => x !== a); }}>×</${K}></span>`)}</div>`}
+    <textarea ref=${ta} rows="1" spellcheck="false" aria-label="first message" disabled=${working}
+      placeholder=${'Write the first message of this fork… (⏎ send · ⇧⏎ newline)'}
+      onInput=${(e) => { const el = e.currentTarget; el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px'; }} onKeyDown=${onKey} onPaste=${onPaste} onFocus=${() => act.focus(p.id)}></textarea>
+    <input type="file" ref=${fileIn} multiple hidden aria-hidden="true" tabindex="-1" accept=${IMAGE_TYPES.join(',')} onChange=${(e) => take([...e.currentTarget.files])} />
+    <div class="faint">${gate}</div>
+    <div class="fbar fit0"><span class="cmenus"><${K} cls="cm" off=${working} title="an image goes with the message" on=${() => { fileIn.current.value = ''; fileIn.current.click(); }}>+ image</${K}></span><span class="grow"></span>
+      <span class="verbs"><${K} off=${working} on=${go} cls="verb"><span class="kh">⏎ </span>send</${K}></span></div>
   </div>`;
 }
 
@@ -216,11 +304,20 @@ function rowMenu(e, r, v, extra = []) {
   e.preventDefault();
   openMenu([
     ...extra,
-    { label: 'fork from here', off: hubOff() },
     { label: sel ? 'copy selection' : 'copy', on: () => copy(sel || el.innerText.trim(), v.act) },
     { label: 'copy as markdown', on: () => copy(rowSource(r), v.act) },
     { label: 'quote into composer', on: () => v.p.prefill(quoted(sel || rowSource(r)) + '\n\n') },
   ], atPointer(e), { title: 'row' });
+}
+
+// `fork from here` on a reply: a new chat that keeps the history up to it (its first message is the turn that makes the branch stay).
+// Not on the latest reply (that is `fork (latest)`), not on a reply cut short, not in a fork still waiting for its first message.
+// A user's own row has none: after it the model would first have to answer it, a turn nobody asked for.
+function forkItems(r, s, v) {
+  if (mode() !== 'perch' || r.record == null || r.cut || r.record === s.lastReply) return [];
+  const row = list.peek().find((x) => x.id === s.sid);
+  if (row && row.pending) return [];
+  return [{ label: 'fork from here', hint: 'a new chat, history up to this reply', on: () => v.act.forkFrom(s.sid, r.record, v.act.name(s)) }];
 }
 
 function RowBody({ r, s, v }) {
@@ -229,14 +326,14 @@ function RowBody({ r, s, v }) {
     case 'day': return html`<div class="row day" role="separator">${r.text}</div>`;
     case 'you':
       return html`<div class="row you" onContextMenu=${cm}><${Who} r=${r} /><div class="body">${r.text}</div>
-        ${r.images > 0 && html`<div class="body faint">[${r.images} image${r.images > 1 ? 's' : ''}]</div>`}</div>`;
+        ${r.images > 0 && html`<${Strip} sid=${s.sid} list=${imageItems(r)} />`}</div>`;
     case 'bot': {
       // A reply an `error` cut short is filled in place by its assistant-message.
       const full = r.full && r.full.value, x = full || r, cut = full ? null : r.cut;
-      return html`<div class="row" onContextMenu=${cm}><${Who} r=${r} />
+      return html`<div class="row" onContextMenu=${(e) => rowMenu(e, r, v, forkItems(r, s, v))}><${Who} r=${r} />
         ${x.thinking && html`<${Fold} cls="think" label=${`thinking (${x.thinking.split('\n').length} lines)`}>${x.thinking}</${Fold}>`}
         ${x.redacted > 0 && html`<div class="think">(${x.redacted} redacted thinking block${x.redacted > 1 ? 's' : ''})</div>`}
-        ${x.text && html`<div class="body">${cut ? x.text : markdown(x.text)}</div>`}
+        ${x.text && html`<div class="body">${cut ? x.text : markdown(x.text, (t) => linkPaths(t, s.sid, s.hello.value && s.hello.value.cwd))}</div>`}
         ${cut && html`<div class="sys y">(${cut})</div>`}</div>`;
     }
     case 'sys': return html`<div class=${'row sys ' + (r.cls || '')} onContextMenu=${cm}>${r.text}</div>`;
@@ -298,6 +395,7 @@ function ToolRow({ c, s, v, cm }) {
     </div>
     ${preview && html`<${Rendered} value=${preview} />`}
     ${shown && body && html`<${Rendered} value=${body} />`}
+    ${c.imgs.value.length > 0 && html`<${Strip} sid=${s.sid} list=${c.imgs.value} fold=${true} />`}
     ${a && html`<${AskMark} a=${a} s=${s} act=${v.act} />`}
     ${settled && html`<${Settled} a=${settled} />`}
   </div>`;

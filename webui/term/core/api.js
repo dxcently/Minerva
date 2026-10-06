@@ -101,7 +101,7 @@ export const rows = () => hubRows;
 // (a door can take ~20 s to come up).
 export const POLL_TIMEOUT_MS = 5000;
 async function hubCall(method, path, body, timeout, raw = false) {
-  if (typeof path !== 'string' || !/^(sessions|tree\?|projects|dirs|models)/.test(path)) throw new Error('hub path must start with sessions, tree?, projects, dirs or models');
+  if (typeof path !== 'string' || !/^(sessions|tree\?|projects|dirs|models|trash)/.test(path)) throw new Error('hub path must start with sessions, tree?, projects, dirs, models or trash');
   const init = { method, cache: 'no-store', headers: auth() };
   if (body !== undefined) {
     init.headers['content-type'] = 'application/json';
@@ -127,7 +127,7 @@ export const hubGet = (path, timeout) => hubCall('GET', path, undefined, timeout
 // The same, answered as the text the perch sent (a 200 only: any other status comes back parsed, as an error body).
 export const hubText = (path, timeout) => hubCall('GET', path, undefined, timeout, true);
 export const hubPost = (path, body) => hubCall('POST', path, body);
-export const hubDelete = (path) => hubCall('DELETE', path);
+export const hubDelete = (path, body) => hubCall('DELETE', path, body);
 // GET /hub/tree?session=<id>&path=<rel> (hub.md section 7): the query is built
 // from parts with encodeURIComponent, never by joining a raw path.
 export const hubTree = (sid, rel) => hubGet(`tree?session=${encodeURIComponent(sid)}&path=${encodeURIComponent(rel || '')}`);

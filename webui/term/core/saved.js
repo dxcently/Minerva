@@ -1,4 +1,6 @@
-// A saved chat, drawn read-only. The perch runs `eidolon log --json` (GET /hub/sessions/<id>/log) and
+// A saved chat, drawn read-only. The perch runs `eidolon log --json` (GET /hub/sessions/<id>/transcript: the
+// `log` route's lines with every image's bytes emptied, so pictures never count against the size cap; they load
+// one by one from GET /hub/sessions/<id>/image/<record>/<n>, panes/imgs.js) and
 // sends eidolon's own lines back: one record per line, `{id, parent, ts_ms, kind}`, where `kind` is a
 // variant name (a bare string) or a one-key object (`{UserMessage: {role, content: [...]}}`). Nothing here
 // decodes the binary log, and nothing starts a door: this only reads.
@@ -29,8 +31,13 @@ export function framesOf(rec) {
   switch (name) {
     case 'SessionStart': return [f('x-line', { text: `started · ${v && v.model || '?'} · ${tildify(v && v.cwd)}`, cls: 'faint' })];
     case 'UserMessage': {
-      const text = textOf(v), images = blocks(v).filter((b) => b && b.type === 'image').length;
-      return text || images ? [f('user-message', { text, images })] : [];
+      const text = textOf(v), pics = blocks(v).filter((b) => b && b.type === 'image'), images = pics.length;
+      const names = pics.map((b) => (typeof b.alt === 'string' ? b.alt : null));
+      // A user message that answers tool calls and carries images is where a tool's images ride: they belong
+      // under that call's row (the same rule perch/src/images.rs lists them by).
+      const answered = blocks(v).filter((b) => b && b.type === 'tool_result').map((b) => b.tool_use_id).pop();
+      if (images && answered) return [f('tool-images', { id: answered, images, names }), ...(text ? [f('user-message', { text, images: 0 })] : [])];
+      return text || images ? [f('user-message', { text, images, names })] : [];
     }
     case 'AssistantMessage': {
       const out = [f('assistant-message', {
@@ -90,7 +97,7 @@ export function draw(s, text) {
 
 // Fetch and draw. Resolves to '' when drawn, null when it was overtaken, else the reason in a sentence. Never resumes anything.
 export async function load(s) {
-  const r = await hubText(`sessions/${encodeURIComponent(s.sid)}/log`, 30000);
+  const r = await hubText(`sessions/${encodeURIComponent(s.sid)}/transcript`, 30000);
   // A resume (or a close) began while this loaded: draw nothing over it.
   if (s.closed || s.conn.peek() !== 'kept') return null;
   if (r.status === 200) {

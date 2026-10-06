@@ -6,6 +6,8 @@
 import { html, K, signal, useMemo, useEffect } from '../core/ui.js';
 import { tildify, kfmt } from '../core/state.js';
 import { mode, hubTree } from '../core/api.js';
+import { list } from '../core/hub.js';
+import { viewFile, isImageName } from './imgs.js';
 
 function build(paths) {
   const root = { kids: new Map() };
@@ -84,6 +86,7 @@ export function FileTree({ paths, q }) {
 const cache = new Map();
 const open = new Set();            // `${sid}\0${path}` of unfolded directories
 const ver = signal(0);
+const lastConn = new Map();     // sid -> the connection word the folder was last asked under
 const key = (sid, path) => sid + '\0' + path;
 const bump = () => { ver.value++; };
 
@@ -92,7 +95,9 @@ const bump = () => { ver.value++; };
 function fail(status, data) {
   if (status === 0) return { err: 'the server is not answering', retry: true };
   if (status === 401) return { err: 'the server refused the login for this page (it restarted?). Run `hoot` again.' };
-  if (status === 404) return { err: 'not found' };
+  const said = data && typeof data.error === 'string' ? data.error : null;
+  if (status === 404) return { err: said || 'not found' };
+  if (status === 409 && said) return { err: said };
   if (status === 409) return { err: `the folder lists only while the session runs (${data && typeof data.state === 'string' ? data.state : 'not running'})` };
   return { err: 'busy, retry', retry: true };
 }
@@ -154,10 +159,15 @@ function folderRows(sid, text) {
   return out;
 }
 
-function Folder({ sid, q }) {
+function Folder({ sid, q, conn }) {
   ver.value; // redraw when a listing lands
   const text = q.value.trim().toLowerCase();
-  useEffect(() => { if (mode() === 'perch' && sid) load(sid, ''); }, [sid]);
+  // A chat whose connection changed since the folder was last drawn (saved <-> resumed) asks afresh; otherwise the cache stands.
+  useEffect(() => {
+    if (mode() !== 'perch' || !sid) return;
+    if (lastConn.has(sid) && lastConn.get(sid) !== conn) drop(sid); else load(sid, '');
+    lastConn.set(sid, conn);
+  }, [sid, conn]);
   if (mode() !== 'perch') return html`<div class="faint">the folder list needs the Minerva server (type hoot)</div>`;
   if (!sid) return null;
   const toggle = (p) => {
@@ -173,6 +183,7 @@ function Folder({ sid, q }) {
         ? html`<${K} on=${() => { cache.delete(key(sid, r.retry)); load(sid, r.retry); }}>${r.text}</${K}>` : r.text}</div>`;
       const { en, p, depth } = r;
       if (r.dir) return html`<div class="fl dir" style=${pad(depth)} title=${p}><${K} on=${() => toggle(p)}>${r.op ? '▾' : '▸'} ${en.name}/</${K}></div>`;
+      if (en.kind === 'file' && isImageName(en.name)) return html`<div class="fl" style=${pad(depth)} title=${'view ' + p}><${K} on=${() => viewFile(sid, p)}>${'◫ ' + en.name}</${K}>${typeof en.size === 'number' ? html` <span class="faint">${kfmt(en.size)}B</span>` : null}</div>`;
       if (en.kind === 'file') return html`<div class="fl" style=${pad(depth)} title=${p}><span>${'  ' + en.name}</span>${typeof en.size === 'number' ? html` <span class="faint">${kfmt(en.size)}B</span>` : null}</div>`;
       if (en.kind === 'link') return html`<div class="fl faint" style=${pad(depth)} title=${p}>${'  ' + en.name + ' ->'}</div>`;
       return html`<div class="fl faint" style=${pad(depth)} title=${p}>${'  ' + en.name}</div>`;
@@ -182,12 +193,17 @@ function Folder({ sid, q }) {
 
 export function FilesTab({ s }) {
   const q = useMemo(() => signal(''), []);
-  const hl = s.hello.value, cwd = hl && hl.cwd ? String(hl.cwd).replace(/\/$/, '') + '/' : null;
+  const hl = s.hello.value, conn = s.conn.value;
+  // A saved chat has no hello: its folder is the one the perch's list says (the same one the tree is served from).
+  const row = list.value.find((r) => r.id === s.sid);
+  const where = hl && hl.cwd ? hl.cwd : conn === 'kept' && row && row.cwd ? row.cwd : null;
+  const cwd = where ? String(where).replace(/\/$/, '') + '/' : null;
   const paths = useMemo(() => [...s.touched.value.keys()].map((p) => (cwd && p.startsWith(cwd) ? p.slice(cwd.length) : p)), [s.touched.value, cwd]);
-  return html`<div class="faint" title=${hl ? hl.cwd : ''}>${hl ? tildify(hl.cwd) : ''}</div>
+  return html`<div class="faint" title=${where || ''}>${where ? tildify(where) : ''}</div>
+    ${conn === 'kept' && mode() === 'perch' ? html`<div class="faint">read-only · chat not running</div>` : null}
     <div class="files"><${Filter} q=${q} /></div>
     <div class="hdr">folder${mode() === 'perch' ? html` <${K} cls="faint" on=${() => drop(s.sid)}>refresh</${K}>` : null}</div>
-    <${Folder} sid=${s.sid} q=${q} />
+    <${Folder} sid=${s.sid} q=${q} conn=${conn} />
     <div class="hdr">touched</div>
     ${paths.length ? html`<${FileTree} paths=${paths} q=${q} />` : html`<div class="faint">no edit or write calls yet</div>`}`;
 }

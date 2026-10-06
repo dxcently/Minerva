@@ -3,9 +3,11 @@
 // is `C:\Users\<you>`). A breadcrumb, a path bar that takes a pasted `C:\...` or WSL path, clickable folder rows,
 // `[ new folder ]` (one inline name field, `POST /hub/dirs`) and `[ use this folder ]`. With `naming`, using a folder
 // goes on to one more line: the project's name, prefilled with the folder's.
+// With `parent` too (`make it a project…`), the folder picked is where a NEW folder goes, not the project itself: the name line is that
+// folder's name (prefilled with `prefill`), it says where the folder will end up, and `doneLabel` words the action.
 //
 // This file holds no policy: the server decides what may be listed or made, and every refusal is said in a sentence.
-// `openPicker({ title, naming, onDone })`: `onDone({ path, name })` resolves to '' (done: the panel closes) or to a
+// `openPicker({ title, naming, parent?, prefill?, doneLabel?, onDone })`: `onDone({ path, name })` resolves to '' (done: the panel closes) or to a
 // sentence (shown; the panel stays).
 import { html, K, signal, useRef, useLayoutEffect } from '../core/ui.js';
 import { hubGet, hubPost } from '../core/api.js';
@@ -92,7 +94,7 @@ export function Picker() {
     if (!c || atRoots) return;
     if (p.naming) {
       chosen.value = c.path;
-      name.value = c.crumbs.length ? c.crumbs[c.crumbs.length - 1].name.replace(/^.*[\\/]/, '') || c.label : c.label;
+      name.value = p.parent ? p.prefill || '' : c.crumbs.length ? c.crumbs[c.crumbs.length - 1].name.replace(/^.*[\\/]/, '') || c.label : c.label;
       stage.value = 'name';
     } else finish(c.path, '');
   };
@@ -102,12 +104,13 @@ export function Picker() {
     return html`<div class="pane frame picker" style="inset:0" ref=${ref} onKeyDown=${esc}>
       <div class="ftitle">${p.title || 'new project'}</div>
       <div class="scroll"><div class="pk">
-        <div class="faint">folder</div>
+        <div class="faint">${p.parent ? 'its folder goes in' : 'folder'}</div>
         <div>${chosen.value}</div>
-        <div class="row namef"><span class="faint">name </span><input type="text" spellcheck="false" autocomplete="off" aria-label="project name" value=${name.value}
+        <div class="row namef"><span class="faint">${p.parent ? 'folder name ' : 'name '}</span><input type="text" spellcheck="false" autocomplete="off" aria-label=${p.parent ? 'folder and project name' : 'project name'} value=${name.value}
           onInput=${(e) => { name.value = e.currentTarget.value; }} onKeyDown=${enter(() => finish(chosen.value, name.peek().trim()))} /></div>
+        ${p.parent && html`<div class="faint">it will be ${chosen.value.replace(/\/$/, '')}/${name.value.trim() || '…'}, and a project of that name</div>`}
         <div class="acts">
-          <${K} cls="act" off=${b || !name.value.trim()} on=${() => finish(chosen.value, name.peek().trim())}>[ create project ]</${K}>
+          <${K} cls="act" off=${b || !name.value.trim()} on=${() => finish(chosen.value, name.peek().trim())}>${p.doneLabel || '[ create project ]'}</${K}>
           <${K} cls="act" on=${() => { stage.value = 'pick'; msg.value = ''; }}>[ back ]</${K}>
           <${K} cls="act" on=${closePicker}>[ cancel ]</${K}>
         </div>
@@ -133,7 +136,7 @@ export function Picker() {
         onInput=${(e) => { folder.value = e.currentTarget.value; }} onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); create(); } else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); making.value = false; } }} />
         <${K} cls="act" off=${b || !folder.value.trim()} on=${create}>[ create ]</${K}> <${K} cls="act" on=${() => { making.value = false; msg.value = ''; }}>[ cancel ]</${K}></div>`}
       <div class="acts">
-        <${K} cls="act" off=${b || !c || atRoots} title=${atRoots ? 'open a folder first' : 'work in this folder'} on=${use}>[ use this folder ]</${K}>
+        <${K} cls="act" off=${b || !c || atRoots} title=${atRoots ? 'open a folder first' : p.parent ? 'put the project inside this folder' : 'work in this folder'} on=${use}>[ use this folder ]</${K}>
         <${K} cls="act" off=${b || !c || atRoots} on=${() => { making.value = true; msg.value = ''; }}>[ new folder ]</${K}>
         <${K} cls="act" on=${closePicker}>[ cancel ]</${K}>
       </div>

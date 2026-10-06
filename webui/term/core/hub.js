@@ -8,6 +8,8 @@
 import { signal } from './ui.js';
 import { hubGet, rows, mode, POLL_TIMEOUT_MS } from './api.js';
 
+export const trash = signal([]); // chats deleted into the perch's trash: [{ id, title, mtime }], newest first
+
 export const POLL_MS = 5000;
 export const list = signal([]);   // rows as the perch sent them
 export const stale = signal(false); // the last poll failed; `list` is the last good one
@@ -23,6 +25,8 @@ export function refresh() {
     const { status, data } = await hubGet('sessions', POLL_TIMEOUT_MS);
     if (status === 200 && Array.isArray(data)) { list.value = data; stale.value = false; }
     else stale.value = true;
+    const t = await hubGet('trash', POLL_TIMEOUT_MS);
+    if (t.status === 200 && Array.isArray(t.data)) trash.value = t.data;
   })().finally(() => { busy = null; });
   return busy;
 }
@@ -40,12 +44,17 @@ export function startPolling() {
 
 // ---------------------------------------------------------------- views of the list
 export const live = (rs) => rs.filter((r) => r.state === 'live');
-// Saved chats of this app, and doors of ours that exited, newest first. The old shared ones (`origin: "other"`) are `older`.
-export const keptRows = (rs) => rs.filter((r) => (r.state === 'kept' && !r.origin) || r.state === 'dead')
+// `other`: eidolon's own shared sessions folder (read-only), plus the chats of this app that were archived by hand or sat idle
+// for 7 days (the perch decides both: `archived`, `auto_other`). A live chat is never in it.
+export const isOther = (r) => r.state !== 'live' && (r.origin === 'other' || !!r.archived || !!r.auto_other);
+// `archived` (by hand), `idle` (aged out), or '' (eidolon's own folder, which has its own words).
+export const otherTag = (r) => (r.origin ? '' : r.archived ? 'archived' : r.auto_other ? 'idle' : '');
+// Saved chats of this app, and doors of ours that exited, newest first, not in `other`.
+export const keptRows = (rs) => rs.filter((r) => ((r.state === 'kept' && !r.origin) || r.state === 'dead') && !isOther(r))
   .sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
 export const elsewhere = (rs) => rs.filter((r) => r.state === 'live-elsewhere');
-// eidolon's own sessions folder: read-only chats, listed only under the collapsed `older chats` group, newest first.
-export const older = (rs) => rs.filter((r) => r.state === 'kept' && r.origin === 'other').sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+// The `other` group, newest first.
+export const older = (rs) => rs.filter((r) => (r.state === 'kept' || r.state === 'dead') && isOther(r)).sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
 
 // 5m, 3h, 2d from a unix mtime in seconds.
 export function age(mtime, now = Date.now() / 1000) {
@@ -57,3 +66,7 @@ export function age(mtime, now = Date.now() / 1000) {
   return Math.floor(s / 86400) + 'd';
 }
 export const label = (r) => r.title || r.id;
+
+// A title as a folder name, the way the perch makes one (names.rs `slug`): lowercase letters and digits, runs of anything else a single
+// `-`, at most 48 characters; '' when nothing is left.
+export const slugOf = (title) => String(title || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+/, '').slice(0, 48).replace(/-+$/, '');

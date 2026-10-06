@@ -1,12 +1,13 @@
-// Projects: a folder with a name, kept by the perch (GET/POST /hub/projects, DELETE /hub/projects/<n>).
+// Projects: a folder with a name, kept by the perch (GET/POST /hub/projects, DELETE /hub/projects {path}).
 // A chat belongs to a project when its folder is the project's or inside it (the deepest project wins).
-// A folderless chat lives in a scratch folder whose name is a time stamp: that name is never shown.
+// A folderless chat (the inbox) lives in `<home>/scratch/<name>`: a three-word birth name, renamed after its title once it has one.
+// That folder is the chat's own, never a project's, and its name is not shown as a project's.
 import { signal } from './ui.js';
 import { hubGet, hubPost, hubDelete, mode } from './api.js';
 
-export const projects = signal([]); // [{ name, path, created }], in the order the perch holds them (the index is the id)
+export const projects = signal([]); // [{ name, path, created }], in the order the perch holds them (a project is named by its path)
 
-const SCRATCH = /\/scratch\/\d{8}-\d{6}(-\d+)?$/;
+const SCRATCH = /\/scratch\/[^/]+\/?$/;
 export const isScratch = (cwd) => SCRATCH.test(String(cwd || ''));
 
 export async function loadProjects() {
@@ -40,11 +41,21 @@ export async function addProject(path, name) {
   return { ok: false, why };
 }
 
-// Forget a project (its folder and files stay). `p` is an entry of `projects`.
+// Give a project a new label (its folder is untouched). Resolves { ok } or { ok: false, why }.
+export async function renameProject(p, name) {
+  const r = await hubPost('projects/rename', { path: p.path, name });
+  if (r.status === 200) { await loadProjects(); return { ok: true }; }
+  const why = r.status === 400 ? (r.data && r.data.error) || 'that name will not do'
+    : r.status === 404 ? 'that project is gone'
+    : r.status === 0 ? 'the server is not answering'
+    : (r.data && r.data.error) || `could not rename it (${r.status})`;
+  return { ok: false, why };
+}
+
+// Forget a project (its folder and files stay). `p` is an entry of `projects`; the perch removes it by its path, so a
+// stale list in another tab cannot remove a different one.
 export async function forgetProject(p) {
-  const n = projects.peek().findIndex((x) => x.path === p.path);
-  if (n < 0) return false;
-  const r = await hubDelete(`projects/${n}`);
+  const r = await hubDelete('projects', { path: p.path });
   await loadProjects();
   return r.status === 204;
 }
