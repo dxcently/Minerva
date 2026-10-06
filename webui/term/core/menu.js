@@ -98,6 +98,7 @@ function Menu({ items, at, title, leave }) {
   return html`<div class="pop frame" role="menu" tabindex="-1" ref=${ref} onKeyDown=${onKey}
       onContextMenu=${(e) => e.preventDefault()}>
     ${title && html`<div class="ftitle">${title}</div>`}
+    <div class="mlist">
     ${items.map((it, i) => (it.sep ? html`<div class="msep" role="separator"></div>`
       : html`<div class=${'mi' + (i === sel ? ' sel' : '') + (it.off ? ' dis' : '')} role="menuitem"
           aria-disabled=${it.off ? 'true' : null} title=${it.off || it.hint || ''}
@@ -106,6 +107,7 @@ function Menu({ items, at, title, leave }) {
         <span class="tick">${it.tick ? '✓' : ' '}</span><span class="ml">${it.label}</span>
         <span class="mh">${it.off || it.hint || ''}</span><span class="arr">${it.sub ? '▸' : ' '}</span>
       </div>`))}
+    </div>
     ${sub && html`<${Menu} key=${sub.i} items=${items[sub.i].sub} at=${sub.at} leave=${back} />`}
   </div>`;
 }

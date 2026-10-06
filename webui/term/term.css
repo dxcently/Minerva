@@ -433,8 +433,10 @@ pre, .pre {
 .keyref {
   left: 50%; top: 50%; transform: translate(-50%, -50%);
   width: min(calc(100vw - 2 * var(--cw)), calc(112 * var(--cw))); max-height: calc(100vh - 4 * var(--ch));
-  overflow-y: auto; white-space: normal; padding: var(--ch) var(--cw) calc(var(--ch) * 0.5);
+  display: flex; flex-direction: column; white-space: normal; padding: var(--ch) var(--cw) calc(var(--ch) * 0.5);
 }
+/* scrolled inside, so the frame's own title on the top border is never clipped */
+.keyref .kgroups { overflow-y: auto; min-height: 0; }
 .keyref .kgroups { display: grid; grid-template-columns: repeat(auto-fill, minmax(calc(44 * var(--cw)), 1fr)); gap: var(--ch) calc(2 * var(--cw)); }
 .keyref .kgh { color: var(--yellow); font-weight: bold; }
 .keyref .kr { display: flex; gap: var(--cw); white-space: nowrap; }
@@ -493,7 +495,8 @@ pre, .pre {
 /* ---- composer: the `other…` model line, and long menus (the model list is ~30 rows) ---- */
 .composer .cother { padding: 0 var(--cw); color: var(--fg); }
 .composer .cother input { background: var(--bg); color: var(--brightest); border: 0; border-bottom: 1px solid var(--faint); font: inherit; width: calc(34 * var(--cw)); outline: none; }
-.pop { max-height: 70vh; overflow-y: auto; }
+/* The scroll lives on the inner list: a scrolling .pop would clip its own title, which sits across the top border. */
+.pop .mlist { max-height: 70vh; overflow-y: auto; overflow-x: hidden; }
 
 /* ---- the chat list: search, groups, rows (2026-10-06 project model) ---- */
 .chats .sq { display: flex; align-items: center; gap: var(--cw); margin-bottom: var(--ch); }
@@ -518,6 +521,11 @@ pre, .pre {
 
 /* ---- the folder picker, over the tiles ---- */
 .picker { position: absolute; z-index: 30; background: var(--bg); }
+/* the strip above the top border, where the covered pane's own title would show through */
+.picker::before {
+  content: ""; position: absolute; left: -1px; right: -1px; top: calc(var(--ch) / -2 - 1px); height: calc(var(--ch) / 2);
+  background: var(--bg);
+}
 .picker .pk { padding: var(--ch) var(--cw); white-space: pre-wrap; }
 .picker .row { display: flex; align-items: center; gap: var(--cw); margin-bottom: var(--ch); }
 .picker .crumbs { margin-bottom: var(--ch); }
