@@ -19,7 +19,9 @@
 #   MINERVA_UI_DIR      default <repo>/webui/term, found from this script's path
 #   MINERVA_HOME        the Minerva home, default $HOME/Minerva: sessions/, scratch/, projects.json and
 #                       minerva.toml created when missing; the perch regenerates config.toml at every start
-#   Roots a chat may work in: $HOME, the Minerva home and the Windows profile folder (USERPROFILE).
+#   MINERVA_SETUP_BIN   default $HOME/setup-target/release/minerva-setup (the wizard; see setup/README.md)
+#   Roots a chat may work in: the `roots` that `minerva setup` saved in <home>/minerva.toml; without them $HOME,
+#   the Minerva home and the Windows profile folder (USERPROFILE).
 
 set -euo pipefail
 umask 077
@@ -34,7 +36,7 @@ for a in "$@"; do
     --no-browser) browser=0; want_code=0 ;;
     --status) mode=status ;;
     --stop) mode=stop ;;
-    -h|--help) sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "perch-open: unknown argument: $a (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -45,6 +47,7 @@ PORT=${MINERVA_PERCH_PORT:-47820}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 UI=${MINERVA_UI_DIR:-$here/../webui/term}
 MHOME=${MINERVA_HOME:-$HOME/Minerva}
+SETUP_BIN=${MINERVA_SETUP_BIN:-$HOME/setup-target/release/minerva-setup}
 
 case "$PORT" in ''|*[!0-9]*) echo "perch-open: MINERVA_PERCH_PORT must be a number" >&2; exit 1 ;; esac
 
@@ -169,14 +172,30 @@ else
   # folder is allowed); --home adds the Minerva home as one more root. The profile folder is asked of
   # cmd.exe (run from /mnt/c, so it does not complain about a UNC working directory) and mapped by
   # wslpath, so a renamed account or a custom automount root still resolves; without one, no extra root.
-  roots=(--root "$HOME")
-  winprofile=$(cd /mnt/c 2>/dev/null && cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r\n' || true)
-  winroot=
-  case "$winprofile" in ''|'%USERPROFILE%') ;; *) winroot=$(wslpath -u "$winprofile" 2>/dev/null || true) ;; esac
-  if [ -n "$winroot" ] && [ -d "$winroot" ]; then
-    roots+=(--root "$winroot")
-  else
-    echo "perch-open: no Windows profile folder found; pasted C:\... folders will be refused" >&2
+  #
+  # Once `minerva setup` has run, its choice wins: `roots` in <home>/minerva.toml, read by
+  # `minerva-setup --print-roots` (one existing folder per line; no TOML parsing in bash). Without the file,
+  # without the built wizard or with an empty list, the defaults above apply.
+  roots=()
+  if [ -f "$MHOME/minerva.toml" ]; then
+    if [ -x "$SETUP_BIN" ]; then
+      while IFS= read -r line; do
+        case "$line" in /*) roots+=(--root "$line") ;; esac
+      done < <(MINERVA_HOME="$MHOME" "$SETUP_BIN" --print-roots || echo "perch-open: could not read the roots in $MHOME/minerva.toml; using the defaults" >&2)
+    else
+      echo "perch-open: $SETUP_BIN is not built, so the roots in minerva.toml are ignored (cd setup && CARGO_TARGET_DIR=\$HOME/setup-target cargo build --release)" >&2
+    fi
+  fi
+  if [ "${#roots[@]}" = 0 ]; then
+    roots=(--root "$HOME")
+    winprofile=$(cd /mnt/c 2>/dev/null && cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r\n' || true)
+    winroot=
+    case "$winprofile" in ''|'%USERPROFILE%') ;; *) winroot=$(wslpath -u "$winprofile" 2>/dev/null || true) ;; esac
+    if [ -n "$winroot" ] && [ -d "$winroot" ]; then
+      roots+=(--root "$winroot")
+    else
+      echo "perch-open: no Windows profile folder found; pasted C:\... folders will be refused" >&2
+    fi
   fi
   setsid nohup "$BIN" --bind "127.0.0.1:$PORT" --ui-dir "$UI" "${roots[@]}" --home "$MHOME" \
     >"$OUTF" 2>"$LOGF" </dev/null &

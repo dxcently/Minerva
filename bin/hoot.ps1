@@ -10,7 +10,9 @@
 # the browser, already signed in (a 30 s single-use link; no password, no
 # token in the URL). It does not start llama-server unless you ask (hoot up).
 #
-#   hoot                                open Minerva in the browser (same as: hoot web)
+#   hoot                                open Minerva in the browser (same as: hoot web);
+#                                       the very first time, the setup wizard runs first
+#   hoot init                           the setup wizard (home, default model, project roots); run it again any time
 #   hoot web [-NoOpen]                  the same; -NoOpen prints the one-time link instead
 #   hoot status web                     is the Minerva server up, and its sessions
 #   hoot stop web                       stop the Minerva server (chats are kept)
@@ -142,7 +144,7 @@ function ConvertTo-WslPath($p) {
 # Passed through WSLENV, so values are never pasted into a command line. They arrive unchanged, so
 # they must already be WSL paths (/home/you/Minerva), not Windows ones.
 function Set-WslEnv {
-    $names = @('MINERVA_PERCH_PORT', 'MINERVA_HOME', 'MINERVA_PERCH_BIN', 'MINERVA_UI_DIR') | Where-Object { Test-Path "env:$_" }
+    $names = @('MINERVA_PERCH_PORT', 'MINERVA_HOME', 'MINERVA_PERCH_BIN', 'MINERVA_UI_DIR', 'MINERVA_SETUP_BIN') | Where-Object { Test-Path "env:$_" }
     if ($names) {
         $have = @($env:WSLENV -split ':' | Where-Object { $_ })
         # Compared by name with any /flags stripped: `MINERVA_HOME/p` already lists MINERVA_HOME.
@@ -159,8 +161,33 @@ function Invoke-PerchOpen([string]$flag) {
     return [pscustomobject]@{ Code = $LASTEXITCODE; Lines = @($out | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) }
 }
 
+# Has `minerva setup` been run? It saves <home>/minerva.toml; the home is MINERVA_HOME or ~/Minerva in WSL.
+function Test-Setup {
+    Set-WslEnv
+    & wsl.exe -e bash -lc 'test -f "${MINERVA_HOME:-$HOME/Minerva}/minerva.toml"'
+    return ($LASTEXITCODE -eq 0)
+}
+
+# The setup wizard (setup/ in the repo, built in WSL), run on the console: NOT output-captured, because
+# the prompts are drawn and answered through it. bin/minerva-setup.sh says how to build it when missing
+# (exit 3). A first-run call ($Strict false) goes on with the defaults then; `hoot init` does not.
+function Invoke-Wizard([bool]$Strict) {
+    Set-WslEnv
+    $script = (ConvertTo-WslPath $Root) + '/bin/minerva-setup.sh'
+    & wsl.exe -e bash -lc "bash '$script'"
+    $code = $LASTEXITCODE
+    if ($code -eq 0) { return }
+    if ($code -eq 3 -and -not $Strict) { Warn 'the setup wizard is not built; going on with the defaults (hoot init once it is)'; return }
+    if ($code -eq 130) { Die 'setup cancelled; run hoot init when you are ready' }
+    Die "the setup wizard did not finish (exit $code; the message above says why)"
+}
+
 # Starts or reuses the server, gets a one-time link, and opens it. Returns nothing.
 function Open-Web {
+    if (-not (Test-Setup)) {
+        Say 'first run: a few questions first (hoot init asks them again any time)'
+        Invoke-Wizard $false
+    }
     Say 'starting Minerva'
     $r = Invoke-PerchOpen '--code'
     if ($r.Code -ne 0) { Die 'the Minerva server did not start (the message above says why)' }
@@ -182,6 +209,11 @@ switch ($Command.ToLower()) {
     { $_ -in '', 'web', 'webui' } {
         # 'webui' is the old name: it used to say "moved"; it now opens Minerva too.
         Open-Web
+    }
+
+    'init' {
+        # Not 'setup': that one is llama's (it fetches the Windows build).
+        Invoke-Wizard $true
     }
 
     'serve' {
@@ -331,8 +363,10 @@ switch ($Command.ToLower()) {
     default {
         Banner
         Box 'commands' @(
-            '(none) | web          open Minerva in the browser, signed in'
-            'stop web | status web stop / check the Minerva server'
+            'web                   open Minerva (same as bare hoot)'
+            'init                  first-run wizard: home, model, roots'
+            'stop web              stop the Minerva server (chats are kept)'
+            'status web            is the Minerva server up, and its chats'
             'serve                 start the llama.cpp router (foreground)'
             'up                    start the router in the background'
             'stop                  stop the router'

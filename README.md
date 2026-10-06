@@ -4,10 +4,10 @@ A club AI workstation: one agent core does the work, a terminal-style web page
 fronts it, and the brain is either an Ollama Pro key or models on your own GPU.
 Nothing leaves the machine unless a cloud provider is deliberately logged in.
 
-**New here? Start with [docs/Getting-Started.md](docs/Getting-Started.md)** — Windows
+**New here? Start with [docs/Getting-Started.md](docs/Getting-Started.md)** â€” Windows
 to a running agent, plus a free coding helper on the same Ollama plan.
 
-**Minerva** is the product. **`hoot`** — `bin/hoot.ps1` — is the Windows
+**Minerva** is the product. **`hoot`** â€” `bin/hoot.ps1` â€” is the Windows
 launcher for its model server, and it keeps that name and filename so existing
 configs and provider ids (`providers/hoot.rn`) go on working.
 
@@ -15,17 +15,21 @@ configs and provider ids (`providers/hoot.rn`) go on working.
 
 | piece | what it is | where |
 |---|---|---|
-| **webui/term** | the face — a terminal-style web UI, served by `eidolon web` | `webui/term/`, WSL |
+| **webui/term** | the face â€” a terminal-style web UI, served by `eidolon web` | `webui/term/`, WSL |
 | **eidolon** | the agent core: a Rust coding-agent harness (vendored, with `harnox/`) | `eidolon/`, WSL |
 | **jev** | the chooser: one-pass `choose`, NLI `entail`, automation graphs; standalone until its tools are ported to Rune | `jev/`, WSL |
 | **aoide** | the mesh node that links club machines (optional, GPL-3.0) | `aoide-core/`, WSL |
 
 A local llama.cpp router (upstream `ggml-org/llama.cpp`, Vulkan build) serves
 the models on `:8080`. It is the one piece that runs natively on Windows;
-everything else runs in WSL. Open WebUI was retired on 2026-09-26 — its skin is
+everything else runs in WSL. Open WebUI was retired on 2026-09-26 â€” its skin is
 kept in [`webui/archive/open-webui/`](webui/archive/open-webui/README.md).
 
 ## Launch it
+
+First run: type `hoot`. It walks you through a short setup (default model, project
+roots; [`setup/`](setup/README.md)) and then opens Minerva. `hoot init` asks the same questions again.
+The wizard is built once in WSL: `cd setup && CARGO_TARGET_DIR=$HOME/setup-target cargo build --release`.
 
 On Windows, the model server:
 

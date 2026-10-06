@@ -1,0 +1,21 @@
+# The Minerva first-run wizard (`minerva setup`).
+#
+# Standalone on purpose, like the perch: its own `Cargo.toml` and `Cargo.lock`, no workspace, and no
+# `eidolon-*` or `aoide-*` dependency (the latter are GPL-3.0; this crate is MIT like the rest of Minerva).
+[package]
+name = "minerva-setup"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "The Minerva first-run wizard: asks for a home folder, a default model and project roots, writes minerva.toml."
+publish = false
+
+[dependencies]
+# The prompts (a Rust port of @clack/prompts): intro/outro, input, select, multiselect, confirm, note, log.
+cliclack = "0.5"
+# `minerva.toml` is parsed and written with a real TOML parser, never by hand; unknown keys are kept.
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

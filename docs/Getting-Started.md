@@ -213,7 +213,9 @@ In Windows PowerShell, type:
 hoot
 ```
 
-That starts (or reuses) the Minerva server in WSL and opens your browser already signed in: a one-time link that works once and dies after 30 seconds, so there is no password and no token to copy. `hoot status web` says whether it is up and `hoot stop web` stops it (your chats are kept). The first run needs the server built once, in WSL: `cd perch && CARGO_TARGET_DIR=$HOME/perch-target cargo build --release`. `hoot` does not start the local-model server; `hoot up` does that.
+The first time, `hoot` walks you through a short setup wizard (default model, which folders a chat may work in; press Enter to accept each default) and saves your answers in `~/Minerva/minerva.toml`. `hoot init` runs the wizard again. Build it once in WSL: `cd setup && CARGO_TARGET_DIR=$HOME/setup-target cargo build --release` (until it is built, a first `hoot` goes on with the defaults).
+
+Then `hoot` starts (or reuses) the Minerva server in WSL and opens your browser already signed in: a one-time link that works once and dies after 30 seconds, so there is no password and no token to copy. `hoot status web` says whether it is up and `hoot stop web` stops it (your chats are kept). The first run needs the server built once, in WSL: `cd perch && CARGO_TARGET_DIR=$HOME/perch-target cargo build --release`. `hoot` does not start the local-model server; `hoot up` does that.
 
 To serve one bare `eidolon web` session by hand instead (no chat list, one session):
 
