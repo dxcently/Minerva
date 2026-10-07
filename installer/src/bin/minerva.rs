@@ -22,15 +22,17 @@ mod app {
 
     use anyhow::{Context, Result, bail};
     use minerva_installer::install::{self, Layout};
-    use minerva_installer::keys::{self, Source, Trust};
+    use minerva_installer::keys::{self, Refusal, Source, Trust};
     use minerva_installer::plugins::{self, PluginEnv, SyncOpts};
-    use minerva_installer::{DEFAULT_BASE, FULL_VERSION, jev, notice, update, verify};
+    use minerva_installer::{DEFAULT_BASE, FULL_VERSION, jev, notice, status, update, verify};
 
     const HELP: &str = "minerva: the Minerva command
 
 usage: minerva <command> [options]
   web [--no-open]        start (or reuse) the Minerva server and open it signed in (prints the link when it cannot open one)
   status                 is the server up, and its chats
+  status --json          what this install knows about itself as JSON: version, update notice, plugins, jev (no network)
+  web --keys-arm FP      let the web page add or remove the key with fingerprint FP, once, within 2 minutes (hoot keys allow-web)
   stop                   stop the server (chats are kept)
   init                   the setup wizard (home, default model, project roots)
   update                 install the newest signed release (the previous one is kept)
@@ -51,12 +53,14 @@ for tests: update --base URL (https://, http://127.0.0.1:..., file:///dir); MINE
 
   keys list [--json]               every key: id, fingerprint, state (trusted/revoked/expired), where it came from
   keys inspect <pubfile|-> [--json]   show the id and fingerprint of a public key file (- = stdin); changes nothing
-  keys add <pubfile|-> [--confirm FP]   trust one more key. Shows the fingerprint; you type it back to confirm
-  keys remove <id> [--confirm FP]       stop trusting a key you added (the compiled-in key cannot be removed)
+  keys add <pubfile|-> [--confirm FP] [--json]   trust one more key. Shows the fingerprint; you type it back to confirm
+  keys remove <id> [--confirm FP] [--json]       stop trusting a key you added (the compiled-in key cannot be removed)
 
 The trusted set is the key compiled into this program plus the .pub files in ~/.config/minerva/update-keys (0700/0600),
 minus revoked keys. A release may carry a signed keys.json that adds and revokes keys; `minerva update` applies it.
 --confirm FP is for programs: the person typed the fingerprint (16 hex digits, spaces optional), the program passes it on.
+--json on add and remove prints {\"added\":ID} / {\"removed\":ID}, or {\"error\":{\"kind\":K,\"sentence\":S}} (exit 1 as without it), K being one of
+mismatch, revoked, collision, compiled, unsafe, not-found, failed.
 ";
 
     pub fn run() -> i32 {
@@ -142,6 +146,8 @@ minus revoked keys. A release may carry a signed keys.json that adds and revokes
             "services" => cmd_services(&mut rest),
             "jev-setup" => cmd_jev_setup(&mut rest),
             "keys" => cmd_keys(&mut rest),
+            "status" if rest.iter().any(|a| a == "--json") => cmd_status_json(&mut rest),
+            "web" if rest.iter().any(|a| a == "--keys-arm") => cmd_keys_arm(&mut rest),
             "web" | "status" | "stop" | "init" => verb(cmd, &rest),
             other => bail!("unknown command {other:?} (try: minerva help)"),
         }
@@ -476,7 +482,7 @@ minus revoked keys. A release may carry a signed keys.json that adds and revokes
             if norm_fp(&g) == norm_fp(expected) {
                 return Ok(());
             }
-            bail!("the confirmation does not match the key's fingerprint; nothing changed");
+            return Err(keys::refuse(Refusal::Mismatch, "the confirmation does not match the key's fingerprint; nothing changed"));
         }
         let tty = std::fs::File::open("/dev/tty").ok();
         let Some(tty) = tty else { bail!("{what} needs a typed confirmation and there is no terminal: pass --confirm \"{expected}\" (after the person has checked the fingerprint)") };
@@ -487,8 +493,14 @@ minus revoked keys. A release may carry a signed keys.json that adds and revokes
         if norm_fp(&line) == norm_fp(expected) {
             Ok(())
         } else {
-            bail!("that is not the fingerprint; nothing changed")
+            Err(keys::refuse(Refusal::Mismatch, "that is not the fingerprint; nothing changed"))
         }
+    }
+
+    /// A key file's comment as a terminal may be shown it: the text of the file is whoever's, so the C0 and C1 control characters and
+    /// DEL (escape sequences, carriage returns, backspaces) are dropped. (JSON output escapes them instead.)
+    fn printable(s: &str) -> String {
+        s.chars().filter(|c| !c.is_control()).collect()
     }
 
     fn json_str(s: &str) -> String {
@@ -498,7 +510,37 @@ minus revoked keys. A release may carry a signed keys.json that adds and revokes
     fn cmd_keys(rest: &mut Vec<String>) -> Result<i32> {
         let sub = if rest.is_empty() { "list".to_string() } else { rest.remove(0) };
         let json = take_flag(rest, "--json");
-        let confirm = take_opt(rest, "--confirm")?;
+        if matches!(sub.as_str(), "add" | "remove") {
+            // Everything that can go wrong from here on, a missing --confirm value or an unusable keys directory included, is an
+            // answer in the shape the caller asked for: with --json one line of JSON, the same exit code as without.
+            let adding = sub == "add";
+            let done = (|| -> Result<String> {
+                let confirm = take_opt(rest, "--confirm")?;
+                let tr = trust()?;
+                if adding { keys_add(&tr, rest, confirm, json) } else { keys_remove(&tr, rest, confirm, json) }
+            })();
+            let word = if adding { "added" } else { "removed" };
+            return match (done, json) {
+                (Ok(id), false) => {
+                    println!("{word} {id}");
+                    Ok(0)
+                }
+                (Ok(id), true) => {
+                    println!(r#"{{"{word}":{}}}"#, json_str(&id));
+                    Ok(0)
+                }
+                (Err(e), false) => Err(e),
+                (Err(e), true) => {
+                    let (kind, sentence) = match keys::refusal(&e) {
+                        Some(r) => (r.why.kind(), r.sentence.clone()),
+                        None => ("failed", format!("{e:#}")),
+                    };
+                    println!(r#"{{"error":{{"kind":{},"sentence":{}}}}}"#, json_str(kind), json_str(&sentence));
+                    Ok(1)
+                }
+            };
+        }
+        take_opt(rest, "--confirm")?; // only add and remove use it; the others have always let it pass
         let tr = trust()?;
         let today = keys::today();
         match sub.as_str() {
@@ -549,40 +591,119 @@ minus revoked keys. A release may carry a signed keys.json that adds and revokes
                 }
                 Ok(0)
             }
-            "inspect" | "add" => {
+            "inspect" => {
                 let arg = rest.first().cloned().context("name a public key file, or - for stdin")?;
                 rest.remove(0);
                 no_more(rest)?;
-                let text = read_pub_arg(&arg)?;
-                let k = keys::parse_pub(&text, Source::Manual)?;
-                if sub == "inspect" {
-                    if json {
-                        println!(r#"{{"id":{},"fingerprint":{},"comment":{}}}"#, json_str(&k.id), json_str(&k.fingerprint), json_str(&k.comment));
-                    } else {
-                        println!("key id       {}\nfingerprint  {}\ncomment      {}", k.id, k.fingerprint, k.comment);
-                    }
-                    return Ok(0);
+                let k = keys::parse_pub(&read_pub_arg(&arg)?, Source::Manual)?;
+                if json {
+                    println!(r#"{{"id":{},"fingerprint":{},"comment":{}}}"#, json_str(&k.id), json_str(&k.fingerprint), json_str(&k.comment));
+                } else {
+                    println!("key id       {}\nfingerprint  {}\ncomment      {}", k.id, k.fingerprint, printable(&k.comment));
                 }
-                eprintln!("Trusting a key lets whoever holds its secret half install software on this machine through `update`.\nCompare the fingerprint with the one the maintainer published, not just the id.");
-                eprintln!("key id       {}\nfingerprint  {}\ncomment      {}", k.id, k.fingerprint, k.comment);
-                confirm_fp(&k.fingerprint, confirm, "adding a key")?;
-                tr.add_manual(&text)?;
-                println!("added {}", k.id);
-                Ok(0)
-            }
-            "remove" => {
-                let id = rest.first().cloned().context("name a key id (minerva keys list)")?;
-                rest.remove(0);
-                no_more(rest)?;
-                let k = tr.all().into_iter().find(|k| k.id.eq_ignore_ascii_case(&id)).with_context(|| format!("no key {id} (minerva keys list)"))?;
-                eprintln!("key id       {}\nfingerprint  {}\nsource       {}", k.id, k.fingerprint, k.source.label());
-                confirm_fp(&k.fingerprint, confirm, "removing a key")?;
-                tr.remove(&k.id)?;
-                println!("removed {}", k.id);
                 Ok(0)
             }
             _ => bail!("usage: minerva keys list|inspect|add|remove (minerva keys help)"),
         }
+    }
+
+    /// `keys add`: the id of the key now trusted. `quiet` (--json) leaves the human banner out of stderr; the prompt, when there is one,
+    /// still shows the fingerprint.
+    fn keys_add(tr: &Trust, rest: &mut Vec<String>, confirm: Option<String>, quiet: bool) -> Result<String> {
+        let arg = rest.first().cloned().context("name a public key file, or - for stdin")?;
+        rest.remove(0);
+        no_more(rest)?;
+        let text = read_pub_arg(&arg)?;
+        let k = keys::parse_pub(&text, Source::Manual)?;
+        if !quiet {
+            eprintln!("Trusting a key lets whoever holds its secret half install software on this machine through `update`.\nCompare the fingerprint with the one the maintainer published, not just the id.");
+            eprintln!("key id       {}\nfingerprint  {}\ncomment      {}", k.id, k.fingerprint, printable(&k.comment));
+        }
+        confirm_fp(&k.fingerprint, confirm, "adding a key")?;
+        tr.add_manual(&text)?;
+        Ok(k.id)
+    }
+
+    /// `keys remove`: the id of the key no longer trusted.
+    fn keys_remove(tr: &Trust, rest: &mut Vec<String>, confirm: Option<String>, quiet: bool) -> Result<String> {
+        let id = rest.first().cloned().context("name a key id (minerva keys list)")?;
+        rest.remove(0);
+        no_more(rest)?;
+        // What is not even a key id is refused first, in words that do not repeat it: it is whatever the caller typed, control
+        // characters included.
+        if !keys::valid_id(&id) {
+            return Err(keys::refuse(Refusal::NotFound, "no such key: a key id is 16 hex digits (minerva keys list)"));
+        }
+        // An unusable keys directory hides its keys from `all()`; say so before claiming a key does not exist.
+        tr.state()?;
+        let k = tr
+            .all()
+            .into_iter()
+            .find(|k| k.id.eq_ignore_ascii_case(&id))
+            .ok_or_else(|| keys::refuse(Refusal::NotFound, format!("no key {id} (minerva keys list)")))?;
+        if !quiet {
+            eprintln!("key id       {}\nfingerprint  {}\nsource       {}", k.id, k.fingerprint, k.source.label());
+        }
+        confirm_fp(&k.fingerprint, confirm, "removing a key")?;
+        tr.remove(&k.id)?;
+        Ok(k.id)
+    }
+
+    // ---- for the perch: status --json, web --keys-arm -------------------------------------------------------------------
+
+    /// Under WSL the person's command is `hoot` (the Windows side); anywhere else it is `minerva`.
+    fn in_wsl() -> bool {
+        std::fs::read_to_string("/proc/version").map(|s| s.to_ascii_lowercase().contains("microsoft")).unwrap_or(false)
+    }
+
+    /// `minerva status --json [--prefix DIR] [--as hoot|minerva]`: one JSON object on stdout (installer/src/status.rs). Reads the
+    /// state files only; the network is never asked, nothing is written.
+    fn cmd_status_json(rest: &mut Vec<String>) -> Result<i32> {
+        take_flag(rest, "--json");
+        let prefix = prefix_arg(rest)?;
+        let who = take_opt(rest, "--as")?.unwrap_or_else(|| if in_wsl() { "hoot" } else { "minerva" }.to_string());
+        no_more(rest)?;
+        if !matches!(who.as_str(), "hoot" | "minerva") {
+            bail!("--as takes hoot or minerva");
+        }
+        let layout = Layout::new(prefix);
+        let version = layout.current_version().unwrap_or_else(installed_version);
+        println!("{}", status::report(&status::Opts { layout: &layout, version: &version, who: &who }));
+        Ok(0)
+    }
+
+    /// The fingerprint `hoot keys allow-web` was given: 16 hex digits, spaces ignored, handed on as one upper-case string.
+    fn arm_fp(given: &str) -> Result<String> {
+        let fp: String = given.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_uppercase();
+        if fp.len() != 16 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("--keys-arm needs the key's fingerprint: 16 hex digits, as one argument (see: minerva keys inspect)");
+        }
+        Ok(fp)
+    }
+
+    /// `minerva web --keys-arm FP [--port P] [--token-file F]`: lets the web page add or remove the key with that fingerprint, once,
+    /// within two minutes. The work is `perch-open.sh --keys-arm`, which reads the perch's token into a 0600 header file and asks
+    /// the perch (`POST /hub/install/keys/arm`); this only checks the fingerprint and hands it over. `--port` and `--token-file`
+    /// are for tests: they default to the running perch's.
+    fn cmd_keys_arm(rest: &mut Vec<String>) -> Result<i32> {
+        let fp = arm_fp(&take_opt(rest, "--keys-arm")?.unwrap_or_default())?;
+        let port = take_opt(rest, "--port")?;
+        let token_file = take_opt(rest, "--token-file")?;
+        no_more(rest)?;
+        let exe = std::env::current_exe()?.canonicalize()?;
+        let script = exe.parent().context("no bin dir")?.join("perch-open.sh");
+        if !script.is_file() {
+            bail!("{} is missing; is this a Minerva bundle?", script.display());
+        }
+        let mut cmd = Command::new("bash");
+        cmd.arg(script).arg("--keys-arm").arg(&fp);
+        if let Some(p) = port {
+            cmd.arg("--port").arg(p);
+        }
+        if let Some(f) = token_file {
+            cmd.arg("--token-file").arg(f);
+        }
+        Ok(cmd.status().context("running perch-open.sh")?.code().unwrap_or(1))
     }
 
     // ---- versions, notice, the verbs ----------------------------------------------------------------------------------
@@ -593,7 +714,7 @@ minus revoked keys. A release may carry a signed keys.json that adds and revokes
 
     fn installed_version_of(exe: &Path) -> String {
         version_dir_of(exe)
-            .and_then(|d| std::fs::read_to_string(d.join("VERSION")).ok())
+            .and_then(|d| status::read_capped(&d.join("VERSION"), 4096))
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| FULL_VERSION.to_string())
@@ -621,7 +742,7 @@ minus revoked keys. A release may carry a signed keys.json that adds and revokes
     fn verb(cmd: &str, rest: &[String]) -> Result<i32> {
         let exe = std::env::current_exe()?.canonicalize()?;
         let bin = exe.parent().context("no bin dir")?.to_path_buf();
-        let in_wsl = std::fs::read_to_string("/proc/version").map(|s| s.to_ascii_lowercase().contains("microsoft")).unwrap_or(false);
+        let in_wsl = in_wsl();
         let perch_open = |flags: &[&str]| -> Result<std::process::ExitStatus> {
             Command::new("bash").arg(bin.join("perch-open.sh")).args(flags).status().context("running perch-open.sh")
         };

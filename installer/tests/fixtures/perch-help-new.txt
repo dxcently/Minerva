@@ -1,0 +1,26 @@
+The Minerva perch: one loopback HTTP server in front of several `eidolon web` doors.
+
+Usage: perch [OPTIONS]
+
+Options:
+      --bind <BIND>                 Loopback only (`127.0.0.0/8` or `::1`). Port `0` picks one; the bound address is printed at boot [default: 127.0.0.1:0]
+      --ui-dir <PATH>               Serve the browser UI from this directory on every path outside `/hub` and `/s`; `/` is `index.html`. These files need no token
+      --root <DIR>                  A directory a new session's cwd must sit under; repeat for more than one. Default: `$HOME`
+      --eidolon <PATH>              The door binary to spawn, as `eidolon web`. Default: `eidolon` on `PATH` [default: eidolon]
+      --sessions-dir <DIR>          Kept session logs, as `<id>.eid`. Default: `<data dir>/eidolon/sessions`, the door's own. Not with `--home`, which owns it (`<home>/sessions`)
+      --eidolon-config <FILE>       Run every door as `eidolon --config <FILE> web ...`. Without `--sessions-dir`, the kept logs are the file's own top-level `sessions_dir`, which must be absolute (eidolon does not expand `~` there); the door's default when it has none. The file must exist and is never written. Not with `--home`, which generates its own
+      --home <DIR>                  The Minerva home (`~/Minerva`). The perch generates `<home>/config.toml` from the member's `~/.config/eidolon/config.toml` at every start (`sessions_dir` forced to `<home>/sessions`, `default_model` from `<home>/minerva.toml` or a default, when absent), runs every door with it and lists `<home>/sessions`. `<home>/scratch/<n>/` is where a new session that names no cwd works, and the home is one more allowed `--root`
+      --plugins-dir <DIR>           The eidolon-plugins collection (`<dir>/jev`, `<dir>/browser`, ...): where a graph run finds the jev workflows
+      --run-graphs <NAME>           The graphs a page may start as a run, comma separated or repeated. Bare names only: each is joined into a path [default: wiki-hop]
+      --jev-health <URL>            jev's health URL, probed before a run starts (`http://127.0.0.1:<port>/health`)
+      --browser-health <URL>        The browser service's health URL, probed before a run starts
+      --aoide <PATH>                The `aoide` binary, as an absolute path. Default: `~/.local/bin/aoide` when it is executable. Never found on `PATH`, which finds a stale one first
+      --aoide-home <DIR>            Aoide's home (`~/.aoide`), which the mesh view reads and never writes
+      --aoide-daemon-socket <PATH>  Aoide's daemon socket, which is only ever asked to `ping`
+      --aoide-events <FILE>         Aoide's audit log, which the mesh view tails
+      --minerva <PATH>              The `minerva` binary the install routes ask, as an absolute path. Default: the one beside this perch, when there is one
+      --term-token-file <FILE>      Write the terminal tools' scoped token here (`0600`, rotated every start, removed on exit). Off unless given
+      --mail-token-file <FILE>      Write the mail tool's scoped token here (`0600`, rotated every start, removed on exit). Off unless given
+      --agent-url-file <FILE>       Write this perch's URL here for the agent tools (removed on exit). Off unless given
+  -h, --help                        Print help
+  -V, --version                     Print version

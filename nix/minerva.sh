@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# minerva: the desktop command of a Nix install. Verbs: web, status, stop, init, plugins, services, update, version.
+# minerva: the desktop command of a Nix install. Verbs: web, status, stop, init, plugins, services, keys, update, version.
 # Store paths are substituted at build time; only coreutils-class tools come from PATH.
 # Behaviour follows bin/perch-open.sh: the perch token never leaves its 0600 file (curl reads it through
 # `-H @file`), and a browser gets a 30 s single-use login code (`POST /hub/code`), never the token.
@@ -20,7 +20,7 @@ PLUGIN_STATE=${XDG_STATE_HOME:-$HOME/.local/state}/minerva-nix
 core() {
   "$CORE" "$@" --eidolon "$EIDOLON_BIN" --src "$PLUGINS" --bin-dir "$PLUGIN_BIN" --prefix "$PLUGIN_STATE" --version "$VERSION"
 }
-PORT=${MINERVA_PERCH_PORT:-47820}
+DEFAULT_PORT=${MINERVA_PERCH_PORT:-47820}
 MHOME=${MINERVA_HOME:-$HOME/Minerva}
 PROFILE_NAME=minerva
 
@@ -34,9 +34,13 @@ usage: minerva <verb> [options]
                              --no-browser  print the address only
   status                     is it up, its url and pid, session counts by state
   stop                       stop the server
+                             web, status and stop take --port P (1 to 65535) in place of MINERVA_PERCH_PORT; a server started
+                             on a port other than that default is a second one and gets no agent token files
   init                       the first-run wizard (home folder, default model, project roots)
   plugins sync|status        install/refresh the bundled plugins (browser, subagent, jev) and trust them
   services start|stop|status the browser service the browser plugin talks to
+  keys allow-web FP          let the web page add or remove the update key with fingerprint FP (16 hex digits, spaces
+                             allowed), once, within 2 minutes; --port P --token-file F is for tests (F needs P)
   update                     print how to update (a Nix install does not update itself)
   version                    print the version
 
@@ -46,6 +50,29 @@ USAGE
 
 verb=${1:-web}
 if [ $# -gt 0 ]; then shift; fi
+
+# keys allow-web FP: the arm of the web page's update-key step (the same as bin/perch-open.sh --keys-arm; keep the two in step).
+arm=0
+arm_fp=
+opt_port=
+arm_tokfile=
+if [ "$verb" = keys ]; then
+  if [ "${1:-}" != allow-web ]; then echo "minerva: only 'keys allow-web FP' is available here (try minerva help)" >&2; exit 2; fi
+  shift
+  arm=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port|--token-file)
+        if [ $# -lt 2 ] || [ -z "$2" ]; then echo "minerva: $1 needs a value" >&2; exit 2; fi
+        if [ "$1" = --port ]; then opt_port=$2; else arm_tokfile=$2; fi
+        shift 2 ;;
+      -*) echo "minerva: unknown argument: $1 (try minerva help)" >&2; exit 2 ;;
+      *) arm_fp="$arm_fp$1"; shift ;;
+    esac
+  done
+  # A token file is one perch's token: it is never read without the port that perch answers on.
+  if [ -n "$arm_tokfile" ] && [ -z "$opt_port" ]; then echo "minerva: --token-file needs --port too" >&2; exit 2; fi
+fi
 
 case "$verb" in
   -h|--help|help) usage; exit 0 ;;
@@ -58,23 +85,34 @@ case "$verb" in
     MINERVA_HOME=$MHOME exec "$SETUP_BIN" "$@" ;;
   plugins) sub=${1:-status}; if [ $# -gt 0 ]; then shift; fi; exec "$CORE" plugins "$sub" "$@" --eidolon "$EIDOLON_BIN" --src "$PLUGINS" --bin-dir "$PLUGIN_BIN" --prefix "$PLUGIN_STATE" --version "$VERSION" ;;
   services) sub=${1:-status}; if [ $# -gt 0 ]; then shift; fi; exec "$CORE" services "$sub" "$@" --eidolon "$EIDOLON_BIN" --src "$PLUGINS" --bin-dir "$PLUGIN_BIN" --prefix "$PLUGIN_STATE" --version "$VERSION" ;;
-  web|status|stop) ;;
+  web|status|stop|keys) ;;
   *) echo "minerva: unknown verb: $verb (try minerva help)" >&2; exit 2 ;;
 esac
 
 browser=1
 want_code=1
 code_only=0
-for a in "$@"; do
-  case "$a" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --code) code_only=1; browser=0 ;;
     --no-browser) browser=0; want_code=0 ;;
-    *) echo "minerva: unknown argument: $a (try minerva help)" >&2; exit 2 ;;
+    --port)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then echo "minerva: --port needs a value" >&2; exit 2; fi
+      opt_port=$2
+      shift ;;
+    *) echo "minerva: unknown argument: $1 (try minerva help)" >&2; exit 2 ;;
   esac
+  shift
 done
 if [ "$code_only" = 1 ]; then want_code=1; fi
 
-case "$PORT" in ''|*[!0-9]*) echo "minerva: MINERVA_PERCH_PORT must be a number" >&2; exit 1 ;; esac
+# One spelling of a port: 1 to 65535, digits only, no leading zero (bash would read 047820 as octal, and a long run of digits
+# wraps). Neither value is echoed back.
+PORT=${opt_port:-$DEFAULT_PORT}
+if ! { [[ $PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )); }; then
+  if [ -n "$opt_port" ]; then echo "minerva: --port must be a port number, 1 to 65535, without leading zeros" >&2; else echo "minerva: MINERVA_PERCH_PORT must be a port number, 1 to 65535, without leading zeros" >&2; fi
+  exit 1
+fi
 if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
   echo "minerva: XDG_RUNTIME_DIR is not set; the perch refuses to keep its token in a shared temp dir" >&2
   exit 1
@@ -91,25 +129,78 @@ URL=http://127.0.0.1:$PORT/
 alive() { [ -f "$PIDF" ] && kill -0 "$(<"$PIDF")" 2>/dev/null; }
 listening() { [ -n "$(ss -ltn "sport = :$PORT" 2>/dev/null | tail -n +2)" ]; }
 
+# The token reaches curl through ONE 0600 header file (curl -H @file) and nowhere else: not argv, not the environment, not output,
+# not xtrace. It is made here, in this shell, before anything is probed, and the EXIT trap removes it on every way out (a signal
+# included); a command substitution only ever uses it. mkhdr fills it from a token file after checking the file is one the perch
+# wrote, so EVERY header built from a token file, on every path, has passed the same checks first. (Keep in step with
+# bin/perch-open.sh.)
 HDR=
-mkhdr() {
-  HDR=$(mktemp "$STATE/hdr.XXXXXX")
-  printf 'Authorization: Bearer %s\n' "$(<"$TOKF")" >"$HDR"
-}
-rmhdr() { if [ -n "$HDR" ]; then rm -f "$HDR"; fi; HDR=; }
+rmhdr() { if [ -n "$HDR" ]; then rm -f -- "$HDR"; fi; }
 trap rmhdr EXIT
+HDR=$(mktemp "$STATE/hdr.XXXXXX")
 
-hub_get() {
-  mkhdr
-  curl -sS --max-time 5 -H "@$HDR" "${URL}${1#/}" || { rmhdr; return 1; }
-  rmhdr
+# mkhdr <token file>: 0 when the header file now holds that token, 1 (with the reason on stderr, never the token) when not.
+mkhdr() {
+  local f=$1 tok
+  if [ ! -f "$f" ] || [ -L "$f" ]; then echo "minerva: the token file is not a plain file" >&2; return 1; fi
+  case "$(stat -c '%u %a' -- "$f")" in
+    "$(id -u) 600"|"$(id -u) 400") ;;
+    *) echo "minerva: the token file is not yours alone (owner and mode 0600 are required)" >&2; return 1 ;;
+  esac
+  { set +x; } 2>/dev/null
+  tok=$(<"$f")
+  if ! [[ $tok =~ ^[A-Za-z0-9_-]{16,128}$ ]]; then echo "minerva: the token file does not hold a token" >&2; return 1; fi
+  printf 'Authorization: Bearer %s\n' "$tok" >"$HDR"
 }
-hub_code() {
-  mkhdr
-  curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H "@$HDR" "${URL}${1#/}" || true
-  rmhdr
+
+# curl for anything that carries the token: -q first (no ~/.curlrc, whose `verbose` would print the Authorization header) and
+# --noproxy '*' (a proxy variable, lowercase ones included, would send the token through the proxy; no_proxy=localhost does not
+# cover 127.0.0.1). Every call below begins this way.
+hub_get() { # body on stdout (mkhdr has filled the header file)
+  curl -q --noproxy '*' -sS --max-time 5 -H "@$HDR" "${URL}${1#/}"
 }
-reusable() { alive && [ -f "$TOKF" ] && [ "$(hub_code /hub/sessions)" = 200 ]; }
+hub_code() { # prints the http status
+  curl -q --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 5 -H "@$HDR" "${URL}${1#/}" || true
+}
+reusable() { alive && [ -f "$TOKF" ] && mkhdr "$TOKF" && [ "$(hub_code /hub/sessions)" = 200 ]; }
+
+if [ "$arm" = 1 ]; then
+  fp=$(printf '%s' "$arm_fp" | tr -d '[:space:]' | tr 'a-f' 'A-F')
+  if ! [[ $fp =~ ^[0123456789ABCDEF]{16}$ ]]; then
+    echo "minerva: keys allow-web needs the key's fingerprint: 16 hex digits (spaces allowed)" >&2
+    exit 2
+  fi
+  if [ -n "$arm_tokfile" ]; then
+    mkhdr "$arm_tokfile" || exit 1 # a test's own token and port: no perch of ours is needed (a stub answers)
+  else
+    # The perch's own token goes only to a perch that is ours and answering on its port, and only from a token file as the perch
+    # writes it (mkhdr checks that before the first call, the liveness probe included).
+    if ! alive || [ ! -f "$TOKF" ]; then
+      echo "minerva: the Minerva server is not running on port $PORT; start it first (minerva web), then allow the key" >&2
+      exit 1
+    fi
+    mkhdr "$TOKF" || exit 1
+    if [ "$(hub_code /hub/sessions)" != 200 ]; then
+      echo "minerva: the Minerva server is not running on port $PORT; start it first (minerva web), then allow the key" >&2
+      exit 1
+    fi
+  fi
+  body=$(printf '{"fingerprint":"%s"}' "$fp")
+  reply=$(curl -q --noproxy '*' -sS --max-time 5 -X POST -H "@$HDR" -H 'Content-Type: application/json' --data "$body" -w '\n%{http_code}' "${URL}hub/install/keys/arm") || {
+    echo "minerva: the perch did not answer on port $PORT" >&2
+    exit 1
+  }
+  status=${reply##*$'\n'}
+  groups=$(printf '%s' "$fp" | sed 's/.\{4\}/& /g; s/ $//')
+  case "$status" in
+    200)
+      echo "allowed: the web page may add or remove the key $groups once in the next 2 minutes"
+      exit 0 ;;
+    404) echo "minerva: this perch has no update-key routes (404): stop it and start it again from the new build" >&2 ;;
+    *) echo "minerva: POST /hub/install/keys/arm answered $status" >&2 ;;
+  esac
+  exit 1
+fi
 
 if [ "$verb" = stop ]; then
   core services stop --quiet || true
@@ -177,8 +268,28 @@ else
       if [ -n "$winroot" ] && [ -d "$winroot" ]; then roots+=(--root "$winroot"); fi
     fi
   fi
+  # The flags newer than a perch an operator may still run (MINERVA_PERCH_BIN): each goes in only when the binary's own --help
+  # lists it as an option (the same probe as bin/perch-open.sh; --aoide is not --aoide-home), once per start.
+  # Plain text only: with CLICOLOR_FORCE or FORCE_COLOR set clap would wrap each flag in colour codes, the line-anchored probe would
+  # find none, and a newer perch would start without the flags it can use. A perch that hangs on --help is given 10 s.
+  help=$(env -u CLICOLOR_FORCE -u FORCE_COLOR NO_COLOR=1 timeout 10 "$PERCH_BIN" --help </dev/null 2>&1 || true)
+  perch_has() { grep -Eq -- "^[[:space:]]+(-[[:alnum:]], )?$1([[:space:]<=]|\$)" <<<"$help"; }
+  extra=()
+  agent_dir=$HOME/.config/eidolon
+  # The agent token and url files are the member's, one set per person, not one per perch: only the perch on the default port is
+  # given them, so a second perch on another port never overwrites the first one's files.
+  if [ "$PORT" = "$DEFAULT_PORT" ]; then
+    if perch_has --term-token-file; then extra+=(--term-token-file "$agent_dir/minerva-term.token"); fi
+    if perch_has --mail-token-file; then extra+=(--mail-token-file "$agent_dir/minerva-mail.token"); fi
+    if perch_has --agent-url-file; then extra+=(--agent-url-file "$agent_dir/minerva-perch.url"); fi
+  fi
+  if [ "${#extra[@]}" -gt 0 ]; then mkdir -p "$agent_dir"; fi
+  case "$HOME" in
+    /*) if perch_has --aoide && [ -f "$HOME/.local/bin/aoide" ] && [ -x "$HOME/.local/bin/aoide" ]; then extra+=(--aoide "$HOME/.local/bin/aoide"); fi ;;
+  esac
+  if perch_has --plugins-dir && [ -d "$PLUGINS" ]; then extra+=(--plugins-dir "$(cd "$PLUGINS" && pwd)"); fi
   setsid nohup "$PERCH_BIN" --bind "127.0.0.1:$PORT" --ui-dir "$UI" --eidolon "$EIDOLON_BIN" \
-    "${roots[@]}" --home "$MHOME" >"$OUTF" 2>"$LOGF" </dev/null &
+    "${roots[@]}" --home "$MHOME" ${extra[@]+"${extra[@]}"} >"$OUTF" 2>"$LOGF" </dev/null &
   spid=$!
   tokline=
   for _ in $(seq 1 40); do
@@ -202,9 +313,8 @@ if [ "$want_code" = 0 ]; then
   exit 0
 fi
 
-mkhdr
-reply=$(curl -sS --max-time 5 -X POST -H "@$HDR" -w '\n%{http_code}' "${URL}hub/code") || { rmhdr; echo "minerva: the perch did not answer POST /hub/code" >&2; exit 1; }
-rmhdr
+mkhdr "$TOKF" || exit 1
+reply=$(curl -q --noproxy '*' -sS --max-time 5 -X POST -H "@$HDR" -w '\n%{http_code}' "${URL}hub/code") || { echo "minerva: the perch did not answer POST /hub/code" >&2; exit 1; }
 status=${reply##*$'\n'}
 body=${reply%$'\n'*}
 if [ "$status" != 200 ]; then echo "minerva: POST /hub/code answered $status" >&2; exit 1; fi

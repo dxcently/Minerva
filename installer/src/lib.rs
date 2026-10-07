@@ -24,6 +24,8 @@ pub mod notice;
 #[cfg(unix)]
 pub mod plugins;
 #[cfg(unix)]
+pub mod status;
+#[cfg(unix)]
 pub mod update;
 
 /// `0.1.0`: the version in the repo-root `VERSION` file (the one source of truth) at build time.

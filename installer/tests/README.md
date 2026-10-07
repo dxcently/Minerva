@@ -1,0 +1,34 @@
+# tests/ — the perch contract, end to end
+
+Cargo's integration tests for what the Minerva server and `hoot` ask of the installer (`installer/README.md`, "The perch contract").
+They run the real `minerva` binary and the real scripts (`bin/perch-open.sh`, `nix/minerva.sh`) in a **cleared environment**: a temp
+`HOME`, a temp `XDG_RUNTIME_DIR`, and nothing of the operator's visible. Unix only. Run in WSL:
+
+```text
+cd installer && MINERVA_ALLOW_PLACEHOLDER_KEY=1 CARGO_TARGET_DIR=$HOME/.cache/minerva-slices-target cargo test --offline
+```
+
+```text
+common/mod.rs         the fixture Env (temp HOME with DECOY tokens at every default place a script could read one), the stub HTTP
+                      server on 127.0.0.1:48110, and the curl shim
+cli.rs                `status --json` over fixture prefixes; `keys add|remove --json` (every error kind, keys dir unchanged on a
+                      refusal); the `web --keys-arm` checks that need no perch
+perch_open.rs         the key arm in both scripts; the flags a newer perch gets and an older one does not
+fixtures/             `perch --help` as printed by the perch an operator has installed today (perch-help-old.txt) and by a build of
+                      master (perch-help-new.txt); the start tests probe against these, not against a hand-written imitation
+```
+
+**Nothing here can reach the operator's perch.** The stub listens on 48110 only, and refuses to start on 47820. A `curl` shim is first
+on `PATH` for every script: it logs each call's argv, the mode of every `-H @file` header file and what it held, and exits 7 without
+making any call aimed at `:47820`. So a script that ignored `--port` would be seen (and stopped), and "the token is not in argv" is
+checked against what curl was really given. The decoy tokens (`DECOY`) sit where the scripts would find a default; the test hands over
+a different one (`GIVEN`), and the stub must receive exactly that.
+
+Tests that listen on 48110 hold a `flock` on a file in the cargo target dir, so they take turns across threads and across processes.
+The start tests run a stub perch that is a shell script: its `--help` is a fixture (coloured when `CLICOLOR_FORCE` or `FORCE_COLOR`
+is in its environment, as clap's is), it records the argv it was started with, and it writes its own pid, which is the one process the
+test kills afterwards (and only while that pid is still the stub).
+
+The unit tests of the same slice are next to the code: `src/status/tests.rs` (the JSON, the cache, the plugin record, the jev states,
+each held to the sentence the command itself would print) and `src/keys.rs` (`every_refusal_carries_its_kind_through_added_context`).
+The `compiled` kind is only reachable there: a test build compiles in the placeholder key, so the CLI has no compiled-in key to refuse.

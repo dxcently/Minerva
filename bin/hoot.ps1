@@ -28,6 +28,8 @@
 #   hoot help                           this list
 #   hoot update [-Check] [-Rollback]    installed copies only: install the newest signed release / only look / go back one
 #   hoot keys list|inspect|add|remove   installed copies only: who may sign releases (runs `minerva keys` in WSL)
+#   hoot keys allow-web <FP>            installed copies only: let the web page add or remove the key with that
+#                                       fingerprint (16 hex digits, spaces allowed), once, within 2 minutes
 #   hoot jev-setup [--dry-run]          installed copies only: the optional jev chooser (Python venv, CPU torch, ~1.2 GB)
 #   hoot version                        installed copies only: the hoot and bundle versions
 #
@@ -341,7 +343,17 @@ switch ($Command.ToLower()) {
 
     'keys' {
         if (-not $Installed) { Die 'hoot keys is for an installed Minerva (minerva-install.exe)' }
-        Invoke-MinervaVerb (@('keys') + @($Rest | Where-Object { $_ }))
+        $words = @($Rest | Where-Object { $_ })
+        if ($words.Count -gt 0 -and $words[0].ToLower() -eq 'allow-web') {
+            # The arm of the web page's update-key step: one add or remove of the key with this fingerprint, within 2
+            # minutes. The page shows the fingerprint as four groups, so any spacing is accepted; what reaches WSL is
+            # 16 hex digits and nothing else (it is validated here, then again by minerva and perch-open.sh).
+            $fp = (@($words | Select-Object -Skip 1) -join '') -replace '\s', ''
+            if ($fp -notmatch '^[0-9A-Fa-f]{16}$') { Die 'usage: hoot keys allow-web <fingerprint>   (16 hex digits, e.g. 0F7A 3A5C 447E C7EF; hoot keys inspect shows it)' }
+            Invoke-MinervaVerb @('web', '--keys-arm', $fp.ToUpper())
+        } else {
+            Invoke-MinervaVerb (@('keys') + $words)
+        }
     }
 
     'jev-setup' {
@@ -523,6 +535,7 @@ switch ($Command.ToLower()) {
             'help                  this list'
             'update                installed copies: install the newest signed release'
             'keys <verb>           installed copies: list/inspect/add/remove release signing keys'
+            'keys allow-web <FP>   installed copies: let the web page add/remove that key, once'
             'jev-setup             installed copies: the optional jev chooser (asks first)'
         )
         Write-Host ''

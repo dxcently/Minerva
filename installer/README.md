@@ -13,7 +13,7 @@ One Linux **bundle**, three ways in:
 
 | Program | Where | What |
 |---|---|---|
-| `minerva` | Linux, in the bundle, `~/.local/bin/minerva` | `install`, `update [--check] [--rollback]`, `uninstall`, `version`, `plugins`, `services`, `jev-setup`, `keys`, and the verbs `web`, `status`, `stop`, `init` |
+| `minerva` | Linux, in the bundle, `~/.local/bin/minerva` | `install`, `update [--check] [--rollback]`, `uninstall`, `version`, `plugins`, `services`, `jev-setup`, `keys`, and the verbs `web`, `status`, `stop`, `init` (and, for the perch: `status --json`, `web --keys-arm`; see "The perch contract") |
 | `minerva-install.exe` | Windows | the installer a club member double-clicks (carries the bundle, no network needed) |
 
 Version: one source of truth, the repo-root **`VERSION`** file (`0.1.0`). The build appends the short git sha:
@@ -108,6 +108,8 @@ two scorer tools; `minerva services start` then runs the service on port 8091. T
 plugin tree from `nix/plugins.nix` and the Nix `eidolon-browser` (Chromium from nixpkgs): `minerva web` runs
 `minerva-core plugins sync --if-needed --quiet --eidolon ... --src ... --bin-dir ... --prefix ~/.local/state/minerva-nix`. The
 store is never written; the record of what is ours lives in that state dir. `minerva plugins` and `minerva services` are the same verbs.
+`minerva keys allow-web <FP>` is the same arm as `hoot keys allow-web` (the other `keys` verbs are not in this script), and the start
+passes the perch the same newer flags only when its `--help` lists them.
 
 ## Windows flow
 
@@ -135,6 +137,8 @@ Then every WSL call is `wsl.exe -d <distro>` and the programs come from `<prefix
 file it is dev mode: the repo checkout, exactly as before. Installed mode has no llama-server verbs (`serve`, `up`,
 `models`, `get`, `setup`, `edit`, `which`); it adds `hoot update [-Check] [-Rollback]`, `hoot keys ...`, `hoot jev-setup` and
 `hoot version`. `hoot keys` and `hoot jev-setup` run the Linux command; a key file named by a Windows path is mapped with `wslpath`.
+`hoot keys allow-web <FP>` (spaces in the fingerprint are fine) is the one `keys` verb that is not the Linux `keys`: it runs
+`minerva web --keys-arm <FP>`, which lets the web page add or remove that one key once within 2 minutes (see "The perch contract").
 
 **Self-refresh.** On every launch an installed hoot compares the version in `install.json` with the installed bundle's `VERSION`.
 If they differ (the Linux side was updated by `minerva update`, `install.sh` or the exe), hoot copies the bundle's `windows/hoot.ps1`
@@ -215,11 +219,11 @@ program whose user already typed it. The key id alone does NOT pass: an id is on
 carry any id. `add` refuses a key id that already exists with different key bytes. The compiled-in key cannot
 be removed by hand; only a signed rotation revokes it. `hoot keys ...` passes through to WSL.
 
-**Contract for the perch (to be called later, not built here).** A perch route that adds a key: run
-`minerva keys inspect - --json` with the public key on stdin (answer `{"id","fingerprint","comment"}`), show the fingerprint to
-the person, and when they have typed the FINGERPRINT back run `minerva keys add - --confirm <FP>` with the same public key on stdin.
-A wrong confirm exits 1 with "nothing changed". Removal: `minerva keys remove <id> --confirm <FP>` (fingerprint from `keys list`). The perch never writes the keys
-dir itself.
+**For the perch.** A perch route that adds a key runs `minerva keys inspect - --json` with the public key on stdin (answer
+`{"id","fingerprint","comment"}`), shows the fingerprint to the person, and when they have typed the FINGERPRINT back runs
+`minerva keys add - --confirm <FP> --json` with the same public key on stdin. A wrong confirm exits 1 with "nothing changed".
+Removal: `minerva keys remove <id> --confirm <FP> --json` (fingerprint from `keys list`). The perch never writes the keys dir
+itself. The answers and the step-up that allows the page to do this at all are in "The perch contract" below.
 
 **Operator's steps to rotate** (the secret keys never enter the repo):
 
@@ -244,6 +248,99 @@ Then build the next release with `-PubKey new.pub` so fresh installs compile the
 version get the rotation first, so their old binary already trusts the new key. If the old key leaked, publish the revoking
 `keys.json` (signed by the old key, the file is checked before the revocation applies) as soon as possible: members apply it at
 their next update, and from then on nothing signed only by the leaked key installs.
+
+## The perch contract
+
+What the Minerva server (the perch, `perch/src/install/`) and `hoot` ask of this program. The perch runs the `minerva` beside it with
+fixed argv and never updates, never writes the keys dir and never asks the network for any of this.
+
+```text
+ start screen --GET /hub/install-----------> perch --> minerva status --json
+ keys overlay --POST /hub/install/keys/...--> perch --> minerva keys inspect|add|remove ... --json        (key on stdin)
+ your terminal: hoot keys allow-web <FP> --> minerva web --keys-arm <FP> --> bin/perch-open.sh --keys-arm <FP>
+                                                                               --> POST /hub/install/keys/arm  (bearer only)
+```
+
+**`minerva status --json [--prefix DIR] [--as hoot|minerva]`.** One line of JSON on stdout, exit 0. It reads
+`<prefix>/state/minerva/{update-check,plugins.json,jev.pid}` and the jev marker, nothing else: no network, no write, not even the
+refresh the once-a-day notice would do. `--prefix` defaults to this install's (else `~/.local`); `--as` names the command a person is
+told to run (default `hoot` under WSL, `minerva` elsewhere).
+
+```text
+ { "version": "0.1.0-gabc1234",                      what `current` points at
+   "notice":  { "line":   "Minerva 0.2.0 available -- run: hoot update" | null,    null when nothing is newer and nothing is stale
+                "latest": "0.2.0" | null,  "stale": "release info is stale ..." | null,  "checked": 1791269513 } | null,
+   "plugins": [ { "name": "browser", "version": "0.3.0", "how": "stock" } ],      what Minerva installed, sorted; [] when none
+   "jev":     { "set_up": true, "running": true, "pid": 4242 } }                 pid only while it runs
+```
+
+`notice` is `null` when there is no cache or it does not parse (or is over 64 KiB). Every file is read capped, and only if it is a regular
+file: a FIFO, a directory or an oversize file reads as absent, so none of them can hang or flood it. Its `line` is worded exactly as the
+command's own notice is. Trust and service state are not recorded anywhere this reads, so they are not in the answer.
+
+**`minerva keys add|remove ... --json`.** The same exit codes as without `--json`; the answer moves from stderr to one line of stdout.
+
+```text
+ success   {"added":"0F7A3A5C447EC7EF"}     {"removed":"0F7A3A5C447EC7EF"}
+ refused   {"error":{"kind":"mismatch","sentence":"the confirmation does not match the key's fingerprint; nothing changed"}}
+```
+
+| kind | when |
+|---|---|
+| `mismatch` | the typed or passed fingerprint is not the key's (an id is not accepted either); the keys dir is untouched |
+| `revoked` | the key was revoked; never accepted again |
+| `collision` | the id is in use by a DIFFERENT key |
+| `compiled` | the compiled-in key: already trusted, and not removable by hand |
+| `unsafe` | the keys dir is not a private directory of yours, or `state.json` is missing, unreadable or corrupt |
+| `not-found` | `remove` of an id nobody has, or of something that is not a 16-hex-digit id at all (the sentence does not repeat it) |
+| `failed` | anything else (not a public key, a usage error such as `--confirm` with no value, no HOME, a disk error); the sentence says what |
+
+The kind is typed (`keys::Refusal`), never read back from the wording. Every failure of `add` and `remove` under `--json` is this one
+line, usage errors included. `keys list --json` and `keys inspect --json` are as before. Without `--json`, a key file's comment is
+printed with its control characters (C0, DEL, C1) dropped; with `--json` it is escaped.
+
+**Allowing the page to change keys (`--keys-arm`).** The page may add or remove an update key only after a person, in a terminal, names
+that key's fingerprint:
+
+```text
+ hoot keys allow-web 0F7A 3A5C 447E C7EF     (nix: minerva keys allow-web ...; Linux: minerva web --keys-arm 0F7A3A5C447EC7EF)
+```
+
+`bin/perch-open.sh --keys-arm FP [--port P [--token-file F]]` reads the perch's bearer token into a 0600 header file in the private
+runtime dir, `POST`s `/hub/install/keys/arm {"fingerprint":"<16 hex>"}` with `curl -H @file` and removes the file. The perch allows
+one add or remove of exactly that key within 120 s. The token is never in argv, the environment, xtrace or the output. It starts and
+stops nothing and, with no `--token-file`, only talks to a perch of ours that is running and answering on its own port. `--port`
+defaults to `MINERVA_PERCH_PORT`, else 47820, and takes one spelling only: 1 to 65535, digits, no leading zero. `--token-file` is for
+a test to aim the script at a stub with its own token, is refused without `--port`, and, like the perch's own file, is read only if it is
+a plain file of yours with mode 0600 or 0400 holding a plain token.
+
+How the scripts handle the token, everywhere they handle it (the arm, the liveness probe, the status line, the login code):
+
+```text
+ header file   ONE, made at the top of the script in the parent shell (mktemp, 0600, in the private runtime dir); the EXIT trap removes
+               it on every way out, a ^C or a kill included. mkhdr <token file> fills it, after checking the file is a plain file (not a
+               link), yours, mode 0600 or 0400, holding [A-Za-z0-9_-]{16,128}. Every header built from a token file passes that first.
+ curl          every call that carries the token begins   curl -q --noproxy '*'   -q so a ~/.curlrc (`verbose` would print the
+               Authorization header) is not read; --noproxy '*' so a proxy variable, lowercase ones included, never sees the
+               token (no_proxy=localhost does not cover 127.0.0.1)
+ xtrace        `set +x` before the token is read, so `bash -x` does not print it
+```
+
+**Flags the perch gets (`bin/perch-open.sh`, `nix/minerva.sh`).** Each is passed only when the perch binary's own `--help` lists it as
+an option, probed once per start (plain text: `CLICOLOR_FORCE` and `FORCE_COLOR` are dropped and `NO_COLOR=1` set for that one call, and
+it is given 10 s), so a perch built before a flag still starts with the command line it always had:
+
+| flag | value |
+|---|---|
+| `--term-token-file` | `$HOME/.config/eidolon/minerva-term.token`, only for the perch on the default port |
+| `--mail-token-file` | `$HOME/.config/eidolon/minerva-mail.token`, only for the perch on the default port |
+| `--agent-url-file` | `$HOME/.config/eidolon/minerva-perch.url`, only for the perch on the default port |
+| `--aoide` | `$HOME/.local/bin/aoide`, when it is an executable file |
+| `--plugins-dir` | `MINERVA_PLUGINS_DIR`, else `<install>/plugins` (a checkout: `<repo>/eidolon-plugins`), when it is a directory |
+
+The agent files are one set per member, not one per perch, so only the perch on the default port (`MINERVA_PERCH_PORT`, else 47820)
+gets them. A second perch is started with `--port P` (`perch-open.sh`, or `minerva web --port P`), differing from the default, and
+does not overwrite the first one's files.
 
 ## Building a release
 
@@ -322,6 +419,19 @@ signer, revoked compiled-in key, manual add/remove, expiry, replay, open keys di
 plugin kept, update keeps trust, uninstall removes only ours) when `MINERVA_TEST_EIDOLON` names an eidolon binary (otherwise that
 one test says it was skipped). The Windows pieces (registry,
 shortcut, WSL calls) are exercised by running the exe with the test options above, never against the real settings.
+
+`tests/` (see `tests/README.md`) holds the perch contract's tests: `status --json` over fixture prefixes (cache present, stale, corrupt,
+absent; no `plugins.json`; every jev state), `keys add|remove --json` (every error kind, and the keys dir byte for byte unchanged on a
+refusal), and the two scripts against a stub HTTP server on 127.0.0.1:48110 (the arm sends exactly the given token, only through a 0600
+header file, never in argv, through no proxy and no `~/.curlrc`, and nothing is aimed at 47820; a ^C leaves no header file), plus the perch
+start with `--help` outputs captured from an old and a current perch (also with colour forced in the environment, and a second perch
+on another port). `bash -n` runs on both scripts. Nothing in `cargo test` parses `hoot.ps1`: that is done by hand, from the
+Windows side (Windows PowerShell 5.1 is the parser that matters), from the repository root, and must print `0`, the number of parse
+errors:
+
+```text
+powershell -NoProfile -Command '$e=$null;$t=$null;[void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path bin\hoot.ps1),[ref]$t,[ref]$e);$e.Count'
+```
 
 ## Threat notes
 

@@ -95,6 +95,61 @@ pub fn valid_id(s: &str) -> bool {
     s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Why a change to the trusted keys was refused, as a kind a program can branch on (`minerva keys add|remove --json`). The sentence a
+/// person reads is the error's message; the kind does not change when its wording does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The fingerprint that was typed or passed is not the key's.
+    Mismatch,
+    /// The key was revoked, and a revoked key is never accepted again.
+    Revoked,
+    /// The key id is already used by a DIFFERENT key.
+    Collision,
+    /// The compiled-in key: already trusted, and it cannot be removed by hand.
+    Compiled,
+    /// The keys directory or its record cannot be relied on (not a private directory of yours; `state.json` missing, unreadable or corrupt).
+    Unsafe,
+    /// No key has that id.
+    NotFound,
+}
+
+impl Refusal {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Refusal::Mismatch => "mismatch",
+            Refusal::Revoked => "revoked",
+            Refusal::Collision => "collision",
+            Refusal::Compiled => "compiled",
+            Refusal::Unsafe => "unsafe",
+            Refusal::NotFound => "not-found",
+        }
+    }
+}
+
+/// The error behind a [`Refusal`]: it prints as its sentence, and survives any context added on top (`refusal` finds it again).
+#[derive(Debug)]
+pub struct Refused {
+    pub why: Refusal,
+    pub sentence: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.sentence)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+pub fn refuse(why: Refusal, sentence: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Refused { why, sentence: sentence.into() })
+}
+
+/// The refusal an error carries, if it is one.
+pub fn refusal(e: &anyhow::Error) -> Option<&Refused> {
+    e.downcast_ref::<Refused>()
+}
+
 pub use crate::version::date_of;
 
 pub fn today() -> String {
@@ -185,11 +240,14 @@ impl Trust {
         };
         let me = unsafe { libc_geteuid() };
         if !m.is_dir() || m.uid() != me || m.mode() & 0o077 != 0 {
-            bail!(
-                "{} is not a private directory of yours (owner, or mode {:o}), so its record of trusted and revoked keys cannot be relied on; refusing. Fix: chmod 700 it, or remove it",
-                self.dir.display(),
-                m.mode() & 0o777
-            );
+            return Err(refuse(
+                Refusal::Unsafe,
+                format!(
+                    "{} is not a private directory of yours (owner, or mode {:o}), so its record of trusted and revoked keys cannot be relied on; refusing. Fix: chmod 700 it, or remove it",
+                    self.dir.display(),
+                    m.mode() & 0o777
+                ),
+            ));
         }
         Ok(true)
     }
@@ -201,15 +259,24 @@ impl Trust {
         let mut st = if self.dir_safe()? {
             let f = self.dir.join("state.json");
             match fs::read_to_string(&f) {
-                Ok(t) => serde_json::from_str::<State>(&t)
-                    .map_err(|e| anyhow!("{} is corrupt ({e}); refusing to guess which keys are revoked. {}", f.display(), RECOVER.replace("<dir>", &self.dir.display().to_string())))?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
-                    "{} is missing although {} exists: the record of revoked keys is gone; refusing. {}",
-                    f.display(),
-                    self.dir.display(),
-                    RECOVER.replace("<dir>", &self.dir.display().to_string())
-                ),
-                Err(e) => return Err(e).with_context(|| format!("reading {}; refusing", f.display())),
+                Ok(t) => serde_json::from_str::<State>(&t).map_err(|e| {
+                    refuse(
+                        Refusal::Unsafe,
+                        format!("{} is corrupt ({e}); refusing to guess which keys are revoked. {}", f.display(), RECOVER.replace("<dir>", &self.dir.display().to_string())),
+                    )
+                })?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(refuse(
+                        Refusal::Unsafe,
+                        format!(
+                            "{} is missing although {} exists: the record of revoked keys is gone; refusing. {}",
+                            f.display(),
+                            self.dir.display(),
+                            RECOVER.replace("<dir>", &self.dir.display().to_string())
+                        ),
+                    ));
+                }
+                Err(e) => return Err(refuse(Refusal::Unsafe, format!("reading {}; refusing: {e}", f.display()))),
             }
         } else {
             State::default()
@@ -328,7 +395,10 @@ impl Trust {
     fn check_id_collision(&self, k: &KeyInfo) -> Result<()> {
         for o in self.all() {
             if o.id.eq_ignore_ascii_case(&k.id) && o.b64 != k.b64 {
-                bail!("key id {} is already in use by a DIFFERENT key (fingerprint {}); refusing this one (fingerprint {})", k.id, o.fingerprint, k.fingerprint);
+                return Err(refuse(
+                    Refusal::Collision,
+                    format!("key id {} is already in use by a DIFFERENT key (fingerprint {}); refusing this one (fingerprint {})", k.id, o.fingerprint, k.fingerprint),
+                ));
             }
         }
         Ok(())
@@ -338,11 +408,11 @@ impl Trust {
     pub fn add_manual(&self, text: &str) -> Result<KeyInfo> {
         let k = parse_pub(text, Source::Manual)?;
         if self.is_revoked(&k.id)? {
-            bail!("key {} was revoked and is never accepted again", k.id);
+            return Err(refuse(Refusal::Revoked, format!("key {} was revoked and is never accepted again", k.id)));
         }
         self.check_id_collision(&k)?;
         if self.compiled_key().map(|c| c.id == k.id).unwrap_or(false) {
-            bail!("key {} is already the compiled-in key", k.id);
+            return Err(refuse(Refusal::Compiled, format!("key {} is already the compiled-in key", k.id)));
         }
         self.ensure_dir()?;
         let body = format!("untrusted comment: {}\n{}\n", if k.comment.is_empty() { "minisign public key (added by hand)" } else { &k.comment }, k.b64);
@@ -354,9 +424,12 @@ impl Trust {
     /// Remove an added key. The compiled-in key cannot be removed here (a rotation revokes it).
     pub fn remove(&self, id: &str) -> Result<KeyInfo> {
         let all = self.all();
-        let k = all.iter().find(|k| k.id.eq_ignore_ascii_case(id)).ok_or_else(|| anyhow!("no key {id} (try: minerva keys list)"))?.clone();
+        let k = all.iter().find(|k| k.id.eq_ignore_ascii_case(id)).ok_or_else(|| refuse(Refusal::NotFound, format!("no key {id} (try: minerva keys list)")))?.clone();
         if k.source == Source::Compiled {
-            bail!("key {} is compiled into this program; it cannot be removed by hand (a signed rotation can revoke it)", k.id);
+            return Err(refuse(
+                Refusal::Compiled,
+                format!("key {} is compiled into this program; it cannot be removed by hand (a signed rotation can revoke it)", k.id),
+            ));
         }
         fs::remove_file(self.dir.join(format!("{}.pub", k.id)))?;
         let _ = fs::remove_file(self.dir.join(format!("{}.json", k.id)));
@@ -828,6 +901,45 @@ pub mod tests {
         let groups: Vec<&str> = f.split(' ').collect();
         assert_eq!(groups.len(), 4);
         assert!(groups.iter().all(|g| g.len() == 4 && g.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())), "{f}");
+    }
+
+    fn kind_of<T: std::fmt::Debug>(r: Result<T>) -> &'static str {
+        let e = r.unwrap_err();
+        refusal(&e).unwrap_or_else(|| panic!("not a typed refusal: {e:#}")).why.kind()
+    }
+
+    #[test]
+    fn every_refusal_carries_its_kind_through_added_context() {
+        // `minerva keys add|remove --json` branches on these, never on the wording
+        let (pk, _) = keypair();
+        let (extra, _) = keypair();
+        let (other, _) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        assert_eq!(kind_of(tr.add_manual(&pk)), "compiled");
+        assert_eq!(kind_of(tr.remove(&id_of(&pk))), "compiled");
+        assert_eq!(kind_of(tr.remove("0123456789ABCDEF")), "not-found");
+        tr.add_manual(&extra).unwrap();
+        assert_eq!(kind_of(tr.add_manual(&forge_same_id(&extra, &other))), "collision");
+        // revoked: the record names `other`, so it is refused however it is offered
+        fs::write(
+            tr.dir.join("state.json"),
+            format!(r#"{{"serial":1,"revoked":[{{"id":"{}","on":"2026-01-01","by":"{}"}}]}}"#, id_of(&other), id_of(&pk)),
+        )
+        .unwrap();
+        assert_eq!(kind_of(tr.add_manual(&other)), "revoked");
+        // unsafe: a corrupt record, a missing one, an open directory
+        fs::write(tr.dir.join("state.json"), "{ not json").unwrap();
+        assert_eq!(kind_of(tr.add_manual(&other)), "unsafe");
+        fs::remove_file(tr.dir.join("state.json")).unwrap();
+        assert_eq!(kind_of(tr.state()), "unsafe");
+        fs::write(tr.dir.join("state.json"), r#"{"serial":0,"revoked":[]}"#).unwrap();
+        fs::set_permissions(&tr.dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(kind_of(tr.add_manual(&other)), "unsafe");
+        // the sentence is still the message, with or without context on top
+        let e = tr.add_manual(&other).unwrap_err();
+        let wrapped = e.context("adding a key");
+        assert!(refusal(&wrapped).is_some(), "context must not hide the refusal");
+        assert!(format!("{wrapped:#}").contains("not a private directory"));
     }
 
     /// `real`'s id with `other`'s key bytes: what an attacker hands over as "the same key".
