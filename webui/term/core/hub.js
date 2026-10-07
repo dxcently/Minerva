@@ -4,9 +4,12 @@
 //
 // Polled at boot, every POLL_MS while the tab is visible, at once when it
 // becomes visible again, and after every start/resume/stop this page makes. A
-// failed poll keeps the last list and marks it stale; it never toasts.
+// failed poll keeps the last list and marks it stale; it never toasts. Both GETs
+// wait their turn in the request lane (lane.js), so the poll never holds more
+// than the one connection the lane uses.
 import { signal } from './ui.js';
-import { hubGet, rows, mode, POLL_TIMEOUT_MS } from './api.js';
+import { rows, mode, POLL_TIMEOUT_MS } from './api.js';
+import { hubPoll } from './lane.js';
 
 export const trash = signal([]); // chats deleted into the perch's trash: [{ id, title, mtime }], newest first
 
@@ -22,10 +25,10 @@ export function refresh() {
   if (busy) return busy;
   busy = (async () => {
     // Timed out (status 0) counts as a failed poll: stale shows and the next tick polls again.
-    const { status, data } = await hubGet('sessions', POLL_TIMEOUT_MS);
+    const { status, data } = await hubPoll('sessions', POLL_TIMEOUT_MS);
     if (status === 200 && Array.isArray(data)) { list.value = data; stale.value = false; }
     else stale.value = true;
-    const t = await hubGet('trash', POLL_TIMEOUT_MS);
+    const t = await hubPoll('trash', POLL_TIMEOUT_MS);
     if (t.status === 200 && Array.isArray(t.data)) trash.value = t.data;
   })().finally(() => { busy = null; });
   return busy;

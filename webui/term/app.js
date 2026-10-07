@@ -2,7 +2,7 @@
 // line. Sessions live in core/state.js and panes draw them (panes/session.js);
 // this file arranges panes and routes every action. Every action is reachable
 // by mouse; keys and the `:` line are shortcuts to the same functions.
-import { html, render, K, HUB, signal, computed, effect, batch, useRef, useLayoutEffect, useMemo } from './core/ui.js';
+import { html, render, K, HUB, signal, computed, effect, batch, useRef, useLayoutEffect } from './core/ui.js';
 import { takeToken, takeCode, redeem, DOOR, detect, mode, rows, hubPost } from './core/api.js';
 import { list, stale, known, refresh, startPolling, modeOf, live, keptRows, older, elsewhere, age, label, otherTag, trash, slugOf } from './core/hub.js';
 import { Session, tildify, kfmt, stateOf, STATE_CLS, backoffMs, connWord } from './core/state.js';
@@ -11,9 +11,15 @@ import { menu, openMenu, closeMenu, outside, atPointer, under, Menus } from './c
 import { Pane } from './panes/session.js';
 import { panel } from './panes/asks.js';
 import { FilesTab } from './panes/files.js';
+import { LoadedTab } from './panes/loaded.js';
+import { DiffTab } from './panes/diff.js';
+import { GraphTab } from './graph/index.js';
+import { MeshTab } from './mesh/index.js';
 import { Home, home } from './panes/home.js';
 import { projects, projectFor, sorted, isScratch, loadProjects, addProject, forgetProject, renameProject } from './core/projects.js';
 import { Picker, picker as pickerOpen, openPicker } from './panes/picker.js';
+import { Overlay, overlay } from './core/overlay.js';
+import { Needs, Kv } from './core/bits.js';
 import { FONTS, DEFAULT_FONT, theme, themes, font, cell, setTheme, setFont, resolve, startLook } from './core/look.js';
 
 const LEFT_TABS = ['sessions', 'projects', 'mesh'];
@@ -1063,11 +1069,6 @@ function Rail({ side }) {
   </nav>`;
 }
 
-const Needs = ({ children }) => html`<div class="needs">${children}</div>`;
-// A feature that is not there yet: on the perch the hub exists, so say only that.
-const Soon = ({ what, door }) => html`<${Needs}>${mode() === 'perch' ? what + ': not available yet' : door || what + ' needs the hub'}</${Needs}>`;
-const Kv = ({ k, v, cls = '' }) => html`<div class="kv"><span class="faint">${k}</span><span class=${'grow ' + cls}>${String(v)}</span></div>`;
-
 function Owl() {
   return html`<div class="owl">${' ,___,  '}<span class="name">minerva</span>${'\n ['}<span class="eyes">O.o</span>${']  '}<span class="faint">Make it,</span>${'\n /)_)   '}<span class="faint">Break it,</span>${'\n  ""    '}<span class="faint">Hack it.</span></div>`;
 }
@@ -1306,9 +1307,7 @@ function Left() {
       ${hl ? html`<div class="list"><div class="it"><div class="l1"><span class="faint">▸</span><span class="grow c" title=${hl.cwd}>${tildify(hl.cwd)}</span></div></div></div>` : html`<div class="faint">—</div>`}
       <div class="hdr">others</div><${Needs}>project list needs the hub</${Needs}>`;
   } else {
-    body = html`<div class="note">node        paired  grants  seen</div>
-      <div class="note dim">──────────  ──────  ──────  ────</div>
-      <${Soon} what="the mesh" door="mesh reads Aoide through the hub (M3)" />`;
+    body = html`<${MeshTab} />`;
   }
   return html`<aside id="left" class="col side frame">
     ${!rail && html`<div class="ftitle"><${Fold} side="l" cls="tab fold" /><span class="tab on">${tab}</span></div>`}
@@ -1341,61 +1340,6 @@ function RunTab({ s }) {
 
 // The status line's mode badge: what each approval mode means, for its tooltip.
 const MODE_TIPS = { yolo: 'yolo: the gate is answering for you', manual: 'manual: it asks before anything that changes things', auto: "auto: eidolon's rules, it asks only for risky commands" };
-
-// What this door has loaded, as far as it says: the hello frame names the
-// model and the gate (yolo); the tools are the ones called so far (no door
-// route lists them), MCP tools grouped by server when named `mcp__<server>__<tool>`.
-// The rest is listed dim with what it needs, not hidden.
-function LoadedTab({ s }) {
-  const hl = s.hello.value, open = useMemo(() => signal(false), []);
-  if (!hl) return html`<div class="faint">waiting for the chat to start</div>`;
-  const tools = [...s.tools.value].sort((a, b) => a[0].localeCompare(b[0]));
-  const m = String(hl.model || '?'), at = m.search(/[/:]/);
-  const mcp = new Map();
-  for (const [t, n] of tools) {
-    const x = /^mcp__(.+?)__(.+)$/.exec(t);
-    if (x) { if (!mcp.has(x[1])) mcp.set(x[1], []); mcp.get(x[1]).push([x[2], n]); }
-  }
-  const plain = tools.filter(([t]) => !t.startsWith('mcp__'));
-  const count = ([t, n]) => html`<div class="kv"><span class="hi">${t}</span><span class="grow"></span><span class="faint">${n}×</span></div>`;
-  const per = hl.persona;
-  return html`
-    <div class="hdr">persona</div>
-    ${per ? html`<div class="m b">${per.name || per}</div>${per.text && html`<${K} cls="faint" on=${() => { open.value = !open.value; }}>${open.value ? '▾ ' : '▸ '}excerpt</${K}>${open.value ? html`<div class="pre">${per.text}</div>` : html`<div class="faint">${String(per.text).slice(0, 120)}…</div>`}`}`
-      : html`<${Soon} what="the persona" door="the persona needs the hub (the door's hello does not name it)" />`}
-    <div class="hdr">model</div>
-    <${Kv} k="model    " v=${at > 0 ? m.slice(at + 1) : m} cls="c" />
-    ${at > 0 ? html`<${Kv} k="provider " v=${m.slice(0, at)} />` : html`<${Needs}>provider: not in the model key</${Needs}>`}
-    <${Soon} what="effort" door="effort needs the hub" />
-    <div class="hdr">gate</div>
-    <${Kv} k="mode     " v=${({ yolo: 'yolo: the gate answers for you', manual: 'manual: it asks before anything that changes things', auto: 'auto: the stock rules, it asks for risky commands' })[modeOf(s.sid, hl)] || 'gated: it asks when policy says'} cls=${modeOf(s.sid, hl) === 'yolo' ? 'r' : modeOf(s.sid, hl) === 'manual' ? 'o' : ''} />
-    <${Kv} k="verdicts " v=${s.verdicts.value.length} />
-    <${Soon} what="the policy" door="the policy itself needs the hub" />
-    <div class="hdr">tools used</div>
-    ${plain.length ? plain.map(count) : html`<div class="faint">none called yet</div>`}
-    <${Soon} what="the full tool list" door="the full tool list needs the hub (the door lists none)" />
-    <div class="hdr">mcp servers</div>
-    ${mcp.size ? [...mcp].map(([srv, ts]) => html`<div class="kv"><span class="m">${srv}</span></div>${ts.map(([t, n]) => html`<div class="kv"><span class="faint">  </span><span class="hi">${t}</span><span class="grow"></span><span class="faint">${n}×</span></div>`)}`)
-      : html`<${Soon} what="MCP servers" door="MCP servers need the hub (none called yet)" />`}
-    <div class="hdr">extensions</div><${Soon} what="extensions" door="extensions need the hub" />
-    <div class="hdr">session</div>
-    <${Kv} k="file     " v=${tildify(hl.session)} />
-    <${Kv} k="cwd      " v=${tildify(hl.cwd)} />
-    <${Kv} k="protocol " v=${hl.protocol ?? '?'} />`;
-}
-
-// Git state (branch, +/−, PR) belongs at the top of this tab once a source exists.
-function DiffTab({ s }) {
-  const files = [...s.touched.value];
-  return html`<div class="hdr">git</div><${Soon} what="branch, +/− and PR" door="branch, +/− and PR need the hub" />
-    <div class="hdr">changed</div>
-    ${files.length ? files.map(([f, n]) => html`<div class="kv"><span class="grow c" title=${f}>${f}</span><span class="faint">${n} call${n > 1 ? 's' : ''}</span></div>`)
-      : html`<div class="faint">no edit or write calls yet</div>`}`;
-}
-
-// The graph tab's slot. M3 replaces this with a Preact graph component
-// (see web-ui.md section 10); it gets the same { s, sid } props as every tab.
-const GraphTab = () => html`<${Soon} what="the turn graph" door="turn graph needs the hub (M3)" />`;
 
 // Inspector tab -> component. Every tab is a Preact component taking
 // { s: Session, sid }, so a new tab (or a real graph) is one entry here.
@@ -1482,7 +1426,7 @@ function Tiles() {
       ...lay.dividers.map((d) => html`<${Divider} key=${d.path} d=${d} />`),
     ];
   }
-  return html`<div id="tiles" class="col" ref=${ref}>${body}${pickerOpen.value && html`<${Picker} />`}</div>`;
+  return html`<div id="tiles" class="col" ref=${ref}>${body}${pickerOpen.value && html`<${Picker} />`}${overlay.value && html`<${Overlay} />`}</div>`;
 }
 
 function Hint() {

@@ -89,19 +89,31 @@ export async function post(sid, route, body) {
 // ---------------------------------------------------------------- the hub
 // `minerva perch` serves `/hub/sessions` (list, spawn, and per session
 // resume/stop); a bare `eidolon web --ui-dir` door answers `/hub/...` with a
-// static 404. That difference is how the page tells the two apart. Only
-// `/hub/sessions...` and `/hub/tree?...` paths are built here.
+// static 404. That difference is how the page tells the two apart. Only the
+// perch's own route families are built here (HUB_PATH).
 let hubMode = 'unknown'; // 'unknown' | 'door' | 'perch'
 let hubRows = [];
 export const mode = () => hubMode;
 export const rows = () => hubRows;
+
+// The paths a hub call may take, relative to `/hub/`: one of the perch's route families, then `/`, `?` or the end (`sessions`,
+// `sessions/<id>/log`, `runs/<id>`, `meta/tools`; a prefix that runs on, `termx`, `terminal`, is not one). `tree` has no sub-routes
+// and takes only a query: `tree?session=...`. `hubPathOk` adds the rule a pattern cannot say well: no `..` segment, however it is
+// spelt (`%2e%2e`, `..%2f`, `\` for `/`: the browser's URL parser and the server may each read them as one), so a path built from a
+// session id or a route name can never climb out of `/hub/`. Only the path part is read: a query value is data, and the perch confines it.
+export const HUB_PATH = /^(?:tree(?=[?])|(?:sessions|projects|dirs|models|trash|runs|mesh|meta|install|term|notes|mail)(?=\/|[?]|$))/;
+const DOTDOT = /(?:^|[/\\])\.\.(?=[/\\]|$)/;
+export function hubPathOk(path) {
+  if (typeof path !== 'string' || !HUB_PATH.test(path)) return false;
+  try { return !DOTDOT.test(decodeURIComponent(path.split(/[?#]/, 1)[0])); } catch { return false; } // a bad escape is no path
+}
 
 // `timeout` (ms) aborts a call the perch never answers: it comes back as status 0, like a
 // network failure. The list poll and the boot probe set it; spawn, resume and stop do not
 // (a door can take ~20 s to come up).
 export const POLL_TIMEOUT_MS = 5000;
 async function hubCall(method, path, body, timeout, raw = false) {
-  if (typeof path !== 'string' || !/^(sessions|tree\?|projects|dirs|models|trash)/.test(path)) throw new Error('hub path must start with sessions, tree?, projects, dirs, models or trash');
+  if (!hubPathOk(path)) throw new Error('hub path must be one of sessions, tree?, projects, dirs, models, trash, runs, mesh, meta, install, term, notes or mail, with no .. segment');
   const init = { method, cache: 'no-store', headers: auth() };
   if (body !== undefined) {
     init.headers['content-type'] = 'application/json';
