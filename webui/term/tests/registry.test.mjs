@@ -76,7 +76,8 @@ test('the stubs register themselves: terms last on the right (global), notes on 
   assert.equal(notes.icon, '✎');
   assert.equal(notes.global, false);
   assert.equal(terms.component().props.children, 'terminals: the ⌨ stack lands with slice T4a');
-  assert.equal(notes.component().props.children, 'notes: the ✎ notepad lands with slice N2a');
+  assert.equal(typeof notes.component, 'function', 'the notepad (slice N2a, tests/notes.test.mjs) is no one-line stub any more; its rail badge is the signal cards.js holds');
+  assert.equal(typeof notes.badge.peek, 'function');
   assert.equal(R.loadedSections.peek().length, 1, 'allow/list.js is the one loaded section');
   assert.equal(R.loadedSections.peek()[0](), null, 'and it draws nothing yet');
 });
@@ -248,6 +249,7 @@ test('the command table has no prototype: `:constructor` and `:toString` are no 
 });
 
 test('commands registered twice keep the latest; the override and the key row it goes with come out together', () => {
+  const had = { commands: R.commands.peek().length, rows: R.keyRows.peek().length }; // the notepad has registered `:note` and its key rows by now
   R.commands.add({ name: 'term', help: 'first', run: fnQ });
   R.commands.add({ name: 'term', help: 'a web terminal', run: fnWeb });
   R.commands.add({ name: 'window', help: 'native', run: fnTerm });
@@ -263,8 +265,8 @@ test('commands registered twice keep the latest; the override and the key row it
     assert.equal(rows[1][1][1][1], ':term (web terminal) · :window term|edit|files (native)');
     assert.equal(rows[1][1][1][2], fnWeb);
   } finally { R.commands.remove('term'); R.commands.remove('window'); R.keyRows.remove('panes\n:term :window'); }
-  assert.equal(R.commands.peek().length, 0);
-  assert.equal(R.keyRows.peek().length, 0);
+  assert.equal(R.commands.peek().length, had.commands);
+  assert.equal(R.keyRows.peek().length, had.rows);
 });
 
 test('key rows: found in the named section, else anywhere; a row that replaces nothing is added to its section; a new section comes last', () => {

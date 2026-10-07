@@ -1,1 +1,59 @@
-/* the notes: the left tab and the note pane (notes/); empty until those slices land */
+/* the notes: the ✎ tab in the left panel and the note pane (notes/). Square, text actions in brackets, the page's colours. */
+
+/* ---- the tab ---- */
+.notes .newrow { margin: calc(var(--ch) * 0.3) 0 var(--ch); }
+.notes .newnote { color: var(--bright); }
+.notes .act { color: var(--bright); }
+.notes .pad { padding-left: var(--cw); }
+.notes .list { white-space: normal; }
+.notes .list .it + .it { margin-top: 0; }
+.notes .it.note { display: flex; gap: var(--cw); }
+.notes .nrow { display: flex; gap: var(--cw); flex: 1; min-width: 0; white-space: pre; }
+.notes .nrow:hover { text-decoration: none; background: var(--sel); }
+.notes .nt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.notes .na { text-align: right; }
+/* the `⋯` at a row's right edge: there on hover or focus, so nobody needs to know right-click; `[ restore ]` is always there */
+.notes .mo { opacity: 0; color: var(--faint); white-space: pre; }
+.notes .it.note:hover .mo, .notes .it.note:focus-within .mo, .notes .mo:focus, .notes .mo.on { opacity: 1; }
+.notes .mo:hover { color: var(--bright); }
+.notes .it.ed input.ren { flex: 1; min-width: 0; background: transparent; color: var(--brightest); border: 0; border-bottom: 1px solid var(--bright); font: inherit; padding: 0; outline: none; }
+.notes .grp { margin-top: calc(var(--ch) * 0.8); }
+.notes .gh2 { display: flex; gap: var(--cw); white-space: pre; }
+.notes .gh2 .gname { flex: 1; min-width: 0; color: var(--bright); font-weight: bold; overflow: hidden; text-overflow: ellipsis; }
+.notes .gh2 .plus { color: var(--bright); }
+.notes .grp > .list { padding-left: 0; }
+
+/* ---- the pane ---- */
+.notepad textarea.np {
+  flex: 1; min-height: 0; display: block; width: 100%; resize: none; border: 0; outline: 0; margin: 0;
+  padding: calc(var(--ch) * 0.7) var(--cw) calc(var(--ch) * 0.9);
+  background: transparent; color: var(--fg); caret-color: var(--bright); caret-shape: block;
+  font: inherit; line-height: var(--ch); overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.notepad textarea.np::placeholder { color: var(--faint); }
+.notepad textarea.np:read-only { color: var(--faint); }
+/* the sentence above the box (a conflict, a save that failed): after the top border's title, not under it */
+.notepad .banner { flex: none; margin-top: calc(var(--ch) * 0.7); margin-bottom: 0; }
+.notepad .banner + textarea.np { padding-top: calc(var(--ch) * 0.5); }
+.notepad > .ftitle.nt { max-width: calc(100% - 12 * var(--cw)); }
+.notepad > .ftitle input.ren {
+  width: calc(30 * var(--cw)); max-width: 60%; background: var(--bg); color: var(--brightest); border: 0; border-bottom: 1px solid var(--bright);
+  font: inherit; line-height: var(--ch); padding: 0; outline: none;
+}
+.notepad.focus > .ftitle input.ren { background: var(--brightest); color: var(--bg); border-bottom-color: var(--bg); }
+/* the bottom border: the verbs on the left, the save state on the right, each cut into the line */
+.notepad > .np-bar {
+  position: absolute; left: var(--cw); right: var(--cw); bottom: calc(var(--ch) / -2 - 0.5px); z-index: 2;
+  display: flex; justify-content: space-between; gap: calc(2 * var(--cw));
+  line-height: var(--ch); white-space: nowrap; pointer-events: none;
+}
+.notepad > .np-bar > span { background: var(--bg); padding: 0 var(--cw); pointer-events: auto; }
+.notepad > .np-bar > .np-verbs { flex: 0 1 auto; min-width: 0; overflow: hidden; display: flex; gap: var(--cw); }
+.notepad > .np-bar > .np-state { flex: none; color: var(--faint); }
+.notepad .act { color: var(--bright); }
+.notepad .act:hover, .notepad .act:focus-visible { background: var(--sel); color: var(--brightest); text-decoration: none; outline: none; }
+.notepad .act.dis { color: var(--faint); }
+/* a narrow pane: when the state needs its two actions, the verbs give way */
+@container (max-width: 640px) {
+  .notepad > .np-bar.bad > .np-verbs { display: none; }
+}
