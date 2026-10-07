@@ -29,6 +29,12 @@ POST /hub/runs/<rid>/answer {text}  202 {rid, state: "running"}   400 empty, ove
 POST /hub/runs/<rid>/cancel         200 detail (202 if the child is still going after 9 s)   409 not running
 POST /hub/runs/<rid>/abandon        200 detail: a parked run becomes abandoned, nothing is started   409 not parked
 GET  /hub/runs/health               {jev: S, browser: S, at_ms}   S = {configured, up, start, why?, ...the service's own fields}
+GET  /hub/runs/<rid>/log[?after=N]  200 application/x-ndjson: the journal's records with id > N (all of them with no after), in order;
+       an empty body is "nothing above N yet" (or no journal yet), never an error   400 any other query   404 unknown run
+       413 the whole log over 16 MiB   502 eidolon failed   504 eidolon took over 15 s
+GET  /hub/runs/graphs               [{name, sha256, bytes}] in --run-graphs order, only graphs a start accepts   503 no --plugins-dir
+GET  /hub/runs/graphs/<g>           {name, sha256, bytes, graph}: <plugins>/jev/graphs/<g>.json as the file has it   404 not listed,
+       missing or a symlink   413 over 1 MiB   502 not a JSON object   400 any query
 ```
 
 A refusal's body is `{error, why}` (one sentence under both names) plus `run` or `state` where it names one. Unknown or malformed run
@@ -97,15 +103,16 @@ connected to; 1 s each, side by side, cached 5 s). jev's `status`, `jevlike`, `o
 services again (not the cache) and are a 503 if one that has a flag is down: a resume calls jev and the browser again, and a failed call
 is journaled and can never be replayed. A service with no flag is not waited for.
 
-## For R1b
+## The log and the graphs (R1b)
 
-`state::config_of(ctx, rid)` is the run's `config.toml` (what `eidolon --config <it> log --json <journal>` is run with) and
-`state::journal_of(ctx, rid)` is its `.eid`; both are `None` for a run the perch does not know. Check a run id with `state::rid_ok`
-before using it for anything. The run's journal is read through `eidolon log --json` only; the perch never decodes the file.
+The page's cursor is the `id` of the last record it holds: the first poll sends no `after` (`after=0` skips record 0). An answer is
+remembered per journal while its mtime, length and `after` are unchanged, so a poll of a run at rest starts no child, and the same `after`
+always gets the same lines (a lost response loses nothing). Polls of one run share one child. A graph is offered only when both
+`jev/graphs/<g>.json` and `jev/workflows/<g>.rn` exist; `sha256` is the bare hex of the JSON file, the `PIN` in the `.rn`.
 
 ## Tests
 
-`tests/runs.rs`. Only `fake_eidolon`'s `workflow` command answers a run (`src/bin/fake_eidolon/workflow.rs`): it replays the F0
+`tests/runs.rs` and `tests/runs_log.rs`. Only `fake_eidolon`'s `workflow` command answers a run (`src/bin/fake_eidolon/workflow.rs`): it replays the F0
 journals in `tests/fixtures/jev/` with their exit codes and last lines, and has knobs for the case, the pace, a held SIGTERM, a deaf
 child and a lingering one (the header of that file lists them). No model, jev or browser is involved; the health tests serve `/health`
 themselves on 48140 and 48141.
