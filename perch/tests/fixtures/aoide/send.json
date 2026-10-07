@@ -1,0 +1,189 @@
+{
+  "_": "The reply a `mail send` gets, by the node in --to. `code` is the exit code; `stdout` is printed as given (an object is pretty-printed JSON, a string is raw); `with_hold` and `with_mesh` replace the reply when --hold or --mesh is in the argv. A node that is not here is `unknown-node`.",
+  "self": {
+    "code": 0,
+    "stdout": {
+      "status": "ok",
+      "command": "mail.send",
+      "message": "filed to self/minerva (msgid 5555555555555555555555555555555555555555555555555555555555555555)",
+      "gated": false,
+      "changed": [
+        "state/mail/base.jsonl: +1 letter to minerva"
+      ],
+      "data": {
+        "seq": 9,
+        "receivedAt": "2026-10-07T10:00:00Z",
+        "type": "letter",
+        "via": "self",
+        "envelope": {
+          "header": {
+            "version": "1",
+            "from": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "to": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "type": "letter",
+            "mintedAt": "2026-10-07T10:00:00Z",
+            "originMesh": ""
+          },
+          "text": "(scripted)",
+          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "msgid": "5555555555555555555555555555555555555555555555555555555555555555"
+        },
+        "disposition": "filed",
+        "ring": "no-daemon"
+      }
+    }
+  },
+  "osaka": {
+    "code": 0,
+    "stdout": {
+      "status": "ok",
+      "command": "mail.send",
+      "message": "spooled to osaka/minerva (msgid 6666666666666666666666666666666666666666666666666666666666666666)",
+      "gated": false,
+      "changed": [
+        "state/outbox/osaka/: +1 entry"
+      ],
+      "data": {
+        "header": {
+          "version": "1",
+          "from": {
+            "node": "workbench",
+            "name": "minerva"
+          },
+          "to": {
+            "node": "osaka",
+            "name": "minerva"
+          },
+          "type": "letter",
+          "mintedAt": "2026-10-07T10:00:00Z",
+          "originMesh": ""
+        },
+        "text": "(scripted)",
+        "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+        "msgid": "6666666666666666666666666666666666666666666666666666666666666666",
+        "disposition": "spooled",
+        "delivery": {
+          "status": "queued",
+          "reason": null,
+          "reasonScope": null,
+          "nextAttemptAt": null,
+          "ackPending": false
+        }
+      }
+    },
+    "with_hold": {
+      "code": 0,
+      "stdout": {
+        "status": "ok",
+        "command": "mail.send",
+        "message": "held for osaka/minerva (msgid 7777777777777777777777777777777777777777777777777777777777777777)",
+        "gated": false,
+        "changed": [
+          "state/outbox/osaka/: +1 entry"
+        ],
+        "data": {
+          "header": {
+            "version": "1",
+            "from": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "to": {
+              "node": "osaka",
+              "name": "minerva"
+            },
+            "type": "letter",
+            "mintedAt": "2026-10-07T10:00:00Z",
+            "originMesh": ""
+          },
+          "text": "(scripted)",
+          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "msgid": "7777777777777777777777777777777777777777777777777777777777777777",
+          "disposition": "held",
+          "delivery": {
+            "status": "held",
+            "reason": null,
+            "reasonScope": null,
+            "nextAttemptAt": null,
+            "ackPending": false
+          }
+        }
+      }
+    }
+  },
+  "bridge": {
+    "code": 1,
+    "stdout": {
+      "status": "error",
+      "command": "mail.send",
+      "message": "node `bridge` is registered but not paired — mail requires a VERIFIED node; pair first with `aoide pair <url> --name bridge`",
+      "gated": false,
+      "data": {
+        "reason": "unpaired-node",
+        "name": "bridge"
+      }
+    }
+  },
+  "multi": {
+    "code": 1,
+    "stdout": {
+      "status": "error",
+      "command": "mail.send",
+      "message": "node `multi` is trusted in more than one mesh (alpha, beta): name one with --mesh=<mesh>",
+      "gated": false,
+      "data": {
+        "reason": "ambiguous-mesh",
+        "name": "multi",
+        "meshes": [
+          "alpha",
+          "beta"
+        ]
+      }
+    },
+    "with_mesh": {
+      "code": 0,
+      "stdout": {
+        "status": "ok",
+        "command": "mail.send",
+        "message": "spooled to multi/minerva (msgid 8888888888888888888888888888888888888888888888888888888888888888)",
+        "gated": false,
+        "changed": [
+          "state/outbox/multi/: +1 entry"
+        ],
+        "data": {
+          "header": {
+            "version": "1",
+            "from": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "to": {
+              "node": "multi",
+              "name": "minerva"
+            },
+            "type": "letter",
+            "mintedAt": "2026-10-07T10:00:00Z",
+            "originMesh": ""
+          },
+          "text": "(scripted)",
+          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "msgid": "8888888888888888888888888888888888888888888888888888888888888888",
+          "disposition": "spooled",
+          "delivery": {
+            "status": "queued",
+            "reason": null,
+            "reasonScope": null,
+            "nextAttemptAt": null,
+            "ackPending": false
+          }
+        }
+      }
+    }
+  }
+}

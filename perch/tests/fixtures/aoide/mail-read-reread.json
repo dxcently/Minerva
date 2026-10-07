@@ -1,0 +1,235 @@
+{
+  "status": "ok",
+  "command": "mail.read",
+  "message": "9 entries",
+  "gated": false,
+  "data": {
+    "entries": [
+      {
+        "seq": 0,
+        "receivedAt": "2026-10-06T08:00:00Z",
+        "type": "letter",
+        "via": "self",
+        "envelope": {
+          "header": {
+            "version": "1",
+            "from": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "to": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "type": "letter",
+            "mintedAt": "2026-10-06T08:00:00Z",
+            "originMesh": ""
+          },
+          "text": "read long ago, printed again only by --reread",
+          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "msgid": "9999999999999999999999999999999999999999999999999999999999999999"
+        }
+      },
+      {
+        "seq": 1,
+        "receivedAt": "2026-10-07T09:00:00Z",
+        "type": "letter",
+        "via": "self",
+        "envelope": {
+          "header": {
+            "version": "1",
+            "from": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "to": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "type": "letter",
+            "mintedAt": "2026-10-07T09:00:00Z",
+            "originMesh": ""
+          },
+          "text": "AOIDE-LETTER/1\n{\"subject\":\"Plan: ship the mesh view\",\"to\":[{\"node\":\"workbench\",\"name\":\"minerva\"}],\"cc\":[],\"body\":\"First line.\\nSecond line, with \\\"quotes\\\" and 世界.\"}",
+          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "msgid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      {
+        "seq": 2,
+        "receivedAt": "2026-10-07T09:05:00Z",
+        "type": "letter",
+        "via": "self",
+        "envelope": {
+          "header": {
+            "version": "1",
+            "from": {
+              "node": "workbench",
+              "name": "minerva-agent"
+            },
+            "to": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "type": "letter",
+            "mintedAt": "2026-10-07T09:05:00Z",
+            "originMesh": ""
+          },
+          "text": "AOIDE-LETTER/1\n{\"subject\":\"Review the diff\",\"to\":[{\"node\":\"workbench\",\"name\":\"minerva\"}],\"cc\":[],\"body\":\"The agent says: the tests pass.\",\"threadId\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"replyTo\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}",
+          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "msgid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      {
+        "seq": 3,
+        "receivedAt": "2026-10-07T09:10:00Z",
+        "type": "letter",
+        "via": "osaka",
+        "envelope": {
+          "header": {
+            "version": "1",
+            "from": {
+              "node": "osaka",
+              "name": "conductor"
+            },
+            "to": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "type": "letter",
+            "mintedAt": "2026-10-07T09:10:00Z",
+            "originMesh": ""
+          },
+          "text": "plain text from a peer\nwith two lines",
+          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "msgid": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      },
+      {
+        "seq": 4,
+        "receivedAt": "2026-10-07T09:15:00Z",
+        "type": "receipt",
+        "via": "osaka",
+        "envelope": {
+          "header": {
+            "version": "1",
+            "from": {
+              "node": "osaka",
+              "name": "minerva"
+            },
+            "to": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "type": "receipt",
+            "mintedAt": "2026-10-07T09:15:00Z",
+            "originMesh": ""
+          },
+          "text": "6666666666666666666666666666666666666666666666666666666666666666",
+          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "msgid": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      {
+        "seq": 5,
+        "receivedAt": "2026-10-07T09:20:00Z",
+        "type": "letter",
+        "via": "osaka",
+        "envelope": {
+          "header": {
+            "version": "1",
+            "from": {
+              "node": "osaka",
+              "name": "minerva"
+            },
+            "to": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "type": "letter",
+            "mintedAt": "2026-10-07T09:20:00Z",
+            "originMesh": ""
+          },
+          "text": "AOIDE-LETTER/1\n{\"subject\":\"half a letter\",\"to\":[{\"node\":\"osaka\",\"name\":\"minerva\"}],\"cc\":[],\"bod",
+          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "msgid": "3333333333333333333333333333333333333333333333333333333333333333"
+        }
+      },
+      {
+        "seq": 6,
+        "receivedAt": "2026-10-07T09:25:00Z",
+        "type": "letter",
+        "via": "osaka",
+        "envelope": {
+          "header": {
+            "version": "1",
+            "from": {
+              "node": "osaka",
+              "name": "minerva"
+            },
+            "to": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "type": "letter",
+            "mintedAt": "2026-10-07T09:25:00Z",
+            "originMesh": ""
+          },
+          "text": "<script>alert(1)</script></script><img src=x onerror=alert('x')>\u001b[31mred\u001b[0m\u001b]0;pwned\u0007 {{7*7}} ${x} ‮ rtl\n\n```\nfence\n````",
+          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "msgid": "4444444444444444444444444444444444444444444444444444444444444444"
+        }
+      },
+      {
+        "seq": 7,
+        "receivedAt": "yesterday-ish",
+        "type": "letter",
+        "via": "osaka",
+        "envelope": {
+          "header": {
+            "version": "1",
+            "from": {
+              "node": "<b>evil</b>\u001b[1m",
+              "name": "minerva-agent\n--hold"
+            },
+            "to": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "type": "letter",
+            "mintedAt": "yesterday-ish",
+            "originMesh": ""
+          },
+          "text": "x",
+          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "msgid": "not-hex"
+        }
+      },
+      {
+        "seq": 8,
+        "receivedAt": "2026-10-07T09:30:00Z",
+        "type": "letter",
+        "via": "self",
+        "envelope": {
+          "header": {
+            "version": "1",
+            "from": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "to": {
+              "node": "workbench",
+              "name": "minerva"
+            },
+            "type": "letter",
+            "mintedAt": "2026-10-07T09:30:00Z",
+            "originMesh": ""
+          },
+          "text": "a raw note, no letter marker",
+          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "msgid": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      }
+    ]
+  }
+}
