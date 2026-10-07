@@ -1,10 +1,29 @@
-# src/bin/ — the stand-in door
+# src/bin/ — the stand-ins
 
-`fake_eidolon.rs` is a test double for `eidolon web`, and nothing else lives here. It is
-built **only** with `--features test-bins` (`required-features` in `../../Cargo.toml`), so a
-plain `cargo build` ships no test double and a plain `cargo test` compiles none; the
-integration tests that need a door are `#[cfg(feature = "test-bins")]` and reach the binary
-through `CARGO_BIN_EXE_fake_eidolon`.
+Test doubles, and nothing else lives here. Each is built **only** with `--features test-bins`
+(`required-features` in `../../Cargo.toml`), so a plain `cargo build` ships no test double and a
+plain `cargo test` compiles none; the integration tests that need one are
+`#[cfg(feature = "test-bins")]` and reach the binary through `CARGO_BIN_EXE_<name>`.
+
+| File | Stands in for | State |
+|---|---|---|
+| `fake_eidolon.rs` | `eidolon`: the door (`web`), `resume`, the read-only `sessions`, `log --json [--after N]` and `models`, and the seams below | built |
+| `fake_eidolon/workflow.rs` | `eidolon [--config C] workflow run\|resume ...` | stub until R1a: says so on stderr, exits 2 |
+| `fake_eidolon/meta.rs` | `eidolon [--config C] tools\|plugins\|policy-rows` | stub until R3: says so on stderr, exits 2 |
+| `fake_eidolon/asks.rs` | the door's open asks: `FAKE_ASKS`, `FAKE_LAG`, a 409 for a second answer | stub until A1a: three no-op hooks (`after_say`, `on_answer`, `on_stream`) |
+| `fake_eidolon/agent.rs` | an agent's tool call into the perch: `FAKE_AGENT_CALL` | stub until AG: one no-op hook (`after_say`) |
+| `fake_aoide.rs` | the `aoide` CLI | stub until R2a: says so on stderr, exits 99 (the code "anything else" gets) |
+| `fake_minerva.rs` | the installer's `minerva` | stub until R4: says so on stderr, exits 2 |
+
+`fake_eidolon.rs` is the only file that calls the seams: `workflow` and `meta` are dispatched by subcommand, after the global flags
+(`--config`, `--yolo`) are parsed into a `Cmd`, and each `run(&Cmd) -> i32` is the process's exit code; the `asks` and `agent` hooks are called
+after a `say` is accepted, when an `/api/answer` has passed its checks, and when an `/api/events` stream has been sent `hello`. The owning slice
+fills its own file and never edits `fake_eidolon.rs`. The submodules sit in `fake_eidolon/` and are declared with `#[path]`, because a bin's root
+file looks for its modules beside itself, where `src/bin/<name>.rs` would be built as a bin of its own.
+
+## fake_eidolon
+
+`fake_eidolon.rs` is a test double for `eidolon web`.
 
 It models the door **as of eidolon `0194f2b`** (the contract the H1c proxy is written
 against): the argv `web --bind ADDR (--cwd DIR | --session PATH) [-m MODEL]`, the two boot

@@ -43,3 +43,34 @@ The post-review tree tests add: NTFS 8.3 aliases (`GIT~1`, `a/SSH~1/x`, escaped,
 
 Directories are `tempfile`'s, under `/tmp` rather than the 9p mount this repository lives
 on: the `0600` and `0700` checks need a filesystem that keeps its promises.
+
+## The harness, and the file each slice owns
+
+The perch child, the requests and answers, the stand-in door's log and the SSE pane reader that `http.rs` is written with live in
+[`common/`](common/) (`mod common;` in each file), so a later slice starts a perch the way `http.rs` does without copying 600 lines. `http.rs`
+keeps the cases of the slices that are built. Every slice that is not yet built has **one file here, with one pin** that says what its seam does
+today (the empty 404 behind the gate, the 401 of an agent path, or a fake that refuses); the slice replaces the pin with its own tests and edits
+no other test file.
+
+| File | Slice | The pin today |
+|---|---|---|
+| `runs.rs` | R1a, R1b | `/hub/runs[...]` is a 404 behind the gate; the fake's `workflow` command refuses |
+| `aoide.rs` | R2a | `fake_aoide` refuses every argv with exit 99 |
+| `mesh.rs` | R2b | `/hub/mesh` and `/hub/mesh/events` are a 404 behind the gate (pinned in `http.rs` until this file took them over) |
+| `meta.rs` | R3 | `/hub/meta/...` is a 404 behind the gate; the fake's `tools`, `plugins` and `policy-rows` refuse |
+| `install.rs` | R4 | `/hub/install[...]` is a 404 behind the gate; `fake_minerva` refuses every argv |
+| `agent.rs` | AG | `/hub/term/a/whoami` and `/hub/mail/a/whoami` are a 401 even for the master bearer |
+| `term.rs` | T1b | `/hub/term[/...]` is a 404 behind the gate |
+| `term_stream.rs` | T1c | `/hub/term/events` is a 404 behind the gate |
+| `term_agent.rs` | T2 | `/hub/term/a/<verb>` is a 401 for the master bearer |
+| `notes.rs` | N1 | `/hub/notes[...]` is a 404 behind the gate |
+| `mail.rs` | M2 | `/hub/mail[...]` is a 404 behind the gate |
+| `mail_agent.rs` | M3 | `/hub/mail/a/send` is a 401; `/hub/sessions/<id>/mailsend` a 404 |
+| `allow.rs` | A1b | `/hub/sessions/<id>/allow` and `/revoke` are a 404 behind the gate |
+| `watch.rs` | A1a | the fake door settles a second answer to one ask too (no 409 yet) |
+| `guard.rs` | G1 | `perch::guard::status()` is off and says "not built yet"; `refuses_term_text` refuses nothing |
+
+Two files are not stubs. `deps_smoke.rs` runs a real `/bin/sh` through `portable-pty` into an `alacritty_terminal` screen and reads it back as
+plain text (the terminal host's two dependencies, doing what T1a assumes; the probe a scout wrote, kept). `gpl_boundary.rs` parses `Cargo.lock`
+and fails on any package named `aoide*`: the perch is MIT and those crates are GPL-3.0. `live/` holds `fake-perch.sh`, the live check a person runs
+in a browser (see its README).

@@ -67,17 +67,38 @@ clap = { version = "4", features = ["derive"] }
 # The member's `~/.config/eidolon/config.toml` is parsed and re-written (never scanned by hand)
 # when `--home` generates the Minerva home's config. Parse + display only; not an eidolon crate.
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+# The terminal host (slice T1a; THIRD-PARTY.md has the licences). `portable-pty` is the PTY pair and the child on it: `openpty`, a
+# login shell as session leader, the master's reader and writer, `process_group_leader`. `alacritty_terminal` is the screen the perch
+# keeps *beside* the raw ring: `Term` fed through its `vte` parser, read back as text (`term_read`) and as a snapshot (a late joiner's
+# `term-reset`). Both are pinned exactly, because a terminal emulator's behaviour is the product: a bump is a reviewed change, and
+# `tests/deps_smoke.rs` is what says whether the pair still does what T1a assumes. `alacritty_terminal` is Apache-2.0 *only* and the
+# alacritty project's other crates are not used; `default-features = false` drops its optional `serde`. Neither crate is GPL, and
+# `tests/gpl_boundary.rs` keeps the whole lock free of the GPL `aoide-*` crates.
+portable-pty = "=0.9.0"
+alacritty_terminal = { version = "=0.26.0", default-features = false }
 
 [features]
-# The stand-in door the tests drive (`src/bin/fake_eidolon.rs`). `cargo build` and
+# The stand-in door the tests drive (`src/bin/fake_eidolon.rs`), and the two other fakes below it. `cargo build` and
 # `cargo test` without it compile no test double at all; `cargo test --features test-bins`
-# builds it, and `tests/http.rs` reaches it through `CARGO_BIN_EXE_fake_eidolon`.
+# builds them, and the tests reach them through `CARGO_BIN_EXE_fake_eidolon` (and `_fake_aoide`, `_fake_minerva`).
 test-bins = []
 
-# The fake is a *test* target (hub.md §11), so a normal build never ships it.
+# The fakes are *test* targets (hub.md §11), so a normal build never ships them.
 [[bin]]
 name = "fake_eidolon"
 path = "src/bin/fake_eidolon.rs"
+required-features = ["test-bins"]
+
+# The stand-in for `aoide` (slice R2a fills it): the mesh view and mail drive it through `CARGO_BIN_EXE_fake_aoide`. A stub until then.
+[[bin]]
+name = "fake_aoide"
+path = "src/bin/fake_aoide.rs"
+required-features = ["test-bins"]
+
+# The stand-in for `minerva` (slice R4 fills it): `status --json` and the `keys` verbs, with argv and stdin logged. A stub until then.
+[[bin]]
+name = "fake_minerva"
+path = "src/bin/fake_minerva.rs"
 required-features = ["test-bins"]
 
 [dev-dependencies]

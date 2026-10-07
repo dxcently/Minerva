@@ -43,7 +43,15 @@
 //! `FAKE_MODELS_SLEEP_MS` (`models` takes that long to answer).
 //!
 //! It also answers the two read-only commands the perch runs on eidolon (not doors): `[--config C] sessions` and
-//! `[--config C] log --json PATH` (see `helper` below); `FAKE_HELPER_FAIL=1` makes both exit 1.
+//! `[--config C] log --json [--after N] PATH` (see `helper` below; `--after N` keeps only the records whose id is above N);
+//! `FAKE_HELPER_FAIL=1` makes both exit 1.
+//!
+//! The rest of what later slices need is **seamed here and filled elsewhere**, so no slice edits this file:
+//!
+//! - `workflow run|resume ...` -> `fake_eidolon/workflow.rs`, `tools`, `plugins` and `policy-rows` -> `fake_eidolon/meta.rs`: each
+//!   `run(&Cmd) -> i32` is the process's exit code, and a stub today (it says so on stderr and exits 2);
+//! - `fake_eidolon/asks.rs` (`FAKE_ASKS`, `FAKE_LAG`, the 409 for a second answer) and `fake_eidolon/agent.rs` (`FAKE_AGENT_CALL`) are
+//!   hooks the door calls after a `say`, on an answer and when an `/api/events` stream opens. Every hook is a no-op today.
 //!
 //! Built only with `--features test-bins` (`required-features` in Cargo.toml), so a normal
 //! `cargo build` ships no test double.
@@ -58,6 +66,17 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::broadcast;
+
+// Not `src/bin/fake_eidolon/mod.rs`-style discovery: a bin's root file looks for its modules beside itself, and `src/bin/<name>.rs` would be
+// built as a bin of its own, so each says where it lives.
+#[path = "fake_eidolon/agent.rs"]
+mod agent;
+#[path = "fake_eidolon/asks.rs"]
+mod asks;
+#[path = "fake_eidolon/meta.rs"]
+mod meta;
+#[path = "fake_eidolon/workflow.rs"]
+mod workflow;
 
 /// The door's `MAX_BODY` (`serve.rs:51`).
 const MAX_BODY: usize = 8 * 1024 * 1024;
@@ -114,6 +133,39 @@ impl Fake {
     }
 }
 
+/// One eidolon command line the way the seamed commands see it: the global flags (`--config <file>`, `--yolo`) that come before the
+/// subcommand, the subcommand, and everything after it as given. The fields are for the slices that fill `workflow.rs` and `meta.rs`.
+#[allow(dead_code)]
+pub struct Cmd<'a> {
+    pub config: Option<&'a str>,
+    pub yolo: bool,
+    pub name: &'a str,
+    pub args: &'a [String],
+}
+
+impl<'a> Cmd<'a> {
+    /// `None` when there is no subcommand.
+    fn parse(argv: &'a [String]) -> Option<Self> {
+        let mut at = 1;
+        let (mut config, mut yolo) = (None, false);
+        loop {
+            match argv.get(at).map(String::as_str) {
+                Some("--config") => {
+                    config = Some(argv.get(at + 1)?.as_str());
+                    at += 2;
+                }
+                Some("--yolo") => {
+                    yolo = true;
+                    at += 1;
+                }
+                _ => break,
+            }
+        }
+        let name = argv.get(at)?.as_str();
+        Some(Self { config, yolo, name, args: &argv[at + 1..] })
+    }
+}
+
 fn main() {
     // A door prints two lines and nothing else on stdout, ever (§10.4: nothing a child
     // prints may carry a token). Diagnostics would go to stderr, which the perch inherits.
@@ -123,6 +175,14 @@ fn main() {
     }
     if helper(&argv) {
         return;
+    }
+    // The commands whose answers live in their own files (see the header).
+    if let Some(cmd) = Cmd::parse(&argv) {
+        match cmd.name {
+            "workflow" => std::process::exit(workflow::run(&cmd)),
+            "tools" | "plugins" | "policy-rows" => std::process::exit(meta::run(&cmd)),
+            _ => {}
+        }
     }
     let args = match Args::parse(&argv) {
         Ok(args) => args,
@@ -190,7 +250,7 @@ fn helper(argv: &[String]) -> bool {
     }
     // `log --json` prints the log file as it is: a test writes the lines in the real shape (image blocks carry
     // `source.data` base64, verified against eidolon 0.1.0; see `image_log` in tests/http.rs), and the fake does not interpret them.
-    if command == "log" && argv.iter().any(|a| a == "--after") {
+    if command == "log" && argv.iter().any(|a| a == "--after") && !argv.iter().any(|a| a == "--json") {
         // The settled check (fork.rs): `log PATH --after N` past the end prints only the `head:` line. A log is settled when its
         // last record is not a user or assistant message or a cancel, as eidolon's `is_settled` reads the end of a branch.
         let path = argv.iter().skip_while(|a| *a != "log").nth(1).expect("a path");
@@ -202,8 +262,33 @@ fn helper(argv: &[String]) -> bool {
     }
     if command == "log" {
         let path = argv.last().expect("a path");
+        // `--json --after N PATH` prints only the records whose id is above N, in file order, as eidolon's `log --json --after` does (the
+        // run graph's poll asks for what it has not seen). A record with no numeric id is not above anything. Without `--after` it is the file.
+        let after = match argv.iter().position(|a| a == "--after") {
+            None => None,
+            Some(at) => match argv.get(at + 1).and_then(|n| n.parse::<u64>().ok()) {
+                Some(n) => Some(n),
+                None => {
+                    eprintln!("fake_eidolon: log: --after needs a record id");
+                    std::process::exit(2);
+                }
+            },
+        };
         match std::fs::read(path) {
-            Ok(bytes) => std::io::stdout().write_all(&bytes).expect("writing the log"),
+            Ok(bytes) => {
+                let mut out = std::io::stdout();
+                match after {
+                    None => out.write_all(&bytes).expect("writing the log"),
+                    Some(after) => {
+                        for line in String::from_utf8_lossy(&bytes).lines() {
+                            let id = serde_json::from_str::<serde_json::Value>(line).ok().and_then(|record| record["id"].as_u64());
+                            if id.is_some_and(|id| id > after) {
+                                writeln!(out, "{line}").expect("writing the log");
+                            }
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("fake_eidolon: {path}: {e}");
                 std::process::exit(1);
@@ -621,7 +706,11 @@ async fn connection(mut sock: TcpStream, fake: Arc<Fake>) -> std::io::Result<()>
 
 ".to_vec());
                 }
-                reply(&mut sock, "202 Accepted", "{\"queued\":false}", "application/json").await
+                let answered = reply(&mut sock, "202 Accepted", "{\"queued\":false}", "application/json").await;
+                // The hooks of the slices that script a door (asks.rs, agent.rs); no-ops until they are built.
+                asks::after_say(&fake);
+                agent::after_say(&fake);
+                answered
             }
         }
         ("POST", "/api/answer") => {
@@ -631,6 +720,9 @@ async fn connection(mut sock: TcpStream, fake: Arc<Fake>) -> std::io::Result<()>
             let (Some(ask_id), Some(answer)) = (asked.get("ask_id").filter(|v| v.is_number()), asked.get("answer").and_then(|v| v.as_str())) else {
                 return reply(&mut sock, "400 Bad Request", "{\"error\":\"ask_id and answer\"}", "application/json").await;
             };
+            if let Some((status, refusal)) = asks::on_answer(&fake, &asked) {
+                return reply(&mut sock, status, refusal, "application/json").await;
+            }
             let mut settled = serde_json::json!({ "type": "ask-settled", "ask_id": ask_id, "how": "answered", "answer": answer });
             if let Some(note) = asked.get("note").and_then(|v| v.as_str()) {
                 settled["note"] = serde_json::Value::String(note.to_string());
@@ -683,6 +775,21 @@ async fn events(sock: &mut TcpStream, fake: &Arc<Fake>) -> std::io::Result<()> {
     sock.write_all(format!("{:x}\r\n{frame}\r\n", frame.len()).as_bytes()).await?;
     sock.flush().await?;
     fake.record("hello-sent");
+
+    // asks.rs: frames to hand this stream at once (the asks still open) and a close that follows them (`FAKE_LAG`). Nothing today.
+    let opening = asks::on_stream(fake, nth);
+    let mut wrote = true;
+    if !opening.replay.is_empty() {
+        let mut chunk = format!("{:x}\r\n", opening.replay.len()).into_bytes();
+        chunk.extend_from_slice(&opening.replay);
+        chunk.extend_from_slice(b"\r\n");
+        wrote = sock.write_all(&chunk).await.is_ok() && sock.flush().await.is_ok();
+    }
+    if !wrote || opening.end {
+        fake.record("stream-closed");
+        fake.streams.fetch_sub(1, Ordering::SeqCst);
+        return Ok(());
+    }
 
     // Hold it. The read is what notices the peer closing, which is the whole point of the Stop
     // finding: this door will not exit on SIGTERM until it returns.
