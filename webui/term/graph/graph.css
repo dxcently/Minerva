@@ -1,1 +1,42 @@
-/* the graph tab: the jev runs and the chat's turn graph (graph/); empty until those slices land */
+/* the graph tab (graph/): the jev runs and the chat's turn graph */
+
+/* a drawing (graph/draw.js): an svg whose user unit is about one pixel of the page's font and which the tab scales down to its width by
+   viewBox; it is never scaled up (its width attribute is its natural width). Colours are the page's tokens, so a scheme switch recolours it. */
+.gdraw { display: block; max-width: 100%; height: auto; overflow: visible; }
+.gdraw rect, .gdraw path { shape-rendering: crispEdges; vector-effect: non-scaling-stroke; }
+.gdraw text { font-family: var(--font); font-size: var(--fs); dominant-baseline: central; white-space: pre; fill: var(--fg); }
+.gdraw .gg { font-size: calc(var(--fs) * 0.8); } /* the triangle and the loop arrow: drawn by a fallback font, so a little smaller */
+.gempty { color: var(--faint); }
+
+/* frames (a compound state): a line and a title */
+.gc .gb { fill: none; stroke: var(--line); }
+.gc .gtitle { fill: var(--faint); }
+.gc.has-visited .gb { stroke: var(--faint); }
+.gc.has-current .gtitle { fill: var(--fg); }
+
+/* boxes: square, one line for the name, one more for each loop (the event that leaves the state and comes back) */
+.gn .gb { fill: var(--bg); stroke: var(--line); }
+.gn .gb2 { fill: none; stroke: var(--line); }
+.gn.k-history .gb, .gn.any .gb { stroke-dasharray: 3 2; }
+.gn .gloop { fill: var(--faint); }
+.gn.any .gname { fill: var(--faint); }
+
+/* lines: the label sits on the line, cutting it */
+.ge .gl { fill: none; stroke: var(--line); }
+.ge .ga { fill: var(--line); stroke: none; }
+.ge.any .gl { stroke-dasharray: 4 3; }
+.ge .gelb { fill: var(--bg); stroke: none; }
+.ge .gel { fill: var(--faint); }
+
+/* a run: once anything is marked, the states it has not been in go faint */
+.gdraw.live .gn:not(.visited):not(.current):not(.final):not(.failed) .gname { fill: var(--faint); }
+.gn.visited .gb, .gn.visited .gb2 { stroke: var(--faint); }
+.gn.current .gb { stroke: var(--bright); stroke-width: 2; fill: var(--sel); }
+.gn.current .gname { fill: var(--brightest); }
+.gn.final .gb, .gn.final .gb2 { stroke: var(--green); }
+.gn.final .gname { fill: var(--green); }
+.gn.failed .gb, .gn.failed .gb2 { stroke: var(--red); }
+.gn.failed .gname { fill: var(--red); }
+.ge.lit .gl { stroke: var(--fg); }
+.ge.lit .ga { fill: var(--fg); }
+.ge.lit .gel { fill: var(--fg); }
