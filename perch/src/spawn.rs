@@ -156,9 +156,12 @@ pub struct Spawner {
     jobs: std::sync::mpsc::Sender<Job>,
 }
 
-struct Job {
-    argv: Vec<OsString>,
-    reply: oneshot::Sender<io::Result<tokio::process::Child>>,
+enum Job {
+    /// A door: the argv to fork, and where the child goes.
+    Door { argv: Vec<OsString>, reply: oneshot::Sender<io::Result<tokio::process::Child>> },
+    /// Anything else that forks (a terminal's shell, slice T1a): run on this same thread, so two forks never interleave and nothing
+    /// that forks does so from a pool thread that goes idle.
+    Call(Box<dyn FnOnce() + Send>),
 }
 
 impl Spawner {
@@ -175,7 +178,15 @@ impl Spawner {
                 // from here happen on a thread that outlives the perch.
                 let _runtime = handle.enter();
                 while let Ok(job) = work.recv() {
-                    let _ = job.reply.send(fork(&job.argv));
+                    match job {
+                        Job::Door { argv, reply } => {
+                            let _ = reply.send(fork(&argv));
+                        }
+                        // A call that panics must not end the thread that forks every door: its caller sees "did not answer".
+                        Job::Call(call) => {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
+                        }
+                    }
                 }
             })
             .context("starting the thread that forks doors")?;
@@ -185,9 +196,25 @@ impl Spawner {
     async fn spawn(&self, argv: Vec<OsString>) -> io::Result<tokio::process::Child> {
         let (reply, answer) = oneshot::channel();
         self.jobs
-            .send(Job { argv, reply })
+            .send(Job::Door { argv, reply })
             .map_err(|_| io::Error::other("the thread that forks doors is gone"))?;
         answer.await.map_err(|_| io::Error::other("the thread that forks doors did not answer"))?
+    }
+
+    /// Runs `work` on the fork thread and hands back what it returned. This is the one generic job kind: the terminal host
+    /// forks its shells through it (the PTY and the child), so a shell's fork and a door's are never in flight at once. That is not
+    /// what keeps the PTY out of a door: the terminal host opens it close-on-exec from the first instant (`posix_openpt` with
+    /// `O_CLOEXEC`, the slave opened `O_CLOEXEC` too), so no fork anywhere, on this thread or another, can carry it into a program.
+    /// Running it here keeps the shell's own fork from interleaving with a door's.
+    /// `work` blocks the thread that forks doors for as long as it runs, so it forks and returns.
+    pub async fn run<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> io::Result<T> {
+        let (reply, answer) = oneshot::channel();
+        self.jobs
+            .send(Job::Call(Box::new(move || {
+                let _ = reply.send(work());
+            })))
+            .map_err(|_| io::Error::other("the thread that forks is gone"))?;
+        answer.await.map_err(|_| io::Error::other("the thread that forks did not answer"))
     }
 }
 
@@ -485,5 +512,23 @@ mod tests {
         assert_eq!(no_proxy_with_loopback(Some("corp.example,")), "corp.example,127.0.0.1,localhost,::1", "no empty entry is made");
         assert_eq!(no_proxy_with_loopback(Some("localhost, 127.0.0.1")), "localhost, 127.0.0.1,::1", "a name already listed is not listed twice");
         assert_eq!(no_proxy_with_loopback(Some("*")), "*,127.0.0.1,localhost,::1");
+    }
+
+    /// The generic job kind (T1a): work runs on the one fork thread, hands its value back, and a panic in it answers an error and
+    /// leaves the thread alive for the next job (a door fork after it must still work).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_runs_on_the_fork_thread_and_a_panic_in_it_does_not_end_that_thread() {
+        let spawner = Spawner::new().unwrap();
+        let name = spawner.run(|| std::thread::current().name().map(str::to_string)).await.unwrap();
+        assert_eq!(name.as_deref(), Some("perch-spawn"), "forks happen on the one thread");
+
+        let panicked = spawner.run(|| -> u8 { panic!("a call that goes wrong") }).await;
+        assert!(panicked.is_err(), "a call that panicked has no value to hand back");
+        let after = spawner.run(|| 7u8).await;
+        assert_eq!(after.unwrap(), 7, "the thread survived, so the next job still runs");
+
+        // The door kind is still served by the same thread, after the generic one.
+        let child = spawner.spawn(vec![OsString::from("/bin/true")]).await.unwrap();
+        assert!(child.id().is_some());
     }
 }
