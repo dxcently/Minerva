@@ -78,7 +78,7 @@ core/path.js         resolveIn(cwd, path): a tool-input path resolved against th
 core/api.js          apiBase(sessionId): the ONE place URLs are built. Hub = `/s/${sid}/api/`; hubGet/hubPost/hubTree (`/hub/sessions...`, `/hub/tree?...`) and detect() (perch or door)
 core/hub.js          the perch's session list as signals: polled GET /hub/sessions, stale flag, kept/live/elsewhere/older views, age(), label() (the title)
 panes/imgs.js        images: thumbnails (`<img src>` from the perch's image route), the full-size viewer (click; Esc or click closes; `open in new tab`), the local preview of an image this tab just sent, `fileUrl`/`viewFile` (an image file in the chat's folder, `GET /hub/file`) and `linkPaths` (image paths in reply text become clicks)
-core/saved.js        a saved chat: eidolon's `log --json` lines mapped to the frames a live door sends, drawn by the Session's own handlers (an unknown record kind is one plain line)
+core/saved.js        a saved chat: eidolon's `log --json` lines mapped to the frames a live door sends, drawn by the Session's own handlers; a jev run's Workflow records become start/end lines, script calls and the park's ask with its answer (an unknown record kind is one plain line naming it)
 core/sse.js          fetch-based SSE (Bearer header, never ?token=)
 core/state.js        one session stream as signals: frames -> rows, calls, asks, running; the reconnect backoff, resume, launch
 (core/ and panes/ each have a README with one line per file)
@@ -93,7 +93,7 @@ panes/asks.js        the tabbed ask panel (batch submit) and the transcript's as
 panes/files.js       the inspector's files tab: `folder` (the session's directory, lazily, through GET /hub/tree) (an image file opens the viewer on GET /hub/file) and `touched` (files edit/write calls touched), one / filter
 core/attach.js       images and text files put into a message, checked against the door's limits
 core/syntax.js       port of eidolon crates/tui/src/syntax.rs: code with line numbers, diffs
-renderers/           generic + files (edit/write diff, read as code) tool renderers; a renderer returns a string, a DOM Node or a vnode
+renderers/           generic + files (edit/write diff, read as code) + jev (jev_choose bars with the best and the margin, jev_entail scores, jev_mark lines; open by default) tool renderers; a renderer returns a string, a DOM Node or a vnode
 core/registry.js     the lists a feature folder registers into (tabs, pane kinds, commands, key rows, owners, frame taps, stream slots) and `host`: app.js draws from them, so a feature never edits app.js
 graph/               the inspector's graph tab: the jev runs and the chat's turn graph (GraphTab)
 mesh/                the left panel's mesh tab: the nodes this machine knows (MeshTab)

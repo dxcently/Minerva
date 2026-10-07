@@ -7,7 +7,7 @@ import { html, K, HUB, Rendered, Component, signal, effect, useRef, useLayoutEff
 import { IMAGE_TYPES, MAX_IMAGES, looksImage, readImage, readText, tooBig } from '../core/attach.js';
 import { markdown } from '../core/markdown.js';
 import { resolveIn } from '../core/path.js';
-import { render as rend, renderCall } from '../renderers/index.js';
+import { render as rend, renderCall, autoOpen } from '../renderers/index.js';
 import { icon, word, shade, CELLS } from '../core/life.js';
 import { tildify, kfmt, hhmm, stateOf, STATE_CLS, connWord } from '../core/state.js';
 import { mode, hubGet, hubPost } from '../core/api.js';
@@ -380,7 +380,7 @@ const VD = { refused: 'r', declined: 'r' };
 function ToolRow({ c, s, v, cm }) {
   const st = c.st.value, out = c.out.value, vd = c.verdict.value, a = c.ask.value, settled = c.settled.value;
   const open = useMemo(() => signal(null), []);
-  const shown = open.value ?? (out && out.isError);
+  const shown = open.value ?? (out && (out.isError || autoOpen(c.name, out.output, out.isError)));
   const sum = useMemo(() => rend(c.name, 'input', c.input), [c.input]);
   const body = useMemo(() => (out ? renderCall(c.input, c.name, 'output', out.output, out.isError) : null), [out]);
   const preview = useMemo(() => renderCall(c.input, c.name, 'preview', c.input), [c.input]);
