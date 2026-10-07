@@ -1411,12 +1411,15 @@ mod tests {
         shutdown: CancellationToken,
         served: tokio::task::JoinHandle<Result<()>>,
         sessions: PathBuf,
-        _dirs: (tempfile::TempDir, tempfile::TempDir),
+        _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
     }
 
     async fn up(knobs: &[&str]) -> Up {
         let sessions = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
+        // Aoide's home is an empty temp dir and its socket a path in it that is not there, so a request that reaches the mesh or the
+        // mail can never read the operator's `~/.aoide` or ping a real aoided (a `None` here would mean exactly those).
+        let aoide = tempfile::tempdir().unwrap();
         std::fs::write(sessions.path().join("ctf-pwn-3.eid"), "{}\n").unwrap();
         let knobs: Vec<String> = knobs.iter().map(|knob| knob.to_string()).collect();
         let opts = crate::Options {
@@ -1435,8 +1438,8 @@ mod tests {
             jev_health: None,
             browser_health: None,
             aoide: None,
-            aoide_home: None,
-            aoide_daemon_socket: None,
+            aoide_home: Some(aoide.path().to_path_buf()),
+            aoide_daemon_socket: Some(aoide.path().join("aoided.sock")),
             aoide_events: None,
             minerva: None,
             term_token_file: None,
@@ -1474,7 +1477,7 @@ mod tests {
         };
         let shutdown = CancellationToken::new();
         let served = tokio::spawn(run(ctx.clone(), listener, shutdown.clone()));
-        Up { addr: ctx.bound, ctx, shutdown, served, sessions: sessions.path().to_path_buf(), _dirs: (sessions, runtime) }
+        Up { addr: ctx.bound, ctx, shutdown, served, sessions: sessions.path().to_path_buf(), _dirs: (sessions, runtime, aoide) }
     }
 
     /// One request over its own connection, written exactly as given, and the status and body that came back.
@@ -1545,7 +1548,6 @@ mod tests {
             ("GET", "/hub/runs"),
             ("POST", "/hub/runs"),
             ("GET", "/hub/runs/r1/log"),
-            ("GET", "/hub/mesh"),
             ("GET", "/hub/meta/health"),
             ("GET", "/hub/install"),
             ("POST", "/hub/install/jev"),

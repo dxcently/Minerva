@@ -127,10 +127,12 @@ impl Perch {
         let runtime = tempfile::tempdir().unwrap();
         own(runtime.path(), 0o700);
         let xdg = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         Command::new(env!("CARGO_BIN_EXE_perch"))
             .arg("--bind")
             .arg("127.0.0.1:0")
             .args(args)
+            .env("HOME", home.path())
             .env("XDG_RUNTIME_DIR", runtime.path())
             .env("XDG_CONFIG_HOME", xdg.path())
             .stdin(Stdio::null())
@@ -239,7 +241,7 @@ impl Builder {
     }
 
     pub fn start(self) -> Perch {
-        let Builder { ui_dir, hub, args: extra, env, member_config, port: bind_port, held } = self;
+        let Builder { ui_dir, hub, args: extra, env, member_config, port: bind_port, mut held } = self;
         let root = tempfile::tempdir().unwrap();
         let ui = root.path().join("ui");
         std::fs::create_dir(&ui).unwrap();
@@ -306,6 +308,11 @@ impl Builder {
             hub_dir = Some(dir);
             fake_log = Some(log);
         }
+        // A HOME of its own, so nothing that defaults under ~ (~/.aoide, ~/Minerva, ~/.config) is the operator's; set before the
+        // test's env, so a test that names its own HOME wins.
+        let home = tempfile::tempdir().unwrap();
+        command.env("HOME", home.path());
+        held.push(Box::new(home));
         for (name, value) in env {
             command.env(name, value);
         }
