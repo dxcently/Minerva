@@ -297,7 +297,7 @@ pub async fn run(opts: Options, cancel: CancellationToken) -> Result<()> {
     };
     // The one hook that can refuse the start, so it runs before the boot lines: a supervisor never reads them from a perch that then
     // dies for a token file it could not write. It also leaves nothing behind: what it wrote and the perch's own token go.
-    if let Err(e) = agent::start(&ctx) {
+    if let Err(e) = agent::start(&ctx, &token_file) {
         agent::on_exit(&ctx);
         remove_token(&token_file, &token);
         return Err(e);

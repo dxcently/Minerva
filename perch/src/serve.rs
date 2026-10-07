@@ -1513,10 +1513,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_credential_a_master_bearer_and_a_cookie_are_all_a_401_on_an_agent_path() {
+    async fn the_master_credential_is_a_404_and_no_credential_a_401_on_an_agent_path() {
         let perch = up(&[]).await;
         let cookie = cookie(&perch);
-        // The controls: the same credentials do open the namespaces around the agent's, so the 401 below is the agent gate's.
+        // The controls: the same credentials do open the namespaces around the agent's, so the answers below are the agent gate's.
         assert_eq!(call(&perch, "GET", "/hub/sessions", &bearer(), "").await.0, 200);
         assert_eq!(call(&perch, "GET", "/hub/sessions", &cookie, "").await.0, 200);
         assert_eq!(call(&perch, "GET", "/hub/term", &bearer(), "").await.0, 404);
@@ -1524,9 +1524,10 @@ mod tests {
         assert_eq!(call(&perch, "GET", "/hub/term", "", "").await.0, 401);
         for path in ["/hub/term/a/list", "/hub/term/a/whoami", "/hub/mail/a/send", "/hub/mail/a/whoami"] {
             for method in ["GET", "POST"] {
-                for (what, credential) in [("a master bearer", bearer()), ("a cookie", cookie.clone()), ("nothing", String::new())] {
+                // A real credential, for another door: nothing is here for it. A stranger is told nothing but 401. Neither has a body.
+                for (what, credential, want) in [("a master bearer", bearer(), 404), ("a cookie", cookie.clone(), 404), ("nothing", String::new(), 401)] {
                     let (code, body) = call(&perch, method, path, &credential, "").await;
-                    assert_eq!((code, body.as_str()), (401, ""), "{what} on {method} {path}");
+                    assert_eq!((code, body.as_str()), (want, ""), "{what} on {method} {path}");
                 }
             }
         }
@@ -1682,9 +1683,10 @@ mod tests {
             assert_eq!((code, body.as_str()), (503, ""), "{method} {path} with the token");
         }
         assert_eq!(call(&perch, "GET", "/hub/sessions", &cookie, "").await.0, 503, "a cookie is no different");
-        // After gate 1, not before it: a caller with no credential, or on an agent path with the master one, still gets the 401.
+        // After gate 1, not before it: a caller with no credential still gets the 401, and one on an agent path with the master one the
+        // agent gate's 404, and neither the 503.
         assert_eq!(call(&perch, "GET", "/hub/sessions", "", "").await.0, 401);
-        assert_eq!(call(&perch, "GET", "/hub/term/a/list", &bearer(), "").await.0, 401);
+        assert_eq!(call(&perch, "GET", "/hub/term/a/list", &bearer(), "").await.0, 404);
         assert_eq!(call(&perch, "GET", "/hub/term/a/list", "", "").await.0, 401);
         // What is not behind the token is not this check's: the static route still answers (404, there is no UI dir here).
         assert_eq!(call(&perch, "GET", "/index.html", "", "").await.0, 404);

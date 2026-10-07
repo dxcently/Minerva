@@ -6,22 +6,43 @@
 //! [`agent_scope`] about the raw path, and the dispatch in `term` and `mail` asks the same predicate ([`verb`]), so a path that is
 //! routed as an agent route has always been through [`authenticate`], and the reverse.
 //!
-//! This is the seam; the gate is AG's. [`authenticate`] is a stub that refuses everything with 401, which is the fail-closed
-//! answer: a perch whose agent gate is not built has no agent route open to any caller, and the 401 is what a caller with no
-//! credential gets anywhere else behind the gate.
+//! **What the gate answers** (slice AG), for a request whose path [`agent_scope`] took:
+//!
+//! ```text
+//!   no bearer, or one that is nobody's                 401
+//!   the other scope's token (mail on term, term on mail) 401   a scoped token is good for its own prefix only
+//!   the master bearer, or a login cookie               404   a real credential, for another door: nothing is here for it
+//!   this scope's token, from a socket no live door owns 403   "term tools work in chats this Minerva opened"
+//!   this scope's token, from a live door's own socket   in: the chat is a [`Caller`] in the request's extensions
+//! ```
+//!
+//! A scope whose file flag was not given has no token at all, and nothing opens it: with no flags every agent path is the 401 of a
+//! caller with no credential. `whoami` is the gate's own verb: it answers `{"chat"}` here, because the answer is the attribution.
 
 pub mod attrib;
 pub mod token;
+
+use std::sync::{Mutex, OnceLock};
 
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 
 use crate::serve::{BoxBody, Ctx};
 
-/// What the agent gate keeps: the two tokens and where they were written. Filled by [`start`]; `Default` is how [`Ctx`] gets one
-/// before the hook runs (nothing here can be given the options at that point), so a field is interior-mutable or a `OnceLock`.
+/// What the agent gate keeps: the two scoped tokens, and what [`start`] wrote (so [`on_exit`] can take back exactly that). Filled by
+/// [`start`]; `Default` is how [`Ctx`] gets one before the hook runs (nothing here can be given the options at that point), so each
+/// field is interior-mutable or a `OnceLock`. No token is ever printed, logged or put in a `Debug`: this type has none.
 #[derive(Default)]
-pub struct State {}
+pub struct State {
+    /// Set once, by [`start`], after every file it wrote has been read back. Until then (and when no flag was given) no scope has a
+    /// token and the gate refuses every credential.
+    tokens: OnceLock<token::Tokens>,
+    /// Each file as soon as it was written, with the content this perch put in it: the token, or the url. A `start` that failed
+    /// part-way has recorded what it had made, so [`on_exit`] can remove it.
+    written: Mutex<Vec<token::Written>>,
+    /// Where the sockets of recent calls were last found, so a kept-alive connection is looked up in one `readlink`.
+    hints: attrib::Hints,
+}
 
 /// Which scoped token a path is behind. One token per scope, so a leaked mail token opens no terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,21 +82,25 @@ pub fn verb(rest: &str) -> Option<&str> {
 }
 
 /// Gate 1 for an agent path: the scoped token for `scope`, in constant time, and the chat the socket belongs to. `Err` is the
-/// answer to send (401, 403 or 404), boxed like the tree's, and nothing else is read from the request first. Stub: 401 for everyone.
+/// answer to send (401, 403 or 404, and for `whoami` the 200 with the chat), boxed like the tree's, and nothing is read from the
+/// request's body: the credential is checked first, and `/proc` is looked at only for a caller that holds the scope's token.
 pub fn authenticate(ctx: &Ctx, req: &Request<Incoming>, scope: Scope) -> Result<Caller, Box<Response<BoxBody>>> {
     token::authenticate(ctx, req, scope)
 }
 
-/// After the bind, before the boot lines (lib.rs): mint the scoped tokens and write the files the flags name. `Err` refuses the start.
-pub fn start(ctx: &Ctx) -> anyhow::Result<()> {
-    token::start(ctx)
+/// After the bind, before the boot lines (lib.rs): mint the scoped tokens and write the files the flags name. `master` is the perch's
+/// own token file, which no agent file may be (by any spelling, link or `..`). `Err` refuses the start.
+pub fn start(ctx: &Ctx, master: &std::path::Path) -> anyhow::Result<()> {
+    token::start(ctx, master)
 }
 
 /// After the drain, beside the perch's own token file's removal (lib.rs): take away the files [`start`] wrote. **Compare before
-/// unlink**: a file is removed only if it still holds what *this* perch wrote into it (the scoped token for a token file, the url for
-/// the url file), exactly as `sessions::drop_token_file` does for a door's. A path a flag named is where a *later* perch, or the
-/// operator, may have put a newer file by now; a bare `remove_file` would take its credential away from whoever holds it. A file that
-/// is gone, unreadable or someone else's is left alone and mentioned at debug level, never an error: this runs on the way out.
+/// unlink**: a file is removed only if it is still the very file this perch wrote (the same device and inode, read back at the end of
+/// [`start`]) and still holds what this perch put in it (the scoped token for a token file, the url for the url file), as
+/// `sessions::drop_token_file` does for a door's. A path a flag named is where a *later* perch, or the operator, may have put a newer
+/// file by now, and the url file of two perches on one port holds the same bytes: content alone cannot tell them apart, identity can. A
+/// bare `remove_file` would take a credential away from whoever holds it. A file that is gone, unreadable, a FIFO or someone else's is
+/// left alone and mentioned at debug level, never an error: this runs on the way out.
 ///
 /// Also called when [`start`] failed part-way, so it removes what exists and is ours, and is quiet about the rest.
 pub fn on_exit(ctx: &Ctx) {

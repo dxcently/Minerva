@@ -107,14 +107,26 @@ pub fn door_token_path(runtime_dir: &Path, port: u16) -> PathBuf {
 /// The refusals are the point (§10.4): a path a child printed is not a path this perch will
 /// follow anywhere, and a token file another user could read was never a secret.
 pub fn read_token_file(path: &Path) -> io::Result<String> {
+    read_token_file_id(path).map(|(text, _)| text)
+}
+
+/// A file's identity on its device: `(st_dev, st_ino)`, from the `fstat` of the descriptor that was read, so it names the file whose
+/// bytes were returned and not whatever is at the path a moment later.
+pub type FileId = (u64, u64);
+
+/// [`read_token_file`], and the identity of the file it read. Two files with the same bytes (a url file that a later perch on the
+/// same port wrote) are told apart by it.
+pub fn read_token_file_id(path: &Path) -> io::Result<(String, FileId)> {
     use std::io::Read as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::os::unix::io::FromRawFd as _;
 
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{} contains a NUL", path.display())))?;
-    // O_NOFOLLOW: a symlink at the token path is a refusal, not something to follow.
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    // O_NOFOLLOW: a symlink at the token path is a refusal, not something to follow. O_NONBLOCK: a FIFO there would otherwise block
+    // this `open` until a writer came (for ever, on the way out of a shutdown); opened without waiting it is refused below as "not a
+    // regular file". It changes nothing for a regular file, which a read never waits on.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -136,7 +148,7 @@ pub fn read_token_file(path: &Path) -> io::Result<String> {
     file.read_to_string(&mut text)?;
     // A trailing newline in a token file is a plausible upstream change and not a different
     // token; nothing else about the bytes is forgiven.
-    Ok(text.trim().to_string())
+    Ok((text.trim().to_string(), (meta.dev(), meta.ino())))
 }
 
 /// The one thread that will ever fork a door for this perch, and the channel to it.
@@ -179,6 +191,23 @@ impl Spawner {
     }
 }
 
+/// The three names a proxy list needs to leave loopback alone.
+const LOOPBACK: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
+
+/// An existing `NO_PROXY` value (kept as it is, first), with the loopback names appended that it does not already list.
+fn no_proxy_with_loopback(existing: Option<&str>) -> String {
+    let mut list = existing.map(str::trim).unwrap_or_default().trim_end_matches(',').to_string();
+    for name in LOOPBACK {
+        if !list.split(',').any(|entry| entry.trim() == name) {
+            if !list.is_empty() {
+                list.push(',');
+            }
+            list.push_str(name);
+        }
+    }
+    list
+}
+
 /// Runs on the spawn thread: this is the call that forks.
 fn fork(argv: &[OsString]) -> io::Result<tokio::process::Child> {
     let (program, args) = argv.split_first().ok_or_else(|| io::Error::other("no door binary in the argv"))?;
@@ -187,6 +216,13 @@ fn fork(argv: &[OsString]) -> io::Result<tokio::process::Child> {
     // §4 step 4. stderr is inherited: a door's complaints belong in the perch's own log,
     // and nothing on that path is a secret either.
     command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit());
+    // A door's own tools call this perch on loopback (`/hub/term/a/..`, `/hub/mail/a/..`), and the HTTP clients they are built on
+    // (hyper-util, reqwest) have no loopback bypass of their own: under an `http_proxy` or `ALL_PROXY` of the operator's the call would
+    // go to the proxy, which is a different socket (so the perch could not tell which door called) and a place the scoped token would
+    // then sit in the history of. Loopback is added to the door's `NO_PROXY`, in both spellings, after whatever the operator had.
+    let (upper, lower) = (std::env::var("NO_PROXY").ok(), std::env::var("no_proxy").ok());
+    command.env("NO_PROXY", no_proxy_with_loopback(upper.as_deref().or(lower.as_deref())));
+    command.env("no_proxy", no_proxy_with_loopback(lower.as_deref().or(upper.as_deref())));
     // Its own process group (pgid == pid): a stop signals the group, so the tool subprocesses a door started die with it, and a ctrl-c
     // at the perch's terminal does not reach doors that the perch is stopping in its own order.
     command.process_group(0);
@@ -408,5 +444,46 @@ mod tests {
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(read_token_file(&link).is_err(), "O_NOFOLLOW: a link at the token path is refused");
         assert!(read_token_file(&dir.path().join("nowhere")).unwrap_err().kind() == io::ErrorKind::NotFound, "a missing file is NotFound, which a cleanup can act on");
+    }
+
+    #[test]
+    fn a_fifo_at_the_token_path_is_refused_and_not_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fifo.token");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // A blocking `open` of a FIFO with no writer never returns, so the read runs on a thread the test can give up on.
+        let (done, answer) = std::sync::mpsc::channel();
+        let probe = path.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(read_token_file(&probe));
+        });
+        let err = answer.recv_timeout(std::time::Duration::from_secs(5)).expect("the read of a FIFO returned").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "refused as not a regular file: {err}");
+    }
+
+    #[test]
+    fn two_files_with_the_same_bytes_are_two_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        for path in [&a, &b] {
+            std::fs::write(path, "same\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let ((text_a, id_a), (text_b, id_b)) = (read_token_file_id(&a).unwrap(), read_token_file_id(&b).unwrap());
+        assert_eq!(text_a, text_b);
+        assert_ne!(id_a, id_b, "the same bytes, another file");
+        assert_eq!(read_token_file_id(&a).unwrap().1, id_a, "and one file is the same file every time it is read");
+    }
+
+    #[test]
+    fn loopback_is_appended_to_a_no_proxy_list_after_what_the_operator_had() {
+        assert_eq!(no_proxy_with_loopback(None), "127.0.0.1,localhost,::1");
+        assert_eq!(no_proxy_with_loopback(Some("")), "127.0.0.1,localhost,::1");
+        assert_eq!(no_proxy_with_loopback(Some("corp.example,10.0.0.0/8")), "corp.example,10.0.0.0/8,127.0.0.1,localhost,::1");
+        assert_eq!(no_proxy_with_loopback(Some("corp.example,")), "corp.example,127.0.0.1,localhost,::1", "no empty entry is made");
+        assert_eq!(no_proxy_with_loopback(Some("localhost, 127.0.0.1")), "localhost, 127.0.0.1,::1", "a name already listed is not listed twice");
+        assert_eq!(no_proxy_with_loopback(Some("*")), "*,127.0.0.1,localhost,::1");
     }
 }

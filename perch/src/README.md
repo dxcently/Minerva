@@ -21,7 +21,7 @@ aoide/    the one place Aoide is spoken to (doc only)
 mesh/     /hub/mesh: the peers (stub)
 meta/     /hub/meta/..: health of jev and the browser, the plugins (stub)
 install/  /hub/install: what the install page asks of `minerva` (stub)
-agent/    the agent gate: scoped tokens for /hub/term/a/<verb> and /hub/mail/a/<verb> (stub: 401 for everyone)
+agent/    the agent gate: scoped tokens for /hub/term/a/<verb> and /hub/mail/a/<verb>, attributed to a live door by its socket; whoami answered here
 term/     /hub/term: web terminals (stub)
 notes/    /hub/notes (stub)
 mail/     /hub/mail: the mailbox, and the opt-in a chat makes to send (stub)

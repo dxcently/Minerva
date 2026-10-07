@@ -11,7 +11,7 @@ plain `cargo test` compiles none; the integration tests that need one are
 | `fake_eidolon/workflow.rs` | `eidolon [--config C] workflow run\|resume ...` | stub until R1a: says so on stderr, exits 2 |
 | `fake_eidolon/meta.rs` | `eidolon [--config C] tools\|plugins\|policy-rows` | stub until R3: says so on stderr, exits 2 |
 | `fake_eidolon/asks.rs` | the door's open asks: `FAKE_ASKS`, `FAKE_LAG`, a 409 for a second answer | stub until A1a: three no-op hooks (`after_say`, `on_answer`, `on_stream`) |
-| `fake_eidolon/agent.rs` | an agent's tool call into the perch: `FAKE_AGENT_CALL` | stub until AG: one no-op hook (`after_say`) |
+| `fake_eidolon/agent.rs` | an agent's tool call into the perch: `FAKE_AGENT_CALL` | AG: after a say, the fake door calls the perch from its own socket (and from an `sh -c curl` child, which is refused); honours http_proxy and no_proxy as reqwest does |
 | `fake_aoide.rs` | the `aoide` CLI | stub until R2a: says so on stderr, exits 99 (the code "anything else" gets) |
 | `fake_minerva.rs` | the installer's `minerva` | stub until R4: says so on stderr, exits 2 |
 

@@ -59,13 +59,13 @@ no other test file.
 | `mesh.rs` | R2b | `/hub/mesh` and `/hub/mesh/events` are a 404 behind the gate (pinned in `http.rs` until this file took them over) |
 | `meta.rs` | R3 | `/hub/meta/...` is a 404 behind the gate; the fake's `tools`, `plugins` and `policy-rows` refuse |
 | `install.rs` | R4 | `/hub/install[...]` is a 404 behind the gate; `fake_minerva` refuses every argv |
-| `agent.rs` | AG | `/hub/term/a/whoami` and `/hub/mail/a/whoami` are a 401 even for the master bearer |
+| `agent.rs` | AG | done: scoped tokens, attribution to a door (its children refused), files on exit by identity, refused starts leave nothing |
 | `term.rs` | T1b | `/hub/term[/...]` is a 404 behind the gate |
 | `term_stream.rs` | T1c | `/hub/term/events` is a 404 behind the gate |
-| `term_agent.rs` | T2 | `/hub/term/a/<verb>` is a 401 for the master bearer |
+| `term_agent.rs` | T2 | `/hub/term/a/<verb>` is a 404 for the master bearer |
 | `notes.rs` | N1 | `/hub/notes[...]` is a 404 behind the gate |
 | `mail.rs` | M2 | `/hub/mail[...]` is a 404 behind the gate |
-| `mail_agent.rs` | M3 | `/hub/mail/a/send` is a 401; `/hub/sessions/<id>/mailsend` a 404 |
+| `mail_agent.rs` | M3 | `/hub/mail/a/send` is a 404 for the master bearer; `/hub/sessions/<id>/mailsend` a 404 |
 | `allow.rs` | A1b | `/hub/sessions/<id>/allow` and `/revoke` are a 404 behind the gate |
 | `watch.rs` | A1a | the fake door settles a second answer to one ask too (no 409 yet) |
 | `guard.rs` | G1 | `perch::guard::status()` is off and says "not built yet"; `refuses_term_text` refuses nothing |
