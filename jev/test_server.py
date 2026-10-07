@@ -8,6 +8,16 @@ fastapi's test client), from the repo root:
 `unittest`, not pytest: the stdlib runner keeps the venv to what the service
 itself needs.
 
+Run it under a throwaway HOME and XDG_CACHE_HOME so nothing can reach the real
+`~/.cache` (the decision log's default home) -- and, in a checkout that has no
+`models/openjev` (a fresh clone or worktree), with OPENJEV_DIR pointed at any
+existing directory, which `ConcurrencyTests.test_openjev_calls_are_serialized`
+needs even though the weights themselves are faked:
+
+    T=$(mktemp -d) && mkdir -p "$T/home" "$T/cache" "$T/openjev" &&
+      HOME="$T/home" XDG_CACHE_HOME="$T/cache" OPENJEV_DIR="$T/openjev" \\
+      jev/.venv/bin/python jev/test_server.py
+
 `choose` runs against the real 169 KB jevlike checkpoint in every run here --
 it is fast enough on CPU that faking it would not save anything and would
 stop testing the thing that actually matters (see docs/Architecture.md,
@@ -89,6 +99,333 @@ class HealthTests(unittest.TestCase):
         server._loaded.clear()
         self.client.get("/health")
         self.assertEqual(server._loaded, {})
+
+    def test_health_has_exactly_these_keys(self):
+        # The first three keep their meaning (files present); the rest is
+        # state the process already holds. A caller (the page's preflight)
+        # reads these by name, so an accidental rename or drop fails here.
+        body = self.client.get("/health").json()
+        self.assertEqual(
+            set(body),
+            {"status", "jevlike", "openjev", "decisions_log", "ckpt", "loaded", "openjev_dtype"},
+        )
+        self.assertEqual(set(body["loaded"]), {"jevlike", "openjev"})
+        self.assertIn(body["openjev_dtype"], ("float32", "bfloat16"))
+
+    def test_health_names_the_decisions_log_path(self):
+        with mock.patch.object(server, "DECISIONS_LOG", Path("/some/where/decisions.jsonl")):
+            body = self.client.get("/health").json()
+        self.assertEqual(body["decisions_log"], str(Path("/some/where/decisions.jsonl")))
+
+    def test_health_says_off_when_the_decision_log_is_off(self):
+        with mock.patch.object(server, "DECISIONS_LOG", None):
+            body = self.client.get("/health").json()
+        self.assertEqual(body["decisions_log"], "off")
+
+    def test_health_ckpt_is_the_basename_of_the_checkpoint(self):
+        self.assertEqual(self.client.get("/health").json()["ckpt"], server.JEVLIKE_CKPT.name)
+        with mock.patch.object(server, "JEVLIKE_CKPT", Path("/deep/dir/runs/jev-base-v0.pt")):
+            body = self.client.get("/health").json()
+        self.assertEqual(body["ckpt"], "jev-base-v0.pt")  # the name, not the path
+
+    def test_health_ckpt_is_reported_even_when_the_file_is_missing(self):
+        # `jevlike` is the file-present boolean; `ckpt` is which file this
+        # process is configured for, present or not.
+        with mock.patch.object(server, "JEVLIKE_CKPT", Path(tempfile.mkdtemp()) / "nope.pt"):
+            body = self.client.get("/health").json()
+        self.assertEqual(body["ckpt"], "nope.pt")
+        self.assertFalse(body["jevlike"])
+
+    def test_loaded_is_false_before_any_call(self):
+        with mock.patch.object(server, "_loaded", {}):
+            body = self.client.get("/health").json()
+        self.assertEqual(body["loaded"], {"jevlike": False, "openjev": False})
+
+    def test_loaded_turns_true_per_model_only_once_it_is_loaded(self):
+        # jevlike loads for real (the 169 KB checkpoint, same as every
+        # other test here); openjev's ~9 GB is replaced by a fake
+        # `modeling_openjev`, with `_openjev()` itself the real code -- so
+        # what is proven is that the real loaders fill the cache entry that
+        # `/health` reads, not that a test poked the dict.
+        fake_module = types.ModuleType("modeling_openjev")
+        fake_module.OpenJevCrossEncoder = mock.Mock(return_value=mock.Mock())
+        with mock.patch.dict(sys.modules, {"modeling_openjev": fake_module}), mock.patch.object(
+            server, "_loaded", {}
+        ), mock.patch.object(server, "OPENJEV_DIR", Path(tempfile.mkdtemp())):
+            self.assertEqual(
+                self.client.get("/health").json()["loaded"], {"jevlike": False, "openjev": False}
+            )
+            server._jevlike()
+            self.assertEqual(
+                self.client.get("/health").json()["loaded"], {"jevlike": True, "openjev": False}
+            )
+            server._openjev()
+            self.assertEqual(
+                self.client.get("/health").json()["loaded"], {"jevlike": True, "openjev": True}
+            )
+
+    def test_a_failed_load_does_not_count_as_loaded(self):
+        missing = Path(tempfile.mkdtemp()) / "no-openjev-here"
+        with mock.patch.object(server, "_loaded", {}), mock.patch.object(
+            server, "OPENJEV_DIR", missing
+        ):
+            with self.assertRaises(RuntimeError):
+                server._openjev()
+            body = self.client.get("/health").json()
+        self.assertFalse(body["loaded"]["openjev"])
+
+
+# Run as a fresh interpreter by `EnvSwitchTests` below: `DECISIONS_LOG` and
+# `OPENJEV_DTYPE` are read at import, so the only way to observe what an
+# environment value does to them is to import `server` in a process that has
+# that environment -- see `DecisionsLogImportTests` for why reloading in this
+# process is off the table. Static text with the jev directory over argv, the
+# same shape `_CROSS_PROCESS_WORKER_SRC` uses. The chooser is stubbed: the
+# probe is about where a row goes, not what the model says.
+_ENV_PROBE_SRC = '''\
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import server
+from fastapi.testclient import TestClient
+
+server._jevlike = lambda: (lambda context, options: [0.7, 0.3])
+client = TestClient(server.app)
+auth = {"authorization": "Bearer " + server.TOKEN}
+before = client.get("/health").json()
+exists_after_health = server.DECISIONS_LOG is not None and server.DECISIONS_LOG.exists()
+reply = client.post(
+    "/call", headers=auth, json={"method": "choose", "args": {"context": "c", "options": ["a", "b"]}}
+).json()
+after = client.get("/health").json()
+print(json.dumps({
+    "log": None if server.DECISIONS_LOG is None else str(server.DECISIONS_LOG),
+    "dtype": server.OPENJEV_DTYPE,
+    "before": before,
+    "log_exists_after_health": exists_after_health,
+    "after": after,
+    "reply": reply,
+}))
+'''
+
+
+def _probe_env(scratch: Path, **env: str) -> subprocess.CompletedProcess:
+    """Run `_ENV_PROBE_SRC` under an environment that cannot reach the
+    operator's real files: HOME, XDG_CACHE_HOME (and their Windows
+    equivalents) all point into `scratch`, and every jev path variable this
+    suite does not set itself is removed, so the default decision log lands
+    inside `scratch` -- never in the real `~/.cache`."""
+    base = dict(os.environ)
+    for name in ("JEV_DECISIONS_LOG", "OPENJEV_DTYPE", "JEVLIKE_CKPT"):
+        base.pop(name, None)
+    base.update(
+        HOME=str(scratch),
+        USERPROFILE=str(scratch),
+        XDG_CACHE_HOME=str(scratch),
+        LOCALAPPDATA=str(scratch),
+    )
+    base.update(env)
+    return subprocess.run(
+        [sys.executable, "-c", _ENV_PROBE_SRC, str(Path(__file__).resolve().parent)],
+        env=base,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _probe_result(case: unittest.TestCase, proc: subprocess.CompletedProcess) -> dict:
+    case.assertEqual(proc.returncode, 0, f"probe failed: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+class EnvSwitchTests(unittest.TestCase):
+    """`JEV_DECISIONS_LOG=off` and `OPENJEV_DTYPE`, end to end through a real
+    import of `server` in a process that has that environment. Each probe
+    pays a full import (several seconds), so the cases below are the ones
+    that need a real import; value parsing is covered in-process further
+    down."""
+
+    def test_off_with_bfloat16_writes_no_row_anywhere_and_health_says_both(self):
+        # Both knobs at once, as the demo box sets them.
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Path(tmp)
+            out = _probe_result(
+                self, _probe_env(scratch, JEV_DECISIONS_LOG="off", OPENJEV_DTYPE="bfloat16")
+            )
+            self.assertIsNone(out["log"])
+            self.assertEqual(out["before"]["decisions_log"], "off")
+            self.assertEqual(out["after"]["decisions_log"], "off")
+            self.assertEqual(out["dtype"], "bfloat16")
+            self.assertEqual(out["after"]["openjev_dtype"], "bfloat16")
+            self.assertTrue(out["reply"]["ok"], out["reply"])  # choose itself still answers
+            self.assertEqual(out["reply"]["result"]["best"], "a")
+            self.assertEqual(
+                [p for p in scratch.rglob("*") if p.is_file()],
+                [],
+                "a file appeared under the scratch home with the log off",
+            )
+            self.assertFalse((scratch / "eidolon").exists())
+
+    def test_unset_names_the_default_path_under_the_cache_dir_and_logs_there(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Path(tmp)
+            out = _probe_result(self, _probe_env(scratch))
+            expected = scratch / "eidolon" / "extensions" / "jev" / "decisions.jsonl"
+            self.assertEqual(out["log"], str(expected))
+            self.assertEqual(out["before"]["decisions_log"], str(expected))
+            self.assertFalse(out["log_exists_after_health"], "a /health probe must not create the log")
+            rows = expected.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(rows), 1)  # the one choose in the probe
+            self.assertEqual(json.loads(rows[0])["options"], ["a", "b"])
+            # And openjev_dtype is the unchanged default with nothing set.
+            self.assertEqual(out["dtype"], "float32")
+            self.assertEqual(out["after"]["openjev_dtype"], "float32")
+
+    def test_an_explicit_path_is_named_and_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Path(tmp)
+            log = scratch / "mine" / "log.jsonl"
+            out = _probe_result(self, _probe_env(scratch, JEV_DECISIONS_LOG=str(log)))
+            self.assertEqual(out["after"]["decisions_log"], str(log))
+            self.assertEqual(len(log.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_a_bad_openjev_dtype_stops_the_service_naming_the_variable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = _probe_env(Path(tmp), OPENJEV_DTYPE="float16")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("OPENJEV_DTYPE", proc.stderr)
+        self.assertIn("float16", proc.stderr)
+
+
+class DecisionsLogSettingTests(unittest.TestCase):
+    """How `JEV_DECISIONS_LOG` parses, without an import per case."""
+
+    def _setting(self, **env: str):
+        # XDG_CACHE_HOME/LOCALAPPDATA are pointed somewhere disposable so the
+        # default branch only ever *computes* a path under a temp dir; it
+        # never does any I/O either way.
+        scratch = tempfile.mkdtemp()
+        base = {"XDG_CACHE_HOME": scratch, "LOCALAPPDATA": scratch}
+        with mock.patch.dict(os.environ, {**base, **env}):
+            if "JEV_DECISIONS_LOG" not in env:
+                os.environ.pop("JEV_DECISIONS_LOG", None)
+            return server._decisions_log_setting(), Path(scratch)
+
+    def test_off_in_any_case_with_any_padding_is_none(self):
+        for value in ("off", "OFF", "Off", " off ", "\toff\n"):
+            with self.subTest(value=value):
+                self.assertIsNone(self._setting(JEV_DECISIONS_LOG=value)[0])
+
+    def test_unset_and_empty_are_the_default_path_not_off(self):
+        for env in ({}, {"JEV_DECISIONS_LOG": ""}):
+            with self.subTest(env=env):
+                got, scratch = self._setting(**env)
+                self.assertEqual(
+                    got, scratch / "eidolon" / "extensions" / "jev" / "decisions.jsonl"
+                )
+
+    def test_anything_else_is_a_path(self):
+        # `./off` is how a log file that really is called "off" is spelled;
+        # "offline" and "no" are paths too, not switches.
+        for value in ("/tmp/x/decisions.jsonl", "./off", "offline", "no", "false", "0"):
+            with self.subTest(value=value):
+                self.assertEqual(self._setting(JEV_DECISIONS_LOG=value)[0], Path(value))
+
+
+class DecisionsLogOffTests(unittest.TestCase):
+    """The same switch from inside this process, where `DECISIONS_LOG` can be
+    patched: with it `None`, nothing may even try to write."""
+
+    def setUp(self):
+        self.client = TestClient(server.app)
+
+    def test_choose_with_the_log_off_never_reaches_the_writer(self):
+        with mock.patch.object(server, "DECISIONS_LOG", None), mock.patch.object(
+            server._paths, "append_locked"
+        ) as writer:
+            r = self.client.post(
+                "/call",
+                headers=AUTH,
+                json={"method": "choose", "args": {"context": "c", "options": ["a", "b"]}},
+            )
+        self.assertTrue(r.json()["ok"], r.json())
+        writer.assert_not_called()
+
+    def test_log_decision_with_the_log_off_returns_without_writing(self):
+        with mock.patch.object(server, "DECISIONS_LOG", None), mock.patch.object(
+            server._paths, "append_locked"
+        ) as writer:
+            self.assertIsNone(server._log_decision("c", ["a", "b"], 0, {"a": 0.6, "b": 0.4}))
+        writer.assert_not_called()
+
+    def test_choose_with_a_path_still_reaches_the_writer(self):
+        # The other half of the pair above, so the first test cannot pass
+        # merely because the writer is never called by anyone.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "decisions.jsonl"
+            with mock.patch.object(server, "DECISIONS_LOG", log):
+                r = self.client.post(
+                    "/call",
+                    headers=AUTH,
+                    json={"method": "choose", "args": {"context": "c", "options": ["a", "b"]}},
+                )
+            self.assertTrue(r.json()["ok"], r.json())
+            self.assertEqual(len(log.read_text(encoding="utf-8").splitlines()), 1)
+
+
+class OpenjevDtypeTests(unittest.TestCase):
+    """`OPENJEV_DTYPE`: unset or `float32` is the load this service has always
+    made; `bfloat16` is the opt-in. `modeling_openjev` is faked, so what is
+    asserted is the `dtype` the real `_openjev()` hands the vendor class."""
+
+    def _load_with(self, dtype_setting: str):
+        import torch
+
+        fake_module = types.ModuleType("modeling_openjev")
+        fake_module.OpenJevCrossEncoder = mock.Mock(return_value=mock.Mock())
+        with mock.patch.dict(sys.modules, {"modeling_openjev": fake_module}), mock.patch.object(
+            server, "_loaded", {}
+        ), mock.patch.object(server, "OPENJEV_DIR", Path(tempfile.mkdtemp())), mock.patch.object(
+            server, "OPENJEV_DTYPE", dtype_setting
+        ):
+            server._openjev()
+        (call,) = fake_module.OpenJevCrossEncoder.call_args_list
+        return torch, call
+
+    def test_float32_is_the_default_load(self):
+        torch, call = self._load_with("float32")
+        self.assertIs(call.kwargs["dtype"], torch.float32)
+        self.assertEqual(call.kwargs["device"], "cpu")  # nothing else about the load changed
+        self.assertEqual(call.kwargs["bs"], 8)
+
+    def test_bfloat16_loads_in_bf16(self):
+        torch, call = self._load_with("bfloat16")
+        self.assertIs(call.kwargs["dtype"], torch.bfloat16)
+        self.assertEqual(call.kwargs["device"], "cpu")
+        self.assertEqual(call.kwargs["bs"], 8)
+
+    def test_the_setting_parses_as_documented(self):
+        for env, want in (
+            ({}, "float32"),
+            ({"OPENJEV_DTYPE": ""}, "float32"),
+            ({"OPENJEV_DTYPE": "float32"}, "float32"),
+            ({"OPENJEV_DTYPE": "bfloat16"}, "bfloat16"),
+            ({"OPENJEV_DTYPE": " BFloat16 "}, "bfloat16"),
+        ):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                if not env:
+                    os.environ.pop("OPENJEV_DTYPE", None)
+                self.assertEqual(server._openjev_dtype_setting(), want)
+
+    def test_anything_else_is_refused_by_name(self):
+        for bad in ("float16", "bf16", "fp32", "half", "int8"):
+            with self.subTest(bad=bad), mock.patch.dict(os.environ, {"OPENJEV_DTYPE": bad}):
+                with self.assertRaises(ValueError) as ctx:
+                    server._openjev_dtype_setting()
+                self.assertIn("OPENJEV_DTYPE", str(ctx.exception))
+                self.assertIn(bad, str(ctx.exception))
 
 
 class CacheDirTests(unittest.TestCase):

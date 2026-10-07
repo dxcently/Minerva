@@ -63,6 +63,29 @@ JEVLIKE_CKPT = Path(os.getenv("JEVLIKE_CKPT", str(_JEV_DIR / "runs" / "synthetic
 OPENJEV_DIR = Path(os.getenv("OPENJEV_DIR", str(_JEV_DIR.parent / "models" / "openjev")))
 OPENJEV_CODE_DIR = _JEV_DIR / "openjev"
 
+# What precision the openjev weights load in. `float32` (the default, and what
+# an unset or empty variable means) is the one this service has always used on
+# CPU; the ~9 GB on disk is stored as bfloat16, so float32 is about twice that
+# in memory. `bfloat16` loads them as stored, for a box that cannot spare the
+# difference, at the cost of slower and lossier CPU matmul (see `_openjev`).
+# Read once at import and validated here, not at the first `entail`: a typo
+# that quietly fell back to float32 would be an out-of-memory surprise in the
+# middle of a run, so a bad value stops the service from starting instead,
+# naming the variable.
+_OPENJEV_DTYPES = ("float32", "bfloat16")
+
+
+def _openjev_dtype_setting() -> str:
+    raw = (os.environ.get("OPENJEV_DTYPE") or "").strip().lower() or "float32"
+    if raw not in _OPENJEV_DTYPES:
+        raise ValueError(
+            f"OPENJEV_DTYPE must be one of {', '.join(_OPENJEV_DTYPES)} (or unset for float32), got {raw!r}"
+        )
+    return raw
+
+
+OPENJEV_DTYPE = _openjev_dtype_setting()
+
 # --- the extension contract ---------------------------------------------------
 # Minted by the extension host and handed to this process in the environment
 # only -- never on the command line (a Linux /proc/<pid>/cmdline is
@@ -197,9 +220,14 @@ Hypothesis: {hypothesis}
             sys.path.insert(0, str(OPENJEV_CODE_DIR))
         from modeling_openjev import OpenJevCrossEncoder
 
-        # float32 on CPU: bf16 is the repo default for GPU, and CPU bf16
-        # matmul is both slower and lossier here.
-        ce = OpenJevCrossEncoder(str(OPENJEV_DIR), device="cpu", dtype=torch.float32, bs=8)
+        # float32 on CPU by default: bf16 is the repo default for GPU, and CPU
+        # bf16 matmul is both slower and lossier here. `OPENJEV_DTYPE=bfloat16`
+        # opts into it anyway for a box short on memory -- the vendor class
+        # hands `dtype` straight to `from_pretrained` and casts the logits
+        # back to float32 in `predict`, so nothing downstream changes.
+        ce = OpenJevCrossEncoder(
+            str(OPENJEV_DIR), device="cpu", dtype=getattr(torch, OPENJEV_DTYPE), bs=8
+        )
         labels = ["contradiction", "entailment", "neutral"]  # CON, ENT, NEU -- the repo's order
 
         def run(premise: str, hypotheses: list[str]) -> list[dict]:
@@ -246,6 +274,12 @@ def _cache_dir() -> Path:
     return _paths.cache_dir()
 
 
+# `JEV_DECISIONS_LOG=off` (case-insensitive, surrounding whitespace ignored)
+# turns this log off entirely: `DECISIONS_LOG` is then `None`, `_log_decision`
+# returns before it builds a row, and `/health` says `"decisions_log": "off"`.
+# It is a switch, not a path, so a log file that really is called `off` has to
+# be spelled `./off`. This is the only decision log this service writes.
+#
 # `os.environ.get(...) or <fallback>`, the same short-circuiting pattern
 # `_cache_dir()` itself uses above for `LOCALAPPDATA` and `XDG_CACHE_HOME` --
 # not `os.getenv("JEV_DECISIONS_LOG", <fallback>)`. Python evaluates a
@@ -261,10 +295,14 @@ def _cache_dir() -> Path:
 # test_server.py's own comment on why its default does exactly that) --
 # `or` below means `_cache_dir()` now runs only when its result would
 # actually be used.
-DECISIONS_LOG = Path(
-    os.environ.get("JEV_DECISIONS_LOG")
-    or (_cache_dir() / "eidolon" / "extensions" / "jev" / "decisions.jsonl")
-)
+def _decisions_log_setting() -> Path | None:
+    raw = os.environ.get("JEV_DECISIONS_LOG") or ""
+    if raw.strip().lower() == "off":
+        return None
+    return Path(raw or (_cache_dir() / "eidolon" / "extensions" / "jev" / "decisions.jsonl"))
+
+
+DECISIONS_LOG: Path | None = _decisions_log_setting()
 
 
 # `_O_BINARY`/`_lock_file`/`_unlock_file` used to be defined here, an
@@ -299,7 +337,12 @@ def _log_decision(context: str, options: list[str], label: int, probs: dict[str,
     logged here trains nothing. Matches the native shape
     `jevlike.data.build_wikispeedia` writes (`"label": menu.index(click)`)
     and the row docs/design/automation.md ss5 specifies for this log.
+
+    Does nothing at all when `DECISIONS_LOG` is `None` (`JEV_DECISIONS_LOG=off`,
+    see above): no row is built, no directory is created, no file appears.
     """
+    if DECISIONS_LOG is None:
+        return
     row = {"context": context, "options": options, "label": label, "probs": probs, "ts": time.time()}
     line = (json.dumps(row) + "\n").encode("utf-8")
     try:
@@ -385,11 +428,30 @@ def health():
     specifically, not just the directory: a 9 GB download still in flight
     leaves config.json sitting there, and reporting true on that basis would
     be a lie the first `entail` call immediately contradicts.
+
+    `status`, `jevlike` and `openjev` mean what they always did -- the files
+    are present. The rest is state this process already holds, so it costs
+    nothing either:
+
+      decisions_log  "off" when JEV_DECISIONS_LOG=off, else the path `choose`
+                     appends to
+      ckpt           basename of JEVLIKE_CKPT, which chooser checkpoint this
+                     process would load (or has)
+      loaded         {jevlike, openjev}: true only once that model is
+                     actually loaded in this process, i.e. a first
+                     `choose`/`entail` has already paid for it
+      openjev_dtype  "float32" or "bfloat16": what OPENJEV_DTYPE made of the
+                     environment, so a caller can see which one a load would
+                     (or did) use
     """
     return {
         "status": "ok",
         "jevlike": JEVLIKE_CKPT.exists(),
         "openjev": any(OPENJEV_DIR.glob("*.safetensors")),
+        "decisions_log": "off" if DECISIONS_LOG is None else str(DECISIONS_LOG),
+        "ckpt": JEVLIKE_CKPT.name,
+        "loaded": {"jevlike": "jevlike" in _loaded, "openjev": "openjev" in _loaded},
+        "openjev_dtype": OPENJEV_DTYPE,
     }
 
 
