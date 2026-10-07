@@ -121,7 +121,7 @@ impl State {
             })
             .request_timeout(Duration::from_secs(120))
             .arg("--disable-back-forward-cache");
-        if std::env::var_os("EIDOLON_BROWSER_NO_SANDBOX").is_some() {
+        if std::env::var("EIDOLON_BROWSER_NO_SANDBOX").is_ok_and(|v| v == "1") {
             builder = builder.no_sandbox();
         }
         let config = builder.build()?;

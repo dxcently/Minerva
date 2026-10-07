@@ -151,7 +151,7 @@ All optional, read by the service at start.
 | `EIDOLON_SERVICE_PORT` | `8090` | change `base_url` in every `tools/browser_*.rn` to match |
 | `EIDOLON_BROWSER_TOKEN_FILE` | `~/.config/eidolon/browser.token` | change `token_file` in the tools to match |
 | `EIDOLON_BROWSER_CHROME` | `chromium`, then `google-chrome` on PATH | the Nix package sets it |
-| `EIDOLON_BROWSER_NO_SANDBOX` | unset | set it only if Chromium can't start its sandbox (some containers) |
+| `EIDOLON_BROWSER_NO_SANDBOX` | unset | `1` turns Chromium's sandbox off; set it only if Chromium can't start its sandbox (some containers). Any other value keeps it on |
 
 ## How it works
 

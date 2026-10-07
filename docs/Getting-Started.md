@@ -235,7 +235,7 @@ Then, in your **Windows** browser, open `http://127.0.0.1:47811/#token=<contents
 
 jev scores a menu of options in one pass (`choose`), checks whether one statement follows from another (`entail`), and runs jev graphs as Rune workflows from the `jev` plugin (for example `eidolon workflow run ~/.config/eidolon/plugins/jev selftest`).
 
-> **Status:** jev loads into eidolon as the `jev` plugin (`eidolon-plugins/jev`): `jev_choose` and `jev_entail` call this service on `127.0.0.1:8091` with the bearer token in `~/.config/eidolon/jev.token`, and the automation graphs run as workflows. Install it, and the `browser` and `subagent` plugins, with `eidolon plugins install dxcently/eidolon-plugins browser subagent jev --ref 3be1e2b378ba0442de2ecf5a2b9625baebadbefc` and then `eidolon plugins trust <name>` for each; each plugin's README (in `eidolon-plugins/<name>/README.md`) has the rest (the browser service, the token grants).
+> **Status:** jev loads into eidolon as the `jev` plugin (`eidolon-plugins/jev`): `jev_choose` and `jev_entail` call this service on `127.0.0.1:8091` with the bearer token in `~/.config/eidolon/jev.token`, and the automation graphs run as workflows. Install it, and the `browser` and `subagent` plugins, with `eidolon plugins install dxcently/eidolon-plugins browser subagent jev --ref 7a0ff8ed288717fad7bdbd8e6163f22c3afa7a6a` and then `eidolon plugins trust <name>` for each; each plugin's README (in `eidolon-plugins/<name>/README.md`) has the rest (the browser service, the token grants).
 
 Set it up:
 
