@@ -67,7 +67,7 @@ no other test file.
 | `mail.rs` | M2 | `/hub/mail[...]` is a 404 behind the gate |
 | `mail_agent.rs` | M3 | `/hub/mail/a/send` is a 404 for the master bearer; `/hub/sessions/<id>/mailsend` a 404 |
 | `allow.rs` | A1b | `/hub/sessions/<id>/allow` and `/revoke` are a 404 behind the gate |
-| `watch.rs` | A1a | the fake door settles a second answer to one ask too (no 409 yet) |
+| `watch.rs` | A1a | none: A1a is built and the file holds its tests (the watcher against the stand-in's `FAKE_ASKS` and `FAKE_LAG`; its `409` for a second answer and `422` for one not offered) |
 | `guard.rs` | G1 | `perch::guard::status()` is off and says "not built yet"; `refuses_term_text` refuses nothing |
 
 Two files are not stubs. `deps_smoke.rs` runs a real `/bin/sh` through `portable-pty` into an `alacritty_terminal` screen and reads it back as
