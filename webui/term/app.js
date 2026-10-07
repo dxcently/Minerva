@@ -20,6 +20,8 @@ import { projects, projectFor, sorted, isScratch, loadProjects, addProject, forg
 import { Picker, picker as pickerOpen, openPicker } from './panes/picker.js';
 import { Overlay, overlay } from './core/overlay.js';
 import { Needs, Kv } from './core/bits.js';
+import { hubPoll } from './core/lane.js';
+import { limitTable } from './core/ctxlimit.js';
 import { FONTS, DEFAULT_FONT, theme, themes, font, cell, setTheme, setFont, resolve, startLook } from './core/look.js';
 import {
   host, paneKinds, commands, keyRows, loadedSections, MAX_SIDS, chatCap, overCap,
@@ -590,6 +592,8 @@ function openCmd(prefill = '') {
 function closeCmd() {
   batch(() => { ui.cmd.value = null; if (ui.hint.value && ui.hint.value.mode === 'menu') ui.hint.value = null; });
 }
+// What an empty match says: the `:` line has the page's own commands (and the ones features register); the door has no list of its own.
+const NO_CMD = "no such command; these are the page's own commands (eidolon's web door lists none)";
 const matches = (text) => {
   const w = (text || '').trim().split(/\s+/)[0] || '';
   return Object.keys(cmdTable.value).filter((c) => c.startsWith(w));
@@ -600,7 +604,7 @@ function runCmd(text = ui.cmd.value || '') {
   if (!w) return;
   const c = cmdTable.value[w]; // no prototype: `:constructor` is no command
   if (c) c[1](rest);
-  else toast(`:${w}: session commands arrive with the registry (M4)`, true);
+  else toast(`:${w}: ${NO_CMD}`, true);
 }
 
 // ---------------------------------------------------------------- menus
@@ -863,7 +867,7 @@ function showItems(p) {
 // ctrl+enter: the split picker under the focused pane (along its longer side),
 // or in the middle with none. Door mode keeps its toast.
 function picker() {
-  if (mode() !== 'perch') { toast('new pane with a picker arrives with the hub (M2); :vsplit mirrors this one'); return; }
+  if (mode() !== 'perch') { toast("the picker needs Minerva's server: open it with hoot; :vsplit mirrors this one"); return; }
   const p = focusedAny.peek(); // a chat pane or an xpane
   const el = p && document.querySelector(`.pane[data-pane="${p.id}"]`);
   const at = el ? under(el) : { x: innerWidth / 2, y: innerHeight / 2, x2: innerWidth / 2, y2: innerHeight / 2 };
@@ -1400,7 +1404,7 @@ function RunTab({ s }) {
   return html`<div class="hdr">open calls</div>
     ${open.length ? open.map((c) => html`<div class="kv"><span class="hi">${c.name}</span><span class="grow faint">${c.st.value}</span></div>`)
       : html`<div class="faint">${run === true ? 'thinking…' : 'nothing running'}</div>`}
-    <div class="hdr">parked</div><${Needs}>live park samples need the park-tick frame (gap 7)</${Needs}>`;
+    <div class="hdr">parked</div><${Needs}>parks of wait_for calls show no live samples: eidolon's web door sends no park-tick (upstream gap 7)</${Needs}>`;
 }
 
 // The status line's mode badge: what each approval mode means, for its tooltip.
@@ -1494,7 +1498,7 @@ function Tiles() {
       <div class="scroll"><${Home} act=${homeAct} /></div></div>`;
   } else if (!panes.length && !xs.length) {
     body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle faint">no pane</div>
-      <div class="empty">no pane open.${'\n\n'}<${K} cls="hi" on=${() => openPane()}>:open</${K}>  reconnect this session${'\n'}<span class="faint">ctrl+enter  new pane with a picker (arrives with the hub, M2)</span></div></div>`;
+      <div class="empty">no pane open.${'\n\n'}<${K} cls="hi" on=${() => openPane()}>:open</${K}>  reconnect this session${'\n'}<span class="faint">ctrl+enter  new pane with a picker (needs Minerva's server: open it with hoot)</span></div></div>`;
   } else {
     body = [
       ...panes.map((p) => rect.get(p.id) && html`<${Pane} key=${p.id + ' ' + p.sid} p=${p} rect=${rect.get(p.id)} focused=${p.id === f} mirror=${isMirror(p)} act=${act} />`),
@@ -1516,7 +1520,7 @@ function Hint() {
   const text = ui.cmd.value || '';
   const m = matches(text);
   return html`<div id="hint" class="menu">${m.length ? m.map((c, i) => html`<${K} cls=${'pair' + (i === 0 && text ? ' sel' : '')} on=${() => runCmd(c)}>${c}</${K}>${i === 0 && text ? html`<span class="faint"> ${cmdTable.value[c][0]}   </span>` : ' '}`)
-    : html`<span class="faint">session commands arrive with the registry (M4)</span>`}
+    : html`<span class="faint">${NO_CMD}</span>`}
     <${K} cls="pair faint" on=${closeCmd}>esc close</${K}></div>`;
 }
 
@@ -1603,6 +1607,23 @@ function KeyRef() {
 // The status line shows what is loaded; switching it is the composer's (its bottom border).
 const openLoaded = () => batch(() => { ui.rrail.value = false; ui.right.value = 'loaded'; });
 
+// The context limit of each model the perch lists: Map of key -> tokens | null, from the note on GET /hub/models (core/ctxlimit.js), null
+// until that list has been read. Read once the focused chat's model is missing from it, at most once a minute (the perch itself caches
+// the listing for ten minutes); a door has no such list, so the limit stays `-` there.
+const limits = signal(null);
+let limitsAt = 0;
+async function loadLimits() {
+  if (mode() !== 'perch' || Date.now() - limitsAt < 60000) return;
+  limitsAt = Date.now();
+  const r = await hubPoll('models');
+  if (r.status === 200 && Array.isArray(r.data)) limits.value = limitTable(r.data);
+}
+effect(() => {
+  known.value; // redraw once the mode is known
+  const p = focused.value, hl = p && p.s.hello.value;
+  if (hl && hl.model && !(limits.value && limits.value.has(hl.model))) loadLimits();
+});
+
 // Messages waiting for the focused pane's turn to end: held here, plus any the door holds.
 const queuedN = (p) => p.queue.value.length + p.s.queued.value;
 
@@ -1624,7 +1645,8 @@ function Status() {
   });
   if (ui.cmd.value != null) return html`<footer id="status" class="cmd"><${CmdLine} /></footer>`;
   const dot = html`<span class="faint"> · </span>`;
-  const ctx = s && s.ctx.value, limit = hl && hl.context_limit, chat = p && hl ? modeOf(p.sid, hl) : '';
+  const ctx = s && s.ctx.value, table = limits.value, limit = hl && table && table.get(hl.model), chat = p && hl ? modeOf(p.sid, hl) : '';
+  const noLimit = mode() !== 'perch' ? 'a bare door reports no context limit' : table ? "eidolon's model list gives no context limit for this model" : 'the model list has not been read';
   const gauges = s ? [
     lvl < 4 && `ctx ${ctx != null ? kfmt(ctx) : '-'}/${limit ? kfmt(limit) : '-'}`,
     lvl < 3 && `in ${kfmt(s.usedIn.value)} out ${kfmt(s.usedOut.value)}`,
@@ -1647,7 +1669,7 @@ function Status() {
       ${st === '?' && lvl < 1 && html`${dot}<span class="faint unk">state unknown until next turn event</span>`}
     </span>
     <span class="grow"></span>
-    <span class="right">${gauges && html`<span class="faint">${gauges}</span>`}<span onMouseDown=${(e) => e.preventDefault()}><${K} cls="qk" title="the key reference" on=${keyRef}><span class="kk">?</span>${lvl < 5 ? ' keys' : ''}</${K}></span></span>
+    <span class="right">${gauges && html`<span class="faint" title=${lvl < 4 && !limit ? noLimit : undefined}>${gauges}</span>`}<span onMouseDown=${(e) => e.preventDefault()}><${K} cls="qk" title="the key reference" on=${keyRef}><span class="kk">?</span>${lvl < 5 ? ' keys' : ''}</${K}></span></span>
   </div></footer>`;
 }
 

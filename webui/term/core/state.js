@@ -243,7 +243,7 @@ export class Session {
     this.banner.value = { text, resume: conn !== 'gone' && mode() === 'perch' };
   }
 
-  // A saved chat is drawn read-only from eidolon's own log lines (core/saved.js, GET /hub/sessions/<id>/log).
+  // A saved chat is drawn read-only from eidolon's own log lines (core/saved.js, GET /hub/sessions/<id>/transcript).
   // It only reads: nothing here starts the chat, which is `resume()` and a person's click. Loaded on demand
   // (a page with no saved chat open never fetches the module). A resume that began meanwhile wins.
   async loadSaved() {
