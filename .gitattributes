@@ -2,3 +2,4 @@
 webui/term/fonts/** -text
 bin/eidolon-theme text eol=lf
 bin/eidolon text eol=lf
+webui/term/vendor/** text eol=lf
