@@ -8,7 +8,7 @@ plain `cargo test` compiles none; the integration tests that need one are
 | File | Stands in for | State |
 |---|---|---|
 | `fake_eidolon.rs` | `eidolon`: the door (`web`), `resume`, the read-only `sessions`, `log --json [--after N]` and `models`, and the seams below | built |
-| `fake_eidolon/workflow.rs` | `eidolon [--config C] workflow run\|resume ...` | stub until R1a: says so on stderr, exits 2 |
+| `fake_eidolon/workflow.rs` | `eidolon [--config C] workflow run\|resume ...` | built: a case per start (`FAKE_WORKFLOW_CASE`, a letter or a file read at each start), `_STEP_MS`, `_LINGER_MS`, `_HOLD_MS`, `_ENV`, and `_DEAF` (ignores SIGTERM, holds a child, for the SIGKILL path) |
 | `fake_eidolon/meta.rs` | `eidolon [--config C] tools\|plugins\|policy-rows` | stub until R3: says so on stderr, exits 2 |
 | `fake_eidolon/asks.rs` | the door's open asks: `FAKE_ASKS`, `FAKE_LAG`, a 409 for a second answer | stub until A1a: three no-op hooks (`after_say`, `on_answer`, `on_stream`) |
 | `fake_eidolon/agent.rs` | an agent's tool call into the perch: `FAKE_AGENT_CALL` | AG: after a say, the fake door calls the perch from its own socket (and from an `sh -c curl` child, which is refused); honours http_proxy and no_proxy as reqwest does |

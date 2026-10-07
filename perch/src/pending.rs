@@ -586,7 +586,7 @@ async fn pump(mut from: impl tokio::io::AsyncRead + Unpin, run: Arc<Run>) {
 }
 
 /// The last words of what the run printed, for a failure the person reads.
-fn tail_words(out: &str) -> String {
+pub(crate) fn tail_words(out: &str) -> String {
     let lines: Vec<&str> = out.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
     let last: Vec<&str> = lines.iter().rev().take(3).rev().copied().collect();
     let words = last.join(" / ");
@@ -666,7 +666,7 @@ async fn ran(ctx: &Ctx, id: &str, fork: &Fork, log: &Path, home: &Path, cwd: Opt
 }
 
 /// A run's process group, killed when this is dropped while it still holds the pid (the future was dropped, or an error left early).
-struct Group(Option<u32>);
+pub(crate) struct Group(pub(crate) Option<u32>);
 
 impl Group {
     fn kill(&self) {
@@ -768,7 +768,7 @@ pub fn wrote_past(text: &[u8], at: u64, base: u64) -> bool {
     ids.contains(&at) && ids.last().is_some_and(|last| *last > base.max(at))
 }
 
-fn spoken(limit: Duration) -> String {
+pub(crate) fn spoken(limit: Duration) -> String {
     let secs = limit.as_secs();
     if secs >= 60 && secs.is_multiple_of(60) { format!("{} minutes", secs / 60) } else { format!("{} seconds", secs.max(1)) }
 }

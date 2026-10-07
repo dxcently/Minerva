@@ -16,7 +16,7 @@ watch.rs     the perch's own /api/events stream to a door, and closing it before
 proxy.rs     GET|POST /s/<id>/api/<route> to that session's door, panes, the hub-stream-end frame
 mode.rs      the three approval modes: Mode, the manual policy wrapper over eidolon's own table, config-manual.toml, chat-modes.json
 bin/fake_eidolon.rs   the stand-in door, built only with `--features test-bins`
-runs/     /hub/runs: detached graph runs, adopted again by a restarted perch (stub)
+runs/     /hub/runs: detached graph runs, adopted again by a restarted perch, and the jev/browser health gate (log, graphs: stub)
 aoide/    the one place Aoide is spoken to (doc only)
 mesh/     /hub/mesh: the peers (stub)
 meta/     /hub/meta/..: health of jev and the browser, the plugins (stub)

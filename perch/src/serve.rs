@@ -1546,8 +1546,6 @@ mod tests {
     async fn every_seam_is_a_404_with_the_token_and_a_401_without_it() {
         let perch = up(&[]).await;
         for (method, path) in [
-            ("GET", "/hub/runs"),
-            ("POST", "/hub/runs"),
             ("GET", "/hub/runs/r1/log"),
             ("GET", "/hub/meta/health"),
             ("GET", "/hub/install"),
@@ -1585,8 +1583,10 @@ mod tests {
                 bearer()
             )
         };
-        // Only the head is sent: the answer cannot have waited for a body that never comes.
-        for path in ["/hub/runs", "/hub/term/t1/input", "/hub/mail/nodes", "/hub/notes/x", "/hub/sessions/c1/allow"] {
+        // Only the head is sent: the answer cannot have waited for a body that never comes. A start reads its body, so at the cap
+        // it waits for one; only the over-the-cap answer is this check's.
+        assert_eq!(raw(&perch, &head("/hub/runs", MAX_BODY + 1)).await.0, 413, "/hub/runs");
+        for path in ["/hub/term/t1/input", "/hub/mail/nodes", "/hub/notes/x", "/hub/sessions/c1/allow"] {
             assert_eq!(raw(&perch, &head(path, MAX_BODY + 1)).await.0, 413, "{path}");
             assert_eq!(raw(&perch, &head(path, MAX_BODY)).await.0, 404, "{path} at the cap is the module's to read");
         }

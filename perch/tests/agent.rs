@@ -48,6 +48,7 @@ impl Files {
     }
 
     /// What the fake door reads to find the perch and the tokens (the names are `fake_eidolon/agent.rs`'s).
+    #[cfg(feature = "test-bins")]
     fn fake_env(&self) -> Vec<(String, String)> {
         vec![
             ("FAKE_AGENT_URL_FILE".into(), self.url.display().to_string()),
