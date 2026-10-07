@@ -1,0 +1,28 @@
+{
+  "case": "f",
+  "title": "first: single picks and a rule pick, no chooser call",
+  "stub": {
+    "mode": "first",
+    "env": {}
+  },
+  "graph": {
+    "variant": "p1",
+    "sha256": "5dea1ebe4badc9dea3f57fe31a628d69d7d5b9b685e21f4a88312fb71b3fb25e"
+  },
+  "args": {
+    "start": "Felidae",
+    "goal": "Egypt"
+  },
+  "invocations": [
+    {
+      "n": 1,
+      "cmd": "run",
+      "answer": null,
+      "signal": null,
+      "exit": 0,
+      "stdout": "{\"report\":\"{\\\"actions\\\": 8, \\\"chooser_calls\\\": 0, \\\"duplicates_collapsed\\\": 0, \\\"escalations\\\": 0, \\\"exhausted\\\": null, \\\"final_state\\\": \\\"arrived\\\", \\\"graph\\\": \\\"wiki-hop\\\", \\\"outcome\\\": \\\"reached\\\", \\\"output\\\": {\\\"path\\\": [\\\"Felidae\\\", \\\"Cat\\\", \\\"Ancient Egypt\\\", \\\"Egypt\\\"]}, \\\"path\\\": [\\\"open\\\", \\\"reading\\\", \\\"reading\\\", \\\"reading\\\", \\\"reading\\\", \\\"arrived\\\"], \\\"rule_picks\\\": 1, \\\"steps\\\": 3}\",\"run\":1,\"session\":\"/tmp/minerva-f0-capture/data/eidolon/sessions/1791393037346.eid\",\"status\":\"completed\"}",
+      "stderr": "[policy] table: /tmp/minerva-f0-capture/cfg/eidolon/policy.rn",
+      "records": 60
+    }
+  ]
+}

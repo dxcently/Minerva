@@ -1,0 +1,48 @@
+{
+  "case": "h",
+  "title": "flat: an answer that is no option re-parks and spends an escalation, then 0",
+  "stub": {
+    "mode": "flat",
+    "env": {}
+  },
+  "graph": {
+    "variant": "p1",
+    "sha256": "5dea1ebe4badc9dea3f57fe31a628d69d7d5b9b685e21f4a88312fb71b3fb25e"
+  },
+  "args": {
+    "start": "Ancient_Egypt",
+    "goal": "Felidae"
+  },
+  "invocations": [
+    {
+      "n": 1,
+      "cmd": "run",
+      "answer": null,
+      "signal": null,
+      "exit": 1,
+      "stdout": "{\"question\":\"jev wiki-hop: top 0.500, margin 0.000 under 0.050\\nWhich link leads toward the article \\\"Felidae\\\"?\\nstate: reading (step 1)\\n  0  0.500  Egypt\\n  1  0.500  Cat\\nAnswer with the number or the exact label, or `stop` (or `stop: <reason>`) to end the run.\",\"run\":1,\"session\":\"/tmp/minerva-f0-capture/data/eidolon/sessions/1791393041253.eid\",\"status\":\"parked\"}",
+      "stderr": "[policy] table: /tmp/minerva-f0-capture/cfg/eidolon/policy.rn",
+      "records": 30
+    },
+    {
+      "n": 2,
+      "cmd": "resume",
+      "answer": "banana",
+      "signal": null,
+      "exit": 1,
+      "stdout": "{\"question\":\"'banana' is not one of the options.\\njev wiki-hop: top 0.500, margin 0.000 under 0.050\\nWhich link leads toward the article \\\"Felidae\\\"?\\nstate: reading (step 1)\\n  0  0.500  Egypt\\n  1  0.500  Cat\\nAnswer with the number or the exact label, or `stop` (or `stop: <reason>`) to end the run.\",\"run\":1,\"session\":\"/tmp/minerva-f0-capture/data/eidolon/sessions/1791393041253.eid\",\"status\":\"parked\"}",
+      "stderr": "[policy] table: /tmp/minerva-f0-capture/cfg/eidolon/policy.rn",
+      "records": 36
+    },
+    {
+      "n": 3,
+      "cmd": "resume",
+      "answer": "0",
+      "signal": null,
+      "exit": 0,
+      "stdout": "{\"report\":\"{\\\"actions\\\": 6, \\\"chooser_calls\\\": 1, \\\"duplicates_collapsed\\\": 0, \\\"escalations\\\": 2, \\\"exhausted\\\": null, \\\"final_state\\\": \\\"arrived\\\", \\\"graph\\\": \\\"wiki-hop\\\", \\\"outcome\\\": \\\"reached\\\", \\\"output\\\": {\\\"path\\\": [\\\"Ancient Egypt\\\", \\\"Egypt\\\", \\\"Felidae\\\"]}, \\\"path\\\": [\\\"open\\\", \\\"reading\\\", \\\"reading\\\", \\\"reading\\\", \\\"arrived\\\"], \\\"rule_picks\\\": 1, \\\"steps\\\": 2}\",\"run\":1,\"session\":\"/tmp/minerva-f0-capture/data/eidolon/sessions/1791393041253.eid\",\"status\":\"completed\"}",
+      "stderr": "[policy] table: /tmp/minerva-f0-capture/cfg/eidolon/policy.rn",
+      "records": 63
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "case": "e",
+  "title": "the graph's failed final, which the door calls completed (the graph from before P1, the long article)",
+  "stub": {
+    "mode": "first",
+    "env": {}
+  },
+  "graph": {
+    "variant": "pre",
+    "sha256": "2db16e39c7016e410bd4f8c96f75255944387762ff4be080af821d94e2124bab"
+  },
+  "args": {
+    "start": "List_of_cat_breeds",
+    "goal": "Ancient Egypt"
+  },
+  "invocations": [
+    {
+      "n": 1,
+      "cmd": "run",
+      "answer": null,
+      "signal": null,
+      "exit": 0,
+      "stdout": "{\"report\":\"{\\\"actions\\\": 2, \\\"chooser_calls\\\": 0, \\\"duplicates_collapsed\\\": 0, \\\"escalations\\\": 0, \\\"exhausted\\\": null, \\\"final_state\\\": \\\"failed\\\", \\\"graph\\\": \\\"wiki-hop\\\", \\\"outcome\\\": \\\"reached\\\", \\\"output\\\": {\\\"error\\\": \\\"observation from 'browser_snapshot' was truncated in transport: 2059 of 13578 declared characters arrived\\\", \\\"path\\\": [], \\\"reason\\\": \\\"truncated\\\"}, \\\"path\\\": [\\\"open\\\", \\\"reading\\\", \\\"failed\\\"], \\\"rule_picks\\\": 0, \\\"steps\\\": 0}\",\"run\":1,\"session\":\"/tmp/minerva-f0-capture/data/eidolon/sessions/1791393035076.eid\",\"status\":\"completed\"}",
+      "stderr": "[policy] table: /tmp/minerva-f0-capture/cfg/eidolon/policy.rn",
+      "records": 21
+    }
+  ]
+}

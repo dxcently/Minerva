@@ -1,0 +1,40 @@
+{
+  "case": "k",
+  "title": "first, killed with SIGKILL in jev_choose (a journal with no end), then resumed with no answer",
+  "stub": {
+    "mode": "first",
+    "env": {
+      "STUB_DELAY_CHOOSE": "3"
+    }
+  },
+  "graph": {
+    "variant": "p1",
+    "sha256": "5dea1ebe4badc9dea3f57fe31a628d69d7d5b9b685e21f4a88312fb71b3fb25e"
+  },
+  "args": {
+    "start": "Ancient_Egypt",
+    "goal": "Felidae"
+  },
+  "invocations": [
+    {
+      "n": 1,
+      "cmd": "run",
+      "answer": null,
+      "signal": "KILL",
+      "exit": 137,
+      "stdout": "",
+      "stderr": "[policy] table: /tmp/minerva-f0-capture/cfg/eidolon/policy.rn",
+      "records": 24
+    },
+    {
+      "n": 2,
+      "cmd": "resume",
+      "answer": null,
+      "signal": null,
+      "exit": 0,
+      "stdout": "{\"report\":\"{\\\"actions\\\": 6, \\\"chooser_calls\\\": 1, \\\"duplicates_collapsed\\\": 0, \\\"escalations\\\": 0, \\\"exhausted\\\": null, \\\"final_state\\\": \\\"arrived\\\", \\\"graph\\\": \\\"wiki-hop\\\", \\\"outcome\\\": \\\"reached\\\", \\\"output\\\": {\\\"path\\\": [\\\"Ancient Egypt\\\", \\\"Egypt\\\", \\\"Felidae\\\"]}, \\\"path\\\": [\\\"open\\\", \\\"reading\\\", \\\"reading\\\", \\\"reading\\\", \\\"arrived\\\"], \\\"rule_picks\\\": 1, \\\"steps\\\": 2}\",\"run\":1,\"session\":\"/tmp/minerva-f0-capture/data/eidolon/sessions/1791393048971.eid\",\"status\":\"completed\"}",
+      "stderr": "[policy] table: /tmp/minerva-f0-capture/cfg/eidolon/policy.rn",
+      "records": 53
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "eidolon": {
+    "version": "eidolon 0.1.0",
+    "binary_sha256": "11583c213e3816a705f894b4172899c444006dc7e245a54bdcd9ed347cbffcf4",
+    "commit_planned": "bab3813 (VENDORED.md says the WSL binary is built from it; the binary does not carry its commit)"
+  },
+  "plugins": {
+    "p1_ref": "jev-wiki-hop-max",
+    "p1_sha": "2fa3b85a1aa831a44de0b7deda0e75f9946076eb",
+    "base_ref": "origin/main",
+    "base_sha": "7a0ff8ed288717fad7bdbd8e6163f22c3afa7a6a"
+  },
+  "graphs": {
+    "p1": "5dea1ebe4badc9dea3f57fe31a628d69d7d5b9b685e21f4a88312fb71b3fb25e",
+    "pre": "2db16e39c7016e410bd4f8c96f75255944387762ff4be080af821d94e2124bab"
+  },
+  "stub": {
+    "port": 48091,
+    "source": "tests/jev/stub_service.py at p1_sha, unchanged; cases d, g, j, k and l run it through a wrapper that adds STUB_BREAK or STUB_DELAY_CHOOSE"
+  },
+  "cases": [
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l"
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "case": "i",
+  "title": "flat on the long article: 64 options, a park under the floor, answered by label",
+  "stub": {
+    "mode": "flat",
+    "env": {}
+  },
+  "graph": {
+    "variant": "p1",
+    "sha256": "5dea1ebe4badc9dea3f57fe31a628d69d7d5b9b685e21f4a88312fb71b3fb25e"
+  },
+  "args": {
+    "start": "List_of_cat_breeds",
+    "goal": "Cat"
+  },
+  "invocations": [
+    {
+      "n": 1,
+      "cmd": "run",
+      "answer": null,
+      "signal": null,
+      "exit": 1,
+      "stdout": "{\"question\":\"jev wiki-hop: top 0.015 under floor 0.350\\nWhich link leads toward the article \\\"Cat\\\"?\\nstate: reading (step 1)\\n  0  0.015  Registered cat breed number 001\\n  1  0.015  Registered cat breed number 002\\n  2  0.015  Registered cat breed number 003\\n  3  0.015  Registered cat breed number 004\\n  4  0.015  Registered cat breed number 005\\n  5  0.015  Registered cat breed number 006\\n  6  0.015  Registered cat breed number 007\\n  7  0.015  Registered cat breed number 008\\n  8  0.015  Registered cat breed number 009\\n  9  0.015  Registered cat breed number 010\\n  10  0.015  Registered cat breed number 011\\n  11  0.015  Registered cat breed number 012\\n  12  0.015  Registered cat breed number 013\\n  13  0.015  Registered cat breed number 014\\n  14  0.015  Registered cat breed number 015\\n  15  0.015  Registered cat breed number 016\\n  16  0.015  Registered cat breed number 017\\n  17  0.015  Registered cat breed number 018\\n  18  0.015  Registered cat breed number 019\\n  19  0.015  Registered cat breed number 020\\n  20  0.015  Registered cat breed number 021\\n  21  0.015  Registered cat breed number 022\\n  22  0.015  Registered cat breed number 023\\n  23  0.015  Registered cat breed number 024\\n  24  0.015  Registered cat breed number 025\\n  25  0.015  Registered cat breed number 026\\n  26  0.015  Registered cat breed number 027\\n  27  0.015  Registered cat breed number 028\\n  28  0.015  Registered cat breed number 029\\n  29  0.015  Registered cat breed number 030\\n  30  0.015  Ancient Egypt\\n  31  0.015  Registered cat breed number 032\\n  32  0.015  Registered cat breed number 033\\n  33  0.015  Registered cat breed number 034\\n  34  0.015  Registered cat breed number 035\\n  35  0.015  Registered cat breed number 036\\n  36  0.015  Registered cat breed number 037\\n  37  0.015  Registered cat breed number 038\\n  38  0.015  Registered cat breed number 039\\n  39  0.015  Registered cat breed number 040\\n  40  0.015  Registered cat breed number 041\\n  41  0.015  Registered cat breed number 042\\n  42  0.015  Registered cat breed number 043\\n  43  0.015  Registered cat breed number 044\\n  44  0.015  Registered cat breed number 045\\n  45  0.015  Registered cat breed number 046\\n  46  0.015  Registered cat breed number 047\\n  47  0.015  Registered cat breed number 048\\n  48  0.015  Registered cat breed number 049\\n  49  0.015  Registered cat breed number 050\\n  50  0.015  Registered cat breed number 051\\n  51  0.015  Registered cat breed number 052\\n  52  0.015  Registered cat breed number 053\\n  53  0.015  Registered cat breed number 054\\n  54  0.015  Registered cat breed number 055\\n  55  0.015  Registered cat breed number 056\\n  56  0.015  Registered cat breed number 057\\n  57  0.015  Registered cat breed number 058\\n  58  0.015  Registered cat breed number 059\\n  59  0.015  Registered cat breed number 060\\n  60  0.015  Registered cat breed number 061\\n  61  0.015  Registered cat breed number 062\\n  62  0.015  Registered cat breed number 063\\n  63  0.015  Registered cat breed number 064\\nAnswer with the number or the exact label, or `stop` (or `stop: <reason>`) to end the run.\",\"run\":1,\"session\":\"/tmp/minerva-f0-capture/data/eidolon/sessions/1791393045149.eid\",\"status\":\"parked\"}",
+      "stderr": "[policy] table: /tmp/minerva-f0-capture/cfg/eidolon/policy.rn",
+      "records": 30
+    },
+    {
+      "n": 2,
+      "cmd": "resume",
+      "answer": "Registered cat breed number 002",
+      "signal": null,
+      "exit": 0,
+      "stdout": "{\"report\":\"{\\\"actions\\\": 4, \\\"chooser_calls\\\": 1, \\\"duplicates_collapsed\\\": 0, \\\"escalations\\\": 1, \\\"exhausted\\\": null, \\\"final_state\\\": \\\"failed\\\", \\\"graph\\\": \\\"wiki-hop\\\", \\\"outcome\\\": \\\"reached\\\", \\\"output\\\": {\\\"error\\\": \\\"url: https://en.wikipedia.org/wiki/Registered_cat_breed_number_002\\\\ntitle: Registered cat breed number 002 - Wikipedia\\\\nheading: Registered cat breed number 002\\\\nscope: main\\\\nchars: 0\\\\n\\\\n--- stderr ---\\\\nawk: fatal: cannot open file `/tmp/minerva-f0-capture/cfg/eidolon/plugins/browser/site/Registered_cat_breed_number_002.txt' for reading: No such file or directory\\\\n\\\", \\\"path\\\": [\\\"List of cat breeds\\\"], \\\"reason\\\": \\\"failed\\\"}, \\\"path\\\": [\\\"open\\\", \\\"reading\\\", \\\"reading\\\", \\\"failed\\\"], \\\"rule_picks\\\": 0, \\\"steps\\\": 1}\",\"run\":1,\"session\":\"/tmp/minerva-f0-capture/data/eidolon/sessions/1791393045149.eid\",\"status\":\"completed\"}",
+      "stderr": "[policy] table: /tmp/minerva-f0-capture/cfg/eidolon/policy.rn",
+      "records": 44
+    }
+  ]
+}

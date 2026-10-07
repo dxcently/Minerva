@@ -1,0 +1,30 @@
+{
+  "case": "l",
+  "title": "first, held in jev_choose and stopped with SIGTERM: the tool is cancelled and the graph parks",
+  "stub": {
+    "mode": "first",
+    "env": {
+      "STUB_DELAY_CHOOSE": "8"
+    }
+  },
+  "graph": {
+    "variant": "p1",
+    "sha256": "5dea1ebe4badc9dea3f57fe31a628d69d7d5b9b685e21f4a88312fb71b3fb25e"
+  },
+  "args": {
+    "start": "Ancient_Egypt",
+    "goal": "Felidae"
+  },
+  "invocations": [
+    {
+      "n": 1,
+      "cmd": "run",
+      "answer": null,
+      "signal": "TERM",
+      "exit": 1,
+      "stdout": "{\"question\":\"jev wiki-hop: chooser unavailable: cancelled while the tool was running\\nWhich link leads toward the article \\\"Felidae\\\"?\\nstate: reading (step 1)\\n  0  0.000  Egypt\\n  1  0.000  Cat\\nAnswer with the number or the exact label, or `stop` (or `stop: <reason>`) to end the run.\",\"run\":1,\"session\":\"/tmp/minerva-f0-capture/data/eidolon/sessions/1791393056251.eid\",\"status\":\"parked\"}",
+      "stderr": "[policy] table: /tmp/minerva-f0-capture/cfg/eidolon/policy.rn\n\n[cancelling]",
+      "records": 30
+    }
+  ]
+}
