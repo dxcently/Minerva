@@ -54,7 +54,8 @@ The list comes from `GET /hub/sessions` (`core/hub.js`), polled every 5 s (a pol
 | `kept` | kept logs and exited doors of this perch (`exited`), newest 15 by mtime as `<id or title>  <age>` (`5m`, `3h`, `2d`); `more… (N)` shows 50 more. A click opens a pane (it reads `saved, not running` with `resume`) |
 | `elsewhere` | live sessions held by another client (a TUI, a door this perch does not own): read-only, menu lines greyed; the first 15, then `more… (N)` for 50 more (the not-open live sessions in the `sessions` tab do the same) |
 | `projects` tab | `sessions here` (the focused pane's folder); `others`: the folders of live sessions, a click opens the first one there. Kept sessions carry no folder |
-| `peers`, `mesh` | still placeholders |
+| `peers` | still a placeholder (the sessions tab line) |
+| `mesh` | the mesh tab: Aoide through the perch (`/hub/mesh`, `/hub/mesh/events`), network-free, ages are cache ages, never presence |
 
 **Fork from here.** The row menu of an assistant reply that ended its turn (never the latest, never a user row) has `fork from here`: POST fork `{at}`, then a pane opens beside with a read-only history up to that reply and a composer (`first message`, images, `working... Ns` with the output tail). When the run ends the pane goes live; a failure shows the error sentence and stays pending. A pending chat has a faint `pending` tag in the sidebar under its source's group and can be trashed. The page decides pending from the list row.
 

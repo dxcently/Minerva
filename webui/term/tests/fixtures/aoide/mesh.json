@@ -1,0 +1,50 @@
+{
+  "status": "ok",
+  "command": "mesh",
+  "message": "alpha: 2 declared, 2 differ\nbeta: 2 declared, 1 differs",
+  "gated": false,
+  "data": {
+    "report": {
+      "sections": [
+        {
+          "name": "alpha",
+          "grant": [
+            "message"
+          ],
+          "sameOperator": false,
+          "declared": 3,
+          "selfDeclared": true,
+          "rows": [
+            {
+              "node": "osaka",
+              "class": "unverified"
+            },
+            {
+              "node": "yomi",
+              "class": "via-mismatch",
+              "declared": "ssh://yomi",
+              "recorded": null
+            }
+          ]
+        },
+        {
+          "name": "beta",
+          "grant": null,
+          "sameOperator": false,
+          "declared": 2,
+          "selfDeclared": true,
+          "rows": [
+            {
+              "node": "osaka",
+              "class": "unverified"
+            }
+          ]
+        }
+      ],
+      "undeclared": [
+        "multi",
+        "bridge"
+      ]
+    }
+  }
+}

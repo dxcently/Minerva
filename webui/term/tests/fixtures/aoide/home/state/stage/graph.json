@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "0",
+  "nodes": [
+    {"id": "project:p", "kind": "project", "name": "p", "path": "/p"},
+    {"id": "session:s1", "kind": "session", "agent": "claude", "cwd": "/p", "state": "running", "title": "t", "petname": "brisk-fox",
+     "say": "SAY-SENTINEL", "activity": "SAY-SENTINEL", "socket": "/run/SOCKET-SENTINEL.sock"},
+    {"id": "session:s2", "kind": "session", "agent": "codex", "cwd": "/p", "state": "idle", "title": "<b>bold</b> title"},
+    {"id": "node:osaka", "kind": "node", "name": "osaka", "state": "fresh", "children": {"nodes": [{"id": "x", "say": "SAY-SENTINEL"}], "edges": []}}
+  ],
+  "edges": [{"from": "project:p", "to": "session:s1", "kind": "anchors"}, {"from": "project:p", "to": "session:s2", "kind": "anchors"}]
+}

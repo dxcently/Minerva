@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "0",
+  "nodes": [
+    {"name": "osaka", "url": "http://user:hunter2@127.0.0.1:8711", "verified": true, "autogate": false, "allows": ["message", "read"],
+     "via": "ssh://khoa@osaka", "addedAt": "2026-09-01T00:00:00Z", "hub": true,
+     "pubkey": "PUBKEY-SENTINEL-0123", "tokenFile": "/home/khoa/.aoide/TOKENFILE-SENTINEL", "bearerSecret": "BEARER-SENTINEL"},
+    {"name": "yomi", "url": "http://yomi:8710", "verified": true, "autogate": true, "addedAt": "2026-10-01T00:00:00Z",
+     "grants": {"alpha": ["message"], "beta": ["message", "spawn"]}, "pubkey": "PUBKEY-SENTINEL-4567"},
+    {"name": "bridge", "url": "http://bridge:8710", "addedAt": "2026-10-02T00:00:00Z"}
+  ]
+}

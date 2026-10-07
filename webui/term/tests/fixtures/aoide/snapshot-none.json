@@ -1,0 +1,16 @@
+{
+  "available": false,
+  "aoide": null,
+  "daemon": {
+    "ping_ms": null,
+    "socket": null
+  },
+  "registry": [],
+  "cache": [],
+  "graph": null,
+  "mesh": null,
+  "outbox": null,
+  "errors": [
+    "Aoide is not available here: this perch has no aoide program (--aoide, or an executable ~/.local/bin/aoide) and there is no state folder to read"
+  ]
+}

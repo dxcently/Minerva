@@ -1,0 +1,66 @@
+{
+  "status": "ok",
+  "command": "mail.outbox",
+  "message": "2 entries waiting",
+  "gated": false,
+  "data": {
+    "entries": [
+      {
+        "node": "osaka",
+        "msgid": "6666666666666666666666666666666666666666666666666666666666666666",
+        "to": "osaka/minerva",
+        "tries": 2,
+        "lastTryAt": "2026-10-07T09:12:00Z",
+        "lastOutcome": "unreachable",
+        "refused": false,
+        "delivery": {
+          "status": "retrying",
+          "reason": "connection refused",
+          "reasonScope": "remote",
+          "nextAttemptAt": "2026-10-07T09:42:00Z",
+          "ackPending": false
+        }
+      },
+      {
+        "node": "bridge",
+        "msgid": "7777777777777777777777777777777777777777777777777777777777777777",
+        "to": "bridge/minerva",
+        "tries": 5,
+        "lastTryAt": "2026-10-07T08:00:00Z",
+        "lastOutcome": "refused",
+        "refused": true,
+        "delivery": {
+          "status": "refused",
+          "reason": "message is not granted",
+          "reasonScope": "remote",
+          "nextAttemptAt": null,
+          "ackPending": false
+        }
+      }
+    ],
+    "summary": {
+      "osaka": {
+        "depth": 1,
+        "oldestMintedAtAgeSecs": 900,
+        "tries": {
+          "2": 1
+        },
+        "lastOutcomeCounts": {
+          "unreachable": 1
+        },
+        "refused": 0
+      },
+      "bridge": {
+        "depth": 1,
+        "oldestMintedAtAgeSecs": 4000,
+        "tries": {
+          "5": 1
+        },
+        "lastOutcomeCounts": {
+          "refused": 1
+        },
+        "refused": 1
+      }
+    }
+  }
+}

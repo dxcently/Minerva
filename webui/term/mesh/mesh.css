@@ -1,1 +1,24 @@
-/* the mesh tab: the nodes this machine knows (mesh/); empty until its slice lands */
+/* the mesh tab (mesh/index.js): what Aoide knows here, as text. Square, the page's colours; nothing here says a node is up or down. */
+
+.mesh .up { color: var(--green); }
+.mesh .mhead { white-space: normal; overflow-wrap: anywhere; }
+.mesh .mact { margin: calc(var(--ch) * 0.3) 0 0; }
+.mesh .grow { flex: 1; min-width: 0; }
+
+/* a node: its name and whether aoide has verified it, then four dim lines. The values wrap, so a narrow sidebar loses nothing. */
+.mesh .mnode + .mnode, .mesh .msec + .msec { margin-top: calc(var(--ch) * 0.5); }
+.mesh .mname { display: flex; gap: var(--cw); white-space: pre; }
+.mesh .mname .grow { overflow: hidden; text-overflow: ellipsis; }
+.mesh .kv .grow { white-space: normal; overflow: visible; overflow-wrap: anywhere; }
+
+/* a row of drift, the graph or the outbox: the name on the left, a word on the right, a dim line under it when there is detail */
+.mesh .mrow { display: flex; gap: var(--cw); white-space: pre; }
+.mesh .mrow .grow { overflow: hidden; text-overflow: ellipsis; }
+.mesh .mdet { padding-left: calc(2 * var(--cw)); white-space: normal; overflow-wrap: anywhere; }
+
+/* an event: the time, its class (audit cyan, gate yellow, as aoide's own screen), then the text, wrapped */
+.mesh .mev { display: flex; gap: var(--cw); white-space: pre; }
+.mesh .mev .mcl { flex: none; width: calc(5 * var(--cw)); }
+.mesh .mev.audit .mcl { color: var(--cyan); }
+.mesh .mev.gate .mcl { color: var(--yellow); }
+.mesh .mev .grow { white-space: normal; overflow-wrap: anywhere; }

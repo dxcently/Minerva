@@ -1,0 +1,213 @@
+{
+  "available": true,
+  "aoide": {
+    "path": "~/.local/bin/aoide",
+    "version": "0.0.26"
+  },
+  "daemon": {
+    "socket": "/run/user/1000/aoide/aoided.sock",
+    "ping_ms": 3
+  },
+  "registry": [
+    {
+      "addedAt": "2026-09-01T00:00:00Z",
+      "allows": [
+        "message",
+        "read"
+      ],
+      "autogate": false,
+      "grants": {},
+      "name": "osaka",
+      "url": "http://127.0.0.1:8711",
+      "verified": true,
+      "via": "ssh://khoa@osaka"
+    },
+    {
+      "addedAt": "2026-10-01T00:00:00Z",
+      "allows": [],
+      "autogate": true,
+      "grants": {
+        "alpha": [
+          "message"
+        ],
+        "beta": [
+          "message",
+          "spawn"
+        ]
+      },
+      "name": "yomi",
+      "url": "http://yomi:8710",
+      "verified": true,
+      "via": null
+    },
+    {
+      "addedAt": "2026-10-02T00:00:00Z",
+      "allows": [],
+      "autogate": false,
+      "grants": {},
+      "name": "bridge",
+      "url": "http://bridge:8710",
+      "verified": false,
+      "via": null
+    }
+  ],
+  "cache": [
+    {
+      "age_secs": 180,
+      "cut": false,
+      "name": "osaka",
+      "text": "{\"schemaVersion\":\"0\",\"node\":\"osaka\",\"fetchedAt\":\"2026-10-07T09:00:00Z\",\"nodes\":[{\"id\":\"session:o1\",\"kind\":\"session\",\"title\":\"<img src=x onerror=alert(1)>\\u001b[31m red\",\"say\":\"<script>alert(1)</script>\"}]}\n"
+    },
+    {
+      "age_secs": 172800,
+      "cut": false,
+      "name": "yomi",
+      "text": "{\"schemaVersion\":\"0\",\"node\":\"yomi\",\"fetchedAt\":\"2026-10-05T09:00:00Z\",\"nodes\":[{\"id\":\"session:y1\",\"kind\":\"session\",\"title\":\"a plain roster\"}]}\n"
+    }
+  ],
+  "graph": {
+    "edges": 2,
+    "kinds": {
+      "node": 1,
+      "project": 1,
+      "session": 2
+    },
+    "nodes": [
+      {
+        "id": "project:p",
+        "kind": "project",
+        "name": "p"
+      },
+      {
+        "agent": "claude",
+        "cwd": "/p",
+        "id": "session:s1",
+        "kind": "session",
+        "petname": "brisk-fox",
+        "state": "running",
+        "title": "t"
+      },
+      {
+        "agent": "codex",
+        "cwd": "/p",
+        "id": "session:s2",
+        "kind": "session",
+        "state": "idle",
+        "title": "<b>bold</b> title"
+      },
+      {
+        "children": 1,
+        "id": "node:osaka",
+        "kind": "node",
+        "name": "osaka",
+        "state": "fresh"
+      }
+    ],
+    "total": 4
+  },
+  "mesh": {
+    "report": {
+      "sections": [
+        {
+          "declared": 3,
+          "grant": [
+            "message"
+          ],
+          "name": "alpha",
+          "rows": [
+            {
+              "class": "unverified",
+              "node": "osaka"
+            },
+            {
+              "class": "via-mismatch",
+              "declared": "ssh://yomi",
+              "node": "yomi",
+              "recorded": null
+            }
+          ],
+          "sameOperator": false,
+          "selfDeclared": true
+        },
+        {
+          "declared": 2,
+          "grant": null,
+          "name": "beta",
+          "rows": [
+            {
+              "class": "unverified",
+              "node": "osaka"
+            }
+          ],
+          "sameOperator": false,
+          "selfDeclared": true
+        }
+      ],
+      "undeclared": [
+        "multi",
+        "bridge"
+      ]
+    }
+  },
+  "outbox": {
+    "entries": [
+      {
+        "delivery": {
+          "ackPending": false,
+          "nextAttemptAt": "2026-10-07T09:42:00Z",
+          "reason": "connection refused",
+          "reasonScope": "remote",
+          "status": "retrying"
+        },
+        "lastOutcome": "unreachable",
+        "lastTryAt": "2026-10-07T09:12:00Z",
+        "msgid": "6666666666666666666666666666666666666666666666666666666666666666",
+        "node": "osaka",
+        "refused": false,
+        "to": "osaka/minerva",
+        "tries": 2
+      },
+      {
+        "delivery": {
+          "ackPending": false,
+          "nextAttemptAt": null,
+          "reason": "message is not granted",
+          "reasonScope": "remote",
+          "status": "refused"
+        },
+        "lastOutcome": "refused",
+        "lastTryAt": "2026-10-07T08:00:00Z",
+        "msgid": "7777777777777777777777777777777777777777777777777777777777777777",
+        "node": "bridge",
+        "refused": true,
+        "to": "bridge/minerva",
+        "tries": 5
+      }
+    ],
+    "summary": {
+      "bridge": {
+        "depth": 1,
+        "lastOutcomeCounts": {
+          "refused": 1
+        },
+        "oldestMintedAtAgeSecs": 4000,
+        "refused": 1,
+        "tries": {
+          "5": 1
+        }
+      },
+      "osaka": {
+        "depth": 1,
+        "lastOutcomeCounts": {
+          "unreachable": 1
+        },
+        "oldestMintedAtAgeSecs": 900,
+        "refused": 0,
+        "tries": {
+          "2": 1
+        }
+      }
+    }
+  },
+  "errors": []
+}
