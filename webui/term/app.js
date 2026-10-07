@@ -21,14 +21,22 @@ import { Picker, picker as pickerOpen, openPicker } from './panes/picker.js';
 import { Overlay, overlay } from './core/overlay.js';
 import { Needs, Kv } from './core/bits.js';
 import { FONTS, DEFAULT_FONT, theme, themes, font, cell, setTheme, setFont, resolve, startLook } from './core/look.js';
+import {
+  host, paneKinds, commands, keyRows, loadedSections, MAX_SIDS, chatCap, overCap,
+  BASE_LEFT, BASE_RIGHT, mergeTabs, rightTabs, leftTabs, pickTab, cycleTab, badgeText,
+  mergeCommands, mergeKeyRows, keyClaimed, focusClaimed, whereOf, splitExtraItems, chatMenuExtras,
+  isXPane, anchorOf, addXPane, dropXPane, paneInfo,
+} from './core/registry.js';
+// Features that register themselves (tabs, panes, sections, commands, keys: core/registry.js); app.js lists none of what they add.
+import './terms/index.js';
+import './notes/index.js';
+import './allow/list.js';
 
-const LEFT_TABS = ['sessions', 'projects', 'mesh'];
-const RIGHT_TABS = ['rec', 'loaded', 'files', 'diff', 'graph', 'run']; // components: INSPECTOR below
-// The activity rails: one icon per sidebar tab, the only table to edit to swap them (Unicode symbols, not emoji).
-const RAIL_ICONS = {
-  sessions: '≡', projects: '▦', mesh: '⋈',
-  rec: '◉', loaded: '▣', files: '▤', diff: '±', graph: '⋔', run: '▶',
-};
+// The tabs of each side: the page's own (BASE_LEFT / BASE_RIGHT in core/registry.js, which also holds their rail icons, Unicode symbols
+// and not emoji), then the ones features registered. Components: Left() and INSPECTOR below for the base ones, the registration for the rest.
+const leftAll = computed(() => mergeTabs(BASE_LEFT, leftTabs.list));
+const rightAll = computed(() => mergeTabs(BASE_RIGHT, rightTabs.list));
+const tabsOn = (side) => (side === 'l' ? leftAll : rightAll).value;
 const RAILS_KEY = 'minerva.rails', NARROW_CELLS = 110; // under this many cells wide, an open panel overlays the tiles
 // Sidebar widths in cells: the defaults a double-click on the border goes back to, and the bounds.
 const SIDES = { l: 30, r: 34 }, SIDE_MIN = 16, SIDE_MAX = 72, SIDES_KEY = 'minerva.sidebars';
@@ -39,16 +47,18 @@ const RAILS0 = (() => {
   let v = null;
   try { v = JSON.parse(localStorage.getItem(RAILS_KEY)); } catch { /* no storage: defaults */ }
   const closed = (x) => (typeof x === 'boolean' ? x : innerWidth < 900); // a small screen starts compact
-  const tab = (x, names, d) => (names.includes(x) ? x : d);
+  const names = (side) => tabsOn(side).map((t) => t.name); // a saved name stays if its tab is still there (a feature's tab registered before this runs)
   return {
     lc: closed(v && v.lc), rc: closed(v && v.rc),
-    lt: tab(v && v.lt, LEFT_TABS, 'sessions'), rt: tab(v && v.rt, RIGHT_TABS, 'rec'),
+    lt: pickTab(v && v.lt, names('l'), 'sessions'), rt: pickTab(v && v.rt, names('r'), 'rec'),
   };
 })();
 const ui = {
   panes: signal([]),            // [{ id, sid, s: Session }]; panes on one sid share s; a pane's sid can change (showIn)
-  tree: signal(null),           // core/tile.js split tree of pane ids
-  focus: signal(null),          // pane id
+  xpanes: signal([]),           // [{ id, kind, ...data }]: panes that are not chats (core/registry.js paneKinds); they and `panes` are leaves of `tree`
+  lastChat: signal(null),       // the id of the chat pane that had focus last: what the inspector keeps showing while an xpane has focus
+  tree: signal(null),           // core/tile.js split tree of pane ids (both kinds)
+  focus: signal(null),          // pane id, of either kind
   left: signal(RAILS0.lt),
   right: signal(RAILS0.rt),
   lrail: signal(RAILS0.lc),     // true: the left panel is closed, only its rail shows
@@ -85,7 +95,12 @@ const saveRails = () => {
   try { localStorage.setItem(RAILS_KEY, JSON.stringify({ lc: ui.lrail.peek(), rc: ui.rrail.peek(), lt: ui.left.peek(), rt: ui.right.peek() })); } catch { /* this tab only */ }
 };
 const byId = (id) => ui.panes.value.find((p) => p.id === id);
+const xById = (id) => ui.xpanes.value.find((x) => x.id === id);
+// `focused` is the focused CHAT pane (null while an xpane has focus): the ~30 sites that read p.s / p.sid stay on it. `focusedAny` is the
+// focused pane of either kind; `inspected` the chat the inspector shows: the focused one, else the last one that was.
 const focused = computed(() => byId(ui.focus.value) || null);
+const focusedAny = computed(() => focused.value || xById(ui.focus.value) || null);
+const inspected = computed(() => focused.value || byId(ui.lastChat.value) || null);
 const isMirror = (p) => ui.panes.value.find((x) => x.s === p.s) !== p;
 let paneSeq = 0, toastTimer = 0;
 
@@ -101,28 +116,30 @@ const sessionFor = (sid) => {
 };
 
 // The session a bare `:open` means. A door serves one session, DOOR. Under the
-// perch there is no `door` session: it is the focused pane's session, else none.
+// perch there is no `door` session: it is the focused pane's session (while an xpane has focus, the chat the inspector shows), else none.
 function defaultSid() {
   if (mode() !== 'perch') return DOOR;
-  const p = focused.peek();
+  const p = inspected.peek();
   return p ? p.sid : null;
 }
 
 // The browser allows six connections per host (shared by every tab of the
 // profile) and every session that follows a stream holds one, so under the
-// perch at most MAX_SIDS distinct sessions hold a stream at once (PLAN G7). Only
-// panes that hold a stream count: a stopped, kept, dead, gone, refused or
-// goodbye'd pane holds none (Session.holdsStream). A mirror of such a session is
-// always allowed. `except` is a pane that is about to stop showing its session.
-const MAX_SIDS = 4;
+// perch at most MAX_SIDS distinct sessions hold a stream at once (PLAN G7),
+// fewer by what extraStreams says other streams hold (the terminal stream
+// takes one: core/registry.js). Only panes that hold a stream count: a stopped,
+// kept, dead, gone, refused or goodbye'd pane holds none (Session.holdsStream).
+// A mirror of such a session is always allowed. `except` is a pane that is about
+// to stop showing its session.
+const holdingSids = (except) => new Set(ui.panes.peek().filter((x) => x !== except && x.s.holdsStream()).map((x) => x.sid));
 function capped(sid, except, opens = false) {
   if (mode() !== 'perch') return false;
   const panes = ui.panes.peek().filter((x) => x !== except);
   // `opens`: the session is about to open a stream of its own (a resume), so a pane already showing it is no excuse.
   if (!opens && panes.some((x) => x.sid === sid)) return false;
-  const sids = new Set(panes.filter((x) => x.s.holdsStream()).map((x) => x.sid));
-  if (sids.has(sid) || sids.size < MAX_SIDS) return false;
-  toast(`${MAX_SIDS} chats can be open at once: the browser allows 6 connections to the server across all its tabs; close or stop one first`, true);
+  if (!overCap(holdingSids(except), sid)) return false;
+  const cap = chatCap();
+  toast(`${cap} chat${cap > 1 ? 's' : ''} can be open at once${cap < MAX_SIDS ? ' while the terminal stream is open' : ''}: the browser allows 6 connections to the server across all its tabs; close or stop one first`, true);
   return true;
 }
 
@@ -146,8 +163,25 @@ function openPane(sid = defaultSid(), { at = ui.focus.value, dir } = {}) {
 
 function mirrorPane(id = ui.focus.value, dir) {
   const p = byId(id);
-  if (!p) { openPane(); return; }
+  if (!p) { openPane(undefined, { dir }); return; } // no chat has focus (none, or an xpane): the chat the inspector shows, beside the focused pane
   openPane(p.sid, { at: p.id, dir });
+}
+
+// A pane of a registered kind (core/registry.js paneKinds), beside pane `at` (default the focused one, of either kind). It takes focus, as a
+// new chat pane does. `data` is kept on the pane ({ id, kind, ...data }); `id` and `kind` are not data.
+function openXPane(kind, data = {}, { at = ui.focus.value, dir } = {}) {
+  if (!paneKinds.get(kind)) { toast(`no such pane kind: ${kind}`, true); return null; }
+  const x = { ...data, id: 'p' + ++paneSeq, kind };
+  const next = addXPane({ xpanes: ui.xpanes.peek(), tree: ui.tree.peek(), focus: ui.focus.peek() }, x, { at, box: ui.box.peek(), dir });
+  batch(() => { ui.xpanes.value = next.xpanes; ui.tree.value = next.tree; ui.focus.value = next.focus; });
+  return x;
+}
+
+// An xpane leaves the tiles: its kind's close(p) runs once (a terminal goes back to its stack), the tree promotes its sibling.
+function closeXPane(x) {
+  paneInfo(x, 'close');
+  const next = dropXPane({ xpanes: ui.xpanes.peek(), tree: ui.tree.peek(), focus: ui.focus.peek() }, x.id);
+  batch(() => { ui.xpanes.value = next.xpanes; ui.tree.value = next.tree; ui.focus.value = next.focus; });
 }
 
 // Open a session the way a click means it: show it in the focused pane (or focus
@@ -187,6 +221,8 @@ function showIn(id, sid, sure = false) {
 }
 
 function closePane(id = ui.focus.value) {
+  const x = xById(id);
+  if (x) { closeXPane(x); return; }
   const p = byId(id);
   if (!p) return;
   const last = !ui.panes.value.some((x) => x !== p && x.s === p.s);
@@ -342,7 +378,7 @@ function focusQueued(q, auto = false) {
   if (!p) return false;
   panel.armed.value = !auto;
   const at = document.activeElement;
-  if (at && at.tagName === 'TEXTAREA' && at.closest('.composer')) returnTo = at;
+  if (at && ((at.tagName === 'TEXTAREA' && at.closest('.composer')) || focusClaimed(at))) returnTo = at; // a composer, or a place a feature owns (a terminal)
   owed = true;
   batch(() => {
     ui.tab.value = q;
@@ -369,7 +405,7 @@ function steer(poll) {
   if (taken.has(tag(head.s, head.a))) { ui.held.value = false; return; }
   const at = document.activeElement;
   const wait = typedAt + PAUSE_MS - performance.now();
-  const busy = holdsText(at) || menu.peek() || ui.cmd.peek() != null || here;
+  const busy = holdsText(at) || menu.peek() || ui.cmd.peek() != null || here || focusClaimed(at); // focus a feature owns (a terminal) is never taken
   if (wait > 0 || busy) {
     ui.held.value = true;
     steerT = setTimeout(() => steer(true), Math.max(wait, 150));
@@ -450,16 +486,16 @@ function railPick(side, name) {
   cur.value = name;
 }
 function cycleRight(d) {
-  const i = RIGHT_TABS.indexOf(ui.right.value);
-  ui.right.value = RIGHT_TABS[(i + d + RIGHT_TABS.length) % RIGHT_TABS.length];
+  ui.right.value = cycleTab(tabsOn('r').map((t) => t.name), ui.right.value, d);
 }
 
 // ---------------------------------------------------------------- hint line
-function toast(text, err) {
+// `act` ({ label, on }) puts one clickable word after the text, as `[ show ]`; a toast with one stays as long as an error does.
+function toast(text, err, act) {
   if (ui.hint.value && ui.hint.value.mode === 'menu') return;
-  ui.hint.value = { mode: 'toast', text, err };
+  ui.hint.value = { mode: 'toast', text, err, act };
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { if (ui.hint.value && ui.hint.value.mode === 'toast') ui.hint.value = null; }, err ? 7000 : 3500);
+  toastTimer = setTimeout(() => { if (ui.hint.value && ui.hint.value.mode === 'toast') ui.hint.value = null; }, err || act ? 7000 : 3500);
 }
 
 // The key reference (`?`), as the TUI's (`space ?`): every key by where it
@@ -509,9 +545,13 @@ const KEYREF = [
 ];
 
 const keyRef = () => { ui.keys.value = !ui.keys.peek(); };
+// The reference as drawn: the rows above, with what features registered added or put in place of a row (core/registry.js keyRows).
+const keyGroups = computed(() => mergeKeyRows(KEYREF, keyRows.list));
 
 // ---------------------------------------------------------------- the : line
-const COMMANDS = {
+// The page's own commands. What a feature registers (core/registry.js commands) is merged over them: a registered name REPLACES its entry
+// here, and the boot log says which.
+const BASE_COMMANDS = {
   q: ['close the pane', () => closePane()],
   close: ['close the pane', () => closePane()],
   open: ['show chat <id> in the focused pane (no id: this door / the focused chat)', (arg) => (arg ? openSession(arg) : openPane())],
@@ -533,6 +573,7 @@ const COMMANDS = {
   files: ["open a file manager at the session's folder, or at <path>", (arg) => withPane((p) => p.s.launch('files', arg || undefined))()],
   font: ['font: :font <name> (none: list them)', (arg) => pickLook('font', arg)],
 };
+const cmdTable = computed(() => mergeCommands(BASE_COMMANDS, commands.list).table); // { name: [help, run] }, base order then registered
 
 function pickLook(what, arg) {
   const names = what === 'theme' ? themes.value : Object.keys(FONTS);
@@ -551,13 +592,13 @@ function closeCmd() {
 }
 const matches = (text) => {
   const w = (text || '').trim().split(/\s+/)[0] || '';
-  return Object.keys(COMMANDS).filter((c) => c.startsWith(w));
+  return Object.keys(cmdTable.value).filter((c) => c.startsWith(w));
 };
 function runCmd(text = ui.cmd.value || '') {
   const m = /^\s*(\S+)\s*([\s\S]*)$/.exec(text), w = m && m[1], rest = m ? m[2].trim() : ''; // the argument keeps its inner spacing (a quoted folder)
   closeCmd();
   if (!w) return;
-  const c = COMMANDS[w];
+  const c = cmdTable.value[w]; // no prototype: `:constructor` is no command
   if (c) c[1](rest);
   else toast(`:${w}: session commands arrive with the registry (M4)`, true);
 }
@@ -774,25 +815,31 @@ function newPick(how) {
   return { label: 'new session', hint: shows, sub: [{ label: 'new chat', hint: shows, on: () => newSession(null, undefined, how) }, ...(dirs.length ? [{ sep: true }, ...dirs] : []), { sep: true }, { label: 'new project…', on: () => newProject() }] };
 }
 
+// `p` is the pane being split: a chat pane (it can be mirrored), an xpane (it cannot, but a split anchors on it all the same), or null
+// (the picker with no pane focused). What features registered in splitExtras comes last.
 function splitItems(p, dir) {
-  const others = p ? sessions().filter(([sid]) => sid !== p.sid) : sessions();
-  const mirror = p && { label: 'mirror', hint: dir === 'row' ? ':vsplit' : ':split', on: () => openPane(p.sid, { at: p.id, dir }) };
+  const { chat, at: anchor } = anchorOf(p);
+  const others = chat ? sessions().filter(([sid]) => sid !== chat.sid) : sessions();
+  const mirror = chat && { label: 'mirror', hint: dir === 'row' ? ':vsplit' : ':split', on: () => openPane(chat.sid, { at: anchor, dir }) };
+  const extra = splitExtraItems(p, dir), more = extra.length ? [{ sep: true }, ...extra] : [];
   if (mode() === 'perch') {
-    const at = (sid) => openPane(sid, { at: p && p.id, dir });
+    const at = (sid) => openPane(sid, { at: anchor, dir });
     const lp = livePicks(at), kp = keptPicks(at);
     return [
-      ...(p ? [mirror] : []),
+      ...(chat ? [mirror] : []),
       newPick({ open: at }),
       kp ? { label: 'resume…', sub: kp } : { label: 'resume…', off: 'no kept sessions' },
       lp ? { label: 'existing session', sub: lp } : { label: 'existing session', off: 'no live sessions' },
+      ...more,
     ];
   }
   return [
-    mirror,
+    ...(chat ? [mirror] : []),
     { label: 'new session', off: HUB },
     { label: 'resume…', off: HUB },
-    others.length ? { label: 'existing session', sub: others.map(([sid, s]) => ({ label: sessionName(s), on: () => openPane(sid, { at: p.id, dir }) })) }
+    others.length ? { label: 'existing session', sub: others.map(([sid, s]) => ({ label: sessionName(s), on: () => openPane(sid, { at: anchor, dir }) })) }
       : { label: 'existing session', off: HUB },
+    ...more,
   ];
 }
 
@@ -817,13 +864,13 @@ function showItems(p) {
 // or in the middle with none. Door mode keeps its toast.
 function picker() {
   if (mode() !== 'perch') { toast('new pane with a picker arrives with the hub (M2); :vsplit mirrors this one'); return; }
-  const p = focused.peek();
+  const p = focusedAny.peek(); // a chat pane or an xpane
   const el = p && document.querySelector(`.pane[data-pane="${p.id}"]`);
   const at = el ? under(el) : { x: innerWidth / 2, y: innerHeight / 2, x2: innerWidth / 2, y2: innerHeight / 2 };
   openMenu(splitItems(p || null, longSide(p)), at, { title: 'new pane', owner: 'picker' });
 }
 
-// Which way a split of pane `p` goes: along its longer side, so panes stay near square (dwindle).
+// Which way a split of pane `p` (of either kind) goes: along its longer side, so panes stay near square (dwindle).
 function longSide(p) {
   const el = p && document.querySelector(`.pane[data-pane="${p.id}"]`);
   const r = el && el.getBoundingClientRect();
@@ -903,15 +950,24 @@ const stopAsk = (sid, name, at) => openMenu([
   { label: 'keep it', on: () => {} },
 ], at, { title: `stop ${name}? its panes will show "stopped"` });
 
+// What features registered in chatMenuItems add at the end of a sidebar chat menu: they get the chat's list row (a pane's chat with no
+// row yet: `{ id, cwd }`) and `{ p, at }`, the pane showing it (or null) and where the menu is, so a menu of their own can open there.
+function chatExtras(row, p, at) {
+  const more = chatMenuExtras(row, { p: p || null, at });
+  return more.length ? [{ sep: true }, ...more] : [];
+}
+
 function sessionMenu(e, p, at0) {
   e.preventDefault();
   const f = focused.value, at = at0 || atPointer(e), perch = mode() === 'perch';
+  const row = list.value.find((x) => x.id === p.sid), hl = p.s.hello.value;
   openMenu([
     { label: 'open beside', hint: 'new pane', on: () => openPane(p.sid) },
     { label: 'show in focused pane', off: !f ? 'no pane focused' : f.sid === p.sid ? 'shown there' : null, on: () => showIn(f.id, p.sid) },
     perch ? { label: 'fork (latest)', hint: 'new chat', on: () => forkSession(p.sid, sessionName(p.s)) } : { label: 'fork (latest)', off: HUB },
     perch ? { label: 'stop this chat', on: () => stopAsk(p.sid, sessionName(p.s), at) } : { label: 'stop this chat', off: HUB },
-    ...markItems(list.value.find((x) => x.id === p.sid), at),
+    ...markItems(row, at),
+    ...chatExtras(row || { id: p.sid, cwd: hl ? hl.cwd : '' }, p, at),
   ], at, { title: sessionName(p.s) });
 }
 
@@ -925,18 +981,21 @@ function idleMenu(e, r, at0) {
     { label: 'fork (latest)', hint: 'new chat', on: () => forkSession(r.id, label(r)) },
     { label: 'stop this chat', on: () => stopAsk(r.id, label(r), at) },
     ...markItems(r, at),
+    ...chatExtras(r, null, at),
   ], at, { title: label(r) });
 }
 
 // An older chat (eidolon's own folder): to read here or beside; continuing is the action in its pane.
 function olderMenu(e, r, at0) {
   e.preventDefault();
+  const at = at0 || atPointer(e);
   openMenu([
     { label: 'open here (read-only)', on: () => openSession(r.id) },
     { label: 'open beside', hint: 'new pane', on: () => openPane(r.id) },
     { label: 'fork (latest)', hint: 'a copy in this app', on: () => forkSession(r.id, label(r)) },
     { label: 'copy id', on: () => copyId(r.id) },
-  ], at0 || atPointer(e), { title: label(r) });
+    ...chatExtras(r, null, at),
+  ], at, { title: label(r) });
 }
 
 function keptMenu(e, r, at0) {
@@ -951,6 +1010,7 @@ function keptMenu(e, r, at0) {
     ]),
     { label: 'copy id', on: () => copyId(r.id) },
     ...markItems(r, at),
+    ...chatExtras(r, null, at),
   ], at, { title: label(r) });
 }
 
@@ -1022,7 +1082,7 @@ function statusMenu(e) {
     { label: 'font', sub: Object.entries(FONTS).map(([k, f]) => ({ label: f.label, hint: k === DEFAULT_FONT ? 'default' : '', tick: k === font.value, on: () => pickLook('font', k) })) },
     p ? { label: 'open', sub: openItems(p) } : { label: 'open', off: 'no pane focused' },
     { sep: true },
-    ...Object.entries(COMMANDS).map(([c, [what, fn]]) => ({ label: ':' + c, hint: what, on: () => fn('') })),
+    ...Object.entries(cmdTable.value).map(([c, [what, fn]]) => ({ label: ':' + c, hint: what, on: () => fn('') })),
   ], atPointer(e), { title: 'status' });
 }
 
@@ -1052,7 +1112,7 @@ const act = {
 };
 
 // The activity rail: always on screen at the far edge of its side, one icon per
-// tab (RAIL_ICONS); the open tab's icon is lit. Click: open on that tab, or
+// tab (the icons are BASE_LEFT / BASE_RIGHT's and what features registered); the open tab's icon is lit. Click: open on that tab, or
 // close if it is the open one. Both rails alone is compact mode.
 // The collapse glyph: only at the outer end of an open panel's title, never in the rail; a closed panel comes back through its rail icons or ctrl+b / ctrl+i.
 // The arrow points toward the panel's own edge, the way it folds away.
@@ -1061,11 +1121,12 @@ function Fold({ side, cls }) {
   return html`<${K} cls=${cls} title=${'collapse' + (left ? ' sidebar' : ' inspector') + ' · ' + (left ? 'ctrl+b' : 'ctrl+i')} on=${() => toggle(left ? 'lrail' : 'rrail')}>${left ? '«' : '»'}</${K}>`;
 }
 function Rail({ side }) {
-  const left = side === 'l', names = left ? LEFT_TABS : RIGHT_TABS;
+  const left = side === 'l', tabs = tabsOn(side);
   const cur = (left ? ui.left : ui.right).value, closed = (left ? ui.lrail : ui.rrail).value;
   const keys = left ? 'ctrl+b' : 'ctrl+i, [ ]';
+  // A tab's badge (a signal it registered) is one character after its icon: a dot, the count's digit, `+` over 9 (core/registry.js badgeText).
   return html`<nav class=${'col arail ' + (left ? 'ral' : 'rar')} aria-label=${left ? 'sidebar tabs' : 'inspector tabs'}>
-    ${names.map((n) => html`<${K} cls=${'ri' + (!closed && n === cur ? ' on' : '')} title=${n + ' · ' + keys} on=${() => railPick(side, n)}>${RAIL_ICONS[n]}</${K}>`)}
+    ${tabs.map((t) => { const b = badgeText(t.badge ? t.badge.value : 0); return html`<${K} cls=${'ri' + (!closed && t.name === cur ? ' on' : '')} title=${t.name + ' · ' + keys} on=${() => railPick(side, t.name)}>${t.icon}${b && html`<span class="bd o">${b}</span>`}</${K}>`; })}
   </nav>`;
 }
 
@@ -1306,8 +1367,12 @@ function Left() {
       : html`<div class="hdr">this door</div>
       ${hl ? html`<div class="list"><div class="it"><div class="l1"><span class="faint">▸</span><span class="grow c" title=${hl.cwd}>${tildify(hl.cwd)}</span></div></div></div>` : html`<div class="faint">—</div>`}
       <div class="hdr">others</div><${Needs}>project list needs the hub</${Needs}>`;
-  } else {
+  } else if (tab === 'mesh') {
     body = html`<${MeshTab} />`;
+  } else {
+    // a tab a feature registered: the chat the inspector shows, if any, as for the inspector's tabs
+    const t = leftAll.value.find((x) => x.name === tab), q = inspected.value;
+    body = t && t.component ? html`<${t.component} key=${tab} s=${q ? q.s : null} sid=${q ? q.sid : null} />` : html`<div class="faint">no such tab</div>`;
   }
   return html`<aside id="left" class="col side frame">
     ${!rail && html`<div class="ftitle"><${Fold} side="l" cls="tab fold" /><span class="tab on">${tab}</span></div>`}
@@ -1341,14 +1406,24 @@ function RunTab({ s }) {
 // The status line's mode badge: what each approval mode means, for its tooltip.
 const MODE_TIPS = { yolo: 'yolo: the gate is answering for you', manual: 'manual: it asks before anything that changes things', auto: "auto: eidolon's rules, it asks only for risky commands" };
 
-// Inspector tab -> component. Every tab is a Preact component taking
-// { s: Session, sid }, so a new tab (or a real graph) is one entry here.
-export const INSPECTOR = { rec: Rec, loaded: LoadedTab, files: FilesTab, diff: DiffTab, graph: GraphTab, run: RunTab };
+// The loaded tab, then the sections features registered under it (core/registry.js loadedSections): each a component taking { s, sid }.
+function Loaded(props) {
+  return html`<${LoadedTab} ...${props} />${loadedSections.list.map((S, i) => html`<${S} key=${i} ...${props} />`)}`;
+}
 
+// The page's own inspector tabs, name -> component. Every tab is a Preact component taking { s: Session, sid }. A tab a feature registered
+// (core/registry.js rightTabs) brings its own component and is not listed here; its icon and place in the rail are BASE_RIGHT's, then registration order.
+export const INSPECTOR = { rec: Rec, loaded: Loaded, files: FilesTab, diff: DiffTab, graph: GraphTab, run: RunTab };
+
+// The inspector shows the chat that has focus, else the last that had it (an xpane with focus is not a chat), else nothing; a `global` tab
+// is drawn either way, with { s: null, sid: null } when there is no chat.
 function Right() {
-  const tab = ui.right.value, rail = ui.rrail.value, p = focused.value;
-  const Tab = INSPECTOR[tab];
-  const body = p && !rail ? html`<${Tab} key=${tab} s=${p.s} sid=${p.sid} />` : html`<div class="faint">no pane focused</div>`;
+  const tab = ui.right.value, rail = ui.rrail.value, p = inspected.value;
+  const t = rightAll.value.find((x) => x.name === tab), Tab = (t && t.component) || INSPECTOR[tab];
+  const body = !Tab ? html`<div class="faint">no such tab</div>`
+    : p ? html`<${Tab} key=${tab} s=${p.s} sid=${p.sid} />`
+    : t && t.global ? html`<${Tab} key=${tab} s=${null} sid=${null} />`
+    : html`<div class="faint">no pane focused</div>`;
   return html`<aside id="right" class="col side frame">
     ${!rail && html`<div class="ftitle"><span class="tab on">${tab}</span><${Fold} side="r" cls="tab fold" /></div>`}
     ${!rail && html`<div class="inner">${body}</div>`}
@@ -1397,7 +1472,7 @@ function Tiles() {
     return () => { ro.disconnect(); removeEventListener('resize', size); };
   }, []);
   known.value; // redraw once the mode is known: the start screen is the perch's, and the first render can come before detect() says so
-  const panes = ui.panes.value, tree = ui.tree.value, box = ui.box.value, f = ui.focus.value;
+  const panes = ui.panes.value, xs = ui.xpanes.value, tree = ui.tree.value, box = ui.box.value, f = ui.focus.value;
   const lay = tile.layout(tree, box);
   const rect = new Map(lay.panes.map((r) => [r.id, r]));
   let body;
@@ -1414,15 +1489,17 @@ function Tiles() {
   } else if (gate) {
     body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle r">${gate === 'refused' ? 'token refused' : 'not answering'}</div>
       <div class="empty">${gate === 'refused' ? 'the server refused the login for this page (it restarted?).\n\nrun `hoot` again.' : 'the server is not answering. this page keeps trying and opens by itself when it does.\n\nif it does not, run `hoot status web`, then `hoot` again.'}</div></div>`;
-  } else if (!panes.length && mode() === 'perch') {
+  } else if (!panes.length && !xs.length && mode() === 'perch') {
     body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle">minerva</div>
       <div class="scroll"><${Home} act=${homeAct} /></div></div>`;
-  } else if (!panes.length) {
+  } else if (!panes.length && !xs.length) {
     body = html`<div class="pane frame tiles-empty" style="inset:0"><div class="ftitle faint">no pane</div>
       <div class="empty">no pane open.${'\n\n'}<${K} cls="hi" on=${() => openPane()}>:open</${K}>  reconnect this session${'\n'}<span class="faint">ctrl+enter  new pane with a picker (arrives with the hub, M2)</span></div></div>`;
   } else {
     body = [
       ...panes.map((p) => rect.get(p.id) && html`<${Pane} key=${p.id + ' ' + p.sid} p=${p} rect=${rect.get(p.id)} focused=${p.id === f} mirror=${isMirror(p)} act=${act} />`),
+      // a pane of a registered kind draws itself; one whose kind is gone is not drawn
+      ...xs.map((x) => { const k = paneKinds.get(x.kind); return k && rect.get(x.id) && html`<${k.Pane} key=${x.id} p=${x} rect=${rect.get(x.id)} focused=${x.id === f} act=${act} />`; }),
       ...lay.dividers.map((d) => html`<${Divider} key=${d.path} d=${d} />`),
     ];
   }
@@ -1432,10 +1509,13 @@ function Tiles() {
 function Hint() {
   const h = ui.hint.value;
   if (!h) return html`<div id="hint"></div>`;
-  if (h.mode === 'toast') return html`<div id="hint" class=${'toast' + (h.err ? ' err' : '')} aria-live="polite">${h.text}</div>`;
+  if (h.mode === 'toast') {
+    const a = h.act; // toast(text, err, { label, on }): one clickable word after the text; a click dismisses the toast, then does it
+    return html`<div id="hint" class=${'toast' + (h.err ? ' err' : '')} aria-live="polite">${h.text}${a && html` <${K} cls="hi" on=${() => { if (ui.hint.peek() === h) ui.hint.value = null; a.on(); }}>${a.label}</${K}>`}</div>`;
+  }
   const text = ui.cmd.value || '';
   const m = matches(text);
-  return html`<div id="hint" class="menu">${m.length ? m.map((c, i) => html`<${K} cls=${'pair' + (i === 0 && text ? ' sel' : '')} on=${() => runCmd(c)}>${c}</${K}>${i === 0 && text ? html`<span class="faint"> ${COMMANDS[c][0]}   </span>` : ' '}`)
+  return html`<div id="hint" class="menu">${m.length ? m.map((c, i) => html`<${K} cls=${'pair' + (i === 0 && text ? ' sel' : '')} on=${() => runCmd(c)}>${c}</${K}>${i === 0 && text ? html`<span class="faint"> ${cmdTable.value[c][0]}   </span>` : ' '}`)
     : html`<span class="faint">session commands arrive with the registry (M4)</span>`}
     <${K} cls="pair faint" on=${closeCmd}>esc close</${K}></div>`;
 }
@@ -1469,6 +1549,8 @@ const FIT = 5;
 function whereNow() {
   const a = document.activeElement;
   if (!a || a === document.body || !a.closest) return 'idle';
+  const owned = whereOf(a); // a place a feature names (a terminal, a notepad) comes first (core/registry.js whereOwners)
+  if (owned) return owned;
   if (a.closest('.ask')) return a.closest('.aline') ? 'note' : 'ask';
   return a.closest('.composer') ? 'compose' : 'idle';
 }
@@ -1508,8 +1590,8 @@ function KeyRef() {
     return () => { document.removeEventListener('mousedown', away, true); removeEventListener('keydown', esc, true); };
   }, []);
   const here = hereKeys(at);
-  const groups = [...(here.length ? [[HERE[at], here]] : []), ...KEYREF,
-    ['commands', Object.entries(COMMANDS).map(([c, [what, fn]]) => [':' + c, what, () => fn('')])]];
+  const groups = [...(here.length ? [[HERE[at], here]] : []), ...keyGroups.value,
+    ['commands', Object.entries(cmdTable.value).map(([c, [what, fn]]) => [':' + c, what, () => fn('')])]];
   const take = (fn) => { ui.keys.value = false; panel.armed.value = true; fn(); }; // a click here is the operator choosing
   return html`<div class="frame pop keyref" ref=${ref} role="dialog" aria-label="key reference" onMouseDown=${(e) => e.preventDefault()}>
     <div class="ftitle">keys<span class="faint"> · click one, esc closes</span></div>
@@ -1531,7 +1613,9 @@ function Status() {
   const budget = s && s.budget.value, waiting = unsent.value, lvl = ui.fit.value; // answered but not submitted still waits
   const t = tabs.value, cur = current.value, inAsk = ui.where.value === 'ask' || ui.where.value === 'note';
   const place = inAsk && cur ? t.findIndex((x) => x.a === cur.a) + 1 : 0;
-  const now = st + waiting + (p ? 'q' + queuedN(p) : '') + (hl ? hl.model : '') + place + conn + ' ' + ui.box.value.w; // a resize re-fits
+  // An xpane with focus says what its kind says (status(p), else title(p), else the kind) where the chat's badge and model would be.
+  const fx = p ? null : xById(ui.focus.value) || null, xs = fx ? paneInfo(fx, 'status') ?? paneInfo(fx, 'title') ?? fx.kind : null;
+  const now = st + waiting + (p ? 'q' + queuedN(p) : '') + (hl ? hl.model : '') + place + conn + ' ' + ui.box.value.w + (typeof xs === 'string' ? xs : ''); // a resize re-fits
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
@@ -1548,6 +1632,7 @@ function Status() {
   ].filter(Boolean).join(' · ') : '';
   return html`<footer id="status" onContextMenu=${statusMenu}><div class="bar" ref=${ref}>
     <span class="left">
+      ${fx && html`<span class="b" title=${'a ' + fx.kind + ' pane has focus'}>${xs}</span>`}
       ${p && html`<span class=${'badge st-' + STATE_CLS[st]} title=${st === '?' ? 'this page connected after the turn began or before any turn event' : ''}>${st}</span>`}
       ${hl && html`<${K} cls="model b" title="the model the door reports: what is loaded" on=${openLoaded}>${hl.model || '?'}</${K}>`}
       ${hl && hl.persona && html`${dot}<${K} cls="persona b" title="the persona: what is loaded" on=${openLoaded}>${hl.persona.name || hl.persona}</${K}>`}
@@ -1576,6 +1661,9 @@ effect(() => { const c = cell.value; batch(() => { ui.box.value = { ...ui.box.pe
 
 // ---------------------------------------------------------------- keys
 document.addEventListener('keydown', (e) => {
+  // First of all: an element a feature owns (a terminal) takes its own keys, ctrl+b, ctrl+i and alt+w included, and none of the page's runs
+  // on them (core/registry.js keyOwners). It must stay above the ctrl+b / ctrl+i / alt+w lines below, or those fire in the page as well.
+  if (keyClaimed(e.target)) return;
   const k = e.key.toLowerCase(), t = e.target;
   const typing = t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT');
   if (typing && !t.closest('.ask')) typedAt = performance.now(); // the pause the ask queue waits for
@@ -1618,8 +1706,36 @@ document.addEventListener('mousedown', outside);
 addEventListener('resize', () => { ui.fit.value = 0; });
 // Looking at a session reads what arrived in it.
 effect(() => { const f = focused.value; if (f) f.s.unread.value = 0; });
+// The inspector keeps the chat it last showed while an xpane has focus.
+effect(() => { const f = focused.value; if (f) ui.lastChat.value = f.id; });
+
+// ---------------------------------------------------------------- what a feature folder calls back
+// A feature cannot import this file (this file imports it): it reaches the page through `host` (core/registry.js has each name's meaning).
+const cwdOf = (p) => (!p ? '' : isXPane(p) ? String(paneInfo(p, 'cwd') || '') : (p.s.hello.peek() || {}).cwd || '');
+// Open that side's panel on that tab (a closed panel opens, and on a narrow screen the other side closes, as a rail click does).
+function showTab(side, name) {
+  if (!tabsOn(side).some((t) => t.name === name)) return;
+  const left = side === 'l', rail = left ? 'lrail' : 'rrail';
+  if (ui[rail].peek()) toggle(rail, name); else (left ? ui.left : ui.right).value = name;
+}
+Object.assign(host, {
+  toast,
+  openXPane,
+  closePane,
+  focusPane,
+  focused: () => focusedAny.peek(),
+  inspected: () => inspected.peek(),
+  chatPanes: () => ui.panes.peek(),
+  xpanes: () => ui.xpanes.peek(),
+  cwd: () => cwdOf(focusedAny.peek()) || cwdOf(inspected.peek()),
+  showTab,
+  chatStreams: () => holdingSids(null).size,
+  openCmd,
+});
 
 // ---------------------------------------------------------------- boot
+// A registered command that took a base command's name hid it: say which, once.
+for (const name of mergeCommands(BASE_COMMANDS, commands.peek()).overridden) console.info(`minerva: the registered :${name} replaces the page's own :${name}`);
 startLook();
 ui.token = takeToken();
 // A token pasted into this tab's URL later (a hash change, no reload) is

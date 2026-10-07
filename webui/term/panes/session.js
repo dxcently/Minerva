@@ -12,6 +12,7 @@ import { icon, word, shade, CELLS } from '../core/life.js';
 import { tildify, kfmt, hhmm, stateOf, STATE_CLS, connWord } from '../core/state.js';
 import { mode, hubGet, hubPost } from '../core/api.js';
 import { list, refresh, modeOf } from '../core/hub.js';
+import { composerExtras, paneStyle } from '../core/registry.js';
 import { openMenu, closeMenu, menu, atPointer, under } from '../core/menu.js';
 import { AskPanel, AskMark, Settled, quoted } from './asks.js';
 import { Strip, items as imageItems, linkPaths } from './imgs.js';
@@ -29,8 +30,6 @@ function viewOf(p) {
 // ---------------------------------------------------------------- the pane
 export function Pane({ p, rect, focused, mirror, act }) {
   const s = p.s, v = viewOf(p);
-  const style = `left:${rect.x - (rect.x > 0 ? 1 : 0)}px;top:${rect.y - (rect.y > 0 ? 1 : 0)}px;` +
-    `width:${rect.w + (rect.x > 0 ? 1 : 0)}px;height:${rect.h + (rect.y > 0 ? 1 : 0)}px`;
   const banner = s.banner.value;
   // A chat that is not running and can be continued (saved, stopped, exited): no composer, a visible action instead.
   const away = !!banner && (!!banner.resume || !!s.resuming);
@@ -38,7 +37,7 @@ export function Pane({ p, rect, focused, mirror, act }) {
   const row = list.value.find((r) => r.id === s.sid);
   const forking = !!row && !!row.pending && s.conn.value === 'kept';
   v.act = act;
-  return html`<section class=${'pane frame' + (focused ? ' focus' : '')} style=${style} tabindex="-1"
+  return html`<section class=${'pane frame' + (focused ? ' focus' : '')} style=${paneStyle(rect)} tabindex="-1"
       data-pane=${p.id} onMouseDown=${() => act.focus(p.id)}>
     <${Title} p=${p} mirror=${mirror} act=${act} />
     <${Glyphs} p=${p} act=${act} />
@@ -46,12 +45,13 @@ export function Pane({ p, rect, focused, mirror, act }) {
     ${banner && !forking && html`<div class=${'banner' + (banner.err ? ' err' : '')}>${banner.text}</div>`}
     ${act.panelPane.value === p.id && html`<${AskPanel} p=${p} act=${act} />`}
     <${Outbox} p=${p} />
+    ${composerExtras.list.map((X, i) => html`<${X} key=${i} p=${p} s=${s} act=${act} />`)}
     ${forking ? html`<${ForkComposer} s=${s} p=${p} act=${act} />` : away ? html`<${Continue} s=${s} p=${p} act=${act} />` : html`<${Composer} s=${s} p=${p} act=${act} />`}
   </section>`;
 }
 
 // Session name, its menu, the project chip, the connection dot.
-function Title({ p, mirror, act }) {
+export function Title({ p, mirror, act }) {
   const s = p.s, conn = s.conn.value, hl = s.hello.value;
   const dot = { live: 'hi', replaying: 'y', connecting: 'y', reconnecting: 'y', goodbye: 'faint', stopped: 'faint', kept: 'faint', gone: 'faint' }[conn] || 'r';
   const open = (e, at) => { e.preventDefault(); e.stopPropagation(); act.paneMenu(p, at); };
@@ -64,8 +64,8 @@ function Title({ p, mirror, act }) {
   </div>`;
 }
 
-// Split and close, cut into the top border on the right.
-function Glyphs({ p, act }) {
+// Split and close, cut into the top border on the right. Works for any pane that has an id: it asks act.splitMenu(p, at) and act.close(p.id).
+export function Glyphs({ p, act }) {
   const g = (ch, title, owner, on) => html`<span class="k glyph" role="button" tabindex="0" title=${title} data-owner=${owner}
     onClick=${(e) => { e.stopPropagation(); on(e.currentTarget); }}
     onKeyDown=${(e) => { if (!e.repeat && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); e.stopPropagation(); on(e.currentTarget); } }}>${ch}</span>`;

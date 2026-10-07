@@ -9,6 +9,7 @@ import { signal, batch } from './ui.js';
 import { apiUrl, auth, post, hubPost, mode } from './api.js';
 import { stream } from './sse.js';
 import { World, TICK_MS } from './life.js';
+import { runTaps } from './registry.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // The wait before the nth consecutive reconnect (n = 0, 1, ...): 250 ms doubled
@@ -516,6 +517,7 @@ export class Session {
       const key = keyOf(f);
       if (key || KEYLESS.has(f.type)) this.seqReplay.push({ type: f.type, key });
     }
+    runTaps(this.sid, f, this.live); // registered taps (core/registry.js) see the frame first; one that throws changes nothing here
     switch (f.type) {
       case 'hello':
         this.reset();

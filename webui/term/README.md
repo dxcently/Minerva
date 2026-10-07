@@ -60,7 +60,7 @@ The list comes from `GET /hub/sessions` (`core/hub.js`), polled every 5 s (a pol
 
 Opening: a click on a row, a recent chat on the start screen, or `:open <id>` shows the chat in the focused pane (the first pane if none; the pane that already shows it is just focused). Ctrl-click or middle-click on a row, or `open beside` in its menu, splits instead. Right-click menus: a session in a group has `open beside`, `show in focused pane` and `stop this chat` (asks `stop <name>? its panes will show "stopped"`: `stop` / `keep it`; 202 toasts and polls, 409 says `that chat is not running here`); a kept row has `open here`, `open beside`, `resume (may continue the last turn)`, `copy id`. `fork (latest)` (in every chat menu, saved ones and shared-folder ones too) copies the whole chat to a NEW chat and opens it in a pane beside the original with a line `forked from <title>`; the original keeps going. There is no `fork from here` on transcript rows: eidolon has no headless way to move a copy's head to an older record (see hub.md 7c), so the item is not offered. In a pane's split and show menus, `existing session` lists every live session and `resume…` the newest 15 kept; a pick only opens a pane (resume stays the pane's own banner action). `new session` is live: see below.
 
-The cap: at most 4 distinct sessions hold an event stream at once. Only panes that hold a stream count: a pane that reads stopped, kept, dead, gone, refused or goodbye holds none. Opening a fifth is refused with a toast, and so is resuming a fifth; a mirror of an open session is always allowed. Door mode is unchanged (the old greyed lines).
+The cap: at most 4 distinct sessions hold an event stream at once (3 while the terminal stream is open: `extraStreams` in `core/registry.js` says how many other streams there are). Only panes that hold a stream count: a pane that reads stopped, kept, dead, gone, refused or goodbye holds none. Opening a fifth is refused with a toast, and so is resuming a fifth; a mirror of an open session is always allowed. Door mode is unchanged (the old greyed lines).
 
 The browser's limit is six connections per host:port for the whole profile, not per tab (HTTP/1.1). The 4 is per tab. Two tabs with 4 sessions each ask for 8 streams: the browser queues the 7th and 8th, and also every later request to the perch behind them (an answer, a say, the poll). The symptom is a `y` that does nothing and no error until a stream closes. Keep the total of followed sessions across all tabs of the profile at 5 or fewer (the sixth connection is the poll and the posts); the page cannot see other tabs.
 
@@ -70,7 +70,7 @@ The browser's limit is six connections per host:port for the whole profile, not 
 index.html           the screen skeleton; one <script type=module src>, no inline script (CSP)
 theme.css            base16 slots -> the page's colour variables, the default scheme as fallback, @font-face (web-ui.md 2.2)
 term.css             the look: square frames, cut-in titles, the TUI prompt frame, no border-radius
-app.js               sidebars, split tree, inspector tabs (INSPECTOR map, the loaded tab), status line, the ask queue and batch submit, menus' items, keys, the : line
+app.js               sidebars, split tree, inspector tabs (INSPECTOR map, the loaded tab and its registered sections), status line, the ask queue and batch submit, menus' items, keys, the : line
 core/ui.js           the one import point for Preact, hooks, signals, htm; K = clickable text
 core/menu.js         right-click / title menus: one open at a time, submenus, keys, kept on screen
 core/look.js         theme + font: base16 parser, --base0X on <html>, per-font size, cell measured, localStorage
@@ -94,6 +94,13 @@ panes/files.js       the inspector's files tab: `folder` (the session's director
 core/attach.js       images and text files put into a message, checked against the door's limits
 core/syntax.js       port of eidolon crates/tui/src/syntax.rs: code with line numbers, diffs
 renderers/           generic + files (edit/write diff, read as code) tool renderers; a renderer returns a string, a DOM Node or a vnode
+core/registry.js     the lists a feature folder registers into (tabs, pane kinds, commands, key rows, owners, frame taps, stream slots) and `host`: app.js draws from them, so a feature never edits app.js
+graph/               the inspector's graph tab: the jev runs and the chat's turn graph (GraphTab)
+mesh/                the left panel's mesh tab: the nodes this machine knows (MeshTab)
+terms/               the web terminals: the terminals tab in the right panel and the terminal panes
+notes/               the notepad: the notes tab in the left panel and the note pane
+allow/               the allow rules of a chat: a section of the loaded tab
+tests/               node tests of the pure modules: node --test "webui/term/tests/*.test.mjs" (tests/README.md)
 brand/owl.svg        copy of webui/owl-green.svg (the door serves only this dir)
 themes/              base16 schemes (*.yaml) + manifest.json, the list the page offers
 fonts/               VT323, Departure Mono (+ OFL licences, VERSIONS with sources and sha256)
@@ -117,7 +124,7 @@ Every action is clickable; keys are shortcuts for the same functions.
 | right-click a chat row | copy (the selection, if any), copy as markdown, quote into composer |
 | right-click a sidebar session | open in new pane, show in focused pane, fork (latest), stop this chat, pin, archive, delete |
 | right-click the status line | loaded (the inspector tab), theme ▸, font ▸ (live, current ticked), then every `:` command |
-| a rail icon (left `≡ ▦ ⋈`, right `◉ ▣ ▤ ± ⋔ ▶`) | open that side's panel on that tab; the lit icon closes it |
+| a rail icon (left `≡ ▦ ⋈ ✎`, right `◉ ▣ ▤ ± ⋔ ▶ ⌨`) | open that side's panel on that tab; the lit icon closes it |
 | `«` / `»` (the outer end of an open panel's title only; never in the rail) | collapse or expand that side's panel |
 | tile borders | drag to resize (snaps to cells) |
 | an ask tab | switch to that ask (the panel moves to its pane) |
@@ -258,7 +265,7 @@ The fonts are pinned the same way by hand in `fonts/VERSIONS`: source URL, tag o
 - No `<button>`: controls are `K` (a `span role=button tabindex=0`).
 - `border-radius: 0` on everything, `<meta name=referrer content=no-referrer>` stays.
 - Streamed text is appended to one text node (O(n)); rows are memoised and read only their own signals.
-- An inspector tab is a component taking `{ s, sid }` (`INSPECTOR` in app.js); the M3 graph goes in the `graph` slot.
+- An inspector tab is a component taking `{ s, sid }` (`INSPECTOR` in app.js; a feature's own tab registers in `core/registry.js` and app.js is not edited); the M3 graph goes in the `graph` slot. Panes that are not chats (`ui.xpanes`) share the tile tree with the chat panes; the ~30 places that read `p.s` / `p.sid` stay on the chat panes (`ui.panes`).
 - One `Session` (one `/api/events` stream) per session id; panes, mirrors included, are views of it. Only `turn-state` sets running.
 - A pane's session can change (`showIn` in app.js): the pane is keyed by id and session id, so it is drawn afresh, and the old `Session` closes when no pane shows it. A pane is a mirror when an earlier pane shows its session.
 

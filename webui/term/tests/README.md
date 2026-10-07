@@ -14,6 +14,7 @@ The glob is quoted so node expands it itself (the same in a shell and in PowerSh
 |---|---|
 | `smoke.test.mjs` | `HUB_PATH` / `hubPathOk` (core/api.js): the route families a hub call may take, `tree` only with a query, no `..` segment however it is spelt; and that `hubGet`/`hubText`/`hubPost`/`hubDelete` all refuse a path the whitelist refuses, before `fetch` |
 | `lane.test.mjs` | the request lane (core/lane.js): one request in flight across all polls, first in first out, a queued path shared by its callers, user actions never waiting, a failed, thrown or unanswered poll freeing the lane; and that core/hub.js's list and trash polls ride it |
+| `registry.test.mjs` | the registries (core/registry.js): tab tables and saved-tab names, badges, bad registrations refused, the stream cap with `extraStreams`, key/focus/where owners, command overrides and the key rows that follow them, frame taps (directly and through a real `Session.frame`), extra panes in the one tree, split and chat-menu extras; and source scans that hold app.js, session.js, state.js and index.html to the wiring (they cannot load in node) |
 
 A test must fail when the change it guards is reverted: check that by hand when you add one (put the old code back, see it go red, put the new code back).
 
