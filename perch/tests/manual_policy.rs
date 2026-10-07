@@ -6,7 +6,8 @@
 //!   eidolon ships, read from `../eidolon/crates/rune/policy.rn`, never copied) is wrapped by [`perch::mode::wrap`] and compiled
 //!   with the same Rune the harness uses; each entry point is called and the answers compared with the unwrapped table.
 //! - **Shell** (`ls`, `cat > f`, `rm`, `sudo`): `eidolon policy '<command>'` classifies without a model call and without running it,
-//!   through the real decomposition algebra and the real generated config. Skipped, loudly, when no `eidolon` is on `PATH`.
+//!   through the real decomposition algebra and the real generated config. The binary is `MINERVA_TEST_EIDOLON` (an absolute path), else
+//!   the first `eidolon` on `PATH`; with none the tests are skipped, loudly, unless `MINERVA_REQUIRE_EIDOLON=1`, which fails them.
 //!
 //! Every eidolon this file starts has `XDG_CONFIG_HOME` pointed at a temp dir (asserted), because a stock eidolon rewrites
 //! `~/.config/eidolon/system` on start.
@@ -164,10 +165,20 @@ fn manual_asks_about_every_shell_leaf_and_keeps_what_stock_denies() {
 // The real eidolon
 // ---------------------------------------------------------------------------
 
-/// `eidolon` on `PATH`, or `None` (the test then says so and passes: this file cannot fail a machine that has no eidolon).
+/// The real eidolon: `MINERVA_TEST_EIDOLON` (an absolute path) when set, else the first `eidolon` on `PATH`. With neither the test says so
+/// and passes, unless `MINERVA_REQUIRE_EIDOLON=1`, in which case it fails: a run that was meant to look at the real thing never passes
+/// without having looked.
 fn eidolon() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|dir| dir.join("eidolon")).find(|candidate| candidate.is_file())
+    if let Some(path) = std::env::var_os("MINERVA_TEST_EIDOLON").map(PathBuf::from) {
+        assert!(path.is_absolute() && path.is_file(), "MINERVA_TEST_EIDOLON={} is not an absolute path to a file", path.display());
+        return Some(path);
+    }
+    let found = std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|dir| dir.join("eidolon")).find(|candidate| candidate.is_file()));
+    assert!(
+        found.is_some() || std::env::var("MINERVA_REQUIRE_EIDOLON").as_deref() != Ok("1"),
+        "MINERVA_REQUIRE_EIDOLON=1 and there is no eidolon: set MINERVA_TEST_EIDOLON to its absolute path"
+    );
+    found
 }
 
 /// A scratch `XDG_CONFIG_HOME` and a Minerva home generated over it with the real eidolon, which is what unpacks its tables.
@@ -183,9 +194,11 @@ struct Real {
 impl Real {
     fn start() -> Option<Self> {
         let Some(eidolon) = eidolon() else {
-            eprintln!("manual_policy: no `eidolon` on PATH; the real-eidolon checks are skipped");
+            eprintln!("manual_policy: no eidolon (MINERVA_TEST_EIDOLON, PATH); the real-eidolon checks are skipped");
             return None;
         };
+        // Counted by the run that wants to know how many real-eidolon tests did look (`--nocapture`, then count the lines).
+        eprintln!("REAL-EIDOLON-RAN {}", std::thread::current().name().unwrap_or("?"));
         let xdg = tempfile::tempdir().unwrap();
         let base = tempfile::tempdir().unwrap();
         let home = base.path().join("Minerva");

@@ -138,7 +138,8 @@ async fn main() -> Result<()> {
     });
     // Under `--home`, eidolon's own dir is a second, read-only source (hub.md section 4); nothing in it is ever written.
     let other_sessions = resolved.home.as_ref().map(|_| perch::config::other_sessions_dir(&member));
-    let modes = perch::mode::prepare(resolved.home.as_deref(), &member, &cli.eidolon)?;
+    let files = perch::mode::AgentFiles { term: cli.term_token_file.as_deref(), mail: cli.mail_token_file.as_deref() };
+    let modes = perch::mode::prepare_with(resolved.home.as_deref(), &member, &cli.eidolon, files)?;
     let options = perch::Options {
         bind: cli.bind,
         ui_dir: cli.ui_dir,

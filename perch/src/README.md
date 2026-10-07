@@ -26,7 +26,7 @@ term/     /hub/term: web terminals (stub)
 notes/    /hub/notes (stub)
 mail/     /hub/mail: the mailbox, and the opt-in a chat makes to send (stub)
 allow/    /hub/sessions/<id>/allow|revoke: standing allows, and the watch::Sink every door's watcher is opened with (stub)
-guard/    what a terminal's text may not say, and whether the guard is on (stub: refuses nothing, reports off)
+guard/    the deny rows in every generated policy (aoide, ssh, update keys), what a terminal's text may not say, and whether they are on
 ```
 
 **The seams** (slice S0P-a). The modules above marked stub are in `serve.rs`'s route table and in `lib.rs`'s hooks now, so the slices

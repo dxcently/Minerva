@@ -11,6 +11,14 @@
 //! The perch then lists sessions from the same absolute directory it wrote into that file, so the
 //! two can never disagree. The files *beside* the config (`providers/`, `policy.rn`, `secrets`)
 //! are shared as they always were.
+//!
+//! **The guard rows.** When the member's policy can be wrapped (see [`crate::guard`]), the generated config also holds
+//! `[policy] path = <the guard file>` and `enabled = true`: auto and yolo then run the member's own table plus the deny rows, and the
+//! permits store stays the one beside the member's policy, which is the one the installer writes. `enabled = true` is forced because a
+//! member's `enabled = false` would drop the rows with the rest of the gate; such a member gets eidolon's gate back in Minerva's chats
+//! (without the `judge` and `yolo` they wrote for a gate that was off), and [`crate::guard::status`] says so. When the rows cannot be
+//! made, or the start-up probe does not see them refuse, the config is the member's own and `status()` carries the reason. The guard
+//! file is removed only after that config is back on disk; if it cannot be written, the perch does not start.
 
 use std::path::{Path, PathBuf};
 
@@ -79,6 +87,8 @@ pub fn resolve(home: Option<&Path>, sessions_dir: Option<PathBuf>, eidolon_confi
         let config = generate(&home, member)?;
         return Ok(Resolved { config: Some(config), sessions_dir: sessions, home: Some(home) });
     }
+    // Without --home the perch writes no policy, so there is nowhere for the rows to live.
+    crate::guard::record(crate::guard::GuardStatus::off("the guard rows are written only under --home, which generates the config"));
     let sessions_dir = match (sessions_dir, eidolon_config.as_deref()) {
         (Some(dir), _) => dir,
         (None, Some(config)) => sessions_dir_of(config)?.unwrap_or_else(default_sessions_dir),
@@ -87,8 +97,122 @@ pub fn resolve(home: Option<&Path>, sessions_dir: Option<PathBuf>, eidolon_confi
     Ok(Resolved { config: eidolon_config, sessions_dir, home: None })
 }
 
-/// Writes `<home>/config.toml` (atomically, `0600`) and returns its path. `home` must be absolute.
+/// Writes `<home>/config.toml` (atomically, `0600`) and returns its path. `home` must be absolute. The guard rows are written beside the
+/// member's policy and named in the config when a table already on disk can be wrapped; nothing is run, so the start-up probe is left
+/// to [`generate_with`] (which [`crate::mode::prepare`] calls once it has eidolon in hand).
 pub fn generate(home: &Path, member: &Path) -> Result<PathBuf> {
+    generate_with(home, member, None)
+}
+
+/// [`generate`], with `eidolon` when there is one: it unpacks its tables on a machine where it has never run, and is asked to refuse
+/// `aoide mail send x` under the finished config before the guard is called on (`guard::probe`). Records [`crate::guard::status`].
+pub fn generate_with(home: &Path, member: &Path, eidolon: Option<&Path>) -> Result<PathBuf> {
+    let base = base_table(home, member)?;
+    // The member's own config first: if anything about the guard fails, this is what stands.
+    let path = write_config(home, &base)?;
+    let status = match add_guard(home, member, &base, &path, eidolon) {
+        Ok(status) => status,
+        Err(e) => {
+            crate::guard::record(crate::guard::GuardStatus::off(format!("{e:#}")));
+            return Err(e);
+        }
+    };
+    match eidolon {
+        Some(_) => crate::guard::record(status),
+        // Not the last word: the start-up pass that has eidolon in hand settles it, and says so in the log if the guard is off.
+        None => crate::guard::record_provisional(status),
+    }
+    Ok(path)
+}
+
+/// What the member's guard-free config says: `base` with the guard's `[policy]` keys, and the guard file named in them.
+///
+/// `Err` only when the config could not be put back to the member's own after the guard failed: the file is then left where it is (the
+/// config may still name it), and the perch does not start on a config it cannot vouch for.
+fn add_guard(home: &Path, member: &Path, base: &toml::Table, config: &Path, eidolon: Option<&Path>) -> Result<crate::guard::GuardStatus> {
+    use crate::guard::GuardStatus;
+    let mut staged = match crate::guard::stage(member, config, home, eidolon) {
+        Ok(staged) => staged,
+        Err(why) => return Ok(GuardStatus::off(why)),
+    };
+    let (guarded, note) = match with_guard(base, &staged.file) {
+        Ok(done) => done,
+        Err(why) => return abandon(home, base, &staged.file, why),
+    };
+    if let Err(e) = write_config(home, &guarded) {
+        return abandon(home, base, &staged.file, format!("the config could not be written with the guard: {e:#}"));
+    }
+    let Some(eidolon) = eidolon else {
+        return Ok(GuardStatus::off("the guard is written, and eidolon has not yet been asked to refuse with it"));
+    };
+    if let Err(why) = crate::guard::probe(eidolon, config, home, &staged.file) {
+        return abandon(home, base, &staged.file, why);
+    }
+    // eidolon syncs its shipped tables when it starts, so the probe may have been the run that changed the member's table: the guard
+    // was made from the old text. Made again from the new, and probed once more.
+    if let Some(again) = crate::guard::restage_if_changed(member, home, &staged) {
+        staged = match again {
+            Ok(staged) => staged,
+            Err(why) => return abandon(home, base, &staged.file, why),
+        };
+        if let Err(why) = crate::guard::probe(eidolon, config, home, &staged.file) {
+            return abandon(home, base, &staged.file, why);
+        }
+    }
+    Ok(GuardStatus::on(staged.file, note))
+}
+
+/// The guard failed: the config goes back to the member's own, and only once that has been written is the guard file removed, so the
+/// config never names a file that is gone. If the config cannot be restored the file stays and this is an error.
+fn abandon(home: &Path, base: &toml::Table, file: &Path, why: String) -> Result<crate::guard::GuardStatus> {
+    write_config(home, base).with_context(|| format!("the guard is off ({why}) and the config could not be put back without it, so {} stays", file.display()))?;
+    let _ = std::fs::remove_file(file);
+    Ok(crate::guard::GuardStatus::off(why))
+}
+
+/// `base` with `[policy] path = <file>` and `enabled = true`, and a note when that turned a member's gate back on.
+///
+/// A `[policy]` entry changes eidolon's posture for a command no table names: with no entry at all it is `allow`, and with an entry that
+/// leaves out `default` it is `flag` (serde's default for the key). The guard adds an entry, so when the member's gate was not already
+/// on through an entry of their own it also writes `default = "allow"`; otherwise every unfamiliar program would start asking. A member
+/// who wrote `[policy]` without `default` keeps what that gave them, and one who wrote `default` keeps theirs.
+///
+/// A member whose gate was off (`enabled = false`) wrote any `judge` and `yolo` for a gate that never ran. With the gate forced on they
+/// would start answering questions for the operator, so they are dropped, the way the manual config drops them, and the note says so.
+fn with_guard(base: &toml::Table, file: &Path) -> std::result::Result<(toml::Table, Option<String>), String> {
+    let path = file.to_str().ok_or_else(|| format!("{} is not UTF-8", file.display()))?;
+    let mut table = base.clone();
+    let had_entry = table.contains_key("policy");
+    let entry = table.entry("policy").or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let Some(entry) = entry.as_table_mut() else { return Err("[policy] in your eidolon config is not a table".to_string()) };
+    let was_off = entry.get("enabled").and_then(toml::Value::as_bool) == Some(false);
+    let note = was_off.then(|| {
+        "your eidolon config says [policy] enabled = false; Minerva's chats run with eidolon's gate on, so the guard rows apply, \
+         and the [policy] judge and yolo are dropped (they were written for a gate that was off)"
+            .to_string()
+    });
+    if !entry.contains_key("default") && (!had_entry || was_off) {
+        entry.insert("default".into(), toml::Value::String("allow".into()));
+    }
+    if was_off {
+        entry.remove("judge");
+        entry.insert("yolo".into(), toml::Value::Boolean(false));
+    }
+    entry.insert("path".into(), toml::Value::String(path.to_string()));
+    entry.insert("enabled".into(), toml::Value::Boolean(true));
+    Ok((table, note))
+}
+
+/// `<home>/config.toml` from `table`, atomically, `0600`.
+fn write_config(home: &Path, table: &toml::Table) -> Result<PathBuf> {
+    let body = toml::to_string(table).context("writing the generated config")?;
+    let path = home.join("config.toml");
+    harnox::fs::write_atomic_0600(&path, format!("{HEADER}{body}").as_bytes()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// The member's config with the keys the perch owns forced: `sessions_dir`, and `default_model` by the operator's ruling.
+fn base_table(home: &Path, member: &Path) -> Result<toml::Table> {
     let mut table = match std::fs::read_to_string(member) {
         Ok(text) => text.parse::<toml::Table>().with_context(|| format!("parsing {}", member.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
@@ -107,10 +231,7 @@ pub fn generate(home: &Path, member: &Path) -> Result<PathBuf> {
         }
         None => {}
     }
-    let body = toml::to_string(&table).context("writing the generated config")?;
-    let path = home.join("config.toml");
-    harnox::fs::write_atomic_0600(&path, format!("{HEADER}{body}").as_bytes()).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+    Ok(table)
 }
 
 /// `<home>/minerva.toml` parsed, or `None` when the file is absent; a file that cannot be read or parsed is an error.
@@ -271,5 +392,46 @@ mod tests {
         // --sessions-dir still wins, and a missing config is an error.
         assert_eq!(resolve(None, Some("/s".into()), Some(config.clone()), dir.path()).unwrap().sessions_dir, PathBuf::from("/s"));
         assert!(resolve(None, None, Some(dir.path().join("nope.toml")), dir.path()).is_err());
+    }
+
+    fn guarded(member: &str) -> std::result::Result<(toml::Table, Option<String>), String> {
+        with_guard(&member.parse().unwrap(), Path::new("/c/eidolon/minerva-guard.rn"))
+    }
+
+    /// The `[policy]` the guard writes is the member's, plus the path and the gate on; and the posture for an unnamed command stays what
+    /// the member's config gave them (no entry at all is `allow`; an entry without `default` is eidolon's `flag`, which is theirs to keep).
+    #[test]
+    fn the_guard_names_its_file_forces_the_gate_on_and_keeps_the_members_posture() {
+        let (table, note) = guarded("[swarm]\nenabled = false\n").unwrap();
+        let policy = table["policy"].as_table().unwrap();
+        assert_eq!(policy["path"].as_str(), Some("/c/eidolon/minerva-guard.rn"));
+        assert_eq!(policy["enabled"].as_bool(), Some(true));
+        assert_eq!(policy["default"].as_str(), Some("allow"), "a config with no [policy] allowed an unrecognised command; it still does");
+        assert_eq!(table["swarm"]["enabled"].as_bool(), Some(false), "the rest is the member's");
+        assert!(note.is_none());
+
+        let (table, note) = guarded("[policy]\njudge = \"fau:cheap\"\nyolo = true\n").unwrap();
+        let policy = table["policy"].as_table().unwrap();
+        assert!(!policy.contains_key("default"), "an entry without `default` stays the member's own (eidolon's flag)");
+        assert_eq!((policy["judge"].as_str(), policy["yolo"].as_bool(), policy["enabled"].as_bool()), (Some("fau:cheap"), Some(true), Some(true)));
+        assert!(note.is_none());
+
+        let (table, _) = guarded("[policy]\ndefault = \"deny\"\npath = \"/theirs.rn\"\n").unwrap();
+        assert_eq!(table["policy"]["default"].as_str(), Some("deny"), "their word");
+        assert_eq!(table["policy"]["path"].as_str(), Some("/c/eidolon/minerva-guard.rn"), "the path is the one thing the guard replaces");
+
+        let (table, note) = guarded("[policy]\nenabled = false\n").unwrap();
+        assert_eq!((table["policy"]["enabled"].as_bool(), table["policy"]["default"].as_str()), (Some(true), Some("allow")));
+        assert!(note.unwrap().contains("enabled = false"), "and the member is told their gate is back on");
+
+        // A gate that was off never ran its judge or its yolo: with the gate forced on they are dropped, and the member is told.
+        let (table, note) = guarded("[policy]\nenabled = false\nyolo = true\njudge = \"x\"\n").unwrap();
+        let policy = table["policy"].as_table().unwrap();
+        assert_eq!((policy["enabled"].as_bool(), policy["yolo"].as_bool()), (Some(true), Some(false)));
+        assert!(!policy.contains_key("judge"), "{policy:?}");
+        let note = note.unwrap();
+        assert!(note.contains("enabled = false") && note.contains("judge") && note.contains("yolo"), "{note}");
+
+        assert!(guarded("policy = 3\n").is_err(), "[policy] must be a table");
     }
 }
