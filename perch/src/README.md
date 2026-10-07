@@ -1,4 +1,4 @@
-# src/ — the perch's nine modules
+# src/ — the perch's modules
 
 One job each, and the reason for the split is the tests: everything a unit test has to
 reach is a plain function here, not a closure inside `main`.
@@ -16,6 +16,39 @@ watch.rs     the perch's own /api/events stream to a door, and closing it before
 proxy.rs     GET|POST /s/<id>/api/<route> to that session's door, panes, the hub-stream-end frame
 mode.rs      the three approval modes: Mode, the manual policy wrapper over eidolon's own table, config-manual.toml, chat-modes.json
 bin/fake_eidolon.rs   the stand-in door, built only with `--features test-bins`
+runs/     /hub/runs: detached graph runs, adopted again by a restarted perch (stub)
+aoide/    the one place Aoide is spoken to (doc only)
+mesh/     /hub/mesh: the peers (stub)
+meta/     /hub/meta/..: health of jev and the browser, the plugins (stub)
+install/  /hub/install: what the install page asks of `minerva` (stub)
+agent/    the agent gate: scoped tokens for /hub/term/a/<verb> and /hub/mail/a/<verb> (stub: 401 for everyone)
+term/     /hub/term: web terminals (stub)
+notes/    /hub/notes (stub)
+mail/     /hub/mail: the mailbox, and the opt-in a chat makes to send (stub)
+allow/    /hub/sessions/<id>/allow|revoke: standing allows, and the watch::Sink every door's watcher is opened with (stub)
+guard/    what a terminal's text may not say, and whether the guard is on (stub: refuses nothing, reports off)
+```
+
+**The seams** (slice S0P-a). The modules above marked stub are in `serve.rs`'s route table and in `lib.rs`'s hooks now, so the slices
+that fill them touch only their own folder. Each has a `mod.rs` that holds its whole internal dispatch, down to submodule stubs
+`pub async fn <verb>(ctx, req, rest) -> Response` that answer 404; a later slice replaces a body and never adds a `mod` line or a
+route arm. What a slice may rely on, and nothing else:
+
+```text
+serve.rs  target()         /s -> proxy, then a module namespace or a session verb below, then the /hub match: the order is tested
+          Ctx              + opts, stop (cancelled first thing at shutdown), and one Arc<mod::State> per module (Default; the hook fills it)
+          Peer             the accept loop's SocketAddr, in the request's extensions; a header cannot set it
+          body_of          the capped read a module uses, since a module takes the request unread
+gate 1    agent::authenticate   /hub/term/a/<verb> and /hub/mail/a/<verb> ask it BEFORE the master check; a master bearer never passes it
+lib.rs    agent::start, runs::adopt, mail::start   after the bind;  agent::on_exit   after the drain, beside the token file
+shutdown  ctx.stop.cancel(), term::shutdown, runs::on_shutdown, registry.stop_all(), the drain   (in that order)
+          the two hooks are each bounded by HOOK_BOUND (3 s) and warned about if they run out, so stop_all is always reached
+          once ctx.stop is cancelled every gated request is a 503 (after gate 1) and door_up refuses to fork: nothing new starts
+agent     on_exit removes a file only if it still holds what this perch wrote (compare before unlink, like drop_token_file)
+bodies    a module reads through serve::body_of; a test fails on a body collected anywhere in src/ but serve.rs and proxy.rs
+watch.rs  Sink::hello / Sink::frame, told under a DoorKey {pid, port} because no chat id exists yet when a door says hello
+sessions  Registry::id_of_pid, Registry::door_pids   read-only, live doors only
+knobs     --knob k=v (hidden, repeatable); doors=off refuses every door start with a 403
 ```
 
 `lib.rs` is the crate's whole surface (`Options`, `run`) and `main.rs` does nothing but

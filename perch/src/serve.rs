@@ -17,6 +17,12 @@
 //! open SSE stream runs hyper's `GracefulShutdown` and ignores SIGTERM for minutes. The one
 //! `CancellationToken` from H1a is what both a stop and a shutdown hang off.
 //!
+//! **The seams** (slice S0P-a): `/hub/runs`, `/mesh`, `/meta/..`, `/install`, `/term`, `/notes` and `/mail` go to their own module
+//! with the request unread (`<mod>::route(ctx, req, rest)`), and so do the session verbs `allow`, `revoke` and `mailsend`; [`target`]
+//! decides, and a test holds its order. `/hub/term/a/<verb>` and `/hub/mail/a/<verb>` take [`agent::authenticate`] in place of the master
+//! check, ahead of it. Everything a later slice needs from this file is a field of [`Ctx`], an extension of the request ([`Peer`],
+//! [`agent::Caller`]) or a hook in the cancel arm, so none of them edits it.
+//!
 //! **No CORS header is written anywhere, and `OPTIONS` is 405.** There is nothing here
 //! to preflight, and a page that holds the token does not need one; a CORS header could
 //! only ever admit a page that cannot hold it. The crate's `src/` is scanned for one by
@@ -50,7 +56,8 @@ use crate::sessions::{self, ExitWatch, Registry};
 use crate::spawn::{self, Spawner};
 use crate::titles;
 use crate::tree;
-use crate::watch::{self, Watcher};
+use crate::watch::{self, DoorKey, Watcher};
+use crate::{agent, allow, install, mail, mesh, meta, notes, runs, term};
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -69,7 +76,41 @@ pub struct Ctx {
     pub tree_slots: tree::Slots,
     /// Login codes and the session secrets they are traded for (hub.md section 10.5).
     pub logins: Arc<crate::login::Logins>,
+    /// What `main` parsed, as given: the flags the later slices read (`--plugins-dir`, `--aoide`, the token files, the knobs).
+    pub opts: Arc<crate::Options>,
+    /// Cancelled first thing in the shutdown arm, before any child is signalled. Every stream and wait the perch owns itself (a
+    /// terminal's SSE, an agent's long read, an answerer's request) selects on it, so none of them is what a shutdown waits for.
+    pub stop: CancellationToken,
+    /// One state per module a later slice fills, `Default` at start and filled by the module's own hook.
+    pub runs: Arc<runs::State>,
+    pub mesh: Arc<mesh::State>,
+    pub meta: Arc<meta::State>,
+    pub install: Arc<install::State>,
+    pub term: Arc<term::State>,
+    pub notes: Arc<notes::State>,
+    pub mail: Arc<mail::State>,
+    /// Also the [`watch::Sink`] every door's watcher is opened with.
+    pub allow: Arc<allow::State>,
+    pub agent: Arc<agent::State>,
 }
+
+impl Ctx {
+    /// `--knob doors=off`: this perch starts no door, for a demo that must never reach a model.
+    pub(crate) fn doors_off(&self) -> bool {
+        self.opts.knobs.is("doors", "off")
+    }
+}
+
+/// The address a request's connection came from, put into the request's extensions by the accept loop and by nothing else: a header
+/// cannot set an extension. The agent gate finds the chat a call came from with it (`agent::attrib`).
+#[derive(Clone, Copy, Debug)]
+pub struct Peer(pub SocketAddr);
+
+/// The sentence for a refused door start (`--knob doors=off`).
+const DOORS_OFF: &str = "chats are off on this perch";
+
+/// The sentence for a door start that arrives once the perch has begun to stop.
+const SHUTTING_DOWN: &str = "the perch is shutting down";
 
 /// Refused at the cap before the rest is buffered. The door caps its own bodies at the same
 /// number (its `MAX_BODY`), and a `say` may legitimately carry up to 8 MiB of base64 images, so
@@ -93,6 +134,10 @@ pub(crate) fn status(code: StatusCode) -> Response<BoxBody> {
 /// How long a shutdown waits for responses in flight to the pages, after every door is stopped.
 const RESPONSE_DRAIN: Duration = Duration::from_secs(3);
 
+/// How long a shutdown gives each of the terminals' and the runs' own hooks before it goes on to the doors. A terminal's host is
+/// itself bounded (about 2.5 s) and a run's hook only waits for what the perch owns, so this is the backstop for a hook that is not.
+const HOOK_BOUND: Duration = Duration::from_secs(3);
+
 pub async fn run(ctx: Ctx, listener: TcpListener, shutdown: CancellationToken) -> Result<()> {
     let graceful = GracefulShutdown::new();
     loop {
@@ -104,7 +149,7 @@ pub async fn run(ctx: Ctx, listener: TcpListener, shutdown: CancellationToken) -
                 // would end the run, and a perch that stopped accepting is every door
                 // behind it invisible. So it is logged and the loop goes round again; only
                 // the cancel arm below leaves the loop.
-                let (stream, _peer) = match accepted {
+                let (stream, peer) = match accepted {
                     Ok(accepted) => accepted,
                     Err(e) => {
                         tracing::warn!(error = %e, "perch: accept failed; the listener stays up");
@@ -120,7 +165,11 @@ pub async fn run(ctx: Ctx, listener: TcpListener, shutdown: CancellationToken) -
                 let ctx = ctx.clone();
                 let conn = http1::Builder::new().serve_connection(
                     io,
-                    hyper::service::service_fn(move |req| handle(ctx.clone(), req)),
+                    hyper::service::service_fn(move |mut req: Request<Incoming>| {
+                        // Where the connection came from, for every request on it: the kernel's word, not a header's.
+                        req.extensions_mut().insert(Peer(peer));
+                        handle(ctx.clone(), req)
+                    }),
                 );
                 // So shutdown drains a response in flight instead of cutting it.
                 let conn = graceful.watch(conn);
@@ -139,7 +188,25 @@ pub async fn run(ctx: Ctx, listener: TcpListener, shutdown: CancellationToken) -
                 // SIGKILL then cuts short, leaving a `0600` token file behind. It all
                 // happens ahead of `lib.rs` removing the perch's own token file, so a door
                 // can never outlive the token that let the page reach it.
+                //
+                // `ctx.stop` goes first of all: every stream and wait the perch owns itself (a terminal's SSE, an agent's long
+                // read) ends on it, so none is what the steps below wait for. Then the terminals, which are the perch's own
+                // children and want their sessions hung up, then the runs (D3: a detached run is left alone, the hook only waits
+                // for what the perch itself owns). Only then the doors: closing the watcher before the SIGTERM is still
+                // `stop_all`'s own first step, and nothing before it opens a stream to a door.
+                //
+                // Each of the two hooks is bounded by `HOOK_BOUND`, and a hook that runs out is warned about and left behind: a
+                // terminal that will not hang up or a run that will not report must not be what keeps `stop_all` from being
+                // reached, because a door is only ever stopped by `stop_all`, and a door outliving the perch is the one failure
+                // this order exists to prevent.
                 drop(listener);
+                ctx.stop.cancel();
+                if tokio::time::timeout(HOOK_BOUND, term::shutdown(&ctx)).await.is_err() {
+                    tracing::warn!("perch: the terminals did not close in time at shutdown; going on to the doors");
+                }
+                if tokio::time::timeout(HOOK_BOUND, runs::on_shutdown(&ctx)).await.is_err() {
+                    tracing::warn!("perch: the runs did not settle in time at shutdown; going on to the doors");
+                }
                 ctx.registry.stop_all().await;
                 // Bounded, because the drain waits for every response hyper is still writing, and
                 // hyper never finishes writing to a page that has stopped reading (a frozen tab
@@ -287,7 +354,7 @@ async fn handle(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, I
     Ok(response)
 }
 
-async fn route(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, Infallible> {
+async fn route(ctx: Ctx, mut req: Request<Incoming>) -> Result<Response<BoxBody>, Infallible> {
     // Read before anything consumes the request: gate 1 is decided on the path, and
     // nothing here parses it beyond the one decode the static route would do itself.
     let method = req.method().clone();
@@ -302,9 +369,29 @@ async fn route(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, In
     //    all. Its other gates (host, fetch metadata, a tiny body) still apply, and any other
     //    method on that path is an ordinary gated 401. The credential is the token as a bearer
     //    header or the session cookie that redeem set.
+    //    The other exception is the agent's two namespaces (`/hub/term/a/<verb>`, `/hub/mail/a/<verb>`): their credential is a
+    //    scoped token, and it is decided *before* the master check so that a master bearer or a cookie never authenticates there. The
+    //    agent gate also names the chat the call came from, and hands it on in the request's extensions. Every other path keeps
+    //    the gate it always had, so a scoped token anywhere else is the ordinary 401.
     let redeem = method == Method::POST && path == REDEEM;
-    if gated && !redeem && !authenticated(&ctx, &req) {
-        return Ok(status(StatusCode::UNAUTHORIZED));
+    if gated && !redeem {
+        match agent::agent_scope(&path) {
+            Some(scope) => match agent::authenticate(&ctx, &req, scope) {
+                Ok(caller) => {
+                    req.extensions_mut().insert(caller);
+                }
+                Err(refusal) => return Ok(*refusal),
+            },
+            None if !authenticated(&ctx, &req) => return Ok(status(StatusCode::UNAUTHORIZED)),
+            None => {}
+        }
+    }
+    // Once a shutdown has begun, nothing behind the token starts anything new: a connection that was open when the listener was
+    // dropped can still send requests for as long as the drain lasts, and a terminal opened or a door started then would be one
+    // the shutdown steps above have already gone past. After gate 1, so a caller without a credential still learns only 401, and
+    // here rather than in each module, so a module a later slice fills is covered without knowing about it.
+    if gated && ctx.stop.is_cancelled() {
+        return Ok(status(StatusCode::SERVICE_UNAVAILABLE));
     }
     // `POST /hub/code` is the launcher's: the bearer token only, never the cookie (below).
     let bearer = bearer_ok(&ctx, &req);
@@ -362,10 +449,23 @@ async fn route(ctx: Ctx, req: Request<Incoming>) -> Result<Response<BoxBody>, In
     //    body is read: `/hub` bodies are small JSON that a route parses, so they are collected
     //    (below); `/s` bodies are a door's, and a `say` may carry several MiB of images, so
     //    they are handed to the proxy unread and streamed through their own `Limited`.
+    //    The modules a later slice fills (`runs`, `term`, `mail`, ...) are the third kind: they take the request unread, like the
+    //    proxy, because some answer with a stream and all of them know best how big their own body may be. Gate 5 is still made
+    //    here for them, as far as it can be before a read: a declared length over the cap is a 413, and what a module reads it reads
+    //    through [`body_of`], which is the same cap.
     //    A 405 for a static path is still the method's answer, and no static body is
     //    read; the door's statics do the same.
-    if gated && (path == "/s" || path.starts_with("/s/")) {
-        return Ok(proxy::handle(&ctx, req).await);
+    if gated {
+        match target(&method, &path, &query) {
+            Target::Proxy => return Ok(proxy::handle(&ctx, req).await),
+            Target::Seam(seam) => {
+                if declared_over_cap(&req) {
+                    return Ok(status(StatusCode::PAYLOAD_TOO_LARGE));
+                }
+                return Ok(delegate(&ctx, seam, req).await);
+            }
+            Target::Hub => {}
+        }
     }
     if gated {
         let (_parts, body) = req.into_parts();
@@ -421,6 +521,128 @@ async fn capped(body: Incoming, cap: usize) -> std::result::Result<Bytes, Status
     }
 }
 
+/// A delegated route's body, read under gate 5's cap: `cap` may lower it and never raises it past [`MAX_BODY`]. `Err` is the
+/// refusal to answer with, boxed as the tree's is (413 over the cap, 400 for a body that broke off). The head comes back whole,
+/// extensions included.
+pub async fn body_of(
+    req: Request<Incoming>,
+    cap: usize,
+) -> std::result::Result<(hyper::http::request::Parts, Bytes), Box<Response<BoxBody>>> {
+    let (parts, body) = req.into_parts();
+    match capped(body, cap.min(MAX_BODY)).await {
+        Ok(bytes) => Ok((parts, bytes)),
+        Err(refusal) => Err(Box::new(status(refusal))),
+    }
+}
+
+/// A declared `Content-Length` over [`MAX_BODY`]: refused before the module is asked, as the proxy refuses it before it connects.
+fn declared_over_cap(req: &Request<Incoming>) -> bool {
+    let declared = req.headers().get(hyper::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok());
+    declared.is_some_and(|len| len > MAX_BODY as u64)
+}
+
+// ---------------------------------------------------------------------------
+// The seams: the modules a later slice fills
+// ---------------------------------------------------------------------------
+
+/// Who a gated request goes to once the gates have passed, decided from the method, the path and the query alone. The order is the
+/// whole point and a test holds it: the proxy's `/s`, then the modules, then the `/hub` match, whose `GET` and `POST` fallbacks
+/// answer *every* path, so a module checked after them would never be reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target<'a> {
+    Proxy,
+    Seam(Seam<'a>),
+    Hub,
+}
+
+/// The modules' arms. The `&str` is the `rest` the module's handler is told: for a namespace the path below it (`""` for the bare path),
+/// for a session verb the session id, which `sessions::id_ok` has already passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seam<'a> {
+    Runs(&'a str),
+    Mesh(&'a str),
+    Meta(&'a str),
+    Install(&'a str),
+    Term(&'a str),
+    Notes(&'a str),
+    Mail(&'a str),
+    AllowList(&'a str),
+    AllowCreate(&'a str),
+    AllowRevoke(&'a str),
+    MailOptIn(&'a str),
+}
+
+fn target<'a>(method: &Method, path: &'a str, query: &str) -> Target<'a> {
+    if path == "/s" || path.starts_with("/s/") {
+        return Target::Proxy;
+    }
+    match seam(method, path, query) {
+        Some(seam) => Target::Seam(seam),
+        None => Target::Hub,
+    }
+}
+
+/// `/hub/term` is the namespace `term` and `/hub/term/x` is below it; `/hub/terminal` and `/hub/termx` are neither. `Some("")` is the
+/// bare namespace. One slash is stripped and no more, so `/hub/term//a/list` is `/a/list`, which is nobody's agent route.
+pub(crate) fn below<'a>(path: &'a str, namespace: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix(namespace)?;
+    if rest.is_empty() { Some("") } else { rest.strip_prefix('/') }
+}
+
+fn seam<'a>(method: &Method, path: &'a str, query: &str) -> Option<Seam<'a>> {
+    if let Some(rest) = below(path, "/hub/runs") {
+        return Some(Seam::Runs(rest));
+    }
+    if let Some(rest) = below(path, "/hub/mesh") {
+        return Some(Seam::Mesh(rest));
+    }
+    // `/hub/meta/<what>` only: the bare `/hub/meta` has nothing to say.
+    if let Some(rest) = below(path, "/hub/meta").filter(|rest| !rest.is_empty()) {
+        return Some(Seam::Meta(rest));
+    }
+    if let Some(rest) = below(path, "/hub/install") {
+        return Some(Seam::Install(rest));
+    }
+    if let Some(rest) = below(path, "/hub/term") {
+        return Some(Seam::Term(rest));
+    }
+    if let Some(rest) = below(path, "/hub/notes") {
+        return Some(Seam::Notes(rest));
+    }
+    if let Some(rest) = below(path, "/hub/mail") {
+        return Some(Seam::Mail(rest));
+    }
+    // The session verbs of the later slices, with the same shape rules as [`session_verb`]'s: no query, a checked id, one segment of verb.
+    let (id, verb) = path.strip_prefix("/hub/sessions/")?.split_once('/')?;
+    if !query.is_empty() || !sessions::id_ok(id) {
+        return None;
+    }
+    match (method.as_str(), verb) {
+        ("GET", "allow") => Some(Seam::AllowList(id)),
+        ("POST", "allow") => Some(Seam::AllowCreate(id)),
+        ("POST", "revoke") => Some(Seam::AllowRevoke(id)),
+        ("POST", "mailsend") => Some(Seam::MailOptIn(id)),
+        _ => None,
+    }
+}
+
+/// The module's own handler, with the request unread.
+async fn delegate(ctx: &Ctx, seam: Seam<'_>, req: Request<Incoming>) -> Response<BoxBody> {
+    match seam {
+        Seam::Runs(rest) => runs::route(ctx, req, rest).await,
+        Seam::Mesh(rest) => mesh::route(ctx, req, rest).await,
+        Seam::Meta(rest) => meta::route(ctx, req, rest).await,
+        Seam::Install(rest) => install::route(ctx, req, rest).await,
+        Seam::Term(rest) => term::route(ctx, req, rest).await,
+        Seam::Notes(rest) => notes::route(ctx, req, rest).await,
+        Seam::Mail(rest) => mail::route(ctx, req, rest).await,
+        Seam::AllowList(id) => allow::list(ctx, req, id).await,
+        Seam::AllowCreate(id) => allow::create(ctx, req, id).await,
+        Seam::AllowRevoke(id) => allow::revoke(ctx, req, id).await,
+        Seam::MailOptIn(id) => mail::optin(ctx, req, id).await,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // H1b: the session lifecycle (hub.md §3, §4)
 // ---------------------------------------------------------------------------
@@ -429,6 +651,11 @@ async fn capped(body: Incoming, cap: usize) -> std::result::Result<Bytes, Status
 /// session, and `/hub/tree` is H2's one directory listing. Everything else behind the token
 /// is a 404: `/hub/events` and `/hub/mesh` are H2/H3.
 async fn hub(ctx: &Ctx, method: &Method, path: &str, query: &str, body: &Bytes, bearer: bool) -> Response<BoxBody> {
+    // `--knob doors=off`: a perch that shows chats and starts none. Refused here, before any verb has done anything (a fork has
+    // copied a log by the time its door is asked for), and once more in `door_up` for a start this match does not name.
+    if ctx.doors_off() && opens_a_door(method, path, query) {
+        return problem(StatusCode::FORBIDDEN, DOORS_OFF);
+    }
     match (method.as_str(), path) {
         ("GET", "/hub/sessions") => json(StatusCode::OK, &ctx.registry.titled_list().await),
         ("POST", "/hub/sessions") => new_session(ctx, body).await,
@@ -535,6 +762,15 @@ enum Verb {
     Rename,
     /// `{"parent", "name"}`: an inbox chat's folder becomes a project (relocate.rs).
     Promote,
+}
+
+/// The requests that start a door: a new chat, a resume, a fork's first message, and the restart a mode or model switch is.
+/// (A fork is the copy; its door waits for `first`, but the copy is the part that is refused here, so it is named too.)
+fn opens_a_door(method: &Method, path: &str, query: &str) -> bool {
+    if *method != Method::POST {
+        return false;
+    }
+    path == "/hub/sessions" || matches!(session_verb(path, query), Some((_, Verb::Resume | Verb::Restart | Verb::Fork | Verb::First)))
 }
 
 /// `POST /hub/trash/<id>/restore`: the id, when the path is exactly that.
@@ -747,6 +983,17 @@ pub(crate) struct Up {
 /// session before the door says it; every failure leaves that row `dead` rather than
 /// half-`starting`.
 pub(crate) async fn door_up(ctx: &Ctx, argv: Vec<OsString>, id: Option<&str>) -> std::result::Result<Up, String> {
+    // The one place every door start passes through. A start that raced a shutdown past `route`'s own check ends here, before a fork:
+    // `stop_all` has already counted the doors there are, and one forked after it would outlive the perch.
+    if ctx.stop.is_cancelled() {
+        dead(ctx, id, 0);
+        return Err(SHUTTING_DOWN.to_string());
+    }
+    // `--knob doors=off` holds here for a caller `hub` did not name.
+    if ctx.doors_off() {
+        dead(ctx, id, 0);
+        return Err(DOORS_OFF.to_string());
+    }
     let mut forked = match spawn::fork_door(&ctx.spawner, &ctx.registry, argv).await {
         Ok(forked) => forked,
         Err(e) => {
@@ -772,7 +1019,10 @@ pub(crate) async fn door_up(ctx: &Ctx, argv: Vec<OsString>, id: Option<&str>) ->
         ctx.registry.ready(id, booted.port, booted.token.clone());
     }
     // Step 7: the watcher's `hello`. Opening it is also what closes it on this path.
-    match watch::open(booted.port, booted.token.clone(), spawn::HELLO_TIMEOUT).await {
+    // The sink is told `hello` under the door's pid and port, because no row exists yet to say which chat this is (a new chat's
+    // id is the thing `hello` names); `allow` binds the pid to the chat later, through `Registry::id_of_pid`.
+    let key = DoorKey { pid, port: booted.port };
+    match watch::open(key, booted.token.clone(), spawn::HELLO_TIMEOUT, ctx.allow.clone()).await {
         Ok((watcher, hello)) => Ok(Up { pid, port: booted.port, token: booted.token, exit, watcher, hello }),
         Err(e) => {
             sessions::signal_and_wait(pid, exit, spawn::GIVE_UP_GRACE).await;
@@ -927,5 +1177,576 @@ mod tests {
                 assert!(!text.contains(needle), "{} writes an {needle} header", path.display());
             }
         }
+    }
+
+    // ---- the seams: which path goes to which module ------------------------------------------------------------------------
+
+    fn seam_of<'a>(method: &Method, path: &'a str) -> Option<Seam<'a>> {
+        match target(method, path, "") {
+            Target::Seam(seam) => Some(seam),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_module_is_its_namespace_and_what_is_below_it() {
+        for (path, want) in [
+            ("/hub/runs", Seam::Runs("")),
+            ("/hub/runs/", Seam::Runs("")),
+            ("/hub/runs/r1/log", Seam::Runs("r1/log")),
+            ("/hub/mesh", Seam::Mesh("")),
+            ("/hub/mesh/nodes", Seam::Mesh("nodes")),
+            ("/hub/meta/health", Seam::Meta("health")),
+            ("/hub/install", Seam::Install("")),
+            ("/hub/install/jev", Seam::Install("jev")),
+            ("/hub/term", Seam::Term("")),
+            ("/hub/term/events", Seam::Term("events")),
+            ("/hub/term/t1/input", Seam::Term("t1/input")),
+            ("/hub/term/a/list", Seam::Term("a/list")),
+            ("/hub/notes", Seam::Notes("")),
+            ("/hub/notes/x", Seam::Notes("x")),
+            ("/hub/mail", Seam::Mail("")),
+            ("/hub/mail/a/send", Seam::Mail("a/send")),
+        ] {
+            for method in [Method::GET, Method::POST] {
+                assert_eq!(seam_of(&method, path), Some(want), "{method} {path}");
+            }
+        }
+    }
+
+    /// The prefix test: a name that merely starts with a namespace is not in it. A `starts_with("/hub/term")` in place of [`below`]
+    /// would send `/hub/terminal` to the terminals, and a path nobody meant for them would be gated as theirs.
+    #[test]
+    fn a_path_that_only_starts_like_a_namespace_is_not_in_it() {
+        for path in [
+            "/hub/terminal",
+            "/hub/termx",
+            "/hub/notesx",
+            "/hub/runsx",
+            "/hub/meshed",
+            "/hub/mailbox",
+            "/hub/installer",
+            "/hub/metadata",
+            "/hub/meta",
+            "/hub/meta/",
+            "/hub/term%2Fa/list",
+            "/hub/%74erm/a/list",
+            "/hub/term\\a/list",
+            "/hub",
+            "/hub/",
+            "/hub/events",
+            "/hub/sessions",
+        ] {
+            for method in [Method::GET, Method::POST] {
+                assert_eq!(target(&method, path, ""), Target::Hub, "{method} {path}");
+            }
+        }
+    }
+
+    /// The order of the arms: the proxy's `/s` first, a module next, and the `/hub` match last, because that match's `GET` and `POST`
+    /// fallbacks answer every path and anything after them is never asked.
+    #[test]
+    fn the_proxy_is_asked_first_then_a_module_then_the_hub_match() {
+        for path in ["/s", "/s/", "/s/x/api/events"] {
+            assert_eq!(target(&Method::POST, path, ""), Target::Proxy, "{path}");
+        }
+        assert_eq!(target(&Method::GET, "/hub/term/a/list", ""), Target::Seam(Seam::Term("a/list")));
+        assert_eq!(target(&Method::GET, "/hub/sessions", ""), Target::Hub);
+        // A query changes nothing for a namespace (the modules read their own), and everything for a session verb.
+        assert_eq!(target(&Method::GET, "/hub/runs", "limit=5"), Target::Seam(Seam::Runs("")));
+        assert_eq!(target(&Method::POST, "/hub/sessions/c1/allow", ""), Target::Seam(Seam::AllowCreate("c1")));
+        assert_eq!(target(&Method::POST, "/hub/sessions/c1/allow", "x=1"), Target::Hub);
+    }
+
+    #[test]
+    fn a_session_verb_of_a_later_slice_is_a_method_an_id_and_no_query() {
+        let want = |method: Method, verb: &str| seam_of(&method, &format!("/hub/sessions/c1/{verb}")).map(|seam| seam.label());
+        assert_eq!(want(Method::GET, "allow"), Some("allow-list"));
+        assert_eq!(want(Method::POST, "allow"), Some("allow-create"));
+        assert_eq!(want(Method::POST, "revoke"), Some("allow-revoke"));
+        assert_eq!(want(Method::POST, "mailsend"), Some("mail-optin"));
+        for (method, verb) in [
+            (Method::GET, "revoke"),
+            (Method::GET, "mailsend"),
+            (Method::DELETE, "allow"),
+            (Method::POST, "allowed"),
+            (Method::POST, "allow/x"),
+            (Method::POST, "Allow"),
+        ] {
+            assert_eq!(want(method.clone(), verb), None, "{method} {verb}");
+        }
+        for id in ["..", "-x", "", "a b", "a%2fb", "a/b"] {
+            assert_eq!(seam_of(&Method::POST, &format!("/hub/sessions/{id}/allow")), None, "id {id:?}");
+        }
+        // Neither the lifecycle verbs nor the images routes claim these, and these claim none of theirs.
+        for verb in ["allow", "revoke", "mailsend"] {
+            let path = format!("/hub/sessions/c1/{verb}");
+            assert!(session_verb(&path, "").is_none() && crate::images::route(&path).is_none(), "{verb}");
+        }
+        for verb in [
+            "resume", "stop", "restart", "fork", "first", "log", "archive", "unarchive", "pin", "unpin", "trash", "rename", "promote",
+            "images", "transcript", "image/1/0",
+        ] {
+            for method in [Method::GET, Method::POST] {
+                assert_eq!(seam_of(&method, &format!("/hub/sessions/c1/{verb}")), None, "{method} {verb}");
+            }
+        }
+    }
+
+    impl Seam<'_> {
+        fn label(&self) -> &'static str {
+            match self {
+                Seam::Runs(_) => "runs",
+                Seam::Mesh(_) => "mesh",
+                Seam::Meta(_) => "meta",
+                Seam::Install(_) => "install",
+                Seam::Term(_) => "term",
+                Seam::Notes(_) => "notes",
+                Seam::Mail(_) => "mail",
+                Seam::AllowList(_) => "allow-list",
+                Seam::AllowCreate(_) => "allow-create",
+                Seam::AllowRevoke(_) => "allow-revoke",
+                Seam::MailOptIn(_) => "mail-optin",
+            }
+        }
+    }
+
+    /// The agent gate's predicate and the dispatch read the same raw path: a path the gate takes as an agent's reaches `term` or `mail`
+    /// as `a/<verb>`, and no other path reaches those two modules in that shape.
+    #[test]
+    fn the_agent_gate_and_the_dispatch_name_the_same_paths() {
+        use crate::agent::{agent_scope, Scope};
+        for path in [
+            "/hub/term/a/list",
+            "/hub/term/a/whoami",
+            "/hub/term/a",
+            "/hub/term/a/",
+            "/hub/term/a/x/y",
+            "/hub/term/a/List",
+            "/hub/term/%61/list",
+            "/hub/term/t1/a/list",
+            "/hub/terma/list",
+            "/hub/mail/a/send",
+            "/hub/mail/a/",
+            "/hub/mail/ab/send",
+            "/hub/notes/a/list",
+            "/hub/runs/a/list",
+            // A doubled slash is not the agent's path for the gate, and it must not become one for the dispatch: only the one slash
+            // that separates the namespace from what is below it is dropped.
+            "/hub/term//a/list",
+            "/hub/term/a//list",
+            "/hub/term///a/list",
+            "/hub/mail//a/x",
+            "/hub/mail/a//x",
+        ] {
+            let (term, mail) = match seam_of(&Method::POST, path) {
+                Some(Seam::Term(rest)) => (crate::agent::verb(rest).is_some(), false),
+                Some(Seam::Mail(rest)) => (false, crate::agent::verb(rest).is_some()),
+                _ => (false, false),
+            };
+            assert_eq!(agent_scope(path) == Some(Scope::Term), term, "{path}");
+            assert_eq!(agent_scope(path) == Some(Scope::Mail), mail, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_door_start_is_a_post_to_one_of_five_routes() {
+        for path in [
+            "/hub/sessions",
+            "/hub/sessions/c1/resume",
+            "/hub/sessions/c1/restart",
+            "/hub/sessions/c1/fork",
+            "/hub/sessions/c1/first",
+        ] {
+            assert!(opens_a_door(&Method::POST, path, ""), "POST {path}");
+            assert!(!opens_a_door(&Method::GET, path, ""), "GET {path}");
+        }
+        for path in ["/hub/sessions/c1/stop", "/hub/sessions/c1/archive", "/hub/sessions/c1/pin", "/hub/sessions/c1/trash", "/hub/tree"] {
+            assert!(!opens_a_door(&Method::POST, path, ""), "POST {path}");
+        }
+        // The same shape rules as the route itself: a query makes it a 404 there and so not a start here.
+        assert!(!opens_a_door(&Method::POST, "/hub/sessions/c1/resume", "x=1"));
+    }
+
+    /// The cancel arm's order is the spec's and no later slice can edit this file, so it is held where it is written: the token first, the
+    /// terminals, the runs, the doors, and only then the drain.
+    #[test]
+    fn the_shutdown_arm_runs_its_steps_in_the_order_the_spec_gives() {
+        let src = include_str!("serve.rs");
+        let (from, to) = (src.find("pub async fn run(").unwrap(), src.find("fn in_gated").unwrap());
+        let body = &src[from..to];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("the cancel arm no longer calls {needle}"));
+        let order = [
+            at("ctx.stop.cancel()"),
+            at("term::shutdown(&ctx)"),
+            at("runs::on_shutdown(&ctx)"),
+            at("ctx.registry.stop_all()"),
+            at("graceful.shutdown()"),
+        ];
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "the cancel arm is out of order: {order:?}");
+        // The two hooks are each inside a timeout, so a hook that never returns cannot keep `stop_all` from being reached. The call
+        // is named by what stands directly before it, which is what fails when the timeout is taken off.
+        for hook in ["term::shutdown(&ctx)", "runs::on_shutdown(&ctx)"] {
+            let before = &body[..at(hook)];
+            assert!(before.ends_with("tokio::time::timeout(HOOK_BOUND, "), "{hook} is not bounded by HOOK_BOUND");
+        }
+        assert!(
+            HOOK_BOUND >= Duration::from_secs(1) && HOOK_BOUND <= Duration::from_secs(5),
+            "a hook gets a few seconds: long enough for the terminals' own 2.5 s, short enough to leave the doors their turn"
+        );
+    }
+
+    // ---- over a socket: the gates and the stubs, with no door and no eidolon ---------------------------------------------------
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    const TOKEN: &str = "a-test-token";
+
+    /// A perch on a loopback port: the real accept loop and gates over a hand-built [`Ctx`], and an `eidolon` that is not there, so
+    /// nothing a request does can start a process or reach a model.
+    struct Up {
+        addr: SocketAddr,
+        ctx: Ctx,
+        shutdown: CancellationToken,
+        served: tokio::task::JoinHandle<Result<()>>,
+        sessions: PathBuf,
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    async fn up(knobs: &[&str]) -> Up {
+        let sessions = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::write(sessions.path().join("ctf-pwn-3.eid"), "{}\n").unwrap();
+        let knobs: Vec<String> = knobs.iter().map(|knob| knob.to_string()).collect();
+        let opts = crate::Options {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ui_dir: None,
+            roots: vec![sessions.path().to_path_buf()],
+            eidolon: PathBuf::from("/nonexistent/eidolon"),
+            sessions_dir: sessions.path().to_path_buf(),
+            eidolon_config: None,
+            scratch: None,
+            other_sessions: None,
+            modes: Default::default(),
+            code_ttl: Duration::from_secs(60),
+            plugins_dir: None,
+            run_graphs: Vec::new(),
+            jev_health: None,
+            browser_health: None,
+            aoide: None,
+            aoide_home: None,
+            aoide_daemon_socket: None,
+            aoide_events: None,
+            minerva: None,
+            term_token_file: None,
+            mail_token_file: None,
+            agent_url_file: None,
+            knobs: crate::Knobs::parse(&knobs).unwrap(),
+        };
+        let registry = Registry::new(
+            sessions.path().to_path_buf(),
+            runtime.path().to_path_buf(),
+            opts.eidolon.clone(),
+            opts.roots.clone(),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctx = Ctx {
+            bound: listener.local_addr().unwrap(),
+            token: Arc::from(TOKEN),
+            ui: None,
+            registry,
+            spawner: Arc::new(Spawner::new().unwrap()),
+            tree_slots: tree::Slots::new(tree::MAX_LISTINGS),
+            logins: Arc::new(crate::login::Logins::new(Duration::from_secs(60))),
+            opts: Arc::new(opts),
+            stop: CancellationToken::new(),
+            runs: Arc::default(),
+            mesh: Arc::default(),
+            meta: Arc::default(),
+            install: Arc::default(),
+            term: Arc::default(),
+            notes: Arc::default(),
+            mail: Arc::default(),
+            allow: Arc::default(),
+            agent: Arc::default(),
+        };
+        let shutdown = CancellationToken::new();
+        let served = tokio::spawn(run(ctx.clone(), listener, shutdown.clone()));
+        Up { addr: ctx.bound, ctx, shutdown, served, sessions: sessions.path().to_path_buf(), _dirs: (sessions, runtime) }
+    }
+
+    /// One request over its own connection, written exactly as given, and the status and body that came back.
+    async fn raw(perch: &Up, request: &str) -> (u16, String) {
+        let mut stream = TcpStream::connect(perch.addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = Vec::new();
+        // A reset after the answer (a body the perch did not read) loses nothing that was already read.
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut answer)).await;
+        assert!(read.is_ok(), "the perch did not answer {request:?}");
+        let text = String::from_utf8_lossy(&answer).into_owned();
+        let code = text.split(' ').nth(1).and_then(|code| code.parse().ok()).unwrap_or_else(|| panic!("no status line in {text:?}"));
+        (code, text.split_once("\r\n\r\n").map(|(_, body)| body.to_string()).unwrap_or_default())
+    }
+
+    /// `credential` is a header block (or nothing), written as is.
+    async fn call(perch: &Up, method: &str, path: &str, credential: &str, body: &str) -> (u16, String) {
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n{credential}Content-Length: {}\r\n\r\n{body}",
+            perch.addr,
+            body.len()
+        );
+        raw(perch, &request).await
+    }
+
+    fn bearer() -> String {
+        format!("Authorization: Bearer {TOKEN}\r\n")
+    }
+
+    fn cookie(perch: &Up) -> String {
+        let secret = perch.ctx.logins.redeem(&perch.ctx.logins.mint_code()).expect("a fresh code redeems");
+        format!("Cookie: {}={secret}\r\nSec-Fetch-Site: same-origin\r\n", cookie_name(perch.ctx.bound))
+    }
+
+    #[tokio::test]
+    async fn no_credential_a_master_bearer_and_a_cookie_are_all_a_401_on_an_agent_path() {
+        let perch = up(&[]).await;
+        let cookie = cookie(&perch);
+        // The controls: the same credentials do open the namespaces around the agent's, so the 401 below is the agent gate's.
+        assert_eq!(call(&perch, "GET", "/hub/sessions", &bearer(), "").await.0, 200);
+        assert_eq!(call(&perch, "GET", "/hub/sessions", &cookie, "").await.0, 200);
+        assert_eq!(call(&perch, "GET", "/hub/term", &bearer(), "").await.0, 404);
+        assert_eq!(call(&perch, "GET", "/hub/term", &cookie, "").await.0, 404);
+        assert_eq!(call(&perch, "GET", "/hub/term", "", "").await.0, 401);
+        for path in ["/hub/term/a/list", "/hub/term/a/whoami", "/hub/mail/a/send", "/hub/mail/a/whoami"] {
+            for method in ["GET", "POST"] {
+                for (what, credential) in [("a master bearer", bearer()), ("a cookie", cookie.clone()), ("nothing", String::new())] {
+                    let (code, body) = call(&perch, method, path, &credential, "").await;
+                    assert_eq!((code, body.as_str()), (401, ""), "{what} on {method} {path}");
+                }
+            }
+        }
+        // A wrong bearer is no better than none, and the scheme is not guessed at.
+        assert_eq!(call(&perch, "GET", "/hub/term/a/list", "Authorization: Bearer nope\r\n", "").await.0, 401);
+        assert_eq!(call(&perch, "GET", "/hub/term/a/list", &format!("Authorization: {TOKEN}\r\n"), "").await.0, 401);
+        // Only the two prefixes are the agent's: a spelling that is not exactly `a/<verb>` is today's gate and then the module's 404.
+        for path in ["/hub/term/a", "/hub/term/a/", "/hub/term/a/x/y", "/hub/term/a/List", "/hub/term/%61/list", "/hub/mail/a/"] {
+            assert_eq!(call(&perch, "GET", path, &bearer(), "").await.0, 404, "{path}");
+            assert_eq!(call(&perch, "GET", path, "", "").await.0, 401, "{path}");
+        }
+        perch.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn every_seam_is_a_404_with_the_token_and_a_401_without_it() {
+        let perch = up(&[]).await;
+        for (method, path) in [
+            ("GET", "/hub/runs"),
+            ("POST", "/hub/runs"),
+            ("GET", "/hub/runs/r1/log"),
+            ("GET", "/hub/mesh"),
+            ("GET", "/hub/meta/health"),
+            ("GET", "/hub/install"),
+            ("POST", "/hub/install/jev"),
+            ("GET", "/hub/term"),
+            ("GET", "/hub/term/events"),
+            ("POST", "/hub/term/t1/input"),
+            ("GET", "/hub/notes"),
+            ("POST", "/hub/notes/x"),
+            ("GET", "/hub/mail"),
+            ("GET", "/hub/mail/nodes"),
+            ("GET", "/hub/sessions/ctf-pwn-3/allow"),
+            ("POST", "/hub/sessions/ctf-pwn-3/allow"),
+            ("POST", "/hub/sessions/ctf-pwn-3/revoke"),
+            ("POST", "/hub/sessions/ctf-pwn-3/mailsend"),
+        ] {
+            let (code, body) = call(&perch, method, path, &bearer(), "{}").await;
+            assert_eq!((code, body.as_str()), (404, ""), "{method} {path} with the token");
+            assert_eq!(call(&perch, method, path, "", "{}").await.0, 401, "{method} {path} without it");
+        }
+        // The two that were already pinned stay where they were, and so does a path that only looks like a namespace.
+        for path in ["/hub/events", "/hub/terminal", "/hub/termx", "/hub/notesx", "/hub/meta"] {
+            assert_eq!(call(&perch, "GET", path, &bearer(), "").await.0, 404, "{path}");
+        }
+        perch.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_declared_length_over_the_cap_is_a_413_before_a_module_is_asked() {
+        let perch = up(&[]).await;
+        let head = |path: &str, declared: usize| {
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n{}Content-Length: {declared}\r\n\r\n",
+                perch.addr,
+                bearer()
+            )
+        };
+        // Only the head is sent: the answer cannot have waited for a body that never comes.
+        for path in ["/hub/runs", "/hub/term/t1/input", "/hub/mail/nodes", "/hub/notes/x", "/hub/sessions/c1/allow"] {
+            assert_eq!(raw(&perch, &head(path, MAX_BODY + 1)).await.0, 413, "{path}");
+            assert_eq!(raw(&perch, &head(path, MAX_BODY)).await.0, 404, "{path} at the cap is the module's to read");
+        }
+        // Without the token the cap is not looked at: the first gate answers.
+        let unauthenticated = format!(
+            "POST /hub/runs HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            perch.addr,
+            MAX_BODY + 1
+        );
+        assert_eq!(raw(&perch, &unauthenticated).await.0, 401);
+        perch.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn doors_off_refuses_every_door_start_and_lists_chats_as_before() {
+        let perch = up(&["doors=off"]).await;
+        let new = serde_json::json!({ "cwd": perch.sessions }).to_string();
+        for (path, body) in [
+            ("/hub/sessions", new.as_str()),
+            ("/hub/sessions", ""),
+            ("/hub/sessions/ctf-pwn-3/resume", ""),
+            ("/hub/sessions/ctf-pwn-3/restart", "{\"model\":\"m\"}"),
+            ("/hub/sessions/ctf-pwn-3/restart", "{\"yolo\":true}"),
+            ("/hub/sessions/ctf-pwn-3/fork", "{}"),
+            ("/hub/sessions/ctf-pwn-3/first", "{\"text\":\"hi\"}"),
+            ("/hub/sessions/nobody/resume", ""),
+        ] {
+            let (code, answer) = call(&perch, "POST", path, &bearer(), body).await;
+            assert_eq!(code, 403, "POST {path}");
+            assert!(answer.contains("chats are off on this perch"), "POST {path}: {answer}");
+        }
+        // What shows chats is untouched: the list, a saved chat's id in it, and a verb that is not a start.
+        let (code, listed) = call(&perch, "GET", "/hub/sessions", &bearer(), "").await;
+        assert_eq!(code, 200);
+        assert!(listed.contains("ctf-pwn-3"), "the saved chat is still listed: {listed}");
+        assert_eq!(call(&perch, "POST", "/hub/sessions/ctf-pwn-3/stop", &bearer(), "").await.0, 409, "stop is not a start");
+        perch.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn without_the_knob_the_same_requests_are_not_refused_for_it() {
+        // No door can come up here (the `eidolon` is not there), so these end in the spawn's own refusal. What matters is that it is
+        // never the 403 of the knob, which a perch that forgot to read it would also not give.
+        let perch = up(&[]).await;
+        let new = serde_json::json!({ "cwd": perch.sessions }).to_string();
+        for (path, body) in [("/hub/sessions", new.as_str()), ("/hub/sessions/ctf-pwn-3/resume", "")] {
+            let (code, answer) = call(&perch, "POST", path, &bearer(), body).await;
+            assert_ne!(code, 403, "POST {path}: {answer}");
+            assert!(!answer.contains("chats are off"), "POST {path}: {answer}");
+        }
+        // And a knob that is not `doors=off` is not it: the value is compared whole.
+        let other = up(&["doors=on", "doorsx=off"]).await;
+        let (code, answer) = call(&other, "POST", "/hub/sessions/ctf-pwn-3/resume", &bearer(), "").await;
+        assert_ne!(code, 403, "{answer}");
+        other.shutdown.cancel();
+        perch.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_cancels_the_stop_token_before_the_perch_returns() {
+        let perch = up(&[]).await;
+        assert!(!perch.ctx.stop.is_cancelled());
+        assert_eq!(call(&perch, "GET", "/hub/sessions", &bearer(), "").await.0, 200);
+        perch.shutdown.cancel();
+        let served = tokio::time::timeout(Duration::from_secs(10), perch.served).await.expect("the perch stopped");
+        assert!(served.unwrap().is_ok());
+        assert!(perch.ctx.stop.is_cancelled(), "the token every stream of the perch's own waits on was cancelled by the shutdown");
+    }
+
+    /// A connection that was open when the listener was dropped still sends requests during the drain: the stop token is cancelled
+    /// here and the accept loop is left running, which is that moment.
+    #[tokio::test]
+    async fn once_the_perch_is_stopping_nothing_behind_the_token_is_started() {
+        let perch = up(&[]).await;
+        let cookie = cookie(&perch);
+        assert_eq!(call(&perch, "GET", "/hub/sessions", &bearer(), "").await.0, 200, "control, before the stop");
+        perch.ctx.stop.cancel();
+        // Every gated route, the modules' and the ones that were there before them: one answer, from one place.
+        for (method, path) in [
+            ("GET", "/hub/sessions"),
+            ("POST", "/hub/sessions"),
+            ("POST", "/hub/sessions/ctf-pwn-3/resume"),
+            ("GET", "/hub/term"),
+            ("POST", "/hub/term"),
+            ("GET", "/hub/term/events"),
+            ("GET", "/hub/runs"),
+            ("POST", "/hub/runs"),
+            ("POST", "/hub/mail/nodes"),
+            ("GET", "/hub/tree"),
+            ("GET", "/s/x/api/events"),
+            ("GET", "/hub/nothing-at-all"),
+        ] {
+            let (code, body) = call(&perch, method, path, &bearer(), "{}").await;
+            assert_eq!((code, body.as_str()), (503, ""), "{method} {path} with the token");
+        }
+        assert_eq!(call(&perch, "GET", "/hub/sessions", &cookie, "").await.0, 503, "a cookie is no different");
+        // After gate 1, not before it: a caller with no credential, or on an agent path with the master one, still gets the 401.
+        assert_eq!(call(&perch, "GET", "/hub/sessions", "", "").await.0, 401);
+        assert_eq!(call(&perch, "GET", "/hub/term/a/list", &bearer(), "").await.0, 401);
+        assert_eq!(call(&perch, "GET", "/hub/term/a/list", "", "").await.0, 401);
+        // What is not behind the token is not this check's: the static route still answers (404, there is no UI dir here).
+        assert_eq!(call(&perch, "GET", "/index.html", "", "").await.0, 404);
+        perch.shutdown.cancel();
+    }
+
+    /// The same moment, one step later: a start that got past `route` (it was already running) still cannot fork once the token is
+    /// cancelled, because `stop_all` has already counted the doors there are.
+    #[tokio::test]
+    async fn a_door_is_not_forked_once_the_perch_is_stopping() {
+        let perch = up(&[]).await;
+        let argv = vec![OsString::from("/nonexistent/eidolon")];
+        // The control: with the token alive the start gets as far as the fork, which is what fails for a binary that is not there.
+        let why = door_up(&perch.ctx, argv.clone(), None).await.err().expect("no such binary, no door");
+        assert_ne!(why, SHUTTING_DOWN, "{why}");
+        perch.ctx.stop.cancel();
+        for id in [None, Some("ctf-pwn-3")] {
+            let why = door_up(&perch.ctx, argv.clone(), id).await.err().expect("no door while stopping");
+            assert_eq!(why, SHUTTING_DOWN, "{id:?}");
+        }
+        perch.shutdown.cancel();
+    }
+
+    /// Whether a source text collects a body the way `serve::capped` does, which is the one thing a module must not do on its own: a
+    /// `collect` of an `Incoming` in a module is an uncapped read of whatever the caller sends, where [`body_of`] is gate 5's cap.
+    /// Whitespace and comment lines are ignored, so a chain split over lines is still the call and a comment about it is not. The
+    /// needles are assembled from pieces, so this file is not what the scan finds in it.
+    fn collects_a_body(text: &str) -> bool {
+        let code: String = text.lines().filter(|line| !line.trim_start().starts_with("//")).flat_map(str::split_whitespace).collect();
+        code.contains(&[".col", "lect()", ".aw", "ait"].concat()) || code.contains(&["BodyExt::col", "lect("].concat())
+    }
+
+    /// `serve.rs` (which owns `capped`) and `proxy.rs` (which streams under its own `Limited`) are the two places that read a body.
+    #[test]
+    fn no_module_collects_a_request_body_but_through_the_cap() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src.clone()];
+        let mut scanned = 0;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let exempt = path.parent() == Some(src.as_path()) && matches!(name, "serve.rs" | "proxy.rs");
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") || exempt {
+                    continue;
+                }
+                scanned += 1;
+                let text = std::fs::read_to_string(&path).unwrap();
+                assert!(!collects_a_body(&text), "{} collects a body: read it through serve::body_of", path.display());
+            }
+        }
+        assert!(scanned > 30, "the scan looked at {scanned} files, so it is not looking at src/");
+    }
+
+    #[test]
+    fn the_collect_scan_finds_the_call_however_it_is_laid_out() {
+        assert!(collects_a_body("let all = req\n    .into_body()\n    .collect()\n    .await;\n"));
+        assert!(collects_a_body("let all = Limited::new(body, 9).collect().await;"));
+        assert!(collects_a_body("let all = http_body_util::BodyExt::collect(body).await;"));
+        assert!(!collects_a_body("// body.collect().await is what body_of is for\nlet v: Vec<_> = it.collect();\n"));
+        assert!(!collects_a_body("let (parts, bytes) = body_of(req, 1024).await?;"));
     }
 }

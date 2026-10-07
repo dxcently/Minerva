@@ -58,6 +58,27 @@ pub struct Hello {
     pub yolo: bool,
 }
 
+/// A door as the perch knows it before it has a chat id: its process and its port. [`open`] runs before the registry row exists
+/// (`serve::door_up`, then `Registry::insert`), so a [`Sink`] is told this and binds it to a chat later, through
+/// [`crate::sessions::Registry::id_of_pid`]. A pid alone is not enough to name a door for good — the kernel reuses them — and the port
+/// is the door's own, so the pair is what one watcher is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DoorKey {
+    pub pid: u32,
+    pub port: u16,
+}
+
+/// Who else wants to hear what the watcher hears. Both methods are no-ops by default, so a sink overrides only what it needs and
+/// the watcher keeps no knowledge of its listeners. A sink is called inline, on the task that is waiting for the watcher: it returns
+/// quickly and never blocks, and a call that has real work to do spawns it.
+pub trait Sink: Send + Sync {
+    /// The door said `hello`: it is up, and this is what it said. Called once per [`open`] that succeeds, before `open` returns.
+    fn hello(&self, _key: DoorKey, _hello: &Hello) {}
+
+    /// One frame of the door's stream, parsed. Nothing calls it yet: the frame reader is slice A1a's.
+    fn frame(&self, _key: DoorKey, _frame: &serde_json::Value) {}
+}
+
 /// A held stream, and the handle that closes it. Dropping it cancels the stream too, so no
 /// error path can leave one open; [`Watcher::close`] is the one that also *waits*, which is
 /// what the stop order needs.
@@ -93,14 +114,20 @@ impl Drop for Watcher {
 }
 
 /// Open the watcher and read until `hello`, or fail within `within`. The port is the door's
-/// own, from its first boot line; the token is the door's, from its `0600` file.
-pub async fn open(port: u16, token: Arc<str>, within: Duration) -> Result<(Watcher, Hello)> {
+/// own, from its first boot line; the token is the door's, from its `0600` file. `sink` hears `hello` (with the door's `key`) when it comes.
+pub async fn open(key: DoorKey, token: Arc<str>, within: Duration, sink: Arc<dyn Sink>) -> Result<(Watcher, Hello)> {
     let close = CancellationToken::new();
     let (hello_tx, hello_rx) = oneshot::channel();
     let running = Arc::new(AtomicBool::new(false));
-    let task = tokio::spawn(watch(port, token, close.clone(), hello_tx, running.clone()));
+    let task = tokio::spawn(watch(key.port, token, close.clone(), hello_tx, running.clone()));
     match tokio::time::timeout(within, hello_rx).await {
-        Ok(Ok(Ok(found))) => Ok((Watcher { close, task: Some(task), running }, found)),
+        Ok(Ok(Ok(found))) => {
+            // The watcher is built before the sink is told: a sink that panics unwinds through here, and the drop of this `Watcher`
+            // is what cancels the stream, where a sink called first would leave it open on a door the caller never learned of.
+            let watcher = Watcher { close, task: Some(task), running };
+            sink.hello(key, &found);
+            Ok((watcher, found))
+        }
         // Every failure closes the stream before it returns: the caller's next move is a
         // SIGTERM, and a door with an open stream ignores one.
         Ok(Ok(Err(e))) => {
@@ -455,5 +482,84 @@ mod tests {
         }
         let err = scan.feed(b"x").err().expect("past the limit is refused").to_string();
         assert!(err.contains("1 MiB"), "{err}");
+    }
+
+    /// Every `hello` a sink was told, with the key it was told it under.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<(DoorKey, PathBuf)>>);
+
+    impl Sink for Recorder {
+        fn hello(&self, key: DoorKey, hello: &Hello) {
+            self.0.lock().unwrap().push((key, hello.session.clone()));
+        }
+    }
+
+    /// A door on a loopback port that answers `/api/events` with `frames` and then, when `hold`, keeps the stream open until the
+    /// perch closes it. The port is the door's; the pid the test makes up, because the sink is told whatever the caller says.
+    async fn fake_door(frames: Vec<u8>, hold: bool) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n").await.unwrap();
+            sock.write_all(&frames).await.unwrap();
+            if hold {
+                // Until the watcher drops its end.
+                while sock.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+            }
+        });
+        (port, task)
+    }
+
+    /// The seam A1b hangs off: `watch::open` runs before the registry has a row, so the sink can only be given the door's own pid
+    /// and port. Mutation: call `sink.hello` with a key built from anything but the one `open` was given, or not at all, and this goes red.
+    #[tokio::test]
+    async fn the_sink_is_told_hello_under_the_door_it_was_opened_for() {
+        let (port, door) = fake_door(hello_frame(), true).await;
+        let recorder = Arc::new(Recorder::default());
+        let key = DoorKey { pid: 4242, port };
+        let (watcher, hello) = open(key, Arc::from("t"), Duration::from_secs(5), recorder.clone()).await.expect("the door said hello");
+        assert_eq!(hello.session, PathBuf::from("/logs/a.eid"));
+        assert_eq!(*recorder.0.lock().unwrap(), vec![(key, PathBuf::from("/logs/a.eid"))], "told once, under the door's key");
+        // The close is still the first step of a stop: it waits until the stream is gone.
+        watcher.close().await;
+        tokio::time::timeout(Duration::from_secs(5), door).await.expect("the door saw its stream end").unwrap();
+    }
+
+    /// A sink that panics in `hello`.
+    struct Breaks;
+
+    impl Sink for Breaks {
+        fn hello(&self, _key: DoorKey, _hello: &Hello) {
+            panic!("a sink that breaks");
+        }
+    }
+
+    /// The panic of a sink unwinds through `open`, and the stream it opened must not outlive the unwind: the `Watcher` exists before
+    /// the sink is called, so dropping it is what ends the stream. The fake door holds its end open until the perch closes its own, so
+    /// seeing its read end is the proof. Mutation: call `sink.hello` before the `Watcher` is built (the order this replaced) and the
+    /// door is never released, so the wait below runs out.
+    #[tokio::test]
+    async fn a_sink_that_panics_in_hello_does_not_leave_the_stream_open() {
+        let (port, door) = fake_door(hello_frame(), true).await;
+        let key = DoorKey { pid: 7, port };
+        let opened = tokio::spawn(open(key, Arc::from("t"), Duration::from_secs(5), Arc::new(Breaks)));
+        let joined = opened.await;
+        assert!(joined.as_ref().is_err_and(|e| e.is_panic()), "the sink's panic is what ended `open`");
+        tokio::time::timeout(Duration::from_secs(5), door).await.expect("the door saw its stream end").unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_door_that_never_says_hello_tells_the_sink_nothing() {
+        let (port, door) = fake_door(frame(serde_json::json!({"type": "caught-up"})), false).await;
+        let recorder = Arc::new(Recorder::default());
+        let key = DoorKey { pid: 1, port };
+        let err = open(key, Arc::from("t"), Duration::from_secs(5), recorder.clone()).await.err().expect("no hello, no watcher");
+        assert!(err.to_string().contains("before hello"), "{err}");
+        assert!(recorder.0.lock().unwrap().is_empty(), "nothing to tell");
+        door.await.unwrap();
     }
 }

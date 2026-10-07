@@ -1048,6 +1048,7 @@ impl Registry {
 
     /// A new session's door, whole: it reached `live` inside the spawn request, so there is
     /// no window in which anyone else could have known an id to reserve.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(&self, id: String, log: PathBuf, cwd: PathBuf, pid: u32, port: u16, token: Arc<str>, watcher: Watcher, exit: ExitWatch) {
         self.titles.lock().unwrap().remember_cwd(&id, &cwd);
         self.cwds.remember(&id, &cwd);
@@ -1101,6 +1102,28 @@ impl Registry {
             .filter(|door| matches!(door.state, State::Starting | State::Live | State::Stopping))
             .map(|door| door.id.clone())
             .collect()
+    }
+
+    /// The chat id of the live door whose process is `pid`: the last step of tying an agent's call to its chat (socket, inode, door pid,
+    /// chat). Only a door that is `live` answers, and only while its exit is unpublished, as for [`Registry::lookup`]; a reservation
+    /// (`pid` 0), a `starting`, `stopping` or `dead` row is not a door a call can come from. Read-only.
+    pub fn id_of_pid(&self, pid: u32) -> Option<String> {
+        if pid == 0 {
+            return None;
+        }
+        self.doors.lock().unwrap().iter().find(|door| door.pid == pid && Self::is_up(door)).map(|door| door.id.clone())
+    }
+
+    /// Every live door as `(chat id, pid)`, under the same rule as [`Registry::id_of_pid`]: what the attribution walks to find the one
+    /// whose descriptors hold a socket. Read-only, and a snapshot: a door may end the moment after.
+    pub fn door_pids(&self) -> Vec<(String, u32)> {
+        let doors = self.doors.lock().unwrap();
+        doors.iter().filter(|door| door.pid != 0 && Self::is_up(door)).map(|door| (door.id.clone(), door.pid)).collect()
+    }
+
+    /// A door that came up and has not ended: `live`, with no exit published yet.
+    fn is_up(door: &Door) -> bool {
+        door.state == State::Live && door.exit.borrow().is_none()
     }
 
     /// The row of a door that stopped cleanly is dropped, so its log reads `kept` again.
@@ -1535,6 +1558,51 @@ mod tests {
         // The right pid still marks it.
         registry.dead("ctf-pwn-3", 4343);
         assert_eq!(registry.list()[0].state, State::Dead);
+    }
+
+    /// The agent gate's last step: a pid names a chat only while that chat's door is live. A door that is starting (its pid is known
+    /// before `hello`), dead, or whose exit is already published is not one an agent's call can come from, and neither is pid 0, which
+    /// is the reservation whose fork never happened. Mutation: drop the state or the exit check and the matching case goes red.
+    #[test]
+    fn a_pid_names_a_chat_only_while_its_door_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        sessions_dir(dir.path());
+        let registry = registry(dir.path(), runtime.path());
+        assert_eq!(registry.id_of_pid(4242), None);
+        assert!(registry.door_pids().is_empty());
+
+        // Starting: reserved and forked, `hello` not read yet.
+        let log = dir.path().join("ctf-pwn-3.eid");
+        assert!(registry.reserve("ctf-pwn-3", &log));
+        assert_eq!(registry.id_of_pid(0), None, "a reservation has no process");
+        registry.attach("ctf-pwn-3", 4242, watch::channel(None).1);
+        assert_eq!(registry.id_of_pid(4242), None, "starting is not live");
+        assert!(registry.door_pids().is_empty());
+
+        // Live, and a second door beside it.
+        registry.ready("ctf-pwn-3", 4477, Arc::from("a-door-token"));
+        registry.mark_live("ctf-pwn-3", &log, Path::new("/tmp"));
+        let (publish, exit) = watch::channel(None);
+        let other = dir.path().join("other.eid");
+        std::fs::write(&other, "{}\n").unwrap();
+        our_door_pid(&registry, "other", &other, 4343, exit);
+        assert_eq!(registry.id_of_pid(4242).as_deref(), Some("ctf-pwn-3"));
+        assert_eq!(registry.id_of_pid(4343).as_deref(), Some("other"));
+        assert_eq!(registry.id_of_pid(4344), None, "another pid is nobody's");
+        let mut pids = registry.door_pids();
+        pids.sort();
+        assert_eq!(pids, vec![("ctf-pwn-3".to_string(), 4242), ("other".to_string(), 4343)]);
+
+        // The exit is published before the reap task marks the row, and that window is already not a door.
+        publish.send(Some(Exit { code: Some(0), signal: None })).unwrap();
+        assert_eq!(registry.id_of_pid(4343), None);
+        assert_eq!(registry.door_pids(), vec![("ctf-pwn-3".to_string(), 4242)]);
+
+        // Dead, by the stop's own line.
+        registry.dead("ctf-pwn-3", 4242);
+        assert_eq!(registry.id_of_pid(4242), None);
+        assert!(registry.door_pids().is_empty());
     }
 
     /// The tree's root check: a cwd is listable only under a `--root`, as the kernel spells it,

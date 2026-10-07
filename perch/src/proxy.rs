@@ -479,12 +479,9 @@ impl Drop for Proxied {
         self.pane = None;
         let Some(conn) = self.conn.take() else { return };
         let cleanup = async move { conn.close().await };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(cleanup);
-            }
-            // No runtime left to wait on: the drops that follow abort the task and release the count.
-            Err(_) => {}
+        // No runtime left to wait on is not an error: the drops that follow abort the task and release the count.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(cleanup);
         }
     }
 }

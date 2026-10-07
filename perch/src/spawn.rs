@@ -280,10 +280,10 @@ pub async fn boot(forked: &mut Forked, runtime_dir: &Path) -> Result<Booted> {
 /// SIGKILLed child never removes its own.
 async fn give_up(forked: &Forked, token_file: Option<PathBuf>) {
     sessions::signal_and_wait(forked.pid, forked.exit.clone(), GIVE_UP_GRACE).await;
-    if let Some(path) = token_file {
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::debug!(error = %e, path = %path.display(), "perch: a refused door token file was not removed");
-        }
+    if let Some(path) = token_file
+        && let Err(e) = std::fs::remove_file(&path)
+    {
+        tracing::debug!(error = %e, path = %path.display(), "perch: a refused door token file was not removed");
     }
 }
 
