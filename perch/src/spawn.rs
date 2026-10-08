@@ -60,6 +60,7 @@ pub enum Target<'a> {
 /// every door a perch spawns (new or resumed) reads the same config and writes the same
 /// sessions dir. A path, never a secret. `yolo` is eidolon's other global flag, `--yolo` (answer every ask with yes), placed
 /// the same way, before the subcommand; a restart that keeps a chat in yolo mode passes it again.
+/// The fork names the same file in the door's environment as `EIDOLON_CONFIG` (see [`name_config`]).
 pub fn argv(eidolon: &Path, config: Option<&Path>, target: Target<'_>, model: Option<&str>, yolo: bool) -> Vec<OsString> {
     let mut argv = vec![eidolon.as_os_str().to_os_string()];
     if let Some(config) = config {
@@ -91,6 +92,34 @@ pub fn argv(eidolon: &Path, config: Option<&Path>, target: Target<'_>, model: Op
         argv.push(model.into());
     }
     argv
+}
+
+/// The variable a child of eidolon reads its config from. eidolon reads none itself; the subagent plugin reads it, so a child a door starts
+/// runs under the config of the perch that started the door, not the operator's `~/.config/eidolon/config.toml` (eidolon-plugins SA1).
+pub const EIDOLON_CONFIG: &str = "EIDOLON_CONFIG";
+
+/// The `--config <file>` an eidolon argv names, if it names one. Every builder here puts the global flags before the subcommand and before
+/// the `--` that ends them, so only that run is read: message text after the `--` is never a flag.
+pub(crate) fn config_in(argv: &[OsString]) -> Option<&Path> {
+    let flags = &argv[..argv.iter().position(|arg| arg == "--").unwrap_or(argv.len())];
+    let at = flags.iter().position(|arg| arg == "--config")?;
+    flags.get(at + 1).map(Path::new)
+}
+
+/// Names the config an eidolon child runs under, in its environment: `EIDOLON_CONFIG` is `config` when there is one, and is removed when
+/// there is not, so a value the operator's shell exported never points a child at another config. Nothing else in the environment changes.
+pub(crate) fn name_config(command: &mut std::process::Command, config: Option<&Path>) {
+    match config {
+        Some(config) => command.env(EIDOLON_CONFIG, config),
+        None => command.env_remove(EIDOLON_CONFIG),
+    };
+}
+
+/// What `command` does to `EIDOLON_CONFIG`: `Some(Some(path))` when it sets it, `Some(None)` when it removes it, and `None` when it says
+/// nothing, which would let an inherited value through.
+#[cfg(test)]
+pub(crate) fn eidolon_config_entry(command: &std::process::Command) -> Option<Option<OsString>> {
+    command.get_envs().find(|(name, _)| *name == std::ffi::OsStr::new(EIDOLON_CONFIG)).map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
 }
 
 /// Where a door's token file must be: `<runtime dir>/eidolon/web-<port>.token` (§4 step 6).
@@ -235,11 +264,13 @@ fn no_proxy_with_loopback(existing: Option<&str>) -> String {
     list
 }
 
-/// Runs on the spawn thread: this is the call that forks.
-fn fork(argv: &[OsString]) -> io::Result<tokio::process::Child> {
+/// The command that forks a door, as [`fork`] runs it: the argv, the stdio, the environment, the process group and PDEATHSIG.
+fn door_command(argv: &[OsString]) -> io::Result<tokio::process::Command> {
     let (program, args) = argv.split_first().ok_or_else(|| io::Error::other("no door binary in the argv"))?;
     let mut command = tokio::process::Command::new(program);
     command.args(args);
+    // The door's config, named in its environment as well as in its argv (SA2): a child of the door reads it from there.
+    name_config(command.as_std_mut(), config_in(args));
     // §4 step 4. stderr is inherited: a door's complaints belong in the perch's own log,
     // and nothing on that path is a secret either.
     command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit());
@@ -263,7 +294,12 @@ fn fork(argv: &[OsString]) -> io::Result<tokio::process::Child> {
             Ok(())
         });
     }
-    command.spawn()
+    Ok(command)
+}
+
+/// Runs on the spawn thread: this is the call that forks.
+fn fork(argv: &[OsString]) -> io::Result<tokio::process::Child> {
+    door_command(argv)?.spawn()
 }
 
 /// A forked door: its pid, the channel its reaper publishes the exit on, and its stdout,
@@ -428,6 +464,31 @@ mod tests {
 
     fn words(argv: &[OsString]) -> Vec<String> {
         argv.iter().map(|arg| arg.to_string_lossy().to_string()).collect()
+    }
+
+    #[test]
+    fn a_door_names_its_config_in_the_environment_and_removes_the_name_without_one() {
+        let eidolon = Path::new("/usr/bin/eidolon");
+        // A config: the door's environment names the file its argv names, and the loopback NO_PROXY is set as it was.
+        let configured = argv(eidolon, Some(Path::new("/h/Minerva/config.toml")), Target::New(Path::new("/h/Minerva/scratch")), None, false);
+        assert_eq!(config_in(&configured[1..]), Some(Path::new("/h/Minerva/config.toml")));
+        let door = door_command(&configured).unwrap();
+        assert_eq!(eidolon_config_entry(door.as_std()), Some(Some(OsString::from("/h/Minerva/config.toml"))));
+        assert!(door.as_std().get_envs().any(|(name, value)| name == "NO_PROXY" && value.is_some()), "the loopback NO_PROXY is still set");
+        // No config: the name is removed, so an EIDOLON_CONFIG the operator exported never reaches a door.
+        let bare = argv(eidolon, None, Target::Kept(Path::new("/logs/a.eid")), None, false);
+        assert_eq!(config_in(&bare[1..]), None);
+        assert_eq!(eidolon_config_entry(door_command(&bare).unwrap().as_std()), Some(None));
+    }
+
+    #[test]
+    fn the_config_is_read_from_the_flags_and_never_from_message_text() {
+        let os = |words: &[&str]| words.iter().map(|word| OsString::from(*word)).collect::<Vec<_>>();
+        assert_eq!(config_in(&os(&["--config", "/c.toml", "web"])), Some(Path::new("/c.toml")));
+        // A message after the `--` that says `--config` names nothing.
+        assert_eq!(config_in(&os(&["resume", "/s.eid", "--", "--config", "/evil.toml"])), None);
+        // A flag with no value names nothing.
+        assert_eq!(config_in(&os(&["--config"])), None);
     }
 
     #[test]

@@ -218,9 +218,7 @@ pub fn restage_if_changed(member: &Path, home: &Path, staged: &Staged) -> Option
 /// own file. A guard that compiles but lets every verdict through, a table eidolon would not load, or a config that names some other
 /// policy is caught here and not discovered when an agent runs `aoide`.
 pub fn probe(eidolon: &Path, config: &Path, cwd: &Path, file: &Path) -> std::result::Result<(), String> {
-    let mut command = Command::new(eidolon);
-    command.arg("--config").arg(config).args(["policy", "--", "aoide", "mail", "send", "x"]).current_dir(cwd);
-    let out = run_bounded(command, PROBE_LIMIT).map_err(|e| format!("the start-up probe could not run eidolon: {e}"))?;
+    let out = run_bounded(probe_command(eidolon, config, cwd), PROBE_LIMIT).map_err(|e| format!("the start-up probe could not run eidolon: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let field = |name: &str| stdout.lines().find_map(|line| line.strip_prefix(name)).map(str::trim);
     match (out.status.success(), field("tier:")) {
@@ -240,6 +238,15 @@ pub fn probe(eidolon: &Path, config: &Path, cwd: &Path, file: &Path) -> std::res
             Err(format!("the start-up probe got no verdict from `eidolon policy` ({}): {}", out.status, line.chars().take(200).collect::<String>()))
         }
     }
+}
+
+/// The start-up probe's command: `eidolon --config <config> policy -- aoide mail send x` in `cwd`, with that config named in its environment
+/// too (`EIDOLON_CONFIG`, SA2).
+fn probe_command(eidolon: &Path, config: &Path, cwd: &Path) -> Command {
+    let mut command = Command::new(eidolon);
+    crate::spawn::name_config(&mut command, Some(config));
+    command.arg("--config").arg(config).args(["policy", "--", "aoide", "mail", "send", "x"]).current_dir(cwd);
+    command
 }
 
 /// Runs `command` with no stdin and both outputs captured, and gives up after `limit`: the child is killed and the answer is an error.
@@ -909,5 +916,12 @@ mod tests {
         assert!(run(&other_reason).unwrap_err().contains("not with the guard's sentence"));
         let allow = stub(&reply(file.to_str().unwrap(), "Allow", "read"));
         assert!(run(&allow).unwrap_err().contains("was not refused"));
+    }
+
+    #[test]
+    fn the_start_up_probe_names_its_config_in_the_environment() {
+        use crate::spawn::eidolon_config_entry;
+        let command = probe_command(Path::new("/usr/bin/eidolon"), Path::new("/h/Minerva/config.toml"), Path::new("/h"));
+        assert_eq!(eidolon_config_entry(&command), Some(Some(std::ffi::OsString::from("/h/Minerva/config.toml"))));
     }
 }

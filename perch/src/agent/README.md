@@ -62,7 +62,7 @@ A token is in the file and in memory. It is not in argv, in the environment, in 
 
 **Doors and proxies.** The HTTP clients a real door's tools are built on (hyper-util, reqwest) have no loopback bypass of their
 own: with `http_proxy` or `ALL_PROXY` exported, a call to this perch would go to the proxy, arrive from the proxy's socket (so
-no door: 403) and leave the scoped token in the proxy's history. `spawn::fork` appends `127.0.0.1,localhost,::1` to the door's
+no door: 403) and leave the scoped token in the proxy's history. `spawn::door_command` (which `spawn::fork` runs) appends `127.0.0.1,localhost,::1` to the door's
 `NO_PROXY` and `no_proxy` (both spellings set, whatever the operator had kept first).
 
 ## The attribution

@@ -46,6 +46,7 @@ use tokio::process::Command;
 use crate::mode::Mode;
 use crate::serve::{BoxBody, Ctx, json, problem, status};
 use crate::sessions::{id_ok, log_path};
+use crate::spawn::{config_in, name_config};
 
 /// How long a first message may run before it is stopped. `MINERVA_PERCH_FIRST_MS` shortens it (the tests do).
 const MAX_RUN: Duration = Duration::from_secs(10 * 60);
@@ -607,14 +608,23 @@ async fn execute(ctx: Ctx, id: String, fork: Fork, log: PathBuf, home: PathBuf, 
     run.finish(outcome);
 }
 
+/// The command for a turn: eidolon with `all` as its argv, and the config that argv names in its environment (`EIDOLON_CONFIG`, SA2).
+/// The caller sets its stdio and its process group.
+fn turn_command(eidolon: &Path, all: &[OsString]) -> Command {
+    let mut command = Command::new(eidolon);
+    name_config(command.as_std_mut(), config_in(all));
+    command.args(all);
+    command
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ran(ctx: &Ctx, id: &str, fork: &Fork, log: &Path, home: &Path, cwd: Option<&Path>, how: &(Mode, Option<PathBuf>, bool), base: u64, pictures: &[(&'static str, Vec<u8>)], text: &str, run: &Arc<Run>) -> std::result::Result<(), String> {
     let (mode, config, yolo) = (how.0, how.1.as_deref(), how.2);
     let pics = Pics::write(home, id, pictures).map_err(|e| format!("{e:#}"))?;
     let all = argv(config, yolo, log, fork.at, cwd, &pics.files, text);
-    let mut command = Command::new(&ctx.registry.eidolon);
+    let mut command = turn_command(&ctx.registry.eidolon, &all);
     // Its own process group, killed as a group (below, and when this future is dropped): the tools a turn starts die with it.
-    command.args(&all).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
     let mut child = command.spawn().map_err(|e| format!("eidolon could not be started: {e}"))?;
     let mut group = Group(child.id());
     // Written down before anything else: a perch that restarts while this runs finds the run in `forks.json` ([`recover`]). Not written
@@ -861,5 +871,20 @@ mod tests {
         let all = argv(Some(Path::new("/h/minerva.toml")), true, Path::new("/h/sessions/7.eid"), 12, Some(Path::new("/w")), &[PathBuf::from("/h/first-7/0.png")], "-rf things");
         let all: Vec<String> = all.iter().map(|a| a.to_string_lossy().into_owned()).collect();
         assert_eq!(all.join(" "), "--config /h/minerva.toml --yolo resume /h/sessions/7.eid --at 12 --cwd /w --image /h/first-7/0.png -- -rf things");
+    }
+
+    #[test]
+    fn a_turn_names_in_its_environment_the_config_its_argv_passes() {
+        use crate::spawn::eidolon_config_entry;
+        let eidolon = Path::new("/usr/bin/eidolon");
+        let log = Path::new("/h/sessions/7.eid");
+        let with = argv(Some(Path::new("/h/minerva.toml")), false, log, 12, None, &[], "hi");
+        assert_eq!(eidolon_config_entry(turn_command(eidolon, &with).as_std()), Some(Some(OsString::from("/h/minerva.toml"))));
+        // No config: the name is removed, so an EIDOLON_CONFIG the perch inherited never reaches a turn.
+        let bare = argv(None, false, log, 12, None, &[], "hi");
+        assert_eq!(eidolon_config_entry(turn_command(eidolon, &bare).as_std()), Some(None));
+        // A message that says `--config` is text after the `--`, so it names no config either.
+        let said = argv(None, false, log, 12, None, &[], "--config");
+        assert_eq!(eidolon_config_entry(turn_command(eidolon, &said).as_std()), Some(None));
     }
 }

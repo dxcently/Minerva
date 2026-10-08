@@ -266,15 +266,22 @@ pub(crate) fn policy_in_force(member: &Path, config: &Path, eidolon: &Path) -> R
         return Ok(text);
     }
     // A machine on which eidolon has never run: any eidolon command unpacks its shipped tables, `policy` being the cheapest.
-    let mut unpack = std::process::Command::new(eidolon);
-    unpack.arg("--config").arg(config).args(["policy", "true"]);
-    let ran = crate::guard::run_bounded(unpack, UNPACK_LIMIT)
+    let ran = crate::guard::run_bounded(unpack_command(eidolon, config), UNPACK_LIMIT)
         .map_err(|e| anyhow::anyhow!("running `{} policy true` to unpack eidolon's tables: {e}", eidolon.display()))?;
     if !ran.status.success() {
         let said: String = String::from_utf8_lossy(&ran.stderr).trim().chars().take(300).collect();
         bail!("`eidolon policy true` failed ({}): {said}", ran.status);
     }
     read_first(&candidates).with_context(|| format!("eidolon's policy table was not found at {}", candidates[0].display()))
+}
+
+/// The command that unpacks eidolon's tables on a machine it has never run on: `eidolon --config <config> policy true`, with that config
+/// named in its environment too (`EIDOLON_CONFIG`, SA2).
+fn unpack_command(eidolon: &Path, config: &Path) -> std::process::Command {
+    let mut unpack = std::process::Command::new(eidolon);
+    crate::spawn::name_config(&mut unpack, Some(config));
+    unpack.arg("--config").arg(config).args(["policy", "true"]);
+    unpack
 }
 
 /// Writes `<home>/policy-manual.rn` and `<home>/config-manual.toml` (atomically, `0600`) from the `config.toml` already generated
@@ -311,6 +318,15 @@ pub struct AgentFiles<'a> {
 const TERM_TOOLS: [&str; 5] = ["term_list", "term_open", "term_read", "term_send", "term_close"];
 const MAIL_TOOLS: [&str; 1] = ["mail_send"];
 
+/// The command that grants one tool a token file in manual's own permits store: `eidolon --config <manual> plugins grant <tool> <source>`,
+/// with that config named in its environment too (`EIDOLON_CONFIG`, SA2).
+fn grant_command(eidolon: &Path, manual: &Path, tool: &str, source: &str) -> std::process::Command {
+    let mut grant = std::process::Command::new(eidolon);
+    crate::spawn::name_config(&mut grant, Some(manual));
+    grant.arg("--config").arg(manual).args(["plugins", "grant", tool, source]);
+    grant
+}
+
 /// Grants each token file in `files` to its tools in manual's own permits store (`<home>/policy.permits.rn`, the one beside
 /// `policy-manual.rn`), through stock `eidolon --config <manual> plugins grant <tool> file:<path>`, so a manual call asks once (the tool
 /// call) and not twice (that, and the credential). Nothing is vouched: every call still asks. Returns what could not be granted, one
@@ -328,9 +344,7 @@ pub fn pregrant(eidolon: &Path, manual: &Path, files: AgentFiles<'_>) -> Vec<Str
             }
         };
         for tool in tools {
-            let mut grant = std::process::Command::new(eidolon);
-            grant.arg("--config").arg(manual).args(["plugins", "grant", *tool, source.as_str()]);
-            match crate::guard::run_bounded(grant, GRANT_LIMIT) {
+            match crate::guard::run_bounded(grant_command(eidolon, manual, tool, source.as_str()), GRANT_LIMIT) {
                 Ok(out) if out.status.success() => {}
                 Ok(out) => {
                     let said: String = String::from_utf8_lossy(&out.stderr).trim().chars().take(300).collect();
@@ -479,5 +493,15 @@ mod tests {
         assert_eq!((b.get("x"), b.get("y"), b.get("z")), (Some(Mode::Manual), Some(Mode::Auto), None));
         b.forget("x");
         assert_eq!(ChatModes::open(Some(file)).get("x"), None);
+    }
+
+    #[test]
+    fn the_unpack_and_the_grants_name_their_config_in_the_environment() {
+        use crate::spawn::eidolon_config_entry;
+        let eidolon = Path::new("/usr/bin/eidolon");
+        let manual = Path::new("/h/Minerva/config-manual.toml");
+        let want = Some(Some(std::ffi::OsString::from("/h/Minerva/config-manual.toml")));
+        assert_eq!(eidolon_config_entry(&unpack_command(eidolon, manual)), want);
+        assert_eq!(eidolon_config_entry(&grant_command(eidolon, manual, "mail_send", "file:/m.token")), want);
     }
 }

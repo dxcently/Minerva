@@ -11,7 +11,7 @@ serve.rs   accept loop, the gate order, the route match, the H1b session routes,
 files.rs   the static rules, ported from eidolon/crates/web/src/files.rs
 tree.rs    GET /hub/tree: parse_query, the deny list, containment, the listing, the 4-listing slots
 sessions.rs  the doors we own, the list (kept + ours + roster), the pane count, the ordered stop
-spawn.rs     the argv, the fork, the boot lines, the door's token file, PDEATHSIG
+spawn.rs     the argv, the fork, the boot lines, the door's token file, PDEATHSIG, EIDOLON_CONFIG (the door's config, by name)
 watch.rs     the perch's own /api/events stream to a door, and closing it before SIGTERM; reads only until `hello` (capped at 1 MiB), holds no transcript
 proxy.rs     GET|POST /s/<id>/api/<route> to that session's door, panes, the hub-stream-end frame
 mode.rs      the three approval modes: Mode, the manual policy wrapper over eidolon's own table, config-manual.toml, chat-modes.json
@@ -28,6 +28,12 @@ mail/     /hub/mail: the mailbox, and the opt-in a chat makes to send (stub)
 allow/    /hub/sessions/<id>/allow|revoke: standing allows, and the watch::Sink every door's watcher is opened with (stub)
 guard/    the deny rows in every generated policy (aoide, ssh, update keys), what a terminal's text may not say, and whether they are on
 ```
+
+**Every eidolon child names its config** (slice SA2): its environment carries `EIDOLON_CONFIG`, set to the file its argv passes with
+`--config`, or removed when the argv passes none, so a value the operator's shell exported never points a child at another config.
+`spawn::name_config` does it wherever eidolon is started: a door (`spawn.rs`), a turn (`pending.rs`), a run (`runs/proc.rs`), the title
+reads (`titles.rs`), the start-up probe (`guard/mod.rs`), and the manual unpack and grants (`mode.rs`). eidolon reads the variable itself
+nowhere; the subagent plugin does.
 
 **The seams** (slice S0P-a). The modules above marked stub are in `serve.rs`'s route table and in `lib.rs`'s hooks now, so the slices
 that fill them touch only their own folder. Each has a `mod.rs` that holds its whole internal dispatch, down to submodule stubs

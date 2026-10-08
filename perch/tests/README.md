@@ -60,6 +60,7 @@ no other test file.
 | `mesh.rs` | R2b | `/hub/mesh` and `/hub/mesh/events` are a 404 behind the gate (pinned in `http.rs` until this file took them over) |
 | `meta.rs` | R3 | `/hub/meta/...` is a 404 behind the gate; the fake's `tools`, `plugins` and `policy-rows` refuse |
 | `install.rs` | R4 | done: the notice, keys list and inspect, the arm (bearer only, never a page), add and remove spending it once, listed/mismatch/unknown/updated/Nix answers, writes that outlive the client, the child's env list |
+| `eidolon_config.rs` | SA2 | done: a door and every other eidolon call started with `--config` see `EIDOLON_CONFIG` naming that file (a shell shim in front of the stand-in records it); a door with no config has the name removed even when the perch inherited one |
 | `agent.rs` | AG | done: scoped tokens, attribution to a door (its children refused), files on exit by identity, refused starts leave nothing |
 | `term.rs` | T1b | `/hub/term[/...]` is a 404 behind the gate |
 | `term_stream.rs` | T1c | `/hub/term/events` is a 404 behind the gate |

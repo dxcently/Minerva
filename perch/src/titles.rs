@@ -31,6 +31,8 @@ use anyhow::{Context, Result};
 use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 
+use crate::spawn::name_config;
+
 /// `eidolon sessions` for ~200 logs is ~35 ms; this is for a wedged or a very large directory.
 pub const SESSIONS_TIMEOUT: Duration = Duration::from_secs(10);
 /// The listing is one short line per log.
@@ -62,15 +64,24 @@ impl std::fmt::Display for RunError {
     }
 }
 
+/// The command for one read: `eidolon --config <config> <args...>`, with that config named in its environment too (`EIDOLON_CONFIG`, SA2),
+/// and removed from it when there is none.
+fn read_command(eidolon: &Path, config: Option<&Path>, args: &[OsString]) -> Command {
+    let mut command = Command::new(eidolon);
+    name_config(command.as_std_mut(), config);
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
+    command.args(args);
+    command
+}
+
 /// `<eidolon> [--config <config>] <args...>`, run to the end with its stdout capped at `cap` bytes
 /// and the whole thing bounded by `within`. stderr is not read (it goes nowhere), and a child still running
 /// when this returns is killed.
 pub async fn run(eidolon: &Path, config: Option<&Path>, args: &[OsString], cap: usize, within: Duration) -> std::result::Result<Vec<u8>, RunError> {
-    let mut command = Command::new(eidolon);
-    if let Some(config) = config {
-        command.arg("--config").arg(config);
-    }
-    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    let mut command = read_command(eidolon, config, args);
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
     let mut child = command.spawn().map_err(|e| RunError::Failed(format!("starting {}: {e}", eidolon.display())))?;
     let mut stdout = child.stdout.take().ok_or_else(|| RunError::Failed("no stdout".into()))?;
     let work = async {
@@ -277,5 +288,15 @@ mod tests {
         assert_eq!(fallback(Some(Path::new("/h/Minerva/scratch/quiet-owl-lantern/sub")), scratch, None, None), "quiet-owl-lantern");
         assert!(fallback(None, None, None, Some(0)).starts_with("chat · "));
         assert_eq!(hhmm(0).map(|t| t.len()), Some(5));
+    }
+
+    #[test]
+    fn a_read_names_its_config_in_the_environment_and_removes_the_name_without_one() {
+        use crate::spawn::eidolon_config_entry;
+        let eidolon = Path::new("/usr/bin/eidolon");
+        let args = [OsString::from("sessions")];
+        let with = read_command(eidolon, Some(Path::new("/h/minerva.toml")), &args);
+        assert_eq!(eidolon_config_entry(with.as_std()), Some(Some(OsString::from("/h/minerva.toml"))));
+        assert_eq!(eidolon_config_entry(read_command(eidolon, None, &args).as_std()), Some(None));
     }
 }

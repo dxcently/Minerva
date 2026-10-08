@@ -75,7 +75,8 @@ Someone else's SIGTERM (not the page's) is not a cancel: eidolon's word stands (
 
 The child is its own process group leader (`process_group(0)`), has no `kill_on_drop`, takes its args from `args.json` on stdin and writes
 `out.log` / `err.log` in its folder: when the perch stops, the child neither dies nor loses its output, and `on_shutdown` waits only for
-a cancel's own grace (2.5 s at most). The pid goes into `runs.json` before the child is trusted. `adopt` reads `runs.json`: a `running`
+a cancel's own grace (2.5 s at most). Its environment names its own `config.toml` as `EIDOLON_CONFIG`, the file its `--config` names
+(`proc::child_command`, SA2). The pid goes into `runs.json` before the child is trusted. `adopt` reads `runs.json`: a `running`
 run whose pid still has `workflow` and its own `config.toml` in `/proc/<pid>/cmdline` is watched until it ends (and keeps its wall clock,
 measured from `child_ms`); one that is gone is settled from `out.log` and the journal. A pid is only ever signalled after that cmdline
 check, so a reused pid is left alone. While no perch runs, nothing enforces the wall clock.

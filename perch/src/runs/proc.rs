@@ -52,6 +52,7 @@ use tokio::process::{Child, Command};
 use super::state::{Phase, Run, Stop, kept};
 use crate::pending::{Group, spoken, tail_words};
 use crate::serve::Ctx;
+use crate::spawn::{config_in, name_config};
 
 /// How long SIGTERM is given before SIGKILL, for a cancel and for the wall clock.
 pub const GRACE: Duration = Duration::from_secs(5);
@@ -141,6 +142,15 @@ pub(crate) fn resume_argv(home: &Path, rid: &str, plugins: &Path, session: &Path
     ]
 }
 
+/// The command for a run's child: eidolon with the run's argv, and the config that argv names in its environment (`EIDOLON_CONFIG`, SA2).
+/// [`launch`] sets its folder, its output and its process group.
+fn child_command(eidolon: &Path, argv: &[OsString]) -> Command {
+    let mut command = Command::new(eidolon);
+    name_config(command.as_std_mut(), config_in(argv));
+    command.args(argv);
+    command
+}
+
 /// Starts the child for run `rid` (already `running` in the store) and hands it to a watcher. Its stdout and stderr are appended to the
 /// run's `out.log` and `err.log`.
 pub(crate) fn launch(ctx: &Ctx, rid: &str, argv: Vec<OsString>, stdin: Option<File>) -> Result<()> {
@@ -152,9 +162,9 @@ pub(crate) fn launch(ctx: &Ctx, rid: &str, argv: Vec<OsString>, stdin: Option<Fi
     };
     let (out, err) = (open("out.log")?, open("err.log")?);
     let out_off = out.metadata().context("measuring out.log")?.len();
-    let mut command = Command::new(&ctx.registry.eidolon);
+    let mut command = child_command(&ctx.registry.eidolon, &argv);
     // Its own process group, and nothing that ends it with the perch: no kill_on_drop, no pipe that closes (D3).
-    command.args(&argv).current_dir(&dir).stdin(stdin.map_or_else(Stdio::null, Stdio::from)).stdout(Stdio::from(out)).stderr(Stdio::from(err)).process_group(0);
+    command.current_dir(&dir).stdin(stdin.map_or_else(Stdio::null, Stdio::from)).stdout(Stdio::from(out)).stderr(Stdio::from(err)).process_group(0);
     let child = command.spawn().map_err(|e| anyhow::anyhow!("eidolon could not be started: {e}"))?;
     let pid = child.id().context("the child has no pid")?;
     // Armed until the pid is written down: a child no perch could find again is stopped rather than left.
@@ -702,5 +712,19 @@ mod tests {
         assert!(!is_run_soon(sleeper.id(), config).await);
         assert!(asked.elapsed() < Duration::from_millis(100), "a pid that is gone is not waited for: {:?}", asked.elapsed());
         assert!(alive(std::process::id()) && !alive(sleeper.id()) && !alive(u32::MAX));
+    }
+
+    #[test]
+    fn a_runs_child_names_its_config_in_the_environment() {
+        use crate::spawn::eidolon_config_entry;
+        let (home, plugins) = paths();
+        let eidolon = Path::new("/usr/bin/eidolon");
+        let want = Some(Some(OsString::from("/h/runs/r7/config.toml")));
+        assert_eq!(eidolon_config_entry(child_command(eidolon, &start_argv(&home, "r7", &plugins, "g")).as_std()), want);
+        let resume = resume_argv(&home, "r7", &plugins, Path::new("/s.eid"), 1, "0");
+        assert_eq!(eidolon_config_entry(child_command(eidolon, &resume).as_std()), want);
+        // An argv that names no config: the name is removed, so an EIDOLON_CONFIG the perch inherited never reaches the run.
+        let bare = vec![os("workflow"), os("resume")];
+        assert_eq!(eidolon_config_entry(child_command(eidolon, &bare).as_std()), Some(None));
     }
 }
