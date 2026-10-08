@@ -56,6 +56,7 @@ The list comes from `GET /hub/sessions` (`core/hub.js`), polled every 5 s (a pol
 | `projects` tab | `sessions here` (the focused pane's folder); `others`: the folders of live sessions, a click opens the first one there. Kept sessions carry no folder |
 | `peers` | still a placeholder (the sessions tab line) |
 | `mesh` | the mesh tab: Aoide through the perch (`/hub/mesh`, `/hub/mesh/events`), network-free, ages are cache ages, never presence |
+| `⌨` tab | the web terminals as a stack: `[ new terminal ]`, each terminal's header and clipped live view, take over and hand back, `⇱` into a pane. An agent's use of a terminal raises the `⌨` badge and a toast with `[ show ]` (terms/activity.js) |
 
 **Fork from here.** The row menu of an assistant reply that ended its turn (never the latest, never a user row) has `fork from here`: POST fork `{at}`, then a pane opens beside with a read-only history up to that reply and a composer (`first message`, images, `working... Ns` with the output tail). When the run ends the pane goes live; a failure shows the error sentence and stays pending. A pending chat has a faint `pending` tag in the sidebar under its source's group and can be trashed. The page decides pending from the list row.
 
@@ -98,7 +99,7 @@ renderers/           generic + files (edit/write diff, read as code) + jev (jev_
 core/registry.js     the lists a feature folder registers into (tabs, pane kinds, commands, key rows, owners, frame taps, stream slots) and `host`: app.js draws from them, so a feature never edits app.js
 graph/               the inspector's graph tab: the jev runs and the chat's turn graph (GraphTab)
 mesh/                the left panel's mesh tab: the nodes this machine knows (MeshTab)
-terms/               the web terminals: the terminals tab in the right panel and the terminal panes
+terms/               the web terminals: the ⌨ tab in the right panel (the stack, one xterm per terminal), the agent's activity while it is closed (badge, toast), and the terminal panes (T4b)
 notes/               the notepad: the notes tab in the left panel and the note pane
 allow/               the allow rules of a chat: a section of the loaded tab
 install/             the update keys overlay ([ update keys ] on the start screen's install block; adds and removes need the terminal arm)

@@ -1,1 +1,36 @@
-/* the terminals: the stack in the right panel and the terminal panes (terms/); empty until those slices land */
+/* The web terminals: the ⌨ tab (tab.js), its clipped live views (view.js, which sets --tch to one row's height) and the rail badge every feature's
+   `badge` signal draws (`<span class="bd o">`, after the icon). Square edges, the page's colours; nothing here sets a hex. */
+.bd { font-size: calc(var(--fs) * 0.6); line-height: 1; vertical-align: super; color: var(--orange); margin-left: 1px; }
+
+.terms { display: flex; flex-direction: column; min-height: 0; height: 100%; }
+.tyolo { color: var(--red); padding-bottom: calc(var(--ch) * 0.3); }
+.tbar { display: flex; flex-wrap: wrap; column-gap: var(--cw); align-items: baseline; padding-bottom: calc(var(--ch) * 0.3); }
+.tword { min-width: 0; }
+.tnone { padding-bottom: var(--ch); }
+
+.tstack { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+.thead-group { flex: none; color: var(--faint); border-bottom: 1px solid var(--line); margin-top: calc(var(--ch) * 0.4); }
+
+.tterm { flex: none; min-width: 0; border: 1px solid var(--line); margin-bottom: calc(var(--ch) * 0.4); }
+.tterm.mine { border-color: var(--bright); }
+.tterm.bell { border-color: var(--orange); }
+.thead { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--cw); padding: 0 var(--cw); min-width: 0; }
+.tfold { color: var(--faint); }
+.tdot.live { color: var(--green); }
+.tdot.dead { color: var(--faint); }
+.ttitle { flex: 1 1 8ch; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--bright); }
+.ended .ttitle { color: var(--faint); }
+.tid, .tage, .tend { color: var(--faint); }
+.tby { color: var(--magenta); }
+.ttype { color: var(--orange); }
+.thold { color: var(--cyan); }
+.tpop { color: var(--faint); }
+.tline { padding: 0 var(--cw); color: var(--faint); white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+.tpane { padding: 0 var(--cw); }
+.tgo { color: var(--cyan); }
+
+/* A screen at 1:1 cells, its last rows in view: the height is eight rows of the terminal's own row (--tch, set from the measure). */
+.tclip { position: relative; height: calc(var(--tch, 16px) * 8); overflow: hidden; margin: 0 var(--cw); background: var(--bg); }
+
+/* Where a terminal's element waits when no host shows it: laid out (so a screen measures), out of sight and out of the tab order. */
+.tpark { position: fixed; left: -200vw; top: 0; visibility: hidden; pointer-events: none; }

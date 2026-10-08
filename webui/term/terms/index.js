@@ -1,8 +1,11 @@
-// The terminals' tab in the right panel. Today only its slot: the stack of web terminals is drawn here by slice T4a. It registers like any
+// The terminals' folder, loaded by app.js: the ⌨ tab in the right panel (tab.js), the screens (view.js), and what an agent does in a
+// terminal while the tab is not showing (activity.js: the rail's badge, the toast, the frame tap, the 5 s roster poll). It registers like any
 // tab (core/registry.js), so app.js lists nothing of it; global, so it is drawn with no chat in view.
-import { html } from '../core/ui.js';
-import { rightTabs } from '../core/registry.js';
+import { rightTabs, frameTaps } from '../core/registry.js';
+import { TermsTab } from './tab.js';
+import { badge, tap, startActivity } from './activity.js';
+import './view.js';
 
-export const TermsTab = () => html`<div class="faint">terminals: the ⌨ stack lands with slice T4a</div>`;
-
-rightTabs.add({ name: 'terms', icon: '⌨︎', component: TermsTab, global: true });
+rightTabs.add({ name: 'terms', icon: '⌨︎', component: TermsTab, global: true, badge });
+frameTaps.add(tap);
+startActivity();
