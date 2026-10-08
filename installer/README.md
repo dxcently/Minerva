@@ -210,10 +210,12 @@ a different one refuses the whole file. An installer built before `revoke_fp` ig
 so a release can carry it without breaking an older install.
 
 **Every id in `revoke` needs its fingerprint.** A client that holds the key takes the fingerprint from its own copy and records it. A
-client that does not hold it needs `revoke_fp` for it. Without that, `minerva update` refuses the whole file and nothing is written (the
-serial does not move): `keys.json revokes <id> without its fingerprint; the maintainer lists every revoked key in revoke_fp`. A key a
-revoked key added is not named in the file. A machine that still holds its bytes records their fingerprint; one that does not records the
-id alone, and does not trust it either, since its bytes are gone from it.
+client that does not hold it takes it from `revoke_fp`, or from its own record when that id was revoked before with its fingerprint: a
+revocation listed again keeps the fingerprint it was given, and its serial still moves. Otherwise `minerva update` refuses the whole file
+and nothing is written (the serial does not move): `keys.json revokes <id> without its fingerprint; the maintainer lists every revoked key
+in revoke_fp`. `release-files.sh` refuses such a file before it is released (see "Releasing"). A key a revoked key added is not named in
+the file. A machine that still holds its bytes records their fingerprint; one that does not records the id alone, and does not trust it
+either, since its bytes are gone from it.
 
 Rules: `serial` must be higher than the last applied but at most 16 higher (a leaked key cannot burn the counter with a huge
 serial); a serial that is not higher is "already applied" and is answered BEFORE the signature or expiry is looked at, so
@@ -237,12 +239,19 @@ was revoked (`revoked`); a key whose id a DIFFERENT key uses (`collision`); a ke
 with the same bytes (`collision`: a key's record is never rewritten, so a rotation key keeps its source, its expiry and who added it);
 the compiled-in key, under its id or its bytes (`compiled`; once that key was revoked it is refused as `revoked`, not `compiled`). A revocation
 keeps the key's fingerprint, and the fingerprint is the sha-256 of the 32 key bytes, so the same bytes under a fresh id are refused too.
-The fingerprint comes from this machine's own copy of the key when it had one, or from the signed file (`revoke_fp`, above). A
-revocation with no fingerprint refuses by id only. There are two ways to get one. A record written before fingerprints were kept (a
-development install; nothing was released): its bytes are not known here, so the same bytes under a fresh id are accepted by hand and by
-a rotation, until a signed file names that key in `revoke_fp` and the record takes its fingerprint. And a key that a revoked key added,
-whose bytes this machine no longer has: it is not trusted here, so only its id is blocked. The first is the accepted residual, not a
-closed hole; the maintainer closes it with one rotation that names the old key's fingerprint (`minerva keys inspect old.pub`).
+The fingerprint comes from this machine's own copy of the key when it had one, from the signed file (`revoke_fp`, above), or from this
+machine's record for that id. A revocation with no fingerprint anywhere refuses by id only. There are two ways to get one, and both are
+accepted residuals, not closed holes:
+
+- **A record written before fingerprints were kept** (a development install; nothing was released). Its bytes are not known here, so
+  the same bytes under a fresh id are accepted by hand and by a rotation, until a signed file names that key in `revoke_fp` and the record
+  takes its fingerprint. The maintainer closes it with one rotation that names the fingerprint (`minerva keys inspect old.pub`).
+- **A key that a revoked key added, whose `.pub` is no longer in the keys dir.** It is not trusted here, so only its id is blocked, and
+  the same bytes under a fresh id are accepted by `keys add` (fingerprint typed back) or by a rotation. Its bytes left a directory only
+  this user can write, and whoever can write there can trust any key directly. The `.pub` goes by `minerva keys remove`, by a hand
+  delete, move or rename, or when it cannot be read or parsed (it is then skipped, so it counts as gone). The maintainer closes it with a
+  signed file that names the key's fingerprint in `revoke_fp` (the maintainer holds the key's bytes, so the fingerprint is at hand); the
+  file does not need to list the key in `revoke`.
 
 **For the perch.** A perch route that adds a key runs `minerva keys inspect - --json` with the public key on stdin (answer
 `{"id","fingerprint","comment"}`), shows the fingerprint to the person, and when they have typed the FINGERPRINT back runs
@@ -256,7 +265,9 @@ itself. The answers and the step-up that allows the page to do this at all are i
 minisign -G -p new.pub -s ~/.minisign/minerva-2.key                  # 1. the new key pair
 # 2. write keys.json: add new.pub's second line (serial = last + 1, an expiry date); if the old key leaked, put its id in "revoke"
 #    AND its fingerprint (minerva keys inspect old.pub) in "revoke_fp". Every id in "revoke" needs its fingerprint there: a client that
-#    does not hold that key refuses the whole file without it, with "keys.json revokes <id> without its fingerprint", and changes nothing
+#    does not hold that key refuses the whole file without it, with "keys.json revokes <id> without its fingerprint", and changes nothing.
+#    release-files.sh refuses that file first, before anything is written: fix it there. A file a client refuses changes nothing on that
+#    machine, so a leaked key that machine holds STAYS trusted there until a corrected file is signed and out: publish it promptly.
 minisign -S -s ~/.minisign/minerva.key -m keys.json                   # 3. sign it with a key members already trust (the OLD one)
 minisign -S -s ~/.minisign/minerva-2.key -m latest.json minerva-*.tar.gz   # 4. the release itself, signed by the NEW key
 #    release assets: latest.json, latest.json.minisig, the bundle, its .minisig, keys.json, keys.json.minisig
@@ -435,7 +446,10 @@ gh release create v$(cat ../../VERSION) --repo dxcently/Minerva --title "Minerva
 once-a-day notice still work but print "release info is stale (signed <date>) -- the maintainer should re-sign" (a replayed old
 manifest is the thing this exposes). **Re-sign at least every 30 days**, without rebuilding: `installer/release-files.sh resign DIR`
 re-stamps `latest.json`, then `minisign -S -s KEY -m latest.json` and re-upload both files. Also re-sign `keys.json` before its own
-`expires`. A re-signed `keys.json` keeps its `revoke_fp` entry for every id in `revoke` (operator step 2).
+`expires`. A re-signed `keys.json` keeps its `revoke_fp` entry for every id in `revoke` (operator step 2). Both modes of `release-files.sh` check
+`keys.json` before they write anything: a file that revokes an id with no `revoke_fp` entry, names a fingerprint that is not 16 hex digits,
+or has a `revoke` or `revoke_fp` list the script cannot read is refused (exit 1, one sentence, nothing written; the missing-fingerprint
+refusal names the id). A file with neither list, or with entries that are all there, passes as before.
 
 The updater fetches `https://github.com/dxcently/Minerva/releases/latest/download/latest.json` (+ `.minisig`, then the
 bundle named in it). The exe and `install.sh` are for people; only `latest.json`, the bundle and their signatures
@@ -448,7 +462,7 @@ keys): good signature installs, tampered bundle refused, wrong key refused, miss
 refused, rollback and forward, Nix refused, notice once a day / silent on failure / bad signature gives no notice,
 install/rerun/upgrade/prune/uninstall layout, WSL list parsing, PATH list edits, key rotation (good, unknown signer, revoked
 signer, revoked compiled-in key, manual add/remove and the refusals of `add`, a revoked key under a fresh id by hand and in a rotation, a rotation that revokes a key with no fingerprint (refused whole,
-nothing written), a fingerprint that is not 16 hex digits, expiry, replay, open keys dir, a crash while the keys dir is made, a fault between its record and its rename leaving no keys dir), and the plugin lifecycle (install, trust, foreign
+nothing written), a revocation listed again keeps the fingerprint it was given, a fingerprint that is not 16 hex digits, expiry, replay, open keys dir, a crash while the keys dir is made, a fault between its record and its rename leaving no keys dir), and the plugin lifecycle (install, trust, foreign
 plugin kept, update keeps trust, uninstall removes only ours) when `MINERVA_TEST_EIDOLON` names an eidolon binary (otherwise that
 one test says it was skipped). The Windows pieces (registry,
 shortcut, WSL calls) are exercised by running the exe with the test options above, never against the real settings.
@@ -459,7 +473,9 @@ refusal), `bin/perch-open.sh`'s arm against the stub HTTP server on a loopback p
 0600 header file, never in argv, through no proxy and no `~/.curlrc`, and nothing is aimed at 47820; a ^C leaves no header file), both
 scripts' start-up flags (the perch start with `--help` outputs captured from an old and a current perch, also with colour forced in the
 environment, and a second perch on another port), and `bash -n` on both scripts. `nix_allow_web.rs` checks that `nix/minerva.sh keys
-allow-web` refuses and arms nothing: it prints the Nix sentence, exits 1, sends no request and makes no runtime file. Nothing in `cargo test` parses `hoot.ps1`: that is done by hand, from the
+allow-web` refuses and arms nothing: it prints the Nix sentence, exits 1, sends no request and makes no runtime file. `release_files.rs`
+runs `release-files.sh` on temp release dirs: a keys.json that revokes an id with no `revoke_fp` entry (or has a list it cannot read) is
+refused in both modes with nothing written, and the forms it must accept (mixed case, spread over lines) pass. Nothing in `cargo test` parses `hoot.ps1`: that is done by hand, from the
 Windows side (Windows PowerShell 5.1 is the parser that matters), from the repository root, and must print `0`, the number of parse
 errors:
 

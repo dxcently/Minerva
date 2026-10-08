@@ -748,10 +748,13 @@ pub fn plan_rotation(trust: &Trust, json: &[u8], sig: Option<&str>, today: &str)
         adds.push((k, a.expires.clone()));
     }
     // The fingerprint of each key revoked: the one the file gives in `revoke_fp`; else this file's own adds (a key that is only in this
-    // file); else the keys dir or the compiled-in key. A key the file names with none of those is refused, the whole file with it. A given
-    // fingerprint that is not the one this machine holds under that id names another key, so the whole file is refused.
+    // file); else the keys dir or the compiled-in key; else the fingerprint this machine's record already has for that id (a revocation
+    // listed again, or a rotation a crash cut short after the record was saved). A key the file names with none of those is refused,
+    // the whole file with it. A given fingerprint that is not the one this machine holds under that id names another key, so the whole
+    // file is refused.
     let known: Vec<KeyInfo> = adds.iter().map(|(k, _)| k.clone()).chain(trust.all()).collect();
     let fp_of = |id: &str| known.iter().find(|k| k.id.eq_ignore_ascii_case(id)).map(|k| fp_hex(&k.fingerprint));
+    let recorded = |id: &str| st.revoked.iter().find(|r| r.id.eq_ignore_ascii_case(id)).and_then(|r| r.fp.clone());
     let mut wanted: Vec<(String, Option<String>)> = Vec::new();
     for r in &rot.revoke {
         if !valid_id(r) {
@@ -775,9 +778,10 @@ pub fn plan_rotation(trust: &Trust, json: &[u8], sig: Option<&str>, today: &str)
             (Some(g), Some(h)) if g != h => {
                 bail!("keys.json revokes key {id} with fingerprint {g}, but this machine holds key {id} with fingerprint {h}; refusing the whole file, nothing changed")
             }
-            // Named, with no fingerprint from the file and no key here: its bytes cannot be checked, so the same bytes under a fresh id
-            // would pass. Refused whole. (Keys a revoked key added are not named here: their fingerprint if this machine holds their bytes, else the id alone.)
-            (None, None) => bail!("keys.json revokes {id} without its fingerprint; the maintainer lists every revoked key in revoke_fp"),
+            // Named, with no fingerprint from the file, no key here and none in the record: its bytes cannot be checked, so the same bytes
+            // under a fresh id would pass. Refused whole. (Keys a revoked key added are not named here: their fingerprint if this machine
+            // holds their bytes, else the id alone.)
+            (None, None) => Some(recorded(&id).ok_or_else(|| anyhow!("keys.json revokes {id} without its fingerprint; the maintainer lists every revoked key in revoke_fp"))?),
             (g, h) => g.or(h),
         };
         push_revoke(&mut revokes, &id, fp);
@@ -1115,6 +1119,35 @@ pub mod tests {
         assert_eq!(apply_rotation(&tr, with_fp.as_bytes(), &sign(&sk, with_fp.as_bytes()), "2026-10-06").unwrap(), Rotated::Applied(vec![], vec![id_of(&never)]));
         assert_eq!(tr.state().unwrap().revoked.iter().find(|r| r.id == id_of(&never)).and_then(|r| r.fp.as_deref()), Some(fp.as_str()));
         assert_eq!(kind_of(tr.add_manual(&with_fresh_id(&never))), "revoked");
+    }
+
+    #[test]
+    fn a_revocation_listed_again_without_its_fingerprint_keeps_the_one_it_was_given() {
+        // a never-held id revoked WITH its fingerprint (serial 1), then listed again with none (serial 2): the record has the fingerprint, so
+        // the file is accepted, the serial moves, no second entry is made, and the same bytes under a fresh id are still refused
+        let (pk, sk) = keypair();
+        let (never, _) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        let fp = fp_hex(&parse_pub(&never, Source::Manual).unwrap().fingerprint);
+        let first = format!(r#"{{"schema":1,"serial":1,"expires":"2030-01-01","add":[],"revoke":[],"revoke_fp":[{{"id":"{}","fp":"{fp}"}}]}}"#, id_of(&never));
+        apply_rotation(&tr, first.as_bytes(), &sign(&sk, first.as_bytes()), "2026-10-06").unwrap();
+        let again = rotation(2, "2030-01-01", &[], &[&id_of(&never)]);
+        assert_eq!(apply_rotation(&tr, again.as_bytes(), &sign(&sk, again.as_bytes()), "2026-10-06").unwrap(), Rotated::Applied(vec![], vec![]));
+        let st = tr.state().unwrap();
+        assert_eq!((st.serial, st.revoked.len()), (2, 1), "the serial moved, and no second entry was made");
+        assert_eq!(st.revoked[0].fp.as_deref(), Some(fp.as_str()), "the fingerprint is kept");
+        assert_eq!(kind_of(tr.add_manual(&with_fresh_id(&never))), "revoked");
+        let back = rotation(3, "2030-01-01", &[&with_fresh_id(&never)], &[]);
+        let e = apply_rotation(&tr, back.as_bytes(), &sign(&sk, back.as_bytes()), "2026-10-06").unwrap_err();
+        assert_eq!(refusal(&e).map(|r| r.why.kind()), Some("revoked"), "{e:#}");
+        assert_eq!(tr.state().unwrap().serial, 2, "a refused file records nothing");
+        // the crash window: the record was saved with the fingerprint and the serial did not move; the same file without one is accepted
+        let (_t2, tr2) = trust_with(&pk);
+        fs::create_dir_all(&tr2.dir).unwrap();
+        fs::set_permissions(&tr2.dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(tr2.dir.join("state.json"), format!(r#"{{"serial":1,"revoked":[{{"id":"{}","on":"2026-10-06","by":"{}","fp":"{fp}"}}]}}"#, id_of(&never), id_of(&pk))).unwrap();
+        assert_eq!(apply_rotation(&tr2, again.as_bytes(), &sign(&sk, again.as_bytes()), "2026-10-06").unwrap(), Rotated::Applied(vec![], vec![]));
+        assert_eq!(tr2.state().unwrap().revoked[0].fp.as_deref(), Some(fp.as_str()));
     }
 
     #[test]
