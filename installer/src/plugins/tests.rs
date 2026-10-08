@@ -1,7 +1,7 @@
 //! Needs a real eidolon: set MINERVA_TEST_EIDOLON to one (the build.sh musl one will do). Without it the lifecycle test says so
 //! and passes, because a test that silently tests nothing is worse than one that says it did not run. Its check that plugins/
 //! carries term runs first, with or without an eidolon: that one FAILS when term is missing, it is never skipped.
-//! It points XDG_* at a temp dir, so nothing of the person's own config is read or written.
+//! It points XDG_* and HOME at a temp dir, so nothing of the person's own config is read or written.
 
 use super::*;
 
@@ -92,7 +92,28 @@ fn assert_term_d6(root: &Path, env: &PluginEnv) {
     assert!(line("term_send ").contains("unvouched"), "term_send is listed as asking: {}", line("term_send "));
 }
 
-/// The tests that point XDG_CONFIG_HOME and friends at a temp dir take this: `sync` reads them, and this test process has one environment.
+/// SA3 on a real permits store: subagent's five verbs are vouched, subagent_spawn and subagent_pick are NOT, and eidolon's listing
+/// (read-only) says the same per verb: "vouched by" for the five, "unvouched" for spawn and pick.
+fn assert_subagent_spawn_asks(root: &Path, env: &PluginEnv) {
+    let permits = fs::read_to_string(root.join("cfg/eidolon/policy.permits.rn")).unwrap();
+    let vouch = permits.lines().find(|l| l.starts_with("const VOUCHE")).unwrap_or("");
+    for v in ["list", "trace", "steer", "cancel", "plan"] {
+        assert!(vouch.contains(&format!("verb: \"subagent_{v}\"")), "subagent_{v} should be vouched: {vouch}");
+    }
+    assert!(!vouch.contains("subagent_spawn"), "subagent_spawn must never be vouched: {vouch}");
+    assert!(!vouch.contains("subagent_pick"), "subagent_pick must never be vouched: {vouch}");
+    let listing = env.eid_ok(&["plugins"]).unwrap();
+    let line = |verb: &str| listing.lines().find(|l| l.trim_start().starts_with(verb)).unwrap_or("").to_string();
+    assert!(line("subagent_spawn ").contains("unvouched"), "subagent_spawn is listed as asking: {}", line("subagent_spawn "));
+    assert!(line("subagent_pick ").contains("unvouched"), "subagent_pick is listed as asking: {}", line("subagent_pick "));
+    for v in ["list", "trace", "steer", "cancel", "plan"] {
+        let l = line(&format!("subagent_{v} "));
+        assert!(l.contains("vouched by") && !l.contains("script changed") && !l.contains("unvouched"), "{l}");
+    }
+}
+
+/// Taken first by every test that points XDG_CONFIG_HOME at a temp dir, and by every test that writes or runs a fake eidolon: `sync`
+/// reads the XDG dirs and this test process has one environment, and a fake written while another test forks fails to exec (ETXTBSY).
 static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
@@ -115,7 +136,15 @@ fn lifecycle_install_trust_update_foreign_and_remove() {
         std::env::set_var("XDG_DATA_HOME", r.join("data"));
         std::env::set_var("XDG_STATE_HOME", r.join("state"));
         std::env::set_var("XDG_CACHE_HOME", r.join("cache"));
+        std::env::set_var("XDG_RUNTIME_DIR", r.join("run"));
+        // HOME too: a path the eidolon under test takes from HOME (not XDG) lands in the temp dir, never in the person's home
+        std::env::set_var("HOME", r.join("home"));
     }
+    // swarm off for the eidolon this test drives: nothing here spawns, and with no [swarm] table a swarm would be on by default
+    fs::create_dir_all(r.join("cfg/eidolon")).unwrap();
+    fs::write(r.join("cfg/eidolon/config.toml"), "[swarm]\nenabled = false\n").unwrap();
+    fs::create_dir_all(r.join("run")).unwrap();
+    fs::create_dir_all(r.join("home")).unwrap();
     let src = r.join("bundle-plugins");
     bundle_plugins(&src);
     write_sixth(&src);
@@ -146,6 +175,8 @@ fn lifecycle_install_trust_update_foreign_and_remove() {
     assert!(text.contains("term: installed"), "{text}");
     assert_eq!(count(&env, "term_"), 5);
     assert_term_d6(r, &env);
+    assert!(text.contains("subagent: trusted list, trace, steer, cancel and plan; subagent_spawn is not vouched and asks"), "{text}");
+    assert_subagent_spawn_asks(r, &env);
     // the sixth plugin is installed and vouched for nothing: no rule names it, so eidolon's listing has its verb asking
     assert!(text.contains("zzprobe: installed") && text.contains("zzprobe: installed, not vouched (no rule in trust_one)"), "{text}");
     let permits = fs::read_to_string(r.join("cfg/eidolon/policy.permits.rn")).unwrap();
@@ -191,9 +222,13 @@ fn lifecycle_install_trust_update_foreign_and_remove() {
     assert!(fs::read_to_string(pdir.join("term/tools/send.rn")).unwrap().contains("a change in a newer Minerva"));
     assert_term_d6(r, &env);
 
-    // 3b. the member edits OUR installed subagent: it is neither re-trusted nor replaced, and an if_needed pass still looks
+    // 3b. the member edits OUR installed subagent: it is neither re-trusted nor replaced, and an if_needed pass still looks. An install
+    // from before SA3 left a bare trust (spawn and pick vouched too), and the edit does not void it, so this pass takes spawn's and
+    // pick's back and keeps the five verbs' vouches.
     let sub_rn = pdir.join("subagent/plugin.rn");
     let original = fs::read_to_string(&sub_rn).unwrap();
+    let (ok, text) = env.eidolon(&["plugins", "trust", "subagent"]).unwrap();
+    assert!(ok, "{text}");
     fs::write(&sub_rn, format!("{original}\n// my own change\n")).unwrap();
     let lines = sync(&env, SyncOpts { version: "0.2.0-gt", if_needed: true, ask_replace: None }).unwrap();
     let text = lines.join("\n");
@@ -201,9 +236,21 @@ fn lifecycle_install_trust_update_foreign_and_remove() {
     assert!(text.contains("earlier vouches of unchanged verbs and the token grants still stand"), "{text}");
     assert!(!text.contains("subagent: trusted"), "{text}");
     assert!(fs::read_to_string(&sub_rn).unwrap().contains("my own change"), "left as it is");
+    assert_subagent_spawn_asks(r, &env);
     fs::write(&sub_rn, original).unwrap();
     let lines = sync(&env, SyncOpts { version: "0.2.0-gt", if_needed: true, ask_replace: None }).unwrap();
     assert!(!lines.join("\n").contains("changed since"), "back to what we installed: fine again: {lines:?}");
+
+    // 3c. an install from before SA3 had subagent trusted whole, which vouched spawn and pick too. The next full pass (a new version
+    // stamps it) takes that back: spawn and pick ask again and the five verbs are vouched. A settled --if-needed pass would not.
+    let (ok, text) = env.eidolon(&["plugins", "trust", "subagent"]).unwrap();
+    assert!(ok, "{text}");
+    let listing = env.eid_ok(&["plugins"]).unwrap();
+    let spawn = listing.lines().find(|l| l.trim_start().starts_with("subagent_spawn ")).unwrap_or("");
+    assert!(spawn.contains("vouched by"), "the bare trust vouches spawn: {spawn}");
+    let lines = sync(&env, SyncOpts { version: "0.2.2-gt", if_needed: true, ask_replace: None }).unwrap();
+    assert!(lines.join("\n").contains("subagent: trusted list, trace, steer, cancel and plan"), "{lines:?}");
+    assert_subagent_spawn_asks(r, &env);
 
     // 4. uninstall removes only ours; the member's jev stays
     let lines = remove_ours(&env).unwrap();
@@ -214,6 +261,7 @@ fn lifecycle_install_trust_update_foreign_and_remove() {
     let permits = fs::read_to_string(r.join("cfg/eidolon/policy.permits.rn")).unwrap();
     let rows: Vec<&str> = permits.lines().filter(|l| l.starts_with("const VOUCHE") || l.starts_with("const GRANT")).collect();
     assert!(rows.iter().all(|l| !l.contains("term_")), "uninstall leaves no term vouch or grant: {rows:?}");
+    assert!(rows.iter().all(|l| !l.contains("subagent_")), "uninstall leaves no subagent vouch: {rows:?}");
     assert!(!lines.iter().any(|l| l.contains("still on record")), "a clean uninstall lists nothing left: {lines:?}");
     assert!(pdir.join("jev/MINE.txt").exists());
     assert!(!state_path(&env.layout).exists());
@@ -266,6 +314,7 @@ fn fake_env(t: &Path) -> (PluginEnv, PathBuf) {
 /// without an ask.
 #[test]
 fn term_is_vouched_per_verb_and_send_is_never_vouched() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t = tempfile::tempdir().unwrap();
     let (env, log) = fake_env(t.path());
     let mut out = Vec::new();
@@ -277,10 +326,11 @@ fn term_is_vouched_per_verb_and_send_is_never_vouched() {
     assert_eq!(out, ["term: trusted list, read, open and close; term_send is not vouched and asks"]);
 }
 
-/// Whatever the plugin, no call ever vouches a send verb, and no bare `plugins trust <name>` is issued for a name outside browser,
-/// jev and subagent (a bare trust vouches every verb of the plugin, so for term it would vouch term_send).
+/// Whatever the plugin, no call ever vouches a send verb, spawn or pick, and no bare `plugins trust <name>` is issued for a name outside
+/// browser and jev (a bare trust vouches every verb of the plugin: for term it would vouch term_send, for subagent spawn and pick).
 #[test]
 fn no_plugin_name_makes_a_vouch_for_term_send() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t = tempfile::tempdir().unwrap();
     let (env, log) = fake_env(t.path());
     let mut out = Vec::new();
@@ -292,13 +342,14 @@ fn no_plugin_name_makes_a_vouch_for_term_send() {
     for l in &all {
         let Some(rest) = l.strip_prefix("plugins trust ") else { continue };
         match rest.split_once(' ') {
-            // a bare trust vouches the whole plugin: only the three that were always vouched whole
-            None => assert!(["browser", "jev", "subagent"].contains(&rest), "a bare trust of {rest} vouches every verb: {l}"),
-            // a verb trust: only term's vouched verbs, never a send
-            Some((name, verb)) => {
-                assert_eq!(name, "term", "{l}");
-                assert!(TERM_VOUCHED.contains(&verb), "a vouch of a verb that is not vouched: {l}");
+            // a bare trust vouches the whole plugin: only the two that were always vouched whole
+            None => assert!(["browser", "jev"].contains(&rest), "a bare trust of {rest} vouches every verb: {l}"),
+            // a verb trust: only term's vouched verbs, never a send; subagent's five, never a spawn or a pick
+            Some(("term", verb)) => assert!(TERM_VOUCHED.contains(&verb), "a vouch of a verb that is not vouched: {l}"),
+            Some(("subagent", verb)) => {
+                assert!(["list", "trace", "steer", "cancel", "plan"].contains(&verb), "a vouch of a verb that is not vouched: {l}")
             }
+            Some((name, _)) => panic!("a verb trust of {name}, which has no rule: {l}"),
         }
     }
     assert!(!all.iter().any(|l| l.contains("other")), "a plugin with no rule got a call: {all:?}");
@@ -306,11 +357,40 @@ fn no_plugin_name_makes_a_vouch_for_term_send() {
     let trusts: Vec<&String> = all.iter().filter(|l| l.starts_with("plugins trust term")).collect();
     assert_eq!(trusts.len(), 4, "{trusts:?}");
     assert_eq!(all.iter().filter(|l| l.starts_with("plugins grant term_")).count(), 5);
+    assert_eq!(all.iter().filter(|l| l.starts_with("plugins trust subagent ")).count(), 5);
+}
+
+/// SA3: subagent is untrusted whole, then vouched verb by verb in the order the arm lists them, and no call names spawn or pick. The
+/// verbs are written out here, not read from plugins.rs, so a spawn or a pick added to SUBAGENT_VOUCHED fails this test.
+#[test]
+fn subagent_is_vouched_per_verb_and_spawn_is_never_vouched() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let t = tempfile::tempdir().unwrap();
+    let (env, log) = fake_env(t.path());
+    let mut out = Vec::new();
+    env.trust_one("subagent", &mut out).unwrap();
+    let mut want = vec!["plugins untrust subagent".to_string()];
+    want.extend(["list", "trace", "steer", "cancel", "plan"].iter().map(|v| format!("plugins trust subagent {v}")));
+    assert_eq!(asked(&log), want);
+    assert_eq!(out, ["subagent: trusted list, trace, steer, cancel and plan; subagent_spawn is not vouched and asks"]);
+}
+
+/// The source itself: the string `spawn` in plugins.rs may appear only on a line that takes a vouch back (an untrust, in the changed-copy
+/// pass), never in a vouch list or a trust call. The runtime tests above catch a bare `plugins trust subagent` (which vouches spawn
+/// too) and a spawn in the vouch list; this one catches the literal.
+#[test]
+fn plugins_rs_never_names_subagent_spawn_as_a_vouch() {
+    let src = include_str!("../plugins.rs").replace("\r\n", "\n");
+    assert!(!src.contains("plugins trust subagent spawn"), "plugins.rs vouches subagent_spawn");
+    for l in src.lines().filter(|l| l.contains("\"spawn\"")) {
+        assert!(l.contains("untrust"), "plugins.rs names spawn outside an untrust, where a vouch of subagent_spawn could be built: {l}");
+    }
 }
 
 /// mail: take back any vouch, then a grant of the token file and no trust at all, so mail_send asks in manual and in auto.
 #[test]
 fn mail_is_granted_its_token_and_never_vouched() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t = tempfile::tempdir().unwrap();
     let (env, log) = fake_env(t.path());
     let mut out = Vec::new();
@@ -323,6 +403,7 @@ fn mail_is_granted_its_token_and_never_vouched() {
 /// and this test is what makes that a decision someone writes down: it fails until the arm exists.
 #[test]
 fn every_bundled_plugin_has_an_explicit_arm() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t = tempfile::tempdir().unwrap();
     let (env, _) = fake_env(t.path());
     let mut names: Vec<String> = minerva_plugin_names();
@@ -338,6 +419,7 @@ fn every_bundled_plugin_has_an_explicit_arm() {
 /// A name with no arm vouches and grants nothing: no call at all, and one line that says so.
 #[test]
 fn an_unknown_plugin_is_installed_and_vouches_nothing() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t = tempfile::tempdir().unwrap();
     let (env, log) = fake_env(t.path());
     let mut out = Vec::new();
@@ -363,6 +445,7 @@ fn fake_eidolon_untrust(dir: &Path, answer: &str) -> (PathBuf, PathBuf) {
 /// eidolon's "no vouch on record" is what `untrust` says on a first install: nothing to take back, not a failure, so the pass goes on.
 #[test]
 fn an_untrust_with_nothing_to_take_back_is_not_a_failure() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t = tempfile::tempdir().unwrap();
     let (bin, log) = fake_eidolon_untrust(t.path(), "no vouch on record for term");
     let env = PluginEnv { eidolon: bin, bin_dir: t.path().join("bin"), src: t.path().join("src"), layout: Layout::new(t.path().join("prefix")) };
@@ -375,6 +458,7 @@ fn an_untrust_with_nothing_to_take_back_is_not_a_failure() {
 /// Any other failure of `untrust` stops the pass before a single vouch: tools keep asking, and the error says which call failed.
 #[test]
 fn a_failed_untrust_stops_the_term_pass_before_any_vouch() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t = tempfile::tempdir().unwrap();
     let (bin, log) = fake_eidolon_untrust(t.path(), "could not write the permits store");
     let env = PluginEnv { eidolon: bin, bin_dir: t.path().join("bin"), src: t.path().join("src"), layout: Layout::new(t.path().join("prefix")) };
@@ -385,9 +469,68 @@ fn a_failed_untrust_stops_the_term_pass_before_any_vouch() {
     assert!(out.is_empty());
 }
 
-/// The other plugins are exactly as before: browser's six grants and service approval, jev and subagent a plain trust.
+/// The changed-copy pass takes one verb's vouch back with `untrust <name> <verb>`: the same rule as the whole-plugin untrust, and nothing
+/// is re-trusted.
+#[test]
+fn a_verb_untrust_with_nothing_to_take_back_is_not_a_failure() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let t = tempfile::tempdir().unwrap();
+    let (bin, log) = fake_eidolon_untrust(t.path(), "no vouch on record for subagent spawn");
+    let env = PluginEnv { eidolon: bin, bin_dir: t.path().join("bin"), src: t.path().join("src"), layout: Layout::new(t.path().join("prefix")) };
+    env.untrust_verb("subagent", "spawn").unwrap();
+    assert_eq!(asked(&log), ["plugins untrust subagent spawn"]);
+
+    let t2 = tempfile::tempdir().unwrap();
+    let (bin2, log2) = fake_eidolon_untrust(t2.path(), "could not write the permits store");
+    let env2 = PluginEnv { eidolon: bin2, bin_dir: t2.path().join("bin"), src: t2.path().join("src"), layout: Layout::new(t2.path().join("prefix")) };
+    let e = env2.untrust_verb("subagent", "pick").unwrap_err().to_string();
+    assert!(e.contains("plugins untrust subagent pick failed"), "{e}");
+    assert_eq!(asked(&log2), ["plugins untrust subagent pick"]);
+}
+
+/// The edited-copy arm of `sync`, through the fake: a subagent on record as ours whose installed folder was then edited takes spawn's and
+/// pick's vouches back, one call each, and trusts nothing (no `plugins trust` at all). Without those two untrusts, an install from before
+/// SA3 would keep its bare vouch, which covers spawn and pick, on the edited copy. Nothing here reaches the real eidolon.
+#[test]
+fn an_edited_subagent_copy_takes_spawn_and_pick_back_and_trusts_nothing() {
+    let _xdg = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let t = tempfile::tempdir().unwrap();
+    let r = t.path();
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", r.join("cfg"));
+        std::env::set_var("XDG_DATA_HOME", r.join("data"));
+        std::env::set_var("XDG_STATE_HOME", r.join("state"));
+        std::env::set_var("XDG_CACHE_HOME", r.join("cache"));
+    }
+    let src = r.join("bundle-plugins");
+    fs::create_dir_all(src.join("subagent")).unwrap();
+    fs::write(src.join("subagent/plugin.rn"), "pub fn manifest() {\n    #{\n        name: \"subagent\",\n        version: \"0.2.0\",\n    }\n}\n").unwrap();
+    let (bin, log) = fake_eidolon(r);
+    let env = PluginEnv { eidolon: bin, bin_dir: r.join("bin"), src: src.clone(), layout: Layout::new(r.join("prefix")) };
+    let pdir = plugins_dir().unwrap();
+
+    // the copy we installed, on record as ours with its installed hash; then the member edits it
+    copy_tree(&src.join("subagent"), &pdir.join("subagent")).unwrap();
+    let mut st = State::default();
+    let installed = hash_tree(&pdir.join("subagent")).unwrap();
+    st.plugins.insert("subagent".into(), Ours { version: "0.2.0".into(), hash: hash_tree(&src.join("subagent")).unwrap(), how: "stock".into(), installed });
+    save_state(&env.layout, &st).unwrap();
+    let sub_rn = pdir.join("subagent/plugin.rn");
+    fs::write(&sub_rn, format!("{}\n// my own change\n", fs::read_to_string(&sub_rn).unwrap())).unwrap();
+
+    let lines = sync(&env, SyncOpts { version: "0.2.1-et", if_needed: false, ask_replace: None }).unwrap();
+    let text = lines.join("\n");
+    assert!(text.contains("subagent: your copy was changed since Minerva installed it"), "{text}");
+    assert!(!text.contains("subagent: trusted"), "{text}");
+    assert_eq!(asked(&log), ["plugins untrust subagent spawn", "plugins untrust subagent pick"]);
+    assert!(fs::read_to_string(&sub_rn).unwrap().contains("my own change"), "left as it is");
+}
+
+/// The other plugins are exactly as before: browser's six grants and service approval, jev a plain trust (subagent is verb by verb,
+/// see subagent_is_vouched_per_verb_and_spawn_is_never_vouched).
 #[test]
 fn the_other_plugins_are_trusted_as_before() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t = tempfile::tempdir().unwrap();
     let (env, log) = fake_env(t.path());
     let mut out = Vec::new();
@@ -407,6 +550,7 @@ fn the_other_plugins_are_trusted_as_before() {
 /// A failed stock call is an error, not a silent half-trust: the first call (the untrust) fails, so no vouch and no grant is made.
 #[test]
 fn a_failing_eidolon_stops_the_term_trust() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use std::os::unix::fs::PermissionsExt;
     let t = tempfile::tempdir().unwrap();
     let (mut env, _) = fake_env(t.path());
@@ -441,6 +585,7 @@ fn rows_left_names_only_what_is_still_on_record_for_the_plugin() {
 /// so and lists the rows still on record, rather than reporting a clean removal.
 #[test]
 fn remove_ours_says_what_it_could_not_take_back() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t = tempfile::tempdir().unwrap();
     let (bin, log) = fake_eidolon_untrust(t.path(), "no installed plugin term under the plugins dir");
     let env = PluginEnv { eidolon: bin, bin_dir: t.path().join("bin"), src: t.path().join("src"), layout: Layout::new(t.path().join("prefix")) };
@@ -459,6 +604,7 @@ fn remove_ours_says_what_it_could_not_take_back() {
 /// Uninstall takes back what install put: the vouches (`untrust`, the whole plugin) and every grant, for term and mail.
 #[test]
 fn remove_ours_revokes_the_term_and_mail_grants() {
+    let _x = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t = tempfile::tempdir().unwrap();
     let (env, log) = fake_env(t.path());
     let mut st = State::default();

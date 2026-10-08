@@ -36,6 +36,12 @@ const TERM_TOKEN: &str = "file:~/.config/eidolon/minerva-term.token";
 /// D6: the verbs the installer vouches, so that they run unasked in auto. term_send is NEVER among them: typing into a terminal is
 /// bash by another door, and a vouch would let it run in auto without an ask. Nothing below may name it in a `trust` call.
 const TERM_VOUCHED: [&str; 4] = ["list", "read", "open", "close"];
+/// SA3: the subagent verbs the installer vouches, in the order it vouches them. subagent_spawn is never among them: a spawn starts a
+/// child eidolon session (a model call, and yolo when its input says so), so it asks in auto, and the ask shows that input.
+/// subagent_pick is never among them either: it saves the model a later spawn runs on, and that spawn's ask does not show the model.
+/// The rest read a child, steer one (a yolo child then acts on it with no ask: installer/README.md), cancel one, or plan (plan spawns
+/// nothing). Its tools: eidolon-plugins/subagent/plugin.rn.
+const SUBAGENT_VOUCHED: [&str; 5] = ["list", "trace", "steer", "cancel", "plan"];
 /// plugins/mail's one verb and its token file. It is granted and not vouched: it asks in manual and in auto.
 const MAIL_TOKEN: &str = "file:~/.config/eidolon/minerva-mail.token";
 
@@ -219,6 +225,16 @@ impl PluginEnv {
         bail!("eidolon plugins untrust {name} failed: {}", text.trim())
     }
 
+    /// `plugins untrust <name> <verb>`: takes back one vouch and re-trusts nothing. "no vouch on record" is nothing to take back, as in
+    /// untrust_all; any other failure stops the sync.
+    fn untrust_verb(&self, name: &str, verb: &str) -> Result<()> {
+        let (ok, text) = self.eidolon(&["plugins", "untrust", name, verb])?;
+        if ok || text.contains("no vouch on record") {
+            return Ok(());
+        }
+        bail!("eidolon plugins untrust {name} {verb} failed: {}", text.trim())
+    }
+
     /// Trust one bundled plugin by the rule for its name. A name with no arm vouches and grants nothing: it is installed, and
     /// what it does asks as it always did. A failure part-way stops the sync with an error: the vouches already made stand and
     /// the rest ask, which is the safe side. The next pass runs the whole arm again, because the plugin is on record (see the
@@ -253,7 +269,16 @@ impl PluginEnv {
                 self.eid_ok(&["plugins", "service", "approve", "browser"])?;
                 out.push("browser: trusted".into());
             }
-            "jev" | "subagent" => {
+            // subagent: trusted verb by verb, as term is, so subagent_spawn never gets a vouch (SUBAGENT_VOUCHED says why). The
+            // untrust first also takes back the bare vouch an earlier install gave it, which vouched spawn and pick too.
+            "subagent" => {
+                self.untrust_all("subagent")?;
+                for v in SUBAGENT_VOUCHED {
+                    self.eid_ok(&["plugins", "trust", "subagent", v])?;
+                }
+                out.push("subagent: trusted list, trace, steer, cancel and plan; subagent_spawn is not vouched and asks".into());
+            }
+            "jev" => {
                 self.eid_ok(&["plugins", "trust", name])?;
                 out.push(format!("{name}: trusted"));
             }
@@ -319,6 +344,12 @@ pub fn sync(env: &PluginEnv, mut o: SyncOpts) -> Result<Vec<String>> {
             (true, Some(ours)) if hash_tree(&dest).map(|h| h != ours.installed).unwrap_or(true) => {
                 // The installed copy is not what we installed: the member edited it (or it was swapped). We neither trust nor
                 // replace it; a vouch is only ever put on bytes we put there ourselves.
+                if n == "subagent" {
+                    // A bare vouch from an install before SA3 covers spawn and pick too, and an edit to plugin.rn does not void it:
+                    // eidolon keys a vouch by its tools/<stem>.rn. Take those two back; the other verbs keep theirs (the line below).
+                    env.untrust_verb("subagent", "spawn")?;
+                    env.untrust_verb("subagent", "pick")?;
+                }
                 out.push(format!(
                     "{n}: your copy was changed since Minerva installed it; left as it is, not re-trusted; earlier vouches of unchanged verbs and the token grants still stand (to get Minerva's again: delete that folder, then minerva plugins sync)"
                 ));

@@ -61,8 +61,9 @@ jev,subagent,term}`, `jev/` (the optional Python service's files), `webui/term/`
 ## Plugins
 
 `browser`, `subagent` and `jev` (from `eidolon-plugins/`) and `term` (Minerva's own, from `plugins/`) are preinstalled and
-pre-trusted, so `eidolon tools` shows them (browser 7, subagent 7, jev 15, term 5 tools) on a fresh install with no network and no
-paid turn. `build.sh` and `nix/plugins.nix` copy every folder of `plugins/` that has a `plugin.rn` (without its `tests/`), so `mail`
+trusted as the rows below say: browser and jev whole, term and subagent verb by verb, so term_send and subagent_spawn still ask.
+`eidolon tools` shows them (browser 7, subagent 7, jev 15, term 5 tools) on a fresh install with no network and no paid turn.
+`build.sh` and `nix/plugins.nix` copy every folder of `plugins/` that has a `plugin.rn` (without its `tests/`), so `mail`
 joins the same way when it lands. `build.sh` copies only what git tracks (a `.env`, a key or a cache in the working tree stays out),
 and it refuses a symlink in a plugin and a folder named like one the bundle already has (`eidolon-plugins/browser` and so on).
 
@@ -70,8 +71,9 @@ and it refuses a symlink in a plugin and a folder named like one the bundle alre
  where eidolon looks:  <config dir>/eidolon/plugins   (~/.config/eidolon/plugins). The only override is the config key
                        `plugins_dir`; the perch's generated config does not set it.
  how:                  stock `eidolon plugins install file://<git repo> <name>` from a temp git repo made from the bundle's
-                       plugins/ (a plain copy when git is missing), then `eidolon plugins trust <name>`; for browser also the
-                       six grants on file:~/.config/eidolon/browser.token and `plugins service approve browser`.
+                       plugins/ (a plain copy when git is missing), then trusted: `eidolon plugins trust <name>` for browser and
+                       jev, verb by verb for term and subagent (below); for browser also the six grants on
+                       file:~/.config/eidolon/browser.token and `plugins service approve browser`.
  term and mail:        trusted verb by verb, never as a whole plugin (D6). term: `plugins untrust term` first (every vouch term has),
                        then `plugins trust term list|read|open|close`, and NEVER send, so term_send asks in auto and in manual and runs
                        only in yolo; plus a grant of each of the five verbs on file:~/.config/eidolon/minerva-term.token, so a call
@@ -81,6 +83,17 @@ and it refuses a symlink in a plugin and a folder named like one the bundle alre
                        (a first install): that is nothing to take back, not a failure. Any other failure stops the pass: the vouches
                        already made stand and the rest ask, which is the safe side. A plugin is on record before its trust is
                        applied, so the next pass finds it as ours and does the whole arm again.
+ subagent:             `plugins untrust subagent` first, then `plugins trust subagent list|trace|steer|cancel|plan`. No grant
+                       (it has no token). subagent_spawn and subagent_pick are NOT vouched, so they ask in auto and in manual.
+                       The spawn ask shows the spawn's input (yolo:true included), and yolo answers every ask yes. The door
+                       (`workflows/door.rn`) reaches its verbs through the same gate, so its spawn asks too. pick asks because it
+                       saves the model a kind's later spawns run on, and that spawn's ask shows no model. steer is vouched, so a
+                       steer reaches a child with no ask: the child reads its text as a change of plan. A yolo child answers every
+                       ask yes, so it acts on the steer unasked; a child that is not yolo still asks for its own bash and write.
+                       An install from before this rule had subagent trusted whole, which vouched spawn and pick too: the update
+                       that brings this version runs the full pass (the stamp changes) and takes both back. A copy the member
+                       edited is not re-trusted, but that pass still takes back spawn's and pick's vouch, and its other verbs keep
+                       theirs. A settled `--if-needed` pass returns before any trust call, so it does not.
  any other name:       `trust_one` has a rule for each name it knows (browser, jev, subagent, term, mail). A plugin folder with no
                        rule is installed, vouches and grants nothing, and the line says so: "<name>: installed, not vouched".
  who owns what:        ~/.local/state/minerva/plugins.json records each plugin WE installed with its hash.
@@ -454,10 +467,11 @@ refused, rollback and forward, Nix refused, notice once a day / silent on failur
 install/rerun/upgrade/prune/uninstall layout, WSL list parsing, PATH list edits, key rotation (good, unknown signer, revoked
 signer, revoked compiled-in key, manual add/remove, expiry, replay, open keys dir), and the plugin lifecycle (install, trust, foreign
 plugin kept, update keeps trust, uninstall removes only ours, a sixth plugin no rule names is installed and vouched for nothing, and on
-the real permits store: term's list, read, open and close vouched, term_send not, all five granted) when `MINERVA_TEST_EIDOLON` names
-an eidolon binary (otherwise that one test says it was skipped). The trust argv is also checked through a fake eidolon that only
-writes down what it is asked (term and mail: the untrust first, then the vouches and grants; the others as before; an untrust that
-says "no vouch on record" is not a failure, any other one stops the pass; every bundled folder has an explicit arm; uninstall's revokes
+the real permits store: term's list, read, open and close vouched, term_send not, all five granted; subagent's five vouched, spawn and
+pick not, and a bare trust from an older install taken back, also under an edited copy) when `MINERVA_TEST_EIDOLON` names an eidolon
+binary (otherwise that one test says it was skipped). The trust argv is also checked through a fake eidolon that only writes down what
+it is asked (term and subagent: the untrust first, then the vouches, spawn and pick never; mail: the untrust, then a grant; jev and browser as before; an untrust that says "no
+vouch on record" is not a failure, any other one stops the pass; every bundled folder has an explicit arm; uninstall's revokes
 and the rows it could not take back), with no eidolon needed. The Windows pieces (registry,
 shortcut, WSL calls) are exercised by running the exe with the test options above, never against the real settings.
 
