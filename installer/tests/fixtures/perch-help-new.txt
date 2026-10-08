@@ -17,7 +17,8 @@ Options:
       --aoide <PATH>                The `aoide` binary, as an absolute path. Default: `~/.local/bin/aoide` when it is executable. Never found on `PATH`, which finds a stale one first
       --aoide-home <DIR>            Aoide's home (`~/.aoide`), which the mesh view reads and never writes
       --aoide-daemon-socket <PATH>  Aoide's daemon socket, which is only ever asked to `ping`
-      --aoide-events <FILE>         Aoide's audit log, which the mesh view tails
+      --aoide-audit-log <PATH>      Aoide's audit log, which the mesh view tails and the runner gives aoide as `AOIDE_AUDIT_LOG`. Default: `<aoide-home>/log`. Absolute only
+      --aoide-daemon-events <PATH>  aoided's events feed, which the mesh view tails and nothing writes. Default: `$AOIDE_DAEMON_EVENTS` when absolute, else `$XDG_RUNTIME_DIR/aoide/events.jsonl`. Absolute only
       --minerva <PATH>              The `minerva` binary the install routes ask, as an absolute path. Default: the one beside this perch, when there is one
       --term-token-file <FILE>      Write the terminal tools' scoped token here (`0600`, rotated every start, removed on exit). Off unless given
       --mail-token-file <FILE>      Write the mail tool's scoped token here (`0600`, rotated every start, removed on exit). Off unless given

@@ -576,7 +576,7 @@ fn the_feed_keeps_two_classes_and_survives_a_truncate_in_place() {
     let lines = [
         r#"{"v":0,"ts":1,"class":"audit","kind":"hand-edit","source":"aoided","payload":{"file":"sessions.json"}}"#,
         r#"{"v":0,"ts":2,"class":"secret","kind":"released","payload":{"secret":"SECRET-NAME-SENTINEL","consumer":"CONSUMER-SENTINEL"}}"#,
-        r#"{"v":0,"ts":3,"class":"gate","kind":"pending","payload":{"node":"osaka","note":"<script>alert(1)</script>\u001b[31m"}}"#,
+        r#"{"v":0,"ts":3,"class":"gate","kind":"pending","source":"a2a-door","note":"NOTE-SENTINEL <script>alert(1)</script>","payload":{"id":"abc12345","node":"osaka","note":"NOTE-SENTINEL <script>alert(1)</script>\u001b[31m"}}"#,
         r#"{"v":0,"ts":4,"class":"notification","kind":"forwarded","payload":{"body":"NOTIFICATION-SENTINEL"}}"#,
         r#"{"v":0,"ts":5,"class":"rice","kind":"repaint"}"#,
         r#"{"v":0,"ts":6,"class":"content","kind":"page"}"#,
@@ -584,7 +584,7 @@ fn the_feed_keeps_two_classes_and_survives_a_truncate_in_place() {
         r#"{"v":0,"ts":7,"class":"audit","kind":"last"}"#,
     ];
     let mut text: String = lines.iter().map(|line| format!("{line}\n")).collect();
-    text.push_str("{\"class\":\"gate\",\"kind\":\"half");
+    text.push_str("{\"v\":0,\"ts\":8,\"class\":\"gate\",\"kind\":\"half");
     std::fs::write(&rig.daemon, text).unwrap();
     let whole = lines.iter().map(|line| line.len() as u64 + 1).sum::<u64>();
 
@@ -593,10 +593,12 @@ fn the_feed_keeps_two_classes_and_survives_a_truncate_in_place() {
     assert_eq!(first["next"]["daemon"], whole, "the cursor stops before the half line");
     assert_eq!(first["reset"]["daemon"], false);
     let answer = rig.perch.get("/hub/mesh/events?daemon=0");
-    for sentinel in ["SECRET-NAME-SENTINEL", "CONSUMER-SENTINEL", "NOTIFICATION-SENTINEL"] {
+    for sentinel in ["SECRET-NAME-SENTINEL", "CONSUMER-SENTINEL", "NOTIFICATION-SENTINEL", "NOTE-SENTINEL", "osaka"] {
         assert!(!answer.body.contains(sentinel), "{sentinel} is in the feed's answer: {}", answer.body);
     }
-    assert_eq!(first["events"][1]["event"]["payload"]["note"], "<script>alert(1)</script>\u{1b}[31m", "remote text is a string, whole");
+    // The gate's named fields are kept, and its free-text fields (`note`, and `node`, which the docs do not name for a gate) are not.
+    assert_eq!(first["events"][1]["event"]["source"], "a2a-door", "a top-level field the docs name");
+    assert_eq!(first["events"][1]["event"]["payload"], json!({"id": "abc12345"}), "only the payload fields the docs name");
 
     // The line is finished, and the next poll has exactly it.
     let mut file = std::fs::OpenOptions::new().append(true).open(&rig.daemon).unwrap();
@@ -610,7 +612,7 @@ fn the_feed_keeps_two_classes_and_survives_a_truncate_in_place() {
     assert_eq!((quiet["next"]["daemon"].clone(), quiet["reset"]["daemon"].clone()), (json!(end), json!(false)));
 
     // Truncated in place, then written to again: the file is shorter than the cursor, so the feed starts over.
-    std::fs::OpenOptions::new().write(true).truncate(true).open(&rig.daemon).unwrap().write_all(b"{\"class\":\"audit\",\"kind\":\"after-truncate\"}\n").unwrap();
+    std::fs::OpenOptions::new().write(true).truncate(true).open(&rig.daemon).unwrap().write_all(b"{\"v\":0,\"ts\":9,\"class\":\"audit\",\"kind\":\"after-truncate\"}\n").unwrap();
     let again = rig.tail(&format!("?daemon={end}"));
     assert_eq!(again["reset"]["daemon"], true);
     assert_eq!(streams_and_kinds(&again), pairs(&[("daemon", "after-truncate")]));
@@ -642,14 +644,15 @@ fn the_audit_allowlist_drops_what_it_cannot_pin_and_forwards_no_text() {
     let ts: Vec<u64> = answer["events"].as_array().unwrap().iter().map(|entry| entry["event"]["ts"].as_u64().unwrap()).collect();
     assert_eq!(ts, [1, 6, 7]);
     let shown = answer.to_string();
-    for sentinel in ["LETTER-SENTINEL", "FORWARD-SENTINEL", "ARG-SENTINEL", "secret-class", "no-ts-here", "node add", "elsewhere", "parked", "STARTED-SENTINEL"] {
+    for sentinel in ["LETTER-SENTINEL", "FORWARD-SENTINEL", "ARG-SENTINEL", "secret-class", "no-ts-here", "node add", "elsewhere", "parked"] {
         assert!(!shown.contains(sentinel), "{sentinel} reached the answer: {shown}");
     }
     assert_eq!(answer["events"][1]["event"], json!({"ts": 6, "class": "gate", "status": "proposed"}));
     assert_eq!(
         answer["events"][2]["event"],
-        json!({"ts": 7, "class": "audit", "door": "daemon", "command": "daemon", "status": "started"}),
-        "the start record keeps its five fields"
+        json!({"ts": 7, "class": "audit", "door": "daemon", "command": "daemon", "status": "started",
+            "message": "STARTED-SENTINEL listening on http://127.0.0.1:8710/"}),
+        "the start record keeps its fields, and its message since its command is not mail's"
     );
 }
 
@@ -733,40 +736,125 @@ fn the_events_route_takes_each_cursor_once_and_nothing_else() {
     }
 }
 
-/// A link at either path is not followed, and a FIFO is not opened for a read that waits. Each is a 502 that names its stream, and the text
-/// planted behind the link is not in any answer.
+/// A link at either path is not followed, and a FIFO is not opened for a read that waits. That stream gets its sentence in `error`, stays empty
+/// with its cursor where it was asked, and the other stream still answers, as a 200. The text behind a link is in no answer.
 #[test]
-fn a_link_or_a_fifo_at_either_path_is_not_read() {
+fn a_link_or_a_fifo_at_either_path_is_not_read_and_the_other_stream_still_answers() {
+    // A link where the audit log is: the feed's record still comes back.
     let rig = Setup::all().start();
     let planted = rig.home.join("planted.jsonl");
     std::fs::write(&planted, "{\"ts\":1,\"class\":\"audit\",\"command\":\"PLANTED-SENTINEL\"}\n").unwrap();
     std::os::unix::fs::symlink(&planted, &rig.audit).unwrap();
-    let answer = rig.perch.get("/hub/mesh/events");
-    assert_eq!(answer.status, 502, "{}", answer.head);
-    assert!(answer.body.contains("the audit log"), "{}", answer.body);
-    assert!(!answer.body.contains("PLANTED-SENTINEL"), "{}", answer.body);
+    append(&rig.daemon, r#"{"v":0,"ts":2,"class":"gate","kind":"feed-still-answers"}"#);
+    let answer = rig.tail("?audit=50");
+    assert_eq!(streams_and_kinds(&answer), pairs(&[("daemon", "feed-still-answers")]));
+    assert!(answer["error"]["audit"].as_str().unwrap().contains("the audit log"), "{answer}");
+    assert_eq!(answer["error"]["daemon"], Value::Null);
+    assert_eq!((answer["next"]["audit"].clone(), answer["reset"]["audit"].clone()), (json!(50), json!(false)), "the cursor it was asked from");
+    assert!(!answer.to_string().contains("PLANTED-SENTINEL"), "{answer}");
 
+    // A FIFO where the feed is: the audit log still answers.
     let rig = Setup::all().start();
     make_fifo(&rig.daemon);
-    let answer = rig.perch.get("/hub/mesh/events");
-    assert_eq!(answer.status, 502, "{}", answer.head);
-    assert!(answer.body.contains("the daemon feed"), "{}", answer.body);
+    append(&rig.audit, r#"{"ts":1,"class":"audit","command":"audit-still-answers"}"#);
+    let answer = rig.tail("");
+    assert_eq!(streams_and_kinds(&answer), pairs(&[("audit", "audit-still-answers")]));
+    assert!(answer["error"]["daemon"].as_str().unwrap().contains("the daemon feed"), "{answer}");
+    assert_eq!(answer["error"]["audit"], Value::Null);
 
     // The other two pairings: a FIFO where the audit log is, and a link where the feed is.
     let rig = Setup::all().start();
     make_fifo(&rig.audit);
-    let answer = rig.perch.get("/hub/mesh/events");
-    assert_eq!(answer.status, 502, "{}", answer.head);
-    assert!(answer.body.contains("the audit log"), "{}", answer.body);
+    let answer = rig.tail("");
+    assert!(answer["error"]["audit"].as_str().unwrap().contains("the audit log"), "{answer}");
+    assert_eq!(answer["next"]["audit"], 0);
 
     let rig = Setup::all().start();
     let planted = rig.home.join("planted-feed.jsonl");
     std::fs::write(&planted, "{\"v\":0,\"ts\":1,\"class\":\"gate\",\"kind\":\"PLANTED-FEED-SENTINEL\"}\n").unwrap();
     std::os::unix::fs::symlink(&planted, &rig.daemon).unwrap();
-    let answer = rig.perch.get("/hub/mesh/events");
-    assert_eq!(answer.status, 502, "{}", answer.head);
-    assert!(answer.body.contains("the daemon feed"), "{}", answer.body);
-    assert!(!answer.body.contains("PLANTED-FEED-SENTINEL"), "{}", answer.body);
+    let answer = rig.tail("");
+    assert!(answer["error"]["daemon"].as_str().unwrap().contains("the daemon feed"), "{answer}");
+    assert!(!answer.to_string().contains("PLANTED-FEED-SENTINEL"), "{answer}");
+}
+
+/// A letter's text does not reach the page: a `mail.read` line carries the body in its `message`, and no byte of the answer has it. A line
+/// with the same body under a command that is not mail's keeps its message, which is the rule, not an exception.
+#[test]
+fn a_mail_letter_is_in_no_answer_byte() {
+    let rig = Setup::all().start();
+    append(&rig.audit, r#"{"ts":10,"door":"cli","class":"audit","command":"mail.read","status":"ok","message":"LETTER-BODY-SENTINEL dear minerva, the body"}"#);
+    append(&rig.audit, r#"{"ts":11,"door":"cli","class":"audit","command":"mail.outbox","status":"ok","message":"LETTER-BODY-SENTINEL in the outbox"}"#);
+    append(&rig.audit, r#"{"ts":12,"door":"cli","class":"audit","command":"mail.send","status":"ok","message":"filed to self/minerva (msgid abc)"}"#);
+    let answer = rig.tail("?audit=0");
+    assert_eq!(streams_and_kinds(&answer), pairs(&[("audit", "mail.read"), ("audit", "mail.outbox"), ("audit", "mail.send")]));
+    assert_eq!(answer["events"][0]["event"], json!({"ts": 10, "class": "audit", "door": "cli", "command": "mail.read", "status": "ok"}));
+    let raw = rig.perch.get("/hub/mesh/events?audit=0");
+    assert!(!raw.body.contains("LETTER-BODY-SENTINEL"), "{}", raw.body);
+    assert!(!raw.body.contains("filed to self"), "{}", raw.body);
+}
+
+/// The start refuses two paths that are one file, and says why. The audit flag and the feed flag at one path; the feed flag at the audit log's
+/// default (`<home>/log`); and `$AOIDE_DAEMON_EVENTS` at the audit flag, with no feed flag. Nothing is made, and the sentence names the path.
+#[test]
+fn a_start_with_both_feeds_at_one_file_is_refused_with_a_sentence() {
+    let dir = tempfile::tempdir().unwrap();
+    let same = dir.path().join("one.log");
+    let home = dir.path().join("aoide");
+    std::fs::create_dir_all(home.join("state")).unwrap();
+    let start = |args: &[&str], env: &[(&str, &str)]| {
+        let (runtime, xdg, user) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        own(runtime.path(), 0o700);
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_perch"));
+        command
+            .arg("--bind")
+            .arg("127.0.0.1:0")
+            .args(args)
+            .env("HOME", user.path())
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("XDG_CONFIG_HOME", xdg.path())
+            .env_remove("AOIDE_DAEMON_EVENTS")
+            .stdin(std::process::Stdio::null());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let out = command.output().expect("running the perch binary");
+        assert!(!out.status.success(), "{args:?} {env:?} must not start");
+        assert!(!same.exists() || std::fs::metadata(&same).unwrap().len() == 0, "nothing is written to the feed");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let same_flags = start(&["--aoide-audit-log", same.to_str().unwrap(), "--aoide-daemon-events", same.to_str().unwrap()], &[]);
+    assert!(same_flags.contains("same file") && same_flags.contains("--aoide-audit-log"), "{same_flags}");
+    let at_default = start(&["--aoide-home", home.to_str().unwrap(), "--aoide-daemon-events", home.join("log").to_str().unwrap()], &[]);
+    assert!(at_default.contains("same file"), "{at_default}");
+    let by_env = start(&["--aoide-audit-log", same.to_str().unwrap()], &[("AOIDE_DAEMON_EVENTS", same.to_str().unwrap())]);
+    assert!(by_env.contains("same file") && by_env.contains("AOIDE_DAEMON_EVENTS"), "{by_env}");
+}
+
+/// A feed file replaced by another (a new inode) while its cursor is still inside the new one starts that stream again: the page is told it is
+/// a reset, and the records are read from 0. A file that only grew is read from the cursor as before.
+#[test]
+fn a_feed_replaced_by_a_new_file_starts_again_though_the_cursor_is_inside_it() {
+    let rig = Setup::all().start();
+    append(&rig.daemon, r#"{"v":0,"ts":1,"class":"gate","kind":"old-one"}"#);
+    append(&rig.daemon, r#"{"v":0,"ts":2,"class":"gate","kind":"old-two"}"#);
+    let first = rig.tail("");
+    let cursor = first["next"]["daemon"].as_u64().unwrap();
+    append(&rig.daemon, r#"{"v":0,"ts":3,"class":"gate","kind":"grown"}"#);
+    let grown = rig.tail(&format!("?daemon={cursor}"));
+    assert_eq!((grown["reset"]["daemon"].clone(), streams_and_kinds(&grown)), (json!(false), pairs(&[("daemon", "grown")])));
+    // Replaced: the new file is longer than the old cursor, so the cursor is inside it, and the poll still says reset.
+    let fresh = rig.daemon.with_extension("new");
+    std::fs::write(
+        &fresh,
+        "{\"v\":0,\"ts\":4,\"class\":\"gate\",\"kind\":\"new-one\"}\n{\"v\":0,\"ts\":5,\"class\":\"gate\",\"kind\":\"new-two\"}\n{\"v\":0,\"ts\":6,\"class\":\"gate\",\"kind\":\"new-three\"}\n",
+    )
+    .unwrap();
+    std::fs::rename(&fresh, &rig.daemon).unwrap();
+    assert!(len(&rig.daemon) > cursor, "the cursor is inside the new file");
+    let replaced = rig.tail(&format!("?daemon={cursor}"));
+    assert_eq!(replaced["reset"]["daemon"], true);
+    assert_eq!(streams_and_kinds(&replaced), pairs(&[("daemon", "new-one"), ("daemon", "new-two"), ("daemon", "new-three")]));
 }
 
 /// A relative `--aoide-audit-log` or `--aoide-daemon-events` is refused at the start, before anything is made, and the refusal names its flag.
@@ -791,7 +879,7 @@ fn kinds_of(answer: &Value) -> Vec<String> {
 #[test]
 fn a_poll_of_the_daemon_feed_is_at_most_64_kib_and_the_polls_lose_nothing() {
     let rig = Setup::all().start();
-    let line = |n: usize| format!("{{\"v\":0,\"class\":\"gate\",\"kind\":\"k{n:05}\",\"payload\":\"{}\"}}\n", "p".repeat(200));
+    let line = |n: usize| format!("{{\"v\":0,\"ts\":{n},\"class\":\"gate\",\"kind\":\"k{n:05}\",\"payload\":\"{}\"}}\n", "p".repeat(200));
     std::fs::write(&rig.daemon, (0..1000).map(line).collect::<String>()).unwrap();
     let size = len(&rig.daemon);
     assert!(size > 3 * 64 * 1024);

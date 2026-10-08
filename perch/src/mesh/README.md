@@ -5,7 +5,7 @@ audit events. Read-only and network-free: nothing here sends, pairs, spawns or d
 is a Unix one to Aoide's own daemon.
 
 ```text
-mod.rs    State, route(ctx, req, rest), nodes(ctx), home(opts): GET /hub/mesh, GET /hub/mesh/events      (R2b)
+mod.rs    State, route(ctx, req, rest), nodes(ctx), home(opts), feeds_apart(...): GET /hub/mesh, GET /hub/mesh/events      (R2b, R2c)
 ```
 
 `serve` hands every `/hub/mesh[/...]` request to `route` with `rest` the path below it (`""` for the bare path), behind the token like
@@ -51,48 +51,79 @@ stayed `"0"` through every change and drift would otherwise be silent.
 
 ```text
 {"events": [{"stream": "audit"|"daemon", "event": object}, ...],
- "next": {"audit": N, "daemon": M}, "reset": {"audit": bool, "daemon": bool}, "files": {"audit": path|null, "daemon": path|null}}
+ "next": {"audit": N, "daemon": M}, "reset": {"audit": bool, "daemon": bool},
+ "error": {"audit": sentence|null, "daemon": sentence|null},
+ "files": {"audit": path|null, "daemon": path|null}}
 ```
 
-Two streams, one answer. Each stream has its own file, cursor and reset, and each record says which stream it came from.
+Two streams, one answer. Each stream has its own file, cursor, reset and error, and each record says which stream it came from.
 
 - **`audit`** is `--aoide-audit-log` (absolute only), else `<--aoide-home or ~/.aoide>/log`. Aoide's own rule for the file it appends to
   is `$AOIDE_AUDIT_LOG`, else `$AOIDE_ROOT/log` (absolute `$AOIDE_ROOT`), else `<home>/.aoide/log` (`docs/Aoide-Wiki/concepts/cli/
-  Doors-and-Nodes.md`, `CLI-Reference.md`). Under the perch the first step is the flag alone: the runner gives aoide the flag's path as
-  `AOIDE_AUDIT_LOG` **only when the flag was given**, sets `AOIDE_ROOT` to `--aoide-home`, and strips every ambient `AOIDE_*` from its
-  call, so a `$AOIDE_AUDIT_LOG` in the perch's own environment does not reach aoide. The two readers are one function,
-  `aoide::audit_flag`, so the runner and this view cannot disagree about the flag. The stream is an **allowlist**, fail closed: a record
-  needs an integer `ts` and a `class` of `audit` or `gate`; when present, `door` must be `cli`, `mcp`, `a2a` or `daemon`, `command` one
-  word (dotted or slashed, no space, at most 64 bytes) and `status` one of `started`, `ok`, `error`, `pending`, `delivered`, `proposed`.
-  The answer keeps `ts`, `class`, `door`, `command` and `status` and nothing else: a `message`, `untrusted_data`, `admitted`, `argv` or any
-  field a later aoide adds is never forwarded. A record that fails a rule is dropped, not repaired.
+  Doors-and-Nodes.md`, `CLI-Reference.md`; aoide's `protocol/src/audit.rs::default_audit_log`). Under the perch the first step is the flag
+  alone: the runner gives aoide the flag's path as `AOIDE_AUDIT_LOG` **only when the flag was given**, sets `AOIDE_ROOT` to `--aoide-home`,
+  and strips every ambient `AOIDE_*` from its call, so a `$AOIDE_AUDIT_LOG` in the perch's own environment does not reach aoide. Without a
+  flag, `--aoide-home` is `AOIDE_ROOT`, so aoide's default and `<home>/log` are the same file; without `--aoide-home` both are `~/.aoide/log`.
+  The two readers are one function, `aoide::audit_flag`, so the runner and this view cannot disagree about the flag. With no home at all
+  (`HOME` unset or empty, and no `--aoide-home`) and no flag, the stream has no file and says nothing is read.
+  The stream is an **allowlist**, fail closed: a record needs an integer `ts` and a `class` of `audit` or `gate`; when present, `door` must
+  be `cli`, `mcp`, `a2a` or `daemon`, `command` one word (dotted or slashed, no space, at most 64 bytes) and `status` one of `started`, `ok`,
+  `error`, `pending`, `delivered`, `proposed`. The answer keeps `ts`, `class`, `door`, `command`, `status`, and `message` **for a command
+  that is not mail's** (see below). `untrusted_data`, `admitted`, `argv` and any field a later aoide adds are never forwarded. A record that
+  fails a rule is dropped, not repaired.
+  - **The letter rule (`message`).** A mail command's `message` is never forwarded. A mail command is one whose first word, before a `.`,
+    `/` or `-`, is `mail` (`mail.read`, `mail.send`, `mail.outbox` and any other `mail.*`). The reason is an observed fact about aoide 0.0.26:
+    a `mail.read` line carries the letter's text in `message` (cut at about 526 characters), while a `mail.send` line carries no body
+    (`filed to self/minerva (msgid ...)`). The page shows a mail line's command and status only. A record with no command keeps no
+    `message`, and a `message` that is not a string is left out (the record stays). Every other command keeps its `message` (the
+    R2c-fix decision): its text is shown as it is, not stripped of any `user:pass@` in it, and it is not checked for other parties' words
+    (see the security inventory).
   - `started` is aoided's own start record (`command` `daemon`, `door` `daemon`, `class` `audit`), which the docs describe as a `daemon
-    started` record, and the `adapter.melete started` record the docs also name. Its `message` is free text (it can hold a URL), so it is
-    dropped with the rest.
+    started` record, and the `adapter.melete started` record the docs also name. Its `message` (a listen URL, as observed) is kept.
   - The shape of the real aoide 0.0.26 log, as the orchestrator observed it (structure only): `{"ts": <integer>, "door": "daemon" | "cli",
-    "class": "audit", "command": "daemon" | "a2a.serve" | ..., "status": "started" | "ok" | ..., "message": <free text>}`. The docs do not
+    "class": "audit", "command": "daemon" | "a2a.serve" | ..., "status": "started" | "ok" | ..., "message": <text>}`. The docs do not
     give `ts`'s unit; this code reads only the integer.
   - Dropped, and why: a `status` or `door` the list does not name. The docs use other audit labels too (`unmailed`, `attribution-drift`,
     `auto-deny-on-code-mismatch`), and none of them is on the list, so a record with one is hidden until a reviewer adds it. A `command`
     with a space in it (`node add osaka`), which is a line of arguments and not a command word. A `class` of `secret`, `notification`,
     `rice` or `content`. A record with no `ts`, a `ts` that is not a non-negative integer, or a line that is not a JSON object.
-- **`daemon`** is `--aoide-daemon-events` (absolute only), else `$AOIDE_DAEMON_EVENTS` when absolute, else `$XDG_RUNTIME_DIR/aoide/events.jsonl`.
-  **The XDG path is the perch's own default**, chosen so it mirrors `default_socket()`. Aoide's rule for the same file is
-  `$AOIDE_DAEMON_EVENTS`, else a sibling of the daemon socket (`docs/Aoide-Wiki/concepts/cli/Doors-and-Nodes.md`, `docs/architecture/AOIDED.md`).
-  The two agree while the socket is the default one; a `--aoide-daemon-socket` somewhere else moves aoide's path and not this one, so pass
-  `--aoide-daemon-events` with it. Its records pass as they are when `class` is `audit` or `gate`; `secret`, `notification`, `rice`,
-  `content` and anything else are never shown. No aoide call is ever given this path.
-- The two are merged by `ts`, at a tie the audit log first, then each file's order. A record with no numeric `ts` in the audit log sorts
-  as 0 and, under the allowlist, is dropped before that. Against a real aoide the audit stream reads by the same integer `ts` the log
-  writes (observed), so it is not empty for want of a timestamp; a record without one is not shown.
+- **`daemon`** is `--aoide-daemon-events` (absolute only), else `$AOIDE_DAEMON_EVENTS` when absolute, else `$XDG_RUNTIME_DIR/aoide/events.jsonl`
+  when `$XDG_RUNTIME_DIR` is absolute. Unset, empty or relative values name no file, so no path under the working directory is ever opened,
+  and with no path the stream is empty and `files.daemon` is `null`. **The XDG path is the perch's own default**, chosen so it mirrors
+  `default_socket()` (the socket's default is `$XDG_RUNTIME_DIR/aoide/aoided.sock`). Aoide's rule for the same file is `$AOIDE_DAEMON_EVENTS`,
+  else a sibling of the daemon socket (`docs/Aoide-Wiki/concepts/cli/Doors-and-Nodes.md`, "aoide events tail"; `docs/architecture/AOIDED.md`,
+  "aoided's own feed and record shape"). The two agree while the socket is the default one. A `--aoide-daemon-socket` somewhere else moves
+  aoide's path and not this one, so pass `--aoide-daemon-events` with it. The runner's `XDG_RUNTIME_DIR` is the same variable, read by the same
+  function (`aoide::runtime_dir`): a relative one is refused by the runner on every call, and names no file here.
+  The feed keeps only what aoide's docs name, and only for two classes: `audit` and `gate`, with an integer `ts`. Of a record it keeps the
+  top-level `v`, `ts`, `class`, `kind` and `source`, and of its `payload`: for a `gate` record `id`, `name`, `originAddr`, `url` and `direction`
+  (Aoide's CONTRACTS.md, at its repository root, "Pairing events feed (P-P5)": "payload carries fields BY NAME ONLY"); for an `audit` record
+  `file` (`docs/architecture/AOIDED.md`, "The first producer: the hand-edit watcher"). Everything else is dropped, so a field a later aoided
+  adds never reaches the page: a free-text field at either level, a gate's `sas`, a `node` or `note`, all of them. `secret`, `notification`,
+  `rice` and `content` records, records with no class, records with no `ts`, and lines that are not objects are dropped as well.
+- The two are merged by `ts`, at a tie the audit log first, then each file's order. A record with no numeric `ts` in either stream is not
+  shown. Against a real aoide the audit stream reads by the same integer `ts` the log writes (observed), so it is not empty for want of one.
 - `next.<stream>` is that stream's next cursor: the end of its last **whole** line read, so a line still being written is read again once
   it has its newline. Pass them back as `?audit=N&daemon=M` (either, or both, each once).
-- `reset.<stream>` is true when that stream's cursor was past the end of its file (truncated in place at 1 MiB, replaced, or gone): that
-  stream reads again from 0, and the other is untouched.
+- `reset.<stream>` is true when, since that stream's last poll, its file was **shorter than the cursor**, or was **another file** (its device
+  or inode changed: replaced, renamed over, rotated), or was **shorter than the size the last poll saw** (cut in place). That stream reads again
+  from 0, and the other is untouched. The last poll's device, inode and length are kept per path in the perch's memory, never on disk; they
+  are lost at a restart, and the first poll after one then compares with nothing. **The limit:** a file cut in place and grown past the
+  cursor again between two polls, with the same inode, is not seen as a reset (its size is only seen at a poll). Records written between the
+  cursor and the regrowth are then not shown, and the read from the cursor can start mid-line, which is dropped.
 - No query is the first poll: each stream's last 64 KiB, from its first whole line. A poll reads at most 64 KiB of each file, so a long
   backlog takes several polls and loses nothing.
-- A file that is not there yet is an empty stream with cursor 0. A file that is a link, a directory or a FIFO is a 502 that names the
-  stream, and nothing is read from it. `files` names each path as a `~` path, or `null` where a stream has none (a relative flag is none).
+- A file that is not there yet is an empty stream with cursor 0. A file that is a link, a directory or a FIFO, or cannot be opened as a
+  plain file, is **that stream's `error`**: the sentence names the stream (`the audit log could not be read as a plain file`), nothing is
+  read from it or said about its contents, the stream has no events, and its cursor stays where it was asked (0 for a first poll, so when
+  the file is fixed the next poll reads its start). **The other stream still answers**, and the answer is a 200. `files` names each path as
+  a `~` path, or `null` where a stream has none (a relative flag is none).
+- **The start refuses one file for both feeds.** `main.rs` calls [`feeds_apart`] before anything under `--home` is made. The audit log and the
+  daemon feed are each resolved as the view resolves them (the flag, else the default), and when they are the same path once symlinks and `..`
+  are resolved, or the same device and inode (a hard link), the perch refuses to start, and says so in a sentence that names the path and the
+  flags. This covers `--aoide-audit-log` and `--aoide-daemon-events` at one path, the feed flag at the audit log's default (`<home>/log`), and
+  `AOIDE_DAEMON_EVENTS` at the audit log's path with no feed flag. The reason: aoide appends its audit records to the audit log, so one file for
+  both would put them into the feed aoided writes.
 - Any other query (`after=`, a repeated key, a key that is neither `audit` nor `daemon`, a value that is not digits, more than 20 digits,
   an empty pair) is a 400.
 
@@ -101,11 +132,17 @@ Two streams, one answer. Each stream has its own file, cursor and reset, and eac
 - **Files**, under `<--aoide-home or ~/.aoide>/state/`: `nodes.json` (1 MiB), `node-cache/*.json` (64 files, 64 KiB each, and 1000
   directory entries looked at at most), `stage/graph.json` (2 MiB). Each is opened `O_NOFOLLOW | O_NONBLOCK` through
   `crate::rawfile::open_regular` and must be a regular file, so a link or FIFO planted under a name is not read. The two event feeds are
-  not under the state folder: they are the paths of `--aoide-audit-log` and `--aoide-daemon-events` (see The events).
+  not under the state folder: they are the paths of `--aoide-audit-log` and `--aoide-daemon-events` (see The events). Both are opened the
+  same way, and only read.
 - **Aoide, through `crate::aoide::Aoide` and nothing else**: `--version`, `mesh --json`, `mail outbox --json`. Never `node list`,
   `session`, `send`, `pair`, `spawn`, `allow`, `node status`, `node pull`, `dispatch` or anything on the A2A door: the runner has no
   variant for them. The perch never spawns aoide itself, and a perch with no `--aoide` and no executable `~/.local/bin/aoide` runs
-  nothing.
+  nothing. **What the perch writes:** the perch never opens either event file for writing. But each aoide call it makes is a command aoide
+  runs, and aoide appends its own audit records for the commands it audits, to the audit log: the flag's file when `--aoide-audit-log` is
+  given (the runner passes it as `AOIDE_AUDIT_LOG`), else aoide's default under `<--aoide-home or ~/.aoide>`. Which commands aoide audits is
+  aoide's rule (the mail commands and the daemon's start were observed; a usage-error exit writes none). How often: the snapshot's three
+  calls are each cached for 60 s, so any number of open tabs cost at most one set of them a minute; the mesh's `nodes` for mail is that
+  same cached report; mail's own calls (send, read, outbox) run once per request; the events poll runs no aoide call at all.
 - **The daemon**: one connection to the socket (`--aoide-daemon-socket`, else `$XDG_RUNTIME_DIR/aoide/aoided.sock`), one line
   `{"v":0,"op":"ping"}`, one line read back (4 KiB at most) within 1 s. Never `subscribe` or `dispatch`. Only the boolean `ok` is read from
   the reply; a pid or a key in it goes nowhere.
@@ -116,6 +153,7 @@ Two streams, one answer. Each stream has its own file, cursor and reset, and eac
 minute. Only a success is cached: a failed run is a sentence in `errors` and is asked for again on the next read. The lock is held across
 the run, so two tabs opened together cost one run, and the three runs and the ping go at once, so a snapshot waits for the slowest (10 s
 at most, the runner's timeout) and not their sum. The files are read fresh on every call; they are small and the page wants their age.
+The events are not cached: each poll reads the files at their cursors.
 
 `--knob mesh_ttl_ms=N` replaces the 60 s so a test can prove expiry. It is the existing hidden `--knob` mechanism; there is no flag.
 
@@ -127,14 +165,16 @@ at most, the runner's timeout) and not their sum. The files are read fresh on ev
   refusal for a node trusted in more than one mesh carries `data.meshes`, and that is what mail should rely on to ask which mesh. No
   registry, no program or a failed run is a shorter list, never an error. It uses the cached mesh report, so asking costs at most one run
   a minute.
-- **`mesh::home(opts)`** is aoide's home as this module resolves it (`--aoide-home`, else `~/.aoide`, absolute or nothing).
+- **`mesh::home(opts)`** is aoide's home as this module resolves it (`--aoide-home`, else `~/.aoide`, absolute or nothing). `home_of(flag)`
+  is the same for a flag that is not in an `Options` yet.
 - **Tests of M2 and W4: always pass an explicit `aoide_home` and `aoide_daemon_socket`** (an `Options` literal: a temp dir and a path in it
   that is not there; a started perch: `--aoide-home <tmp> --aoide-daemon-socket <tmp>/aoided.sock`, and a `HOME` of your own, as
   `tests/mesh.rs` does). A `None` means the operator's `~/.aoide` and `$XDG_RUNTIME_DIR/aoide/aoided.sock`, and a test that reaches `/hub/mesh`
   or `mesh::nodes` with one reads real node rosters and pings a real daemon. Under `cfg(test)` (this crate's unit tests only) a `None`
   resolves to `/nonexistent-minerva-test/aoide` instead, so a lib test that forgets cannot reach real state; the integration tests run the
-  real binary and get no such net: `tests/common`'s `Perch::builder()` points `XDG_RUNTIME_DIR` at a temp dir but leaves `HOME` as it is,
-  so without your own `HOME` and `--aoide-home` the perch reads the real `~/.aoide`.
+  real binary and get no such net: `tests/common`'s `Perch::builder()` sets `HOME` to a temp dir (a test that names its own `HOME` wins) and
+  `XDG_RUNTIME_DIR` to a temp dir (the test cannot change that one), so without your own `HOME` and `--aoide-home` the perch reads the real
+  `~/.aoide`.
 - The page (W4) renders `registry`, `cache`, `graph`, `mesh` and `outbox` as text and tables only; nothing in the response is HTML or
   a URL to open, and `cache[].text` and any string inside `mesh`, `outbox` or `events` may be hostile.
 
@@ -143,6 +183,8 @@ at most, the runner's timeout) and not their sum. The files are read fresh on ev
 `tests/mesh.rs` runs a real perch against `fake_aoide` (the tests' stand-in, `tests/fixtures/aoide/`) with a temporary aoide home, a
 `UnixListener` standing in for aoided, and checks the fake's log for exactly `--version`, `mesh --json` and `mail outbox --json`. The
 module's own unit tests cover the projections (both registry shapes, the allowlist, the graph, the cache), the two event streams (the
-audit allowlist, the merge, the cursors and resets, the 64 KiB window, the query), the paths each stream resolves to, and the TTL cache.
-`tests/mesh.rs` runs the events end to end: both streams with their labels, a stream's truncate resetting only itself, a link or a FIFO at
-either path, the runner's environment (the audit flag and never the feed), and the defaults.
+audit allowlist and the letter rule, the daemon feed's fields, the merge, the cursors, the resets and the identity a poll keeps, the 64 KiB
+window, the query), the paths each stream resolves to (and that no default is ever a relative path), the start's check that the two feeds
+are two files, and the TTL cache. `tests/mesh.rs` runs the events end to end: both streams with their labels, a stream's truncate resetting only
+itself, a feed replaced by a new file, a link or a FIFO at either path (the other stream still answers), a mail letter in no answer byte,
+the runner's environment (the audit flag and never the feed), the defaults, and the start refused with both feeds at one file.

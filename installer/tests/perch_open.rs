@@ -644,7 +644,7 @@ const HELP_NEW: &str = include_str!("fixtures/perch-help-new.txt");
 #[test]
 fn the_fixtures_are_what_they_claim() {
     // captured from the perch an operator has installed today, and from a build of master
-    let new_flags = ["--term-token-file", "--mail-token-file", "--agent-url-file", "--aoide", "--plugins-dir"];
+    let new_flags = ["--term-token-file", "--mail-token-file", "--agent-url-file", "--aoide", "--plugins-dir", "--aoide-audit-log", "--aoide-daemon-events"];
     for f in new_flags {
         assert!(!HELP_OLD.lines().any(|l| l.trim_start().starts_with(f)), "{f} in the old help");
         assert!(HELP_NEW.lines().any(|l| l.trim_start().starts_with(f)), "{f} missing from the new help");
@@ -706,7 +706,7 @@ fn aoide_and_the_plugins_dir_go_in_only_when_there_is_something_to_name() {
 fn a_flag_is_found_by_being_an_option_not_by_being_mentioned() {
     let _g = port_lock();
     // --aoide-home without --aoide; and every new flag named in the prose of another option
-    let help = "Usage: perch [OPTIONS]\n\nOptions:\n      --home <DIR>         The home. Not with --term-token-file, --mail-token-file, --agent-url-file, --aoide or --plugins-dir\n      --eidolon-config <FILE>  A config\n      --aoide-home <DIR>   Aoide's home\n      --aoide-events <FILE>  Its log\n  -h, --help               Print help\n";
+    let help = "Usage: perch [OPTIONS]\n\nOptions:\n      --home <DIR>         The home. Not with --term-token-file, --mail-token-file, --agent-url-file, --aoide or --plugins-dir\n      --eidolon-config <FILE>  A config\n      --aoide-home <DIR>   Aoide's home\n      --aoide-audit-log <PATH>  Its log\n  -h, --help               Print help\n";
     for w in BOTH {
         let s = Start::new(w, help);
         write(&s.env.home.join(".local/bin/aoide"), "#!/bin/sh\n", 0o755);

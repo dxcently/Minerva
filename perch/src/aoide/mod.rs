@@ -105,6 +105,13 @@ pub fn audit_flag(opts: &Options) -> Option<PathBuf> {
     opts.aoide_audit_log.clone()
 }
 
+/// `$XDG_RUNTIME_DIR` as the perch was started with it, or none when it is not set: the one reader of that variable. The runner gives it to
+/// each call and refuses a relative one ([`Aoide::env_for`]); the mesh view takes its default daemon socket and feed from it only when it is
+/// absolute, so no path under the working directory is ever opened. Both read it here, so they agree on the value.
+pub fn runtime_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+}
+
 impl Aoide {
     pub fn new(bin: impl Into<PathBuf>) -> Self {
         Self { bin: bin.into(), root: None, audit_log: None, daemon_socket: None, runtime_dir: None, limits: Limits::default(), extra: Vec::new() }
@@ -118,7 +125,7 @@ impl Aoide {
             .root(opts.aoide_home.clone())
             .audit_log(audit_flag(opts))
             .daemon_socket(opts.aoide_daemon_socket.clone())
-            .runtime_dir(std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)))
+            .runtime_dir(runtime_dir()))
     }
 
     pub fn root(mut self, root: Option<PathBuf>) -> Self {

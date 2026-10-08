@@ -248,12 +248,22 @@ export function clock(ts) {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-// A payload as `key=value` words: the first four keys whose value is text, a number or a boolean, each cut short; nested values are left out.
-function payloadText(p) {
-  if (typeof p === 'string') return clean(p, 100);
+// The payload fields the page draws, by class: the ones aoide's docs name for each (the perch forwards only these; the page draws only these
+// too, so a field a later aoided adds is never drawn). A gate's fields are CONTRACTS.md's "Pairing events feed (P-P5)"; an audit's, the
+// hand-edit watcher's `file` (docs/architecture/AOIDED.md).
+const PAYLOAD_KEYS = { gate: ['id', 'name', 'originAddr', 'url', 'direction'], audit: ['file'] };
+
+// A mail command's `message` is a letter's text, so it is never drawn (the perch does not send it either). A mail command is one whose first
+// word, before a `.`, `/` or `-`, is `mail`: the same rule the perch applies.
+const isMail = (command) => typeof command === 'string' && /^mail([./-]|$)/.test(command);
+
+// A payload as `key=value` words: the first four of the class's fields whose value is text, a number or a boolean, each cut short.
+function payloadText(cls, p) {
   if (!isObj(p)) return '';
   const words = [];
-  for (const [k, v] of Object.entries(p)) {
+  for (const k of PAYLOAD_KEYS[cls] || []) {
+    if (!Object.prototype.hasOwnProperty.call(p, k)) continue;
+    const v = p[k];
     if (typeof v !== 'string' && num(v) == null && typeof v !== 'boolean') continue;
     words.push(`${clean(k, 16)}=${clean(String(v), 40)}`);
     if (words.length === 4) break;
@@ -268,33 +278,37 @@ export function eventLine(entry) {
   const e = entry.event;
   const what = str(e.kind, 40) || str(e.command, 40);
   const who = str(e.source, 24) || str(e.door, 24);
-  const msg = str(e.message, 100) || payloadText(e.payload);
+  const cls = e.class === 'gate' ? 'gate' : 'audit';
+  const msg = isMail(e.command) ? '' : str(e.message, 100) || payloadText(cls, e.payload);
   return {
     at: clock(e.ts),
     cls: entry.stream === 'daemon' ? 'daemon' : 'audit',
-    text: [e.class === 'gate' ? 'gate' : 'audit', what || '?', who ? `(${who})` : '', str(e.status, 24), msg].filter(Boolean).join(' '),
+    text: [cls, what || '?', who ? `(${who})` : '', str(e.status, 24), msg].filter(Boolean).join(' '),
   };
 }
 
-export const emptyFeed = () => ({ lines: [], next: { audit: null, daemon: null }, files: { audit: '', daemon: '' }, why: '', at: 0 });
+export const emptyFeed = () => ({ lines: [], next: { audit: null, daemon: null }, files: { audit: '', daemon: '' }, err: { audit: '', daemon: '' }, why: '', at: 0 });
 
 // Take one answer of /hub/mesh/events into what is held. A stream's `reset` clears what that stream held first; its cursor is the answer's
-// `next` for it, and its file is the answer's `files` for it. An entry for a stream that is not one of the two is left out. A failed or
-// unreadable answer changes nothing but the sentence for it: a hiccup keeps the lines and the cursors.
+// `next` for it, and its file is the answer's `files` for it. Its `error`, when it has one, is what that stream's label says (feedView). An
+// entry for a stream that is not one of the two is left out. A failed or unreadable answer changes nothing but the sentence for it: a hiccup
+// keeps the lines and the cursors.
 export function foldFeed(feed, r, now = Date.now()) {
   if (!r || r.status !== 200 || !isObj(r.data) || !Array.isArray(r.data.events)) {
     return { ...feed, why: r && r.status === 200 ? 'the events answer was not in a shape this page reads' : why(r), at: now };
   }
-  const { events, next, reset, files } = r.data;
+  const { events, next, reset, files, error } = r.data;
   const kept = feed.lines.filter((line) => !(isObj(reset) && reset[line.cls] === true));
   const fresh = events.filter((entry) => isObj(entry) && STREAMS.includes(entry.stream) && isObj(entry.event)).map(eventLine);
   const cursor = { ...feed.next };
   const shown = { ...feed.files };
+  const err = { audit: '', daemon: '' };
   for (const s of STREAMS) {
     if (isObj(next) && num(next[s]) != null && next[s] >= 0) cursor[s] = next[s];
     if (isObj(files) && (typeof files[s] === 'string' || files[s] === null)) shown[s] = str(files[s], 200);
+    if (isObj(error)) err[s] = str(error[s], 200);
   }
-  return { lines: [...kept, ...fresh].slice(-HELD), next: cursor, files: shown, why: '', at: now };
+  return { lines: [...kept, ...fresh].slice(-HELD), next: cursor, files: shown, err, why: '', at: now };
 }
 
 // The feed a reopened tab continues: the one it held, or a fresh one when that is older than FEED_STALE_MS.
@@ -307,10 +321,14 @@ export function feedPath(feed) {
   return `mesh/events?${STREAMS.map((s) => `${s}=${feed.next[s] == null ? 0 : feed.next[s]}`).join('&')}`;
 }
 
-// What the tail draws: the newest events first, how many older ones are held, and the sentence for when there is nothing (or a failure).
+// What the tail draws: the newest events first, how many older ones are held, and the sentence for when there is nothing (or a failure). A
+// stream that could not be read is a line of its own, first, under that stream's label (`cls` is the label: `audit` or `daemon`), so the
+// sentence is on the stream it is about and the other stream's lines are not blanked by it.
 export function feedView(feed) {
-  const lines = feed.lines.slice(-SHOWN).reverse();
-  const older = Math.max(0, feed.lines.length - lines.length);
+  const shown = feed.lines.slice(-SHOWN).reverse();
+  const older = Math.max(0, feed.lines.length - shown.length);
+  const errors = feed.at ? STREAMS.filter((s) => feed.err && feed.err[s]).map((s) => ({ at: clock(feed.at), cls: s, text: `could not be read: ${feed.err[s]}` })) : [];
+  const lines = [...errors, ...shown];
   if (feed.why) return { lines, older, sentence: `the events feed could not be read: ${feed.why}`, cls: 'o' };
   if (!feed.at) return { lines, older, sentence: 'reading the events feed…', cls: 'faint' };
   if (!lines.length) return { lines, older, sentence: emptySentence(feed), cls: 'faint' };

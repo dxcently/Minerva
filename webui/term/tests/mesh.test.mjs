@@ -167,37 +167,47 @@ test('the perch\'s own sentences about what it left out come through, at most 8,
 test('an event line says its stream and reads both record shapes: the daemon feed (kind, source, payload) and the audit log (command, door)', () => {
   const lines = events.events.map(V.eventLine);
   assert.deepEqual(lines.map((l) => [l.cls, l.text]), [
-    ['audit', 'audit daemon (daemon) started'],
+    ['audit', 'audit daemon (daemon) started aoided started, listening on http://127.0.0.1:8710/'],
     ['daemon', 'audit hand-edit (aoided) file=sessions.json'],
-    ['daemon', 'gate pair-parked (a2a-door) direction=inbound id=abc12345 name=box-a originAddr=10.0.0.5'],
+    ['daemon', 'gate pair-parked (a2a-door) id=abc12345 name=box-a originAddr=10.0.0.5 url=http://box-a/'],
+    ['daemon', 'gate pair-parked (a2a-door) id=def67890 name=box-b direction=outbound'],
     ['audit', 'audit mail.send (cli) ok'],
     ['audit', 'gate node.add (mcp) proposed'],
-    ['daemon', 'gate pending node=osaka note=<script>alert(1)</script> [31m'],
+    ['daemon', 'gate pending'],
+    ['audit', 'audit mail.read (cli) ok'],
   ]);
-  assert.deepEqual(lines.map((l) => l.at), [1791365990, 1791366000, 1791366020, 1791366040, 1791366045, 1791366050].map(hhmmss), 'the time is the event\'s own, local');
+  assert.deepEqual(lines.map((l) => l.at), [1791365990, 1791366000, 1791366020, 1791366025, 1791366040, 1791366045, 1791366050, 1791366055].map(hhmmss), 'the time is the event\'s own, local');
   assert.equal(V.clock(undefined), '--:--:--');
   assert.equal(V.clock(1791366000000), hhmmss(1791366000), 'milliseconds are taken as such');
 });
 
-test('the events fixture is the perch\'s answer over the two files: the classes the page must never see are not in it, and each stream has its cursor at its file\'s end', () => {
+test('the events fixture is the perch\'s answer over the two files: nothing the docs do not name, and no mail letter, is in it; each stream has its cursor at its file\'s end', () => {
   const shown = JSON.stringify(events);
-  for (const sentinel of ['SECRET-NAME-SENTINEL', 'CONSUMER-SENTINEL', 'NOTIFICATION-SENTINEL', 'FORWARDED-SENTINEL', 'STARTED-SENTINEL', 'spooled to osaka', 'secret.get', 'node add osaka']) {
+  for (const sentinel of ['SECRET-NAME-SENTINEL', 'CONSUMER-SENTINEL', 'NOTIFICATION-SENTINEL', 'FORWARDED-SENTINEL', 'LETTER-SENTINEL', 'NO-TS-SENTINEL', 'PAYLOAD-EXTRA-SENTINEL', 'EXTRA-FREE-TEXT-SENTINEL', '<script>', 'alert(1)', '\\u001b', 'spooled to osaka', 'secret.get', 'node add osaka']) {
     assert.ok(!shown.includes(sentinel), `${sentinel} is in the answer`);
   }
+  assert.ok(shown.includes('aoided started, listening on http://127.0.0.1:8710/'), 'a start record\'s message is not a mail letter, so the answer keeps it');
   assert.deepEqual(events.next, { audit: Buffer.byteLength(read('./fixtures/aoide/audit.log')), daemon: Buffer.byteLength(read('./fixtures/aoide/daemon-events.jsonl')) });
   assert.deepEqual(events.reset, { audit: false, daemon: false });
+  assert.deepEqual(events.error, { audit: null, daemon: null }, 'neither stream failed');
 });
 
 test('the tail takes each answer in: the events join the held ones, each stream moves its own cursor, a reset clears only its own stream, a failed poll keeps all', () => {
   let f = V.foldFeed(V.emptyFeed(), { status: 200, data: events }, 1000);
-  assert.deepEqual([f.lines.length, f.next, f.files.audit, f.why, f.at], [6, events.next, '~/.aoide/log', '', 1000]);
+  assert.deepEqual([f.lines.length, f.next, f.files.audit, f.why, f.at], [8, events.next, events.files.audit, '', 1000]);
   const late = { events: [{ stream: 'daemon', event: { v: 0, ts: 1791366100, class: 'audit', kind: 'late' } }], next: { audit: events.next.audit, daemon: 900 }, reset: { audit: false, daemon: false }, files: events.files };
   f = V.foldFeed(f, { status: 200, data: late }, 2000);
-  assert.deepEqual([f.lines.length, f.next.daemon, f.lines[6].text], [7, 900, 'audit late']);
+  assert.deepEqual([f.lines.length, f.next.daemon, f.lines[8].text], [9, 900, 'audit late']);
   const kept = V.foldFeed(f, { status: 0, data: { error: 'network error' } }, 3000);
   assert.deepEqual([kept.lines, kept.next, kept.why], [f.lines, f.next, 'the perch did not answer'], 'a hiccup keeps what was held');
   const cleared = V.foldFeed(kept, { status: 200, data: { events: [{ stream: 'audit', event: { class: 'gate', command: 'again', status: 'ok', ts: 1791366200 } }], next: { audit: 40, daemon: 40 }, reset: { audit: false, daemon: true }, files: events.files } }, 4000);
-  assert.deepEqual(cleared.lines.map((l) => [l.cls, l.text]), [['audit', 'audit daemon (daemon) started'], ['audit', 'audit mail.send (cli) ok'], ['audit', 'gate node.add (mcp) proposed'], ['audit', 'gate again ok']], 'a reset of the daemon clears the daemon lines and nothing else');
+  assert.deepEqual(cleared.lines.map((l) => [l.cls, l.text]), [
+    ['audit', 'audit daemon (daemon) started aoided started, listening on http://127.0.0.1:8710/'],
+    ['audit', 'audit mail.send (cli) ok'],
+    ['audit', 'gate node.add (mcp) proposed'],
+    ['audit', 'audit mail.read (cli) ok'],
+    ['audit', 'gate again ok'],
+  ], 'a reset of the daemon clears the daemon lines (the late one too) and nothing else');
   assert.deepEqual(cleared.next, { audit: 40, daemon: 40 });
   assert.match(V.foldFeed(f, { status: 200, data: { oops: 1 } }).why, /not in a shape/);
 });
@@ -257,6 +267,39 @@ test('with nothing to show, the feed names each file and what was read of it, an
   for (const text of [empty.sentence, bytes.sentence, failed.sentence]) assert.doesNotMatch(text, /no activity|nothing is happening|quiet/i);
 });
 
+test('a stream that could not be read is a line of its own under its label, and the other stream still shows its lines', () => {
+  const data = { ...events, error: { audit: 'the audit log could not be read as a plain file', daemon: null } };
+  const f = V.foldFeed(V.emptyFeed(), { status: 200, data }, 1000);
+  assert.deepEqual(f.err, { audit: 'the audit log could not be read as a plain file', daemon: '' });
+  const v = V.feedView(f);
+  assert.deepEqual(v.lines[0], { at: V.clock(1000), cls: 'audit', text: 'could not be read: the audit log could not be read as a plain file' });
+  assert.equal(v.lines.length, 9, 'the error line, then the eight events');
+  assert.deepEqual([v.lines.filter((l) => l.cls === 'audit').length, v.lines.filter((l) => l.cls === 'daemon').length], [5, 4]);
+  const both = V.feedView(V.foldFeed(V.emptyFeed(), { status: 200, data: { ...events, error: { audit: 'A', daemon: 'D' } } }, 1000));
+  assert.deepEqual(both.lines.slice(0, 2).map((l) => [l.cls, l.text]), [['audit', 'could not be read: A'], ['daemon', 'could not be read: D']]);
+  assert.deepEqual(V.foldFeed(f, { status: 200, data: events }, 2000).err, { audit: '', daemon: '' }, 'an answer with no error clears it');
+});
+
+test('a gate payload draws the first four of its named fields that hold text, a number or a boolean; a fifth is cut, and a field the docs do not name is never drawn', () => {
+  const gate = (payload) => V.eventLine({ stream: 'daemon', event: { class: 'gate', kind: 'pending', ts: 1, payload } }).text;
+  assert.equal(gate({ node: 'osaka', note: '<b>x</b>' }), 'gate pending', 'node and note are not gate fields');
+  assert.equal(gate({ id: 'abc', note: 'NOTE-SENTINEL', body: 'BODY-SENTINEL' }), 'gate pending id=abc');
+  assert.equal(gate(JSON.parse('{"__proto__":{"x":1},"name":"box-a","constructor":"c","direction":true}')), 'gate pending name=box-a direction=true', 'a key the payload does not own is not drawn; a boolean is');
+  assert.equal(gate({ id: '1', name: 'n', originAddr: 'o', url: 'u', direction: 'd' }), 'gate pending id=1 name=n originAddr=o url=u', 'the fifth, direction, is cut: four words at most');
+  assert.equal(gate({ id: { nested: 1 }, name: ['x'] }), 'gate pending', 'an object or a list is not a value to draw');
+  assert.equal(V.eventLine({ stream: 'daemon', event: { class: 'audit', kind: 'hand-edit', ts: 1, payload: { file: 'a.json', secret: 'S-SENTINEL' } } }).text, 'audit hand-edit file=a.json');
+});
+
+test('a mail command\'s message is never drawn, and any other command\'s message is', () => {
+  const audit = (command, extra = {}) => V.eventLine({ stream: 'audit', event: { class: 'audit', command, door: 'cli', status: 'ok', ts: 1, ...extra } }).text;
+  for (const command of ['mail.read', 'mail.send', 'mail.outbox', 'mail/read', 'mail-read', 'mail']) {
+    assert.equal(audit(command, { message: 'LETTER-SENTINEL dear osaka' }), `audit ${command} (cli) ok`, command);
+  }
+  assert.equal(audit('mailbox.read', { message: 'kept' }), 'audit mailbox.read (cli) ok kept', 'a word that starts with mail is not mail');
+  assert.equal(audit('daemon', { door: 'daemon', message: 'aoided started, listening on http://127.0.0.1:8710/' }), 'audit daemon (daemon) ok aoided started, listening on http://127.0.0.1:8710/', 'the start record keeps its message');
+  assert.ok(audit('node.add', { message: 'x'.repeat(300) }).length < 150, 'a message is cut short');
+});
+
 
 // ---------------------------------------------------------------- hostile text
 // Everything here is another node's or a model's. view.js hands back strings and numbers; the component draws them as text nodes.
@@ -293,7 +336,7 @@ test('hostile text in every part stays a plain string: markup is left as the cha
   const out = {
     state: V.stateOf({ status: 200, data: s }), header: V.headerParts(s), nodes: V.nodeRows(s), drift: V.driftView(s.mesh), graph: V.graphView(s.graph),
     outbox: V.outboxView(s.outbox, NOW), notes: V.noteLines(s), event: V.eventLine({ stream: 'daemon', event: ev }), failed: V.stateOf({ status: 500, data: { error: HOSTILE } }),
-    feed: V.feedView(hostileFold({ events: [{ stream: 'daemon', event: ev }, { stream: 'audit', event: { class: 'audit', payload: HOSTILE } }, { stream: 'audit', event: { class: 'audit', payload: { a: { b: HOSTILE }, c: HOSTILE } } }], next: { audit: 9, daemon: 9 } })),
+    feed: V.feedView(hostileFold({ events: [{ stream: 'daemon', event: ev }, { stream: 'audit', event: { class: 'audit', payload: HOSTILE } }, { stream: 'audit', event: { class: 'audit', payload: { a: { b: HOSTILE }, c: HOSTILE } } }], next: { audit: 9, daemon: 9 }, error: { audit: HOSTILE, daemon: HOSTILE } })),
     empty: V.feedView(hostileFold({ events: [], next: { audit: 9, daemon: 0 } })),
     files: hostileFold({ events: [], next: { audit: 0, daemon: 0 } }).files,
     gone: V.feedView(V.foldFeed(V.emptyFeed(), { status: 500, data: { error: HOSTILE } }, 1)),

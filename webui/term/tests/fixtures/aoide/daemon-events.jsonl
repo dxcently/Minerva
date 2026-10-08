@@ -1,5 +1,7 @@
 {"v":0,"ts":1791366000,"class":"audit","kind":"hand-edit","source":"aoided","payload":{"file":"sessions.json"}}
 {"v":0,"ts":1791366010,"class":"secret","kind":"released","payload":{"secret":"SECRET-NAME-SENTINEL","consumer":"CONSUMER-SENTINEL"}}
-{"v":0,"ts":1791366020,"class":"gate","kind":"pair-parked","source":"a2a-door","payload":{"id":"abc12345","name":"box-a","originAddr":"10.0.0.5","url":"http://box-a/","direction":"inbound"}}
+{"v":0,"ts":1791366020,"class":"gate","kind":"pair-parked","source":"a2a-door","payload":{"id":"abc12345","name":"box-a","originAddr":"10.0.0.5","url":"http://box-a/","direction":"inbound","note":"PAYLOAD-EXTRA-SENTINEL"}}
+{"v":0,"ts":1791366025,"class":"gate","kind":"pair-parked","source":"a2a-door","payload":{"id":"def67890","name":"box-b","direction":"outbound"},"body":"EXTRA-FREE-TEXT-SENTINEL"}
 {"v":0,"ts":1791366030,"class":"notification","kind":"forwarded","payload":{"body":"NOTIFICATION-SENTINEL"}}
 {"v":0,"ts":1791366050,"class":"gate","kind":"pending","payload":{"node":"osaka","note":"<script>alert(1)</script>\u001b[31m"}}
+{"v":0,"class":"gate","kind":"pending","payload":{"id":"NO-TS-SENTINEL"}}
