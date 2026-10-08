@@ -12,7 +12,7 @@ plain `cargo test` compiles none; the integration tests that need one are
 | `fake_eidolon/meta.rs` | `eidolon [--config C] tools\|plugins\|policy-rows` | stub until R3: says so on stderr, exits 2 |
 | `fake_eidolon/asks.rs` | the door's open asks: `FAKE_ASKS`, `FAKE_LAG`, a 409 for a second answer | stub until A1a: three no-op hooks (`after_say`, `on_answer`, `on_stream`) |
 | `fake_eidolon/agent.rs` | an agent's tool call into the perch: `FAKE_AGENT_CALL` | AG: after a say, the fake door calls the perch from its own socket (and from an `sh -c curl` child, which is refused); honours http_proxy and no_proxy as reqwest does |
-| `fake_aoide.rs` | the `aoide` CLI | stub until R2a: says so on stderr, exits 99 (the code "anything else" gets) |
+| `fake_aoide.rs` | the `aoide` CLI | built: the runner's argvs (`schema`, `mesh --json`, `mail outbox --json`, `mail read --for=minerva --json [--reread]`, `mail send --json --to=... --subject=...`), replayed from `FAKE_AOIDE_DIR`; `--version` exits 2 as aoide does; anything else exits 99 |
 | `fake_minerva.rs` | the installer's `minerva` | stub until R4: says so on stderr, exits 2 |
 
 `fake_eidolon.rs` is the only file that calls the seams: `workflow` and `meta` are dispatched by subcommand, after the global flags
@@ -56,3 +56,29 @@ exit (hyper's `GracefulShutdown` waits an SSE connection out), and it logs
 streams first" something a test can read. It also logs `sigterm-received streams=N` a beat
 (20 ms) after the signal lands, before the 500 ms window in which streams may still close:
 that line is the one that says the streams were closed *before* the signal, not merely soon after.
+
+## fake_aoide
+
+`fake_aoide.rs` is the `aoide` CLI for the perch's tests. It accepts exactly the argvs the runner builds, from a parser that shares no code
+with `Shape::argv()`. Anything else exits 99 with nothing on stdout, and a missing fixture exits 99 with its name, so a test that forgot
+its fixture fails loudly. `--version` exits 2 with usage, as aoide 0.0.26 does: the version is read from `schema`.
+
+Every call is logged to `FAKE_AOIDE_LOG` before it is answered, a refused one too: `argv`, `session` (`AOIDE_SESSION_ID`), `aoide_env`
+(the other `AOIDE_*` variables), `xdg_runtime_dir`, `env_names` (every variable the fake was given) and `pid`. A line with an `event` is
+not a call: `woke` after a sleep, `stdin` after a `FAKE_AOIDE_STDIN` read.
+
+| Knob | Does |
+|---|---|
+| `FAKE_AOIDE_DIR` | the fixture directory (required; the perch's is `tests/fixtures/aoide/`) |
+| `FAKE_AOIDE_LOG` | the call log, one JSON line per call |
+| `FAKE_AOIDE_SLEEP_MS` | waits before answering |
+| `FAKE_AOIDE_FLOOD=<n>` | prints n bytes of `x` on stdout in place of the fixture |
+| `FAKE_AOIDE_FLOOD_SPARES_REREAD=1` | the flood leaves a `--reread` alone, so a plain read is the one that is too big |
+| `FAKE_AOIDE_SPARES_SCHEMA=1` | the sleep and the flood leave `schema` alone, so a slowed or flooded send follows a schema check that passed |
+| `FAKE_AOIDE_STDERR_FLOOD=<n>` | writes n bytes to stderr first, more than a pipe holds |
+| `FAKE_AOIDE_STRAGGLER_MS=<n>` | leaves a process holding stdout open for n ms after the answer, as a daemon an aoide started would |
+| `FAKE_AOIDE_STDIN=1` | reads stdin to its end first: a closed stdin ends at once, a held-open pipe never does |
+
+The perch hands its children only its allowlist (`aoide::ENV_KEEP` and the `LC_*` locale variables), so a test that starts a whole perch and
+wants a knob in the fake runs the fake through a generated `sh` wrapper that sets it: `steered` in `tests/mail.rs`, `wrapper` in
+`tests/mesh.rs`. A test that drives `Aoide` directly sets them with `Aoide::env`.

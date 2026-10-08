@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use perch::aoide::{Aoide, Error, Limits, Reply, Sender, Shape, To, READER, STDERR_KEEP, STDOUT_CAP, TEXT_MAX};
+use perch::aoide::{Aoide, Error, Limits, Reply, Sender, Shape, To, READER, SCHEMA_CAP, STDERR_KEEP, TEXT_MAX};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ async fn every_shape_runs_with_its_exact_argv() {
     assert_eq!(
         fake.argvs(),
         vec![
-            words(&["--version"]),
+            words(&["schema"]),
             words(&["mesh", "--json"]),
             words(&["mail", "outbox", "--json"]),
             words(&["mail", "read", "--for=minerva", "--json"]),
@@ -221,7 +221,7 @@ async fn the_reader_identity_is_set_on_reads_only() {
     let fake = Fake::new();
     let aoide = fake.aoide();
     let shapes = [
-        Shape::Version,
+        Shape::Schema,
         Shape::MeshJson,
         Shape::MailOutboxJson,
         Shape::MailRead { reread: false },
@@ -262,19 +262,19 @@ fn alive(pid: i64) -> bool {
 #[tokio::test]
 #[ignore = "started by no_path_lookup_and_no_ambient_identity, which gives it the environment it needs"]
 async fn inner_environment_probe() {
-    let log = std::env::var_os("PROBE_LOG").expect("PROBE_LOG: this test is started by no_path_lookup_and_no_ambient_identity");
+    let log = PathBuf::from(std::env::var_os("PROBE_LOG").expect("PROBE_LOG: this test is started by no_path_lookup_and_no_ambient_identity"));
     let aoide = Aoide::new(common::fake_aoide().unwrap())
-        .env("FAKE_AOIDE_LOG", log)
+        .env("FAKE_AOIDE_LOG", log.clone().into_os_string())
         .env("FAKE_AOIDE_DIR", fixtures())
         .env("FAKE_AOIDE_STDIN", "1")
         .limits(Limits { timeout: Duration::from_secs(3), ..Limits::default() });
     // A bare name is what `Command::new` would look up on PATH, and a stale `aoide` is first there.
     for bare in ["aoide", "./aoide"] {
-        let outcome = Aoide::new(bare).run(&Shape::Version).await;
+        let outcome = Aoide::new(bare).run(&Shape::Schema).await;
         assert!(matches!(outcome, Err(Error::Refused(_))), "{bare}: {outcome:?}");
     }
     let shapes = [
-        Shape::Version,
+        Shape::Schema,
         Shape::MeshJson,
         Shape::MailOutboxJson,
         Shape::MailRead { reread: false },
@@ -283,6 +283,15 @@ async fn inner_environment_probe() {
     ];
     for shape in &shapes {
         aoide.run(shape).await.unwrap_or_else(|e| panic!("{shape:?}: {e}"));
+    }
+    // Nothing the probe's environment carries but the allowlist reached any child: the proxy and the key set by the outer test did not.
+    let calls: Vec<Value> = std::fs::read_to_string(&log).unwrap_or_default().lines().filter_map(|line| serde_json::from_str(line).ok()).filter(|line: &Value| line.get("argv").is_some()).collect();
+    assert_eq!(calls.len(), shapes.len(), "every call the probe made is logged, and the refused ones never ran");
+    for call in &calls {
+        let names: Vec<&str> = call["env_names"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        for banned in ["HTTP_PROXY", "OPENAI_API_KEY"] {
+            assert!(!names.contains(&banned), "{banned} reached the child: {names:?}");
+        }
     }
     println!("inner probe ok");
 }
@@ -302,6 +311,9 @@ fn no_path_lookup_and_no_ambient_identity() {
         .env("PATH", format!("{}:/usr/bin:/bin", stale.display()))
         .env("STALE_MARKER", &marker)
         .env("PROBE_LOG", &log)
+        // What the outer test's environment carries and the child must not get: a proxy, and a provider key (made-up values).
+        .env("HTTP_PROXY", "http://proxy.invalid:3128")
+        .env("OPENAI_API_KEY", "sk-made-up-for-the-probe")
         .env("AOIDE_SESSION_ID", "ambient-session")
         .env("AOIDE_STATE_DIR", "/ambient/state")
         .env("AOIDE_STAGE_DIR", "/ambient/stage")
@@ -357,13 +369,15 @@ async fn the_timeout_kills_a_fake_that_sleeps() {
 }
 
 #[tokio::test]
-async fn the_stdout_cap_holds_to_the_byte() {
+async fn the_schema_cap_holds_to_the_byte() {
     let fake = Fake::new();
-    let exact = fake.aoide().env("FAKE_AOIDE_FLOOD", STDOUT_CAP.to_string()).run(&Shape::Version).await.unwrap();
-    assert_eq!(exact.stdout.len(), STDOUT_CAP, "exactly the cap is taken whole");
-    let over = fake.aoide().env("FAKE_AOIDE_FLOOD", (STDOUT_CAP + 1).to_string()).run(&Shape::Version).await;
-    assert!(matches!(over, Err(Error::TooBig(cap)) if cap == STDOUT_CAP), "{over:?}");
-    assert!(over.unwrap_err().to_string().contains("more than 1048576 bytes"));
+    // A flood is not JSON: at the cap it is read whole and then refused as not JSON, and one byte over the cap it is too big. The version
+    // is the only way the perch asks for the schema, so the cap is the one `version` and `schema_check` use.
+    let exact = fake.aoide().env("FAKE_AOIDE_FLOOD", SCHEMA_CAP.to_string()).version().await;
+    assert!(matches!(exact, Err(Error::NotJson)), "exactly the cap is taken whole: {exact:?}");
+    let over = fake.aoide().env("FAKE_AOIDE_FLOOD", (SCHEMA_CAP + 1).to_string()).version().await;
+    assert!(matches!(over, Err(Error::TooBig(cap)) if cap == SCHEMA_CAP), "{over:?}");
+    assert!(over.unwrap_err().to_string().contains("more than 524288 bytes"));
 }
 
 #[tokio::test]
@@ -383,9 +397,9 @@ async fn a_child_that_fills_stderr_is_not_stalled_and_only_its_start_is_kept() {
     // Two megabytes on a pipe that holds sixty-four KiB: a runner that read stdout to the end first would wait for ever.
     let aoide = fake.aoide().env("FAKE_AOIDE_STDERR_FLOOD", "2097152").limits(Limits { timeout: Duration::from_secs(5), ..Limits::default() });
     let begun = Instant::now();
-    let reply = aoide.run(&Shape::Version).await.unwrap();
+    let reply = aoide.run(&Shape::Schema).await.unwrap();
     assert!(begun.elapsed() < Duration::from_secs(4), "{:?}", begun.elapsed());
-    assert_eq!(reply.stdout.trim(), "aoide 0.0.26");
+    assert_eq!(reply.json.as_ref().unwrap()["aoide"], "0.0.26");
     assert_eq!(reply.stderr.len(), STDERR_KEEP);
 }
 
@@ -401,12 +415,47 @@ async fn a_process_that_outlives_the_child_on_its_pipe_does_not_hold_the_call() 
 }
 
 #[tokio::test]
-async fn a_json_call_that_prints_something_else_is_not_json_and_a_version_may_be() {
+async fn a_json_call_that_prints_something_else_is_not_json() {
     let fake = Fake::new();
     let outcome = fake.aoide().env("FAKE_AOIDE_FLOOD", "10").run(&Shape::MeshJson).await;
     assert!(matches!(outcome, Err(Error::NotJson)), "{outcome:?}");
-    let version = fake.aoide().env("FAKE_AOIDE_FLOOD", "10").run(&Shape::Version).await.unwrap();
-    assert_eq!(version.stdout, "xxxxxxxxxx");
+    let schema = fake.aoide().env("FAKE_AOIDE_FLOOD", "10").run(&Shape::Schema).await;
+    assert!(matches!(schema, Err(Error::NotJson)), "the schema is JSON too, and the version is read from it: {schema:?}");
+}
+
+#[tokio::test]
+async fn the_version_is_read_from_the_schema_and_no_flag_is_asked() {
+    let fake = Fake::new();
+    let aoide = fake.aoide();
+    assert_eq!(aoide.version().await.unwrap().as_deref(), Some("0.0.26"));
+    aoide.schema_check().await.expect("the fixture lists every command and flag the perch sends");
+    let argvs = fake.argvs();
+    assert_eq!(argvs.len(), 2, "one schema call for each");
+    assert!(argvs.iter().all(|argv| argv.len() == 1 && argv[0] == "schema"), "{argvs:?}");
+}
+
+#[tokio::test]
+async fn a_schema_that_lacks_a_flag_the_perch_sends_refuses_mail_with_a_sentence_that_names_it() {
+    let fake = Fake::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut schema = fixture("schema.json");
+    let read = schema["commands"].as_array_mut().unwrap().iter_mut().find(|command| command["path"] == serde_json::json!(["mail", "read"])).unwrap();
+    let kept: Vec<Value> = read["flags"].as_array().unwrap().iter().filter(|flag| flag["name"] != "reread").cloned().collect();
+    read["flags"] = Value::Array(kept);
+    std::fs::write(dir.path().join("schema.json"), schema.to_string()).unwrap();
+    let aoide = fake.aoide().env("FAKE_AOIDE_DIR", dir.path().to_path_buf());
+    match aoide.schema_check().await {
+        Err(Error::Refused(why)) => assert!(why.contains("--reread") && why.contains("mail is off"), "{why}"),
+        other => panic!("a schema without --reread was not refused: {other:?}"),
+    }
+}
+
+#[test]
+fn the_fake_refuses_the_version_flag_as_aoide_does_and_the_perch_never_sends_it() {
+    let fake = Fake::new();
+    let out = fake.raw(&["--version"], &[]);
+    assert_eq!(out.status.code(), Some(2), "aoide 0.0.26 has no version flag: it exits 2 with usage");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown command"));
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +478,7 @@ async fn the_multi_mesh_refusal_sentence_is_returned_verbatim_and_a_resend_with_
     assert_eq!(as_error.to_string(), said, "what a caller shows is aoide's sentence and nothing added");
 
     let sent = aoide.run(&letter(node("multi"), Some("alpha"), false, "s", "t")).await.unwrap();
-    assert_eq!(sent.data().unwrap()["msgid"], "8".repeat(64));
+    assert_eq!(sent.data().unwrap()["recipients"][0]["msgid"], "8".repeat(64));
     let argvs = fake.argvs();
     assert!(!argvs[0].iter().any(|word| word.starts_with("--mesh")), "{:?}", argvs[0]);
     assert!(argvs[2].contains(&"--mesh=alpha".to_string()), "{:?}", argvs[2]);
@@ -452,16 +501,18 @@ async fn unknown_and_unpaired_nodes_each_say_why() {
 async fn a_send_answers_with_what_was_scripted_for_its_node_and_its_hold() {
     let fake = Fake::new();
     let aoide = fake.aoide();
+    // The `--subject` shape: the one recipient of the answer is the copy this send made.
+    let recipient = |reply: &Reply| reply.data().unwrap()["recipients"][0].clone();
     let filed = aoide.run(&letter(To::SelfNode, None, false, "s", "t")).await.unwrap();
-    assert_eq!(filed.data().unwrap()["envelope"]["msgid"], "5".repeat(64), "a self send answers with the mailbase entry");
-    assert_eq!(filed.data().unwrap()["disposition"], "filed");
+    assert_eq!(recipient(&filed)["msgid"], "5".repeat(64), "a self send answers with the copy it filed");
+    assert_eq!(recipient(&filed)["status"], "filed");
     let spooled = aoide.run(&letter(node("osaka"), None, false, "s", "t")).await.unwrap();
-    assert_eq!(spooled.data().unwrap()["msgid"], "6".repeat(64));
-    assert_eq!(spooled.data().unwrap()["disposition"], "spooled");
-    assert_eq!(spooled.data().unwrap()["delivery"]["status"], "queued");
+    assert_eq!(recipient(&spooled)["msgid"], "6".repeat(64));
+    assert_eq!(recipient(&spooled)["status"], "spooled");
+    assert_eq!(recipient(&spooled)["delivery"]["status"], "queued");
     let held = aoide.run(&letter(node("osaka"), None, true, "s", "t")).await.unwrap();
-    assert_eq!(held.data().unwrap()["msgid"], "7".repeat(64));
-    assert_eq!(held.data().unwrap()["disposition"], "held");
+    assert_eq!(recipient(&held)["msgid"], "7".repeat(64));
+    assert_eq!(recipient(&held)["status"], "held");
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +597,7 @@ fn the_fixtures_hold_the_cases_the_other_slices_lean_on() {
     assert!(entries.iter().any(|e| name(e) == "minerva-agent" && structured(e)), "a structured letter from an agent");
     assert!(entries.iter().any(|e| name(e) == "minerva" && !text(e).starts_with(marker)), "a raw note from the page");
     assert!(entries.iter().any(|e| !["minerva", "minerva-agent"].contains(&name(e).as_str()) && !text(e).starts_with(marker)), "a peer's raw text");
-    let sent = fixture("send.json")["osaka"]["stdout"]["data"]["msgid"].as_str().unwrap().to_string();
+    let sent = fixture("send.json")["osaka"]["stdout"]["data"]["recipients"][0]["msgid"].as_str().unwrap().to_string();
     assert!(entries.iter().any(|e| e["type"] == "receipt" && text(e) == sent), "a receipt whose text is the msgid osaka's send returned");
     assert!(entries.iter().any(|e| text(e).starts_with(marker) && !structured(e)), "a broken AOIDE-LETTER");
     assert!(entries.iter().any(|e| text(e).contains("<script>") && text(e).contains('\u{1b}')), "hostile text");

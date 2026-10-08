@@ -6,12 +6,13 @@ reads this directory through `FAKE_AOIDE_DIR`; `src/bin/fake_aoide.rs` says whic
 
 | File | Replayed for | Holds |
 |---|---|---|
-| `version.txt` | `--version` | `aoide 0.0.26` |
+| `version.txt` | nothing: `--version` is not a shape (aoide 0.0.26 exits 2 on it) | `aoide 0.0.26`. `tests/aoide.rs` checks it, and `tests/mesh.rs` copies it into the snapshot beside `schema.json` |
+| `schema.json` | `schema` | the top-level `aoide` version and the `commands` the perch uses (`mail send`, `mail read`, `mail outbox`, `mesh`), with 0.0.26's flag names and made-up summaries |
 | `mesh.json` | `mesh --json` | two meshes (`alpha`, `beta`) with drift rows, `osaka` unverified in both, and two undeclared nodes |
 | `outbox.json` | `mail outbox --json` | two entries (one retrying toward `osaka`, one refused toward `bridge`) and the per-node summary |
-| `mail-read.json` | `mail read --for=minerva --json` | eight entries, below |
+| `mail-read.json` | `mail read --for=minerva --json` | eight entries, below. Each letter is in the envelope's `message` and in `data.entries[i].envelope.text`, both JSON-escaped, as aoide prints it |
 | `mail-read-reread.json` | the same with `--reread` | the same eight and one older letter that only a reread prints |
-| `send.json` | `mail send ...` | a table by the node in `--to`: `self`, `osaka` (`with_hold`), `bridge` (unpaired), `multi` (the multi-mesh refusal; `with_mesh` succeeds); any other node is `unknown-node` |
+| `send.json` | `mail send ...` | a table by the node in `--to`, answering in the `--subject` shape (`data.recipients[0]` holds the msgid, status, delivery and error): `self` (filed), `osaka` (spooled, queued; `with_hold` held), `bridge` (unpaired), `multi` (the multi-mesh refusal; `with_mesh` spooled), `nosubject` (the envelope a send without `--subject` answers, see below). Any other node is `unknown-node` |
 
 The eight entries of `mail-read.json`, which are the cases M2 and the mesh view lean on:
 
@@ -26,10 +27,16 @@ seq 7  letter   from "<b>evil</b>"   hostile header fields: markup and escapes a
 seq 8  letter   from minerva         a raw note with no letter marker
 ```
 
-**The shapes are modelled, not observed.** They follow the vendored `aoide-core` (0.0.23) source and the field names in the plan
-(`disposition`, `data.reason`); the real 0.0.26's output was never run for this slice. Two differences between a self send and a remote one
-are kept on purpose because the 0.0.23 source has them: a self send answers with the mailbase entry (`data.envelope.msgid`, `ring`), a remote
-one with the envelope (`data.msgid`, `data.delivery`). `X0` compares these against a real `aoide` on a temp root, and a fixture that disagrees
-with it is a fixture to fix.
+**What is observed and what is modelled.** The read, reread, `--subject` send to self, empty outbox and schema shapes were observed on
+aoide 0.0.26 (a temp root, self-mail, `env -i`). The fixtures keep those structures and use made-up values (names, msgids, signatures,
+node names); no raw output is copied. Not observed, because no node is paired: a remote send, `--hold`, a non-empty outbox entry, a
+remote letter's delivery object, and a remote receipt. Those are modelled from the vendored `aoide-core` (0.0.23) source and the field
+names in the plan, and the entries that depend on them say so. A self send and a remote one answer the same `--subject` shape (the
+`self` and `osaka` entries of `send.json`), and the perch reads `data.recipients[0]` for both.
+
+**`nosubject`** is the envelope a send without `--subject` answers (`data.envelope` with its msgid, `data.disposition`, `data.ring`, and no
+`recipients`), so the perch reads no msgid from it and writes no row that names one. The perch always sends `--subject`, and no registered node is named `nosubject`, so no integration test asks for it. The
+proof that the perch reads no msgid from that shape is the unit test `a_letter_aoide_took_is_read_from_the_recipient_of_its_subject_shape`
+in `src/mail/send.rs`.
 
 The files are generated once and edited by hand after that; ids are runs of one hex digit so a test can say which letter it means.

@@ -6,18 +6,20 @@
 //! parser that shares no code with it. The shapes, in the order the runner spells them:
 //!
 //! ```text
-//! --version
+//! schema
 //! mesh --json
 //! mail outbox --json
 //! mail read --for=minerva --json [--reread]          AOIDE_SESSION_ID must be minerva-perch, else exit 99
 //! mail send --json --to=<node>/minerva --from=<minerva|minerva-agent> [--mesh=<m>] --subject=<s> [--hold] -- <text>
 //! ```
 //!
+//! `--version` is not a shape: aoide 0.0.26 has no such flag and exits 2 with usage on stderr, and so does this (the perch never asks).
+//!
 //! `<node>` is `self` or a name matching `^[a-z0-9][a-z0-9-]*$`; so is `<m>`. The subject is one line of 1 to 120 characters. `--hold` and
 //! `--mesh` with `self` are refused, as aoide refuses a hold without `<node>/<name>`.
 //!
 //! **It replays, it does not compute.** Each shape prints a file of the fixture directory `FAKE_AOIDE_DIR` (required; the perch keeps its
-//! own at `tests/fixtures/aoide/`): `version.txt` (default `aoide 0.0.26`), `mesh.json`, `outbox.json`, `mail-read.json` and
+//! own at `tests/fixtures/aoide/`): `schema.json` (what `schema` prints: the version and the commands the perch uses), `mesh.json`, `outbox.json`, `mail-read.json` and
 //! `mail-read-reread.json` (what a `--reread` prints; falls back to `mail-read.json`), and for a send `send.json`, a table by node with
 //! the exit code and stdout of the reply, `with_hold` and `with_mesh` variants, and `unknown-node` generated for a node that is not in it.
 //! A missing file is exit 99 with the file's name, so a test that forgot its fixture fails loudly and not as an empty answer.
@@ -30,7 +32,12 @@
 //! **Knobs**, by environment: `FAKE_AOIDE_SLEEP_MS` (wait before answering), `FAKE_AOIDE_FLOOD=<n>` (print n bytes of `x` on stdout in
 //! place of the fixture), `FAKE_AOIDE_STDERR_FLOOD=<n>` (write n bytes to stderr first, more than a pipe holds), `FAKE_AOIDE_STRAGGLER_MS=<n>`
 //! (leave a process that holds stdout open for n ms after the answer, as a daemon an aoide started would), and `FAKE_AOIDE_STDIN=1` (read
-//! stdin to its end first and log `{"event": "stdin", "bytes": N}`: a closed stdin ends at once, a held-open pipe never does).
+//! stdin to its end first and log `{"event": "stdin", "bytes": N}`: a closed stdin ends at once, a held-open pipe never does), and
+//! `FAKE_AOIDE_SPARES_SCHEMA=1` (the sleep and the flood leave `schema` alone, so a slowed or flooded send follows a schema check that passed),
+//! and `FAKE_AOIDE_FLOOD_SPARES_REREAD=1` (the flood leaves a `--reread` alone, so a plain read is the one that is too big).
+//!
+//! The perch hands its children only its allowlist, so a test that wants these knobs in the child runs the fake through a script that
+//! sets them (`steered` in `tests/mail.rs`, `wrapper` in `tests/mesh.rs`).
 //!
 //! Built only with `--features test-bins` (`required-features` in Cargo.toml), so a normal `cargo build` ships no test double.
 
@@ -44,7 +51,7 @@ const SUBJECT_MAX: usize = 120;
 const TEXT_MAX: usize = 64 * 1024;
 
 enum Call {
-    Version,
+    Schema,
     Mesh,
     Outbox,
     Read { reread: bool },
@@ -60,6 +67,11 @@ struct Letter {
 fn main() {
     let argv: Vec<String> = std::env::args_os().skip(1).map(|arg| arg.to_string_lossy().into_owned()).collect();
     log(&argv);
+    if argv == ["--version"] {
+        // The real aoide's answer to a flag it does not have: usage on stderr, and exit 2.
+        eprintln!("[usage] --version: unknown command: `--version`\n\nrun 'aoide --help' for the full command list");
+        std::process::exit(2);
+    }
     let call = parse(&argv).unwrap_or_else(|why| refuse(&why));
     if let Call::Read { .. } = call {
         let session = std::env::var("AOIDE_SESSION_ID").ok();
@@ -73,7 +85,10 @@ fn main() {
         let bytes = std::io::Read::read_to_end(&mut std::io::stdin(), &mut taken).map(|_| taken.len()).ok();
         append(&json!({ "event": "stdin", "pid": std::process::id(), "bytes": bytes }));
     }
-    if let Some(ms) = number("FAKE_AOIDE_SLEEP_MS") {
+    // `FAKE_AOIDE_SPARES_SCHEMA=1`: the sleep and the flood leave `schema` alone, so a test can slow or flood a send once the schema check
+    // has passed.
+    let spares = std::env::var_os("FAKE_AOIDE_SPARES_SCHEMA").is_some() && matches!(call, Call::Schema);
+    if let Some(ms) = number("FAKE_AOIDE_SLEEP_MS").filter(|_| !spares) {
         std::thread::sleep(std::time::Duration::from_millis(ms));
         append(&json!({ "event": "woke", "pid": std::process::id() }));
     }
@@ -84,7 +99,9 @@ fn main() {
         // A process that outlives this one and holds the same pipes. `sleep` is run by `sh` so there is nothing to wait on here.
         let _ = std::process::Command::new("/bin/sh").arg("-c").arg(format!("sleep {}.{:03}", ms / 1000, ms % 1000)).spawn();
     }
-    if let Some(bytes) = number("FAKE_AOIDE_FLOOD") {
+    // `FAKE_AOIDE_FLOOD_SPARES_REREAD=1`: the flood leaves a reread alone, so the plain read is the one that is too big.
+    let flood_spares = spares || (std::env::var_os("FAKE_AOIDE_FLOOD_SPARES_REREAD").is_some() && matches!(call, Call::Read { reread: true }));
+    if let Some(bytes) = number("FAKE_AOIDE_FLOOD").filter(|_| !flood_spares) {
         flood(&mut std::io::stdout(), bytes, b'x');
         std::process::exit(0);
     }
@@ -144,6 +161,8 @@ fn log(argv: &[String]) {
         "session": std::env::var("AOIDE_SESSION_ID").ok(),
         "aoide_env": aoide_env,
         "xdg_runtime_dir": std::env::var("XDG_RUNTIME_DIR").ok(),
+        // The names only, never a value, of every variable the call was run with: how a test sees what the runner let through.
+        "env_names": std::env::vars_os().map(|(key, _)| key.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         "pid": std::process::id(),
     }));
 }
@@ -162,7 +181,7 @@ fn name_ok(name: &str) -> bool {
 fn parse(argv: &[String]) -> Result<Call, String> {
     let words: Vec<&str> = argv.iter().map(String::as_str).collect();
     match words.as_slice() {
-        ["--version"] => Ok(Call::Version),
+        ["schema"] => Ok(Call::Schema),
         ["mesh", "--json"] => Ok(Call::Mesh),
         ["mail", "outbox", "--json"] => Ok(Call::Outbox),
         ["mail", "read", "--for=minerva", "--json"] => Ok(Call::Read { reread: false }),
@@ -236,7 +255,7 @@ fn fixture(name: &str) -> Result<String, String> {
 
 fn answer(call: &Call) -> (i32, String) {
     let replayed = match call {
-        Call::Version => Ok((0, fixture("version.txt").unwrap_or_else(|_| "aoide 0.0.26\n".to_string()))),
+        Call::Schema => fixture("schema.json").map(|text| (0, text)),
         Call::Mesh => fixture("mesh.json").map(|text| (0, text)),
         Call::Outbox => fixture("outbox.json").map(|text| (0, text)),
         Call::Read { reread } => {

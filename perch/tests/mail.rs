@@ -167,8 +167,6 @@ impl Setup {
         // `HOME` is empty and has no `.local/bin/aoide`: a perch with no `--aoide` has no aoide, and never the operator's.
         let mut builder = Perch::builder()
             .env("HOME", user.to_str().unwrap())
-            .env("FAKE_AOIDE_DIR", fixtures.to_str().unwrap())
-            .env("FAKE_AOIDE_LOG", log.to_str().unwrap())
             // What a perch started from inside a conducted session has in its environment: none of it may reach a call.
             .env("AOIDE_SESSION_ID", "a-conducted-session")
             .env("AOIDE_STATE_DIR", "/nonexistent/ambient-state");
@@ -184,7 +182,7 @@ impl Setup {
             builder = builder.arg("--home").arg(&home);
         }
         if self.aoide {
-            builder = builder.arg("--aoide").arg(fake_aoide().expect("the stand-in aoide"));
+            builder = builder.arg("--aoide").arg(steered(root.join("aoide-bin"), &fixtures, &log, &self.env));
         }
         builder = builder
             .arg("--aoide-home")
@@ -207,6 +205,22 @@ impl Setup {
 }
 
 /// A copy of the stock fixtures, with the entries of both `mail read` files replaced when a test brings its own.
+/// The stand-in, run through a script that sets its steering: the fixtures, the log, and every `FAKE_AOIDE_*` the test gave the perch. A
+/// perch hands its children only its allowlist (`aoide::ENV_KEEP`, and the AOIDE_* it sets itself), so the steering cannot ride on the
+/// perch's environment, and the script is what carries it.
+fn steered(path: PathBuf, fixtures: &Path, log: &Path, env: &[(String, String)]) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    let mut settings = format!("FAKE_AOIDE_DIR={} FAKE_AOIDE_LOG={}", quote(&fixtures.display().to_string()), quote(&log.display().to_string()));
+    for (key, value) in env.iter().filter(|(key, _)| key.starts_with("FAKE_AOIDE_")) {
+        settings.push_str(&format!(" {key}={}", quote(value)));
+    }
+    let bin = fake_aoide().expect("the stand-in aoide").replace('\'', "'\\''");
+    std::fs::write(&path, format!("#!/bin/sh\n{settings} exec '{bin}' \"$@\"\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
 fn lay_fixtures(dest: &Path, entries: Option<&[Value]>) {
     std::fs::create_dir(dest).unwrap();
     for file in std::fs::read_dir(stock()).unwrap().flatten() {
@@ -314,6 +328,23 @@ impl Rig {
     fn calls(&self) -> Vec<Value> {
         let text = std::fs::read_to_string(&self.log).unwrap_or_default();
         text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter(|line| line.get("argv").is_some()).collect()
+    }
+
+    /// The calls that a request asked for: every call but the schema check, which the perch makes itself before it asks aoide for anything.
+    fn asked_calls(&self) -> Vec<Value> {
+        self.calls().into_iter().filter(|call| call["argv"][0] != "schema").collect()
+    }
+
+    fn asked(&self) -> Vec<Vec<String>> {
+        self.asked_calls().iter().map(|call| call["argv"].as_array().unwrap().iter().map(|word| word.as_str().unwrap().to_string()).collect()).collect()
+    }
+
+    /// The files of the mail folder other than its lock: the folder is made at start, so only what a request kept counts.
+    fn kept_files(&self) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(self.mail_dir()).map(|dir| dir.flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+        names.retain(|name| name != ".lock");
+        names
     }
 
     fn argvs(&self) -> Vec<Vec<String>> {
@@ -449,7 +480,7 @@ fn every_mail_route_is_behind_the_token() {
         }
     }
     assert!(rig.calls().is_empty(), "a refused request ran aoide: {:?}", rig.argvs());
-    assert!(!rig.mail_dir().exists(), "a refused request made the mail folder");
+    assert!(rig.kept_files().is_empty(), "a refused request kept a file in the mail folder");
 }
 
 #[test]
@@ -464,7 +495,7 @@ fn a_scoped_agent_token_opens_none_of_the_operators_mail() {
             assert_eq!((answer.status, answer.body.as_str()), (401, ""), "{method} {path} with a scoped token: {}", answer.head);
         }
     }
-    assert!(rig.calls().is_empty() && !rig.mail_dir().exists());
+    assert!(rig.calls().is_empty() && rig.kept_files().is_empty());
 }
 
 #[test]
@@ -595,10 +626,10 @@ fn a_note_sent_to_this_machine_is_one_exact_call_and_one_row() {
     );
 
     // Exactly the argv the runner builds: a fixed sender, a node that is `self`, the title as the subject, the whole note after `--`.
-    let calls = rig.calls();
+    let calls = rig.asked_calls();
     assert_eq!(calls.len(), 1, "{:?}", rig.argvs());
     assert_eq!(
-        rig.argvs()[0],
+        rig.asked()[0],
         ["mail", "send", "--json", "--to=self/minerva", "--from=minerva", "--subject=Plan: the mesh", "--", text.as_str()]
     );
     // Run as nobody in particular: no session id, and none of the perch's own AOIDE_* variables (the three that are there are the
@@ -799,7 +830,8 @@ fn a_mesh_the_node_is_not_in_is_refused_when_the_perch_knows_its_meshes() {
 #[test]
 fn an_answer_that_never_came_may_have_gone_and_leaves_a_row_that_says_so() {
     for (flood, label) in [("100", "output that is not JSON"), ("5000000", "more output than the runner reads")] {
-        let rig = Setup::new().env("FAKE_AOIDE_FLOOD", flood).start();
+        // The flood spares the schema check, so the send is the one that is flooded.
+        let rig = Setup::new().env("FAKE_AOIDE_FLOOD", flood).env("FAKE_AOIDE_SPARES_SCHEMA", "1").start();
         let name = rig.note("Maybe", "text");
         let answer = rig.send(&name, json!({ "node": "self" }));
         let error = error_of(&answer, 502, label);
@@ -824,9 +856,11 @@ fn many_sends_at_once_write_whole_lines() {
         let threads: Vec<_> = (0..12).map(|_| scope.spawn(|| rig.send(&name, json!({ "node": "self" })).status)).collect();
         threads.into_iter().map(|thread| thread.join().unwrap()).collect()
     });
-    assert_eq!(answers, vec![202; 12]);
+    // Two run at once at most: the others are 429 at once, and nothing is half-written for any of them.
+    assert!(answers.iter().all(|status| *status == 202 || *status == 429), "{answers:?}");
+    let accepted = answers.iter().filter(|status| **status == 202).count();
     let rows = rig.lines("sent.jsonl");
-    assert_eq!(rows.len(), 12, "every line whole and none lost");
+    assert_eq!(rows.len(), accepted, "every line whole and none lost");
     assert!(rows.iter().all(|row| row["msgid"] == id('5')));
 }
 
@@ -835,8 +869,7 @@ fn the_mail_folder_is_private_and_a_planted_link_or_a_loose_file_is_not_followed
     let rig = Setup::new().start();
     let name = rig.note("Private", "text");
     let dir = rig.mail_dir();
-    // A folder and a file from before, too open: tightened and kept.
-    std::fs::create_dir(&dir).unwrap();
+    // A folder and a file from before, too open: tightened and kept. The perch made the folder at start (its lock is in it).
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     let sent = dir.join("sent.jsonl");
     std::fs::write(&sent, "{\"old\":1}\n").unwrap();
@@ -890,9 +923,9 @@ fn nothing_is_asked_of_aoide_until_a_page_looks_and_then_a_reread_and_one_read()
     assert_eq!(reads.len(), 2, "{reads:?}");
     assert_eq!(reads[0], ["mail", "read", "--for=minerva", "--json", "--reread"], "the reread comes once, first");
     assert_eq!(reads[1], ["mail", "read", "--for=minerva", "--json"]);
-    assert_eq!(rig.calls().len(), 2, "and nothing else: {:?}", rig.argvs());
+    assert_eq!(rig.asked_calls().len(), 2, "and nothing else: {:?}", rig.argvs());
     // As the reader that moves only Minerva's own cursor, with nothing of the perch's environment.
-    for call in rig.calls() {
+    for call in rig.asked_calls() {
         assert_eq!((call["session"].clone(), call["aoide_env"].clone()), (json!("minerva-perch"), rig.aoide_env()), "{call}");
     }
 
@@ -901,7 +934,7 @@ fn nothing_is_asked_of_aoide_until_a_page_looks_and_then_a_reread_and_one_read()
         rig.mail();
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(rig.calls().len(), 2, "{:?}", rig.argvs());
+    assert_eq!(rig.asked_calls().len(), 2, "{:?}", rig.argvs());
 
     // A changed one costs one plain read, and the letters it prints again are not new cards.
     rig.touch_mailbox();
@@ -934,7 +967,7 @@ fn a_mailbox_that_is_not_there_costs_no_call_and_one_that_appears_is_read() {
     let rig = Setup::new().no_base().start();
     rig.mail();
     std::thread::sleep(Duration::from_millis(600));
-    assert!(rig.calls().is_empty(), "no mailbox file, nothing to read: {:?}", rig.argvs());
+    assert!(rig.asked_calls().is_empty(), "no mailbox file, nothing to read: {:?}", rig.argvs());
     assert_eq!(rig.mail()["received"], json!([]));
     std::fs::write(rig.base_file(), "{\"seq\":1}\n").unwrap();
     rig.wait_cards(7);
@@ -969,7 +1002,7 @@ fn letters_become_cards_decoded_dated_and_attributed() {
     };
     assert_eq!(
         keys(&mail["received"][0]),
-        "at,broken,chat,clipped,format,mailbox,msgid,node,reply_to,seen,sender,seq,state,subject,text,thread,via"
+        "at,broken,chat,clipped,format,from_label,mailbox,msgid,node,reply_to,seen,sender,sender_claimed,seq,state,subject,text,thread,via"
     );
 
     let a = card(&mail, &id('a'));
@@ -1206,23 +1239,35 @@ fn a_card_is_placed_in_a_known_chat_dismissed_or_saved_and_nothing_is_ever_said_
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_cards_file_that_is_not_json_is_set_aside_and_the_cards_start_over() {
+fn a_cards_file_that_does_not_parse_refuses_mail_until_it_is_moved_aside() {
     let rig = Setup::new().start();
-    std::fs::create_dir(rig.mail_dir()).unwrap();
+    std::fs::create_dir_all(rig.mail_dir()).unwrap();
     std::fs::set_permissions(rig.mail_dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(rig.mail_dir().join("cards.json"), "this is {not json").unwrap();
-    rig.mail();
-    let mail = rig.wait_cards(7);
-    assert_eq!(mail["error"], Value::Null);
-    let kept: Value = serde_json::from_str(&std::fs::read_to_string(rig.mail_dir().join("cards.json")).unwrap()).unwrap();
-    assert_eq!(kept["cards"].as_object().unwrap().len(), 7);
+    // The page says why, and no letter is read into a store that does not parse; the file is not set aside behind the operator's back.
+    let mail = until(Duration::from_secs(5), "the refusal", || {
+        let mail = rig.mail();
+        mail["error"].as_str().is_some().then_some(mail)
+    });
+    assert!(mail["error"].as_str().unwrap().contains("cards.json does not parse"), "{mail}");
+    assert_eq!(mail["received"], json!([]));
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(rig.reads().is_empty(), "no letter is read into it: {:?}", rig.argvs());
+    assert_eq!(std::fs::read_to_string(rig.mail_dir().join("cards.json")).unwrap(), "this is {not json", "the file is kept as it is");
+    // Moved aside, the store starts over with the mailbox's letters, and nothing is lost of them.
+    std::fs::rename(rig.mail_dir().join("cards.json"), rig.mail_dir().join("cards.json.old")).unwrap();
+    // The cards arrive before the read clears the complaint, so both are waited for.
+    until(Duration::from_secs(10), "the store started over", || {
+        let mail = rig.mail();
+        (mail["error"].is_null() && mail["received"].as_array().is_some_and(|cards| cards.len() == 7)).then_some(())
+    });
 }
 
 #[test]
 fn a_fifo_where_a_file_goes_is_an_error_sentence_and_not_a_hang() {
     use std::os::unix::ffi::OsStrExt as _;
     let rig = Setup::new().start();
-    std::fs::create_dir(rig.mail_dir()).unwrap();
+    std::fs::create_dir_all(rig.mail_dir()).unwrap();
     std::fs::set_permissions(rig.mail_dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
     for file in ["received.jsonl", "sent.jsonl"] {
         let path = std::ffi::CString::new(rig.mail_dir().join(file).as_os_str().as_bytes()).unwrap();
@@ -1242,7 +1287,7 @@ fn a_fifo_where_a_file_goes_is_an_error_sentence_and_not_a_hang() {
 #[test]
 fn a_full_store_stops_the_reading_and_says_so() {
     let rig = Setup::new().start();
-    std::fs::create_dir(rig.mail_dir()).unwrap();
+    std::fs::create_dir_all(rig.mail_dir()).unwrap();
     std::fs::set_permissions(rig.mail_dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut cards = serde_json::Map::new();
     for n in 0..5000u32 {
@@ -1256,5 +1301,151 @@ fn a_full_store_stops_the_reading_and_says_so() {
     });
     assert!(mail["error"].as_str().unwrap().contains("card store is full"), "{mail}");
     std::thread::sleep(Duration::from_millis(300));
-    assert!(rig.calls().is_empty(), "a full store reads nothing: {:?}", rig.argvs());
+    assert!(rig.asked_calls().is_empty(), "a full store reads nothing: {:?}", rig.argvs());
+}
+
+// ---------------------------------------------------------------------------
+// The M2 fix round: the reread state machine, the caps, the sends
+// ---------------------------------------------------------------------------
+
+fn rereads(rig: &Rig) -> usize {
+    rig.reads().iter().filter(|argv| argv.last().map(String::as_str) == Some("--reread")).count()
+}
+
+/// A plain read that is too big to keep is not the end of it: the cursor may have moved past letters that were not kept, so a reread is
+/// due, and it is made before any plain read. Here the plain output is 5 MiB (over the plain cap) and the reread is not flooded: the
+/// reread keeps the letters, and the plain read after it is too big again, so the reread is armed again each time. Nothing is lost.
+#[test]
+fn a_plain_read_too_big_re_arms_the_reread_and_the_reread_keeps_the_letters() {
+    let rig = Setup::new()
+        .env("FAKE_AOIDE_FLOOD", &(5 * 1024 * 1024).to_string())
+        .env("FAKE_AOIDE_FLOOD_SPARES_REREAD", "1")
+        .env("FAKE_AOIDE_SPARES_SCHEMA", "1")
+        .start();
+    rig.mail();
+    until(Duration::from_secs(10), "the seven letters of the reread", || {
+        let mail = rig.mail();
+        (mail["received"].as_array().unwrap().len() == 7).then_some(())
+    });
+    until(Duration::from_secs(10), "a second reread, armed by the plain read", || (rereads(&rig) >= 2).then_some(()));
+    let reads = rig.reads();
+    assert_eq!(reads[0], ["mail", "read", "--for=minerva", "--json", "--reread"], "the first look is a reread");
+    assert_eq!(reads[1], ["mail", "read", "--for=minerva", "--json"], "then the plain read, which is too big");
+    assert_eq!(reads[2], ["mail", "read", "--for=minerva", "--json", "--reread"], "and the reread it arms");
+    let error = rig.mail()["error"].as_str().unwrap_or_default().to_string();
+    assert!(!error.contains("could not be read here"), "the reread kept the letters, so nothing is lost: {error}");
+}
+
+/// A reread too big to print can never succeed (the history only grows): it is not armed again, and the page says the letters could not be
+/// read here, and how to read them in a terminal, until the perch restarts. Plain reads go on for new letters.
+#[test]
+fn a_reread_too_big_to_print_is_a_loss_said_on_the_page_and_never_armed_again() {
+    let rig = Setup::new().env("FAKE_AOIDE_FLOOD", &(20 * 1024 * 1024).to_string()).env("FAKE_AOIDE_SPARES_SCHEMA", "1").start();
+    let mail = until(Duration::from_secs(10), "the loss", || {
+        let mail = rig.mail();
+        mail["error"].as_str().unwrap_or_default().contains("could not be read here").then_some(mail)
+    });
+    assert!(mail["error"].as_str().unwrap().contains("aoide mail read --for=minerva --reread"), "{mail}");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(rereads(&rig), 1, "a reread too big to print is not tried again: {:?}", rig.reads());
+    assert!(rig.mail()["error"].as_str().unwrap_or_default().contains("could not be read here"), "the loss stays until a restart");
+}
+
+/// Every letter of one read is kept, not the first 2000 by position: 2001 letters make 25 cards shown and 1976 more, with none dropped.
+#[test]
+fn two_thousand_and_one_letters_are_all_kept_and_the_page_counts_the_rest() {
+    let rig = Setup::new().start();
+    let entries: Vec<Value> = (1..=2001)
+        .map(|i| {
+            json!({
+                "seq": i, "receivedAt": "2026-10-07T09:10:00Z", "type": "letter", "via": "osaka",
+                "envelope": {
+                    "header": { "version": "1", "from": { "node": "osaka", "name": "minerva-agent" }, "type": "letter" },
+                    "text": format!("letter {i}"), "sig": "ab", "msgid": format!("{i:064x}"),
+                },
+            })
+        })
+        .collect();
+    rig.set_entries(&entries);
+    let mail = until(Duration::from_secs(20), "all 2001 letters", || {
+        let mail = rig.mail();
+        (mail["received"].as_array().unwrap().len() as u64 + mail["more"].as_u64().unwrap() == 2001).then_some(mail)
+    });
+    assert_eq!((mail["received"].as_array().unwrap().len(), mail["more"].as_u64()), (25, Some(1976)), "{mail}");
+    assert_eq!(mail["error"], Value::Null, "{mail}");
+}
+
+/// A send that outlives its timeout after aoide has started is not a resend invitation: the row is `unknown`, the page says to check the
+/// outbox, and it is a 502 and never a 504.
+#[test]
+fn a_send_that_times_out_after_aoide_started_is_an_unknown_row_and_no_resend() {
+    let rig = Setup::new().env("FAKE_AOIDE_SLEEP_MS", "3000").env("FAKE_AOIDE_SPARES_SCHEMA", "1").knob("mail_send_ms", "500").start();
+    let name = rig.note("Slow", "text");
+    let answer = rig.send(&name, json!({ "node": "self" }));
+    assert_eq!(answer.status, 502, "{}{}", answer.head, answer.body);
+    assert!(answer.body.contains("may or may not have been sent"), "{}", answer.body);
+    let rows = rig.lines("sent.jsonl");
+    assert_eq!((rows.len(), rows[0]["status"].clone()), (1, json!("unknown")), "{rows:?}");
+    assert_eq!(rig.asked().len(), 1, "one send, and nothing sent again for it: {:?}", rig.argvs());
+}
+
+/// Two sends run at once, and a third is 429 at once with a sentence that says to wait; the refused one keeps no row.
+#[test]
+fn the_third_send_at_once_is_429_and_the_two_that_run_are_kept() {
+    let rig = Setup::new().env("FAKE_AOIDE_SLEEP_MS", "800").env("FAKE_AOIDE_SPARES_SCHEMA", "1").start();
+    let name = rig.note("Busy", "text");
+    let answers: Vec<(u16, String)> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..3)
+            .map(|_| {
+                scope.spawn(|| {
+                    let answer = rig.send(&name, json!({ "node": "self" }));
+                    (answer.status, answer.body)
+                })
+            })
+            .collect();
+        threads.into_iter().map(|thread| thread.join().unwrap()).collect()
+    });
+    let mut codes: Vec<u16> = answers.iter().map(|(status, _)| *status).collect();
+    codes.sort_unstable();
+    assert_eq!(codes, vec![202, 202, 429], "{answers:?}");
+    let refused = answers.iter().find(|(status, _)| *status == 429).unwrap();
+    assert!(refused.1.contains("sends are running already"), "{}", refused.1);
+    assert_eq!(rig.lines("sent.jsonl").len(), 2, "the two that ran are kept, and the refused one kept nothing");
+}
+
+/// A schema that does not list a flag the perch sends turns mail off, with a sentence that names the flag, for the listing and every send.
+#[test]
+fn a_schema_without_a_flag_the_perch_sends_turns_mail_off_with_the_sentence() {
+    let rig = Setup::new().start();
+    let mut schema: Value = serde_json::from_str(&std::fs::read_to_string(rig.fixtures.join("schema.json")).unwrap()).unwrap();
+    let read = schema["commands"].as_array_mut().unwrap().iter_mut().find(|command| command["path"] == json!(["mail", "read"])).unwrap();
+    let kept: Vec<Value> = read["flags"].as_array().unwrap().iter().filter(|flag| flag["name"] != "reread").cloned().collect();
+    read["flags"] = Value::Array(kept);
+    std::fs::write(rig.fixtures.join("schema.json"), schema.to_string()).unwrap();
+    let mail = until(Duration::from_secs(10), "the schema's refusal", || {
+        let mail = rig.mail();
+        mail["error"].as_str().is_some_and(|error| error.contains("--reread")).then_some(mail)
+    });
+    assert_eq!(mail["available"], json!(false), "{mail}");
+    let name = rig.note("Off", "text");
+    let answer = rig.send(&name, json!({ "node": "self" }));
+    assert_eq!(answer.status, 503, "{}{}", answer.head, answer.body);
+    assert!(answer.body.contains("--reread"), "{}", answer.body);
+    assert!(rig.asked().is_empty(), "nothing was sent: {:?}", rig.argvs());
+}
+
+/// The perch's own proxy and provider key are not handed to aoide: the runner passes its allowlist, and a send's call shows neither.
+#[test]
+fn the_proxy_and_the_provider_key_of_the_perch_do_not_reach_aoide() {
+    let rig = Setup::new().env("HTTP_PROXY", "http://proxy.invalid:3128").env("OPENAI_API_KEY", "sk-made-up-for-the-test").start();
+    let name = rig.note("Env", "text");
+    json_of(&rig.send(&name, json!({ "node": "self" })), 202, "the send");
+    let calls = rig.calls();
+    assert!(!calls.is_empty());
+    for call in &calls {
+        let names: Vec<&str> = call["env_names"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        for banned in ["HTTP_PROXY", "OPENAI_API_KEY"] {
+            assert!(!names.contains(&banned), "{banned} reached aoide: {names:?}");
+        }
+    }
 }

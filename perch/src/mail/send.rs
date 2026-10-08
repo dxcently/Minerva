@@ -8,34 +8,39 @@
 //! ```
 //!
 //! **The send** is `aoide mail send --json --to=<node>/minerva --from=minerva [--mesh=<m>] --subject=<title> [--hold] -- <text>`
-//! ([`crate::aoide::Shape::MailSend`]): the note's whole text, its title (the first non-empty line) as the one-line subject, and a
-//! sender that is a fixed value (`minerva`) and not a field of the request, so nothing a page sends can name another one.
+//! ([`crate::aoide::Shape::MailSend`]): the note's whole text, its title (the first non-empty line, cleaned to one printable line) as the
+//! subject, and a sender that is a fixed value (`minerva`) and not a field of the request, so nothing a page sends can name another one.
+//! The perch always sends a subject, so aoide answers in its `--subject` shape: one recipient, whose `msgid`, `status`, `delivery` and
+//! `error` are the letter's, and the whole send's `complete` and `accepted`.
 //!
-//! **Every refusal, in the order it is made.** The first four cost nothing: no process is started, and the fake `aoide`'s log is empty.
+//! **Every refusal, in the order it is made.** The first five cost nothing: no process is started, and the fake `aoide`'s log is empty.
 //!
 //! ```text
 //!   400  the body is not {node, mesh?, hold?} with those types (an unknown field, `from` included, is refused)
 //!   404  the note is not there (`notes::load`: the name grammar, a link or a FIFO under the name, a missing folder), or no --home
 //!   413  the note's text is over 64 KiB (it sits in a command line while aoide runs, readable in /proc)
 //!   400  the runner's own checks, run before anything: a node or mesh name outside ^[a-z0-9][a-z0-9-]*$; a mesh with `self`; hold
-//!        with `self` ("hold needs another node"); a subject that is empty, longer than 120 characters or not one line (a U+2028
-//!        in the first line counts); no text
-//!   503  there is no aoide (no --aoide, and no executable ~/.local/bin/aoide), or the Aoide folder cannot be used
+//!        with `self` ("hold needs another node"); a subject that is empty, longer than 120 characters or not one line; no text
+//!   503  another perch keeps this home's mail folder (`mail/.lock`), or aoide is not there or does not list what the perch sends
+//!   429  two sends are running already (see [`mail::SENDS_AT_ONCE`]): wait for one, then send again
 //!   409  the node is not in Aoide's registry, or is registered but not paired ("mail needs a VERIFIED node"), or `mesh` is not one
-//!        of the meshes `mesh --json` puts that node in (when it puts it in any: an empty list is "unknown", not "unreachable")
-//!   ---- the process runs ----
-//!   409  aoide refused: unknown-node and unpaired-node become the same sentences as above; a refusal that carries `data.meshes` (a
-//!        node trusted in more than one mesh) is `{error, why, meshes}`, so the page can ask which and send again with `mesh`; any
-//!        other envelope with a refusal in it is aoide's own sentence
-//!   502  aoide could not be started, printed too much, or failed without an envelope
-//!   504  aoide did not answer in 10 s and was killed. 502/504 for an answer that may have come after the letter was spooled (a
-//!        timeout, too much output, output that is not JSON) also write a row with disposition `unknown`, because the letter may be out
+//!        of the meshes `mesh --json` puts that node in (when it puts it in any: an empty list is "unknown", not "unreachable").
+//!        This is the one refusal that reads aoide before the letter: a read-only `mesh --json`, which runs no send
+//!   ---- the process runs (`mail send`, with the send's own timeout, [`aoide::SEND_TIMEOUT`], longer than aoide's own) ----
+//!   409  aoide refused for a reason it names (unknown-node, unpaired-node, ambiguous-mesh): nothing was spooled, so no row. A
+//!        refusal with `data.meshes` is `{error, why, meshes}`, so the page can ask which and send again with `mesh`
+//!   502  any other answer that may come after the letter was spooled: a refusal without a reason, an envelope-less failure, a
+//!        signal, a timeout, too much output, output that is not JSON, or a reply with no recipient the perch can read. Each writes a
+//!        row with status `unknown` (msgid absent when none was read), and says "may or may not have been sent: check `aoide mail
+//!        outbox` for <node>/minerva before sending it again". Never a 504 that invites a resend
+//!   502  aoide could not be started (nothing ran, no row)
 //! ```
 //!
 //! **The row.** A letter that aoide took is one line of `<home>/mail/sent.jsonl` (`0600`): `{ts, origin, from, note, subject, sha256,
-//! to, mesh?, msgid, disposition, status}`. The text is not kept, only the sha256 of what was sent. `status` is the first one aoide
-//! reported (`queued`, `held`; `delivered` for a letter filed on this machine); `GET /hub/mail` works out the current one. A row that
-//! cannot be written does not undo the send: the answer is still the 202, with a `warning` sentence.
+//! to, mesh?, msgid, disposition, status}`. The text is not kept, only the sha256 of what was sent; the subject and the note's title are
+//! kept, and a title is one line of at most 120 characters. `disposition` is the recipient's `status` word as aoide printed it (`filed`,
+//! `spooled`, `held`); `status` is the recipient's `delivery.status` when there is one, else what the word means. `GET /hub/mail` works
+//! out the current one. A row that cannot be written does not undo the send: the answer is still the 202, with a `warning` sentence.
 //!
 //! **For M3.** [`send`] is the whole of it for the agent too: [`Letter`] names the sender ([`Sender::MinervaAgent`]) and the origin
 //! (`agent:<chat>`), and the checks, the node rules, the argv and the row are the same.
@@ -159,7 +164,6 @@ pub async fn send_note(ctx: &Ctx, req: Request<Incoming>, rest: &str) -> Respons
 // ---------------------------------------------------------------------------
 
 /// What is to be sent, from whom and why. Nothing in it is taken from a request body but `node`, `mesh` and `hold`.
-#[derive(Debug)]
 pub(crate) struct Letter {
     /// The sender aoide is told (`--from`), a fixed choice.
     pub from: Sender,
@@ -175,7 +179,25 @@ pub(crate) struct Letter {
     pub text: String,
 }
 
-/// Why a send did not happen (or, for the 502/504 with `maybe_sent`, may have). A sentence for a person, and the status it travels with.
+/// The letter's text and subject are the operator's words and an agent's: a `{:?}` in a log line is not a place for them, so it prints
+/// the sizes and the names (the same rule as `aoide::Shape`).
+impl std::fmt::Debug for Letter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Letter")
+            .field("from", &self.from.name())
+            .field("origin", &self.origin)
+            .field("note", &self.note)
+            .field("node", &self.node)
+            .field("mesh", &self.mesh)
+            .field("hold", &self.hold)
+            .field("subject_chars", &self.subject.chars().count())
+            .field("text_bytes", &self.text.len())
+            .finish()
+    }
+}
+
+/// Why a send did not happen (or, for a 502 that says "may or may not have been sent", it may have). A sentence for a person, and the
+/// status it travels with.
 #[derive(Debug)]
 pub(crate) struct Refusal {
     pub code: StatusCode,
@@ -216,7 +238,9 @@ pub(crate) struct Sent {
     pub status: String,
     pub to: String,
     pub mesh: Option<String>,
-    /// The row could not be written; the letter went anyway.
+    /// The recipient's `error` as aoide printed it, cleaned to one line, when it printed one.
+    pub error: Option<String>,
+    /// The row could not be written, or the send was not complete; the letter went anyway.
     pub warning: Option<String>,
 }
 
@@ -231,6 +255,9 @@ impl Sent {
         });
         if let Some(mesh) = &self.mesh {
             answer["mesh"] = json!(mesh);
+        }
+        if let Some(error) = &self.error {
+            answer["error"] = json!(error);
         }
         if let Some(warning) = &self.warning {
             answer["warning"] = json!(warning);
@@ -268,7 +295,8 @@ fn shape_of(letter: &Letter, to: To) -> Shape {
     }
 }
 
-/// Sends `letter`: the checks that cost nothing, aoide, the node and the mesh, the run, and the row. `Ok` is a letter aoide took.
+/// Sends `letter`: the checks that cost nothing, a place among the sends, aoide, the node and the mesh, the run, and the row. `Ok` is a
+/// letter aoide took.
 pub(crate) async fn send(ctx: &Ctx, letter: Letter) -> Result<Sent, Refusal> {
     let Some(dir) = mail::mail_dir(ctx) else { return Err(Refusal::new(StatusCode::NOT_FOUND, "this perch has no home to keep mail in")) };
     // 1. What is refused without asking anyone. The runner's own checks are the ones used: they run before a process exists.
@@ -283,11 +311,22 @@ pub(crate) async fn send(ctx: &Ctx, letter: Letter) -> Result<Sent, Refusal> {
     if let Err(Error::Refused(why)) = shape_of(&letter, to.clone()).argv() {
         return Err(Refusal::bad(why));
     }
-    // 2. Aoide at all.
-    let aoide = Aoide::from_options(&ctx.opts).map_err(|e| Refusal::new(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
-    // 3. The node and the mesh.
+    // 2. Another perch on this home keeps the mail folder: this one sends nothing.
+    if let Some(why) = mail::refused(&ctx.mail) {
+        return Err(Refusal::new(StatusCode::SERVICE_UNAVAILABLE, why));
+    }
+    // 3. A place among the sends: a third one at once is 429, and nothing is started for it.
+    let Some(_slot) = mail::take_send_slot(&ctx.mail) else {
+        return Err(Refusal::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("{} sends are running already: wait for one to finish, then send again", mail::SENDS_AT_ONCE),
+        ));
+    };
+    // 4. Aoide, and that it lists what the perch sends.
+    let aoide = mail::usable(ctx).await.map_err(|why| Refusal::new(StatusCode::SERVICE_UNAVAILABLE, why))?;
+    // 5. The node and the mesh.
     resolve(ctx, &letter).await?;
-    // 4. The run.
+    // 6. The run.
     deliver(ctx, &aoide, &dir, letter, to).await
 }
 
@@ -315,54 +354,103 @@ async fn resolve(ctx: &Ctx, letter: &Letter) -> Result<(), Refusal> {
 async fn deliver(ctx: &Ctx, aoide: &Aoide, dir: &std::path::Path, letter: Letter, to: To) -> Result<Sent, Refusal> {
     let sha = harnox::crypto::hex(&harnox::crypto::sha256(letter.text.as_bytes()));
     let address = format!("{}/{}", letter.node, aoide::MAILBOX);
-    let may_have_gone = |why: String, code: StatusCode| {
-        Refusal::new(code, format!("{why}; the letter may or may not have been sent, so look at the sent list before sending it again"))
+    // Once aoide has been spawned the letter may be spooled, whatever came back: the attempt is on record as `unknown`, with the msgid
+    // when one was read, and the page is told to look at the outbox before it sends again.
+    let unknown = |why: String| {
+        Refusal::new(StatusCode::BAD_GATEWAY, format!("{why}; the letter may or may not have been sent: check `aoide mail outbox` for {address} before sending it again"))
     };
-    match aoide.run(&shape_of(&letter, to)).await {
+    let timeout = mail::knob_ms(ctx, "mail_send_ms", aoide::SEND_TIMEOUT);
+    match aoide.for_send(timeout).run(&shape_of(&letter, to)).await {
         Ok(reply) => {
             let took = parse_took(&reply);
+            if !took.accepted {
+                // Aoide took the letter's shape and said no to this recipient: nothing was spooled.
+                return Err(Refusal::conflict(took.error.unwrap_or_else(|| format!("aoide did not accept the letter for {address}"))));
+            }
+            if took.msgid.is_none() {
+                let _ = record(ctx, dir, row_of(&letter, &sha, &address, None, "unknown", "unknown")).await;
+                return Err(unknown("aoide answered in a shape the perch does not read".to_string()));
+            }
             let row = row_of(&letter, &sha, &address, took.msgid.as_deref(), &took.disposition, &took.status);
-            let warning = record(ctx, dir, row).await.err();
-            Ok(Sent { msgid: took.msgid, disposition: took.disposition, delivery: took.delivery, status: took.status, to: address, mesh: letter.mesh, warning })
+            let mut warning = record(ctx, dir, row).await.err();
+            if !took.complete && warning.is_none() {
+                warning = Some(format!("aoide did not complete the send to {address}: check `aoide mail outbox` before sending it again"));
+            }
+            Ok(Sent {
+                msgid: took.msgid,
+                disposition: took.disposition,
+                delivery: took.delivery,
+                status: took.status,
+                to: address,
+                mesh: letter.mesh,
+                error: took.error,
+                warning,
+            })
         }
-        Err(Error::Failed(reply)) => Err(refused_by_aoide(&reply, &letter.node)),
+        Err(Error::Failed(reply)) if certain(&reply) => Err(refused_by_aoide(&reply, &letter.node)),
+        Err(Error::Failed(reply)) => {
+            let why = refused_by_aoide(&reply, &letter.node).why;
+            let _ = record(ctx, dir, row_of(&letter, &sha, &address, None, "unknown", "unknown")).await;
+            Err(unknown(why))
+        }
         Err(Error::Refused(why)) => Err(Refusal::bad(why)),
         Err(e @ Error::NoBinary) => Err(Refusal::new(StatusCode::SERVICE_UNAVAILABLE, e.to_string())),
+        // Not started: nothing was spooled, so there is no row and nothing to check.
         Err(e @ Error::Spawn(_)) => Err(Refusal::new(StatusCode::BAD_GATEWAY, e.to_string())),
         Err(e @ (Error::Timeout(_) | Error::TooBig(_) | Error::NotJson)) => {
-            let code = if matches!(e, Error::Timeout(_)) { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::BAD_GATEWAY };
-            let refusal = may_have_gone(e.to_string(), code);
-            // The attempt is on record, with nothing to follow it by.
             let _ = record(ctx, dir, row_of(&letter, &sha, &address, None, "unknown", "unknown")).await;
-            Err(refusal)
+            Err(unknown(e.to_string()))
         }
     }
 }
 
-/// What aoide said it did with the letter.
+/// Whether an aoide that ran and said no said so before anything was spooled: it named a reason that is certain (`unknown-node`,
+/// `unpaired-node`, `ambiguous-mesh`) or listed the meshes it would choose from. Any other failure, or a signal, may have spooled.
+fn certain(reply: &Reply) -> bool {
+    if reply.code < 0 || reply.json.is_none() {
+        return false;
+    }
+    let data = reply.data();
+    let named = data.and_then(|data| data.get("reason")).and_then(Value::as_str);
+    let meshes = data.and_then(|data| data.get("meshes")).and_then(Value::as_array).is_some_and(|list| !list.is_empty());
+    matches!(named, Some("unknown-node" | "unpaired-node" | "ambiguous-mesh")) || meshes
+}
+
+/// What aoide said it did with the letter, from its `--subject` shape: the one recipient's `msgid`, `status` (the word `disposition` is
+/// kept as), `delivery` and `error`, and the whole send's `accepted` and `complete`.
 struct Took {
     msgid: Option<String>,
     disposition: String,
     delivery: Option<Value>,
     status: String,
+    /// The recipient was accepted (`false` for a letter aoide would not take for this node).
+    accepted: bool,
+    /// The send was complete (every copy filed or spooled).
+    complete: bool,
+    error: Option<String>,
 }
 
-/// `data.msgid` for a letter that went to a node, `data.envelope.msgid` for one filed on this machine; `data.disposition`; `data.delivery`.
-/// Read defensively: aoide's `--json` shapes are not in its schema, and a field that is not what it should be is left out.
+/// `data.recipients[0]`, the one recipient the perch sends to. Read defensively: aoide's `--json` shapes are not in its schema, and a
+/// field that is not what it should be is left out. A reply with other than one recipient has no msgid this perch can tell is its own.
 fn parse_took(reply: &Reply) -> Took {
     let data = reply.data();
-    let msgid = data
-        .and_then(|data| data.get("msgid").or_else(|| data.pointer("/envelope/msgid")))
+    let recipients = data.and_then(|data| data.get("recipients")).and_then(Value::as_array);
+    let recipient = recipients.filter(|list| list.len() == 1).and_then(|list| list.first());
+    let msgid = recipient
+        .and_then(|recipient| recipient.get("msgid"))
         .and_then(Value::as_str)
         .filter(|msgid| mail::hex64(msgid))
         .map(str::to_string);
-    let disposition = data
-        .and_then(|data| data.get("disposition"))
+    let disposition = recipient
+        .and_then(|recipient| recipient.get("status"))
         .and_then(Value::as_str)
         .filter(|word| mail::word_ok(word))
         .unwrap_or("unknown")
         .to_string();
-    let delivery = data.and_then(|data| data.get("delivery")).and_then(clean_delivery);
+    let delivery = recipient.and_then(|recipient| recipient.get("delivery")).and_then(clean_delivery);
+    let error = recipient.and_then(|recipient| recipient.get("error")).and_then(clean_error);
+    let accepted = recipient.and_then(|recipient| recipient.get("accepted")).and_then(Value::as_bool).unwrap_or(true);
+    let complete = data.and_then(|data| data.get("complete")).and_then(Value::as_bool).unwrap_or(false);
     let reported = delivery.as_ref().and_then(|delivery| delivery.get("status")).and_then(Value::as_str).map(str::to_string);
     let status = reported.unwrap_or_else(|| match disposition.as_str() {
         "filed" => "delivered",
@@ -371,7 +459,18 @@ fn parse_took(reply: &Reply) -> Took {
         _ => "unknown",
     }
     .to_string());
-    Took { msgid, disposition, delivery, status }
+    Took { msgid, disposition, delivery, status, accepted, complete, error }
+}
+
+/// The recipient's `error` as one line: a string, or an object's `reason` or `message`. Anything else is nothing.
+fn clean_error(error: &Value) -> Option<String> {
+    let text = match error {
+        Value::String(text) => text.as_str(),
+        Value::Object(object) => object.get("reason").or_else(|| object.get("message"))?.as_str()?,
+        _ => return None,
+    };
+    let line = mail::line_safe(text, WHY_MAX);
+    (!line.is_empty()).then_some(line)
 }
 
 /// The fields of aoide's `delivery` that the page shows, each checked: a status word, a reason sentence, a scope word, a time, a flag.
@@ -474,37 +573,56 @@ mod tests {
         }
     }
 
+    /// The `--subject` shape of a send to one recipient, as the probe observed it (made-up values).
+    fn subject_reply(recipient: Value) -> Value {
+        json!({"status": "ok", "command": "mail.send", "message": "1/1 recipient copies filed or spooled; inspect recipient delivery status before retrying",
+               "gated": false, "data": {"accepted": 1, "complete": true, "recipients": [recipient], "replyTo": null, "subject": "s", "threadId": "e".repeat(64)}})
+    }
+
     #[test]
-    fn a_letter_aoide_took_is_read_from_either_shape() {
-        let remote = reply(
-            0,
-            json!({"status": "ok", "data": {"msgid": "6".repeat(64), "disposition": "spooled",
-                   "delivery": {"status": "queued", "reason": null, "reasonScope": null, "nextAttemptAt": null, "ackPending": false}}}),
-        );
-        let took = parse_took(&remote);
+    fn a_letter_aoide_took_is_read_from_the_recipient_of_its_subject_shape() {
+        let spooled = json!({"accepted": true, "address": {"name": "minerva", "node": "osaka"}, "delivery":
+            {"status": "queued", "reason": null, "reasonScope": null, "nextAttemptAt": null, "ackPending": false},
+            "error": null, "msgid": "6".repeat(64), "ring": "no-daemon", "role": "to", "status": "spooled"});
+        let took = parse_took(&reply(0, subject_reply(spooled)));
         assert_eq!((took.msgid.as_deref(), took.disposition.as_str(), took.status.as_str()), (Some("6".repeat(64).as_str()), "spooled", "queued"));
         assert_eq!(took.delivery.as_ref().unwrap()["ackPending"], json!(false));
-        let filed = reply(0, json!({"status": "ok", "data": {"envelope": {"msgid": "5".repeat(64)}, "disposition": "filed", "ring": "no-daemon"}}));
-        let took = parse_took(&filed);
+        assert!(took.accepted && took.complete && took.error.is_none());
+        let filed = json!({"accepted": true, "address": {"name": "minerva", "node": "self"}, "delivery": null, "error": null,
+            "msgid": "5".repeat(64), "ring": "no-daemon", "role": "to", "status": "filed"});
+        let took = parse_took(&reply(0, subject_reply(filed)));
         assert_eq!((took.msgid.as_deref(), took.disposition.as_str(), took.status.as_str()), (Some("5".repeat(64).as_str()), "filed", "delivered"));
         assert!(took.delivery.is_none());
-        let held = reply(0, json!({"status": "ok", "data": {"msgid": "7".repeat(64), "disposition": "held"}}));
-        assert_eq!(parse_took(&held).status, "held");
+        let held = json!({"accepted": true, "delivery": null, "error": {"reason": "held\u{1b}[0m\nfor a while"}, "msgid": "7".repeat(64), "status": "held"});
+        let took = parse_took(&reply(0, subject_reply(held)));
+        assert_eq!((took.status.as_str(), took.error.as_deref()), ("held", Some("held[0mfor a while")));
+        // The envelope with no subject is not a shape the perch reads: no msgid comes from it.
+        let no_subject = reply(0, json!({"status": "ok", "data": {"envelope": {"msgid": "5".repeat(64)}, "disposition": "filed", "ring": "no-daemon"}}));
+        let took = parse_took(&no_subject);
+        assert_eq!((took.msgid, took.disposition.as_str(), took.status.as_str()), (None, "unknown", "unknown"));
+        // Two recipients is not the one the perch sent to.
+        let two = json!({"status": "ok", "data": {"complete": true, "recipients": [{"msgid": "6".repeat(64), "status": "filed"}, {"msgid": "7".repeat(64), "status": "filed"}]}});
+        assert_eq!(parse_took(&reply(0, two)).msgid, None);
     }
 
     #[test]
     fn what_aoide_printed_that_is_not_what_it_should_be_is_left_out() {
-        for data in [
-            json!({"msgid": "short", "disposition": "Spooled; rm -rf", "delivery": "queued"}),
-            json!({"msgid": "G".repeat(64), "disposition": ["spooled"], "delivery": [1, 2]}),
-            json!({"msgid": 7, "disposition": 7, "delivery": {"status": "a b c"}}),
-            json!("data is a string"),
+        for recipient in [
+            json!({"msgid": "short", "status": "Spooled; rm -rf", "delivery": "queued"}),
+            json!({"msgid": "G".repeat(64), "status": ["spooled"], "delivery": [1, 2]}),
+            json!({"msgid": 7, "status": 7, "delivery": {"status": "a b c"}}),
+            json!("recipient is a string"),
             json!(null),
         ] {
+            let took = parse_took(&reply(0, subject_reply(recipient.clone())));
+            assert_eq!(took.msgid, None, "{recipient}");
+            assert_eq!((took.disposition.as_str(), took.status.as_str()), ("unknown", "unknown"), "{recipient}");
+            assert!(took.delivery.is_none(), "{recipient}");
+        }
+        for data in [json!("data is a string"), json!(null)] {
             let took = parse_took(&reply(0, json!({"status": "ok", "data": data})));
             assert_eq!(took.msgid, None, "{data}");
             assert_eq!((took.disposition.as_str(), took.status.as_str()), ("unknown", "unknown"), "{data}");
-            assert!(took.delivery.is_none(), "{data}");
         }
         let delivery =
             clean_delivery(&json!({"status": "retrying", "reason": "bad\u{1b}[31m\nline", "reasonScope": "remote", "nextAttemptAt": "t", "extra": 1}))

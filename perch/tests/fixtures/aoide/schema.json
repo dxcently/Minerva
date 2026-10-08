@@ -1,0 +1,54 @@
+{
+  "_": "What `aoide schema` prints, cut to the commands and flags the perch sends. The top-level fields and the flag names are the 0.0.26 ones; the summaries and descriptions are made up. The version is the only field the perch reads at the top.",
+  "schemaVersion": "0",
+  "aoide": "0.0.26",
+  "commands": [
+    {
+      "path": ["mail", "send"],
+      "summary": "A made-up summary of mail send",
+      "args": [
+        { "name": "text", "type": "string", "required": true, "description": "The letter's text (made up)" }
+      ],
+      "flags": [
+        { "name": "json", "type": "bool", "description": "Structured I/O (made up)" },
+        { "name": "to", "type": "string", "description": "Recipient address (made up)" },
+        { "name": "hold", "type": "bool", "description": "Spool the letter but never send it (made up)" },
+        { "name": "from", "type": "string", "description": "Sender name (made up)" },
+        { "name": "subject", "type": "string", "description": "Subject line (made up)" },
+        { "name": "thread", "type": "string", "description": "Thread id (made up)" },
+        { "name": "reply-to", "type": "string", "description": "Reply target (made up)" },
+        { "name": "cc", "type": "string", "description": "Copies (made up)" },
+        { "name": "mesh", "type": "string", "description": "Mesh to reach the node through (made up)" }
+      ]
+    },
+    {
+      "path": ["mail", "read"],
+      "summary": "A made-up summary of mail read",
+      "args": [],
+      "flags": [
+        { "name": "json", "type": "bool", "description": "Structured I/O (made up)" },
+        { "name": "for", "type": "string", "description": "Whose mailbox (made up)" },
+        { "name": "all-names", "type": "bool", "description": "Every name (made up)" },
+        { "name": "reread", "type": "bool", "description": "Print the whole history again (made up)" }
+      ]
+    },
+    {
+      "path": ["mail", "outbox"],
+      "summary": "A made-up summary of mail outbox",
+      "args": [
+        { "name": "node", "type": "string", "required": false, "description": "List only this node (made up)" }
+      ],
+      "flags": [
+        { "name": "json", "type": "bool", "description": "Structured I/O (made up)" }
+      ]
+    },
+    {
+      "path": ["mesh"],
+      "summary": "A made-up summary of mesh",
+      "args": [],
+      "flags": [
+        { "name": "json", "type": "bool", "description": "Structured I/O (made up)" }
+      ]
+    }
+  ]
+}

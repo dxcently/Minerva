@@ -15,10 +15,17 @@
 //! **The receive task** ([`start`]) reads the mailbox only while a page is looking: `GET /hub/mail` within the last 60 s. Every 5 s it
 //! stats `<aoide-home>/state/mail/base.jsonl` (inode, size, mtime) and runs `mail read --for=minerva --json` (as the reader
 //! `minerva-perch`, so only Minerva's own cursor moves) when that changed; an unchanged file costs no call at all. The first look after
-//! the perch started also runs `--reread` once (4 MiB at most), which recovers a letter that aoide handed over, advanced its cursor past,
-//! and the perch never wrote down. A plain read that may have advanced the cursor without the letters being kept (a timeout, too much
-//! output, output that is not JSON, a write that failed) is followed by a `--reread` too, after a pause of 30 s. `mail export` is not
-//! used: it is read-only, but it returns Markdown threads for every mailbox and no receipts.
+//! the perch started also runs `--reread` once. **A reread prints the whole history** of the mailbox and moves the cursor to its newest
+//! entry, so it consumes the unread letters as a plain read does, and every letter it prints is kept (deduplicated by message id). A
+//! plain read that fails (a timeout, too much output, output that is not JSON, a write that failed) may have moved the cursor past
+//! letters it did not keep, so a `--reread` is due after a pause (30 s), and no plain read runs until it has gone through. A reread that
+//! failed for another reason is tried again after [`REREAD_GAP`] (a minute). A reread that is too big (the history is over
+//! [`REREAD_CAP`]) can never succeed later, because the history only grows: it is not tried again, and the page's `error` says so until
+//! the perch restarts. `mail export` is not used: it is read-only, but it returns Markdown threads for every mailbox and no receipts.
+//!
+//! **Caps.** `mail read --json` prints each letter twice (in the envelope's `message` and in `data.entries`), both JSON-escaped, so the
+//! output is about twice the letter bytes and up to 12 times for control bytes. A plain read is taken up to [`PLAIN_CAP`] (4 MiB), a
+//! reread up to [`REREAD_CAP`] (16 MiB); the formula is in `README.md`.
 //!
 //! **A letter** is decoded as `AOIDE-LETTER/1` (a marker line, then a JSON object with `subject` and `body`) when it parses and is raw
 //! text otherwise (a marker that does not parse is `broken`, shown raw). The header fields a card keeps are clamped to their grammars:
@@ -32,13 +39,24 @@
 //! while a row is waiting on it, never by `GET /hub/mail` itself: a row that left the outbox after it was sent is `accepted`.
 //!
 //! **Files and bounds.** `received.jsonl` is append-only (a letter once, by message id, text cut at 64 KiB), `cards.json` holds one slot
-//! per message id ever read (`new`, `placed{chat}`, `dismissed`: the dedupe and the state) and the receipts. The task stops reading at
-//! 5000 cards or 32 MiB of letters and says so in `error`: aoide keeps the letters it was not asked for, so nothing is lost, and
-//! moving `received.jsonl` and `cards.json` aside starts a fresh store. `GET` shows the 25 newest cards that are not dismissed (`more`
-//! counts the rest) and the 50 newest sent rows, and reads only the last 2 MiB of letters and 256 KiB of rows.
+//! per message id ever read (`new`, `placed{chat}`, `dismissed`: the state) and the receipts, and `dismissed.jsonl` is append-only and
+//! holds the message id of every card dismissed (the tombstones): a card whose tombstone is there is dismissed however `cards.json` came
+//! to be, so a rebuilt or set-aside `cards.json` cannot bring a dismissed letter back. The task stops reading at 5000 live cards (not
+//! counting dismissed ones) or 32 MiB of letters and says so in `error`; moving the files aside, or dismissing cards, lets it go on.
+//! `GET` shows the 25 newest cards that are not dismissed (`more` counts the rest) and the 50 newest sent rows, and reads only the last
+//! 2 MiB of letters and 256 KiB of rows.
+//!
+//! **Nothing is lost silently.** A letter that aoide handed over and the perch could not keep (a plain read that failed, whatever the
+//! cause) is printed again by the next reread that goes through, which prints the whole history while it fits [`REREAD_CAP`]. When a
+//! reread is too big, the page's `error` says that letters for minerva could not be read here, and how to read them in a terminal; the
+//! perch keeps none of them.
+//!
+//! **One perch per home.** The first thing [`start`] does is take an exclusive lock on `<home>/mail/.lock`. A second perch on the same
+//! home cannot take it, and every mail route of that one answers with a sentence instead.
 
 use std::collections::{BTreeMap, HashSet};
-use std::os::unix::fs::MetadataExt as _;
+use std::io::Read as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -60,15 +78,20 @@ const RECEIVED_WINDOW: u64 = 2 * 1024 * 1024;
 const SENT_WINDOW: u64 = 256 * 1024;
 /// How much of `sent.jsonl` a receipt is matched against.
 const MATCH_WINDOW: u64 = 1024 * 1024;
-/// The task stops reading at this many cards, or this many bytes of letters.
+/// The task stops reading at this many live cards, or this many bytes of letters.
 const MAX_CARDS: usize = 5000;
 const RECEIVED_CAP: u64 = 32 * 1024 * 1024;
-/// What `--reread` may print. A plain read has the runner's 1 MiB.
-const REREAD_CAP: usize = 4 * 1024 * 1024;
-/// At most this many entries of one read are looked at.
-const ENTRIES_MAX: usize = 2000;
+/// What a plain `mail read` may print, and what a `--reread` may. See the formula in `README.md`: a letter costs about twice its bytes in
+/// stdout, and up to 12 times for control bytes, plus about 1 KiB of envelope per entry. Both are above the runner's 1 MiB default.
+pub const PLAIN_CAP: usize = 4 * 1024 * 1024;
+pub const REREAD_CAP: usize = 16 * 1024 * 1024;
+/// How many entries of one `mail outbox` are kept. A cut outbox is marked incomplete, and a row that is not in it is `unknown`.
+const OUTBOX_MAX: usize = 2000;
 /// `cards.json` is read only when it is at most this big.
 const CARDS_FILE_CAP: u64 = 16 * 1024 * 1024;
+/// Tombstones kept in memory: the newest this many of `dismissed.jsonl`, read from its last window.
+const TOMBSTONES_KEEP: usize = 10_000;
+const TOMBSTONES_WINDOW: u64 = 1024 * 1024;
 /// Receipts kept in `cards.json`.
 const DELIVERED_KEEP: usize = 1000;
 /// A row is waited on for this long.
@@ -78,6 +101,13 @@ const BODY_CAP: usize = 1024;
 /// How long the task rests after a failure (`--knob mail_pause_ms=N`), and how long `mail outbox --json` is trusted (`mail_ttl_ms=N`).
 const PAUSE: Duration = Duration::from_secs(30);
 const OUTBOX_TTL: Duration = Duration::from_secs(60);
+/// The gap before a reread that failed for another reason is tried again (`--knob mail_reread_ms=N`): at most once a minute.
+pub const REREAD_GAP: Duration = Duration::from_secs(60);
+/// A reread prints the whole history, so it gets longer than a plain read's default (10 s).
+const REREAD_TIMEOUT: Duration = Duration::from_secs(30);
+const MIB: usize = 1024 * 1024;
+/// A notice is at most this many characters, one line.
+const NOTICE_MAX: usize = 300;
 
 // ---------------------------------------------------------------------------
 // What is kept
@@ -89,7 +119,10 @@ const OUTBOX_TTL: Duration = Duration::from_secs(60);
 pub struct State {
     cards: Mutex<Option<Cards>>,
     outbox: Mutex<Option<Arc<Outbox>>>,
+    /// The task's last complaint, cleared when a read goes through.
     notice: Mutex<Option<String>>,
+    /// A complaint that stays: letters a reread cannot print any more. Until the perch restarts.
+    lost: Mutex<Option<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,7 +142,7 @@ struct Slot {
     at: u64,
 }
 
-/// `cards.json`.
+/// `cards.json`, and the tombstones (`dismissed.jsonl`) read beside it: a message id in `tombs` is dismissed whatever `cards` says.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Cards {
     #[serde(default)]
@@ -119,10 +152,20 @@ struct Cards {
     /// Sent message id -> when its receipt was read.
     #[serde(default)]
     delivered: BTreeMap<String, u64>,
+    /// The dismissed message ids, from `dismissed.jsonl`. Not written to `cards.json`.
+    #[serde(skip)]
+    tombs: HashSet<String>,
+}
+
+impl Cards {
+    /// The cards that are not dismissed: what the store's cap counts.
+    fn live(&self) -> usize {
+        self.cards.values().filter(|slot| slot.state != Mood::Dismissed).count()
+    }
 }
 
 /// A letter as `received.jsonl` keeps it and a card shows it. Everything in it is clamped or checked by [`parse_entry`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct Row {
     msgid: String,
     #[serde(default)]
@@ -153,6 +196,22 @@ struct Row {
     reply_to: Option<String>,
 }
 
+/// The sizes and the identity of a letter, and not its subject or text: a `{:?}` in a log line is not a place for them.
+impl std::fmt::Debug for Row {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Row")
+            .field("msgid", &self.msgid)
+            .field("seq", &self.seq)
+            .field("sender", &self.sender)
+            .field("node", &self.node)
+            .field("format", &self.format)
+            .field("subject_chars", &self.subject.chars().count())
+            .field("text_bytes", &self.text.len())
+            .field("clipped", &self.clipped)
+            .finish()
+    }
+}
+
 /// A line of `sent.jsonl` (`send.rs` writes it).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SentRow {
@@ -180,6 +239,8 @@ struct Outbox {
     /// Unix seconds when it was fetched: a row sent after that has not been looked for yet.
     fetched: u64,
     entries: BTreeMap<String, OutboxEntry>,
+    /// Whether every entry is in it: a cut outbox (more than [`OUTBOX_MAX`]) cannot say that a row is absent, so it does not.
+    complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -317,13 +378,13 @@ fn parse_entry(entry: &Value, seen: u64) -> Option<Item> {
     }
 }
 
-/// `data.entries` of a `mail read`, at most [`ENTRIES_MAX`] of them: the letters (deduped within the read) and the receipts.
+/// `data.entries` of a `mail read`: every letter (deduped within the read) and every receipt, in order. Nothing is cut by position: the
+/// stdout cap is what bounds a read, and a read that fits it is kept whole. The count of entries that are neither is returned for the log.
 fn parse_entries(data: &Value, seen: u64) -> (Vec<Row>, Vec<Receipt>, usize) {
     let (mut letters, mut receipts, mut skipped) = (Vec::new(), Vec::new(), 0);
     let mut ids = HashSet::new();
     let entries = data.get("entries").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-    skipped += entries.len().saturating_sub(ENTRIES_MAX);
-    for entry in entries.iter().take(ENTRIES_MAX) {
+    for entry in entries {
         match parse_entry(entry, seen) {
             Some(Item::Letter(row)) if ids.insert(row.msgid.clone()) => letters.push(*row),
             Some(Item::Letter(_)) => {}
@@ -392,7 +453,8 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 /// `mail outbox --json`'s `data.entries`: message id to the status aoide reports and its reason. Read defensively.
 fn outbox_of(data: &Value, fetched: u64) -> Outbox {
     let mut entries = BTreeMap::new();
-    for entry in data.get("entries").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default().iter().take(ENTRIES_MAX) {
+    let listed = data.get("entries").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    for entry in listed.iter().take(OUTBOX_MAX) {
         let Some(msgid) = id_of(entry.get("msgid")) else { continue };
         let delivery = entry.get("delivery");
         let reported = delivery.and_then(|d| d.get("status")).and_then(Value::as_str).filter(|word| mail::word_ok(word));
@@ -401,12 +463,12 @@ fn outbox_of(data: &Value, fetched: u64) -> Outbox {
         let reason = delivery.and_then(|d| d.get("reason")).and_then(Value::as_str).map(|r| mail::line_safe(r, 200)).filter(|r| !r.is_empty());
         entries.insert(msgid, OutboxEntry { status, reason });
     }
-    Outbox { at: Some(Instant::now()), fetched, entries }
+    Outbox { at: Some(Instant::now()), fetched, entries, complete: listed.len() <= OUTBOX_MAX }
 }
 
 /// The status a sent row has now, and the reason when there is one. `delivered`: a receipt came back, or the letter was filed on this
-/// machine. Otherwise what the outbox says; a row that is not in an outbox fetched after it was sent has left it: `accepted`. Without
-/// an outbox answer, the status the send reported.
+/// machine. Otherwise what the outbox says. A row that is not in an outbox fetched after it was sent has left it: `accepted`, when that
+/// outbox is complete. A cut outbox cannot say that, so the row is `unknown`. A row with no message id is `unknown` too.
 fn current(row: &SentRow, delivered: &BTreeMap<String, u64>, outbox: Option<&Outbox>) -> (String, Option<String>) {
     let Some(msgid) = row.msgid.as_deref() else { return (row.status.clone(), None) };
     if delivered.contains_key(msgid) || row.disposition == "filed" {
@@ -417,10 +479,15 @@ fn current(row: &SentRow, delivered: &BTreeMap<String, u64>, outbox: Option<&Out
             return (entry.status.clone(), entry.reason.clone());
         }
         if outbox.fetched > row.ts {
-            return ("accepted".to_string(), None);
+            return (if outbox.complete { "accepted" } else { "unknown" }.to_string(), None);
         }
     }
     (row.status.clone(), None)
+}
+
+/// The sentence a sent row that has no message id shows: nothing can settle it and nothing can retry it, so the person is told where to look.
+fn unknown_sentence(row: &SentRow) -> String {
+    format!("no message id was recorded for this letter, so nothing can settle it: check `aoide mail outbox` for {} before sending it again", row.to)
 }
 
 /// Whether `mail outbox --json` has something to tell about this row that the cached answer does not.
@@ -446,11 +513,18 @@ struct Paths {
     received: PathBuf,
     cards: PathBuf,
     sent: PathBuf,
+    tombs: PathBuf,
 }
 
 fn paths(ctx: &Ctx) -> Option<Paths> {
     let dir = mail::mail_dir(ctx)?;
-    Some(Paths { received: dir.join("received.jsonl"), cards: dir.join("cards.json"), sent: dir.join("sent.jsonl"), dir })
+    Some(Paths {
+        received: dir.join("received.jsonl"),
+        cards: dir.join("cards.json"),
+        sent: dir.join("sent.jsonl"),
+        tombs: dir.join("dismissed.jsonl"),
+        dir,
+    })
 }
 
 /// A file's trouble as a sentence; the error itself goes to the log, where a path is no harm.
@@ -459,22 +533,34 @@ fn io_sentence(what: &str, e: &std::io::Error) -> String {
     format!("{what} could not be used as a plain file")
 }
 
-/// `cards.json`, or an empty set when it is not there. A file that does not parse is set aside by `statefile::load` (and the cards
-/// start empty); one that is not a plain file or is far too big is not touched, and mail says so.
-fn load_cards(path: &Path) -> Result<Cards, String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_file() && meta.len() <= CARDS_FILE_CAP => Ok(crate::statefile::load::<Cards>(Some(path))),
-        Ok(_) => Err("cards.json is not a plain file of a size the perch reads".to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Cards::default()),
-        Err(e) => Err(io_sentence("cards.json", &e)),
-    }
+/// `cards.json`, or an empty set when it is not there. Read through a descriptor that was checked to be a regular file ([`crate::rawfile`]),
+/// and capped. A file that does not parse is NOT set aside: the store refuses to read until the operator moves it aside, because a rebuilt
+/// store would forget what the old one had. The tombstones are read with it, so a dismissed letter stays dismissed.
+fn load_cards(paths: &Paths) -> Result<Cards, String> {
+    let mut cards = match crate::rawfile::open_regular(&paths.cards) {
+        Ok((file, len)) if len <= CARDS_FILE_CAP => {
+            let mut bytes = Vec::new();
+            file.take(CARDS_FILE_CAP + 1).read_to_end(&mut bytes).map_err(|e| io_sentence("cards.json", &e))?;
+            serde_json::from_slice::<Cards>(&bytes).map_err(|_| {
+                "cards.json does not parse, so no mail is read: move it aside to start a fresh card list (dismissed cards stay dismissed)".to_string()
+            })?
+        }
+        Ok(_) => return Err("cards.json is not a plain file of a size the perch reads".to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Cards::default(),
+        Err(e) => return Err(io_sentence("cards.json", &e)),
+    };
+    let window = mail::read_tail(&paths.tombs, TOMBSTONES_WINDOW).map_err(|e| io_sentence("dismissed.jsonl", &e))?;
+    let mut tombs: Vec<String> = mail::whole_lines(&window).filter_map(|line| std::str::from_utf8(line).ok()).map(str::to_string).filter(|id| mail::hex64(id)).collect();
+    let keep = tombs.len().saturating_sub(TOMBSTONES_KEEP);
+    cards.tombs = tombs.split_off(keep).into_iter().collect();
+    Ok(cards)
 }
 
 /// Reads the cards (loading them first if this is the first need) under the lock.
 fn with_cards<T>(state: &State, paths: &Paths, work: impl FnOnce(&Cards) -> T) -> Result<T, String> {
     let mut held = state.cards.lock().unwrap_or_else(|e| e.into_inner());
     if held.is_none() {
-        *held = Some(load_cards(&paths.cards)?);
+        *held = Some(load_cards(paths)?);
     }
     held.as_ref().map(work).ok_or_else(|| "the cards could not be loaded".to_string())
 }
@@ -497,7 +583,7 @@ fn fail(code: StatusCode, why: &str) -> Fail {
 fn change<T>(state: &State, paths: &Paths, work: impl FnOnce(&mut Cards) -> Result<T, Fail>) -> Result<T, Fail> {
     let mut held = state.cards.lock().unwrap_or_else(|e| e.into_inner());
     if held.is_none() {
-        *held = Some(load_cards(&paths.cards).map_err(|why| (StatusCode::SERVICE_UNAVAILABLE, why))?);
+        *held = Some(load_cards(paths).map_err(|why| (StatusCode::SERVICE_UNAVAILABLE, why))?);
     }
     let mut next = held.clone().unwrap_or_default();
     let done = work(&mut next)?;
@@ -514,12 +600,12 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
     })
 }
 
-/// The newest row of `received.jsonl` with this message id, found in its last 36 MiB (the file is held to 32 MiB plus one read).
+/// The newest row of `received.jsonl` with this message id, found in its last 48 MiB (the store is held to 32 MiB, and one reread may add 16).
 fn find_row(path: &Path, msgid: &str) -> Result<Option<Row>, String> {
     let bytes = mail::read_tail(path, RECEIVED_CAP + REREAD_CAP as u64).map_err(|e| io_sentence("received.jsonl", &e))?;
     let needle = msgid.as_bytes();
     let mut found = None;
-    for line in bytes.split(|&b| b == b'\n') {
+    for line in mail::whole_lines(&bytes) {
         // A parse is only for a line that names the id at all.
         if line.windows(needle.len()).any(|window| window == needle)
             && let Ok(row) = serde_json::from_slice::<Row>(line)
@@ -529,6 +615,17 @@ fn find_row(path: &Path, msgid: &str) -> Result<Option<Row>, String> {
         }
     }
     Ok(found)
+}
+
+/// The message ids already in `received.jsonl`, read whole: a letter is appended once, whatever the cards say (a rebuilt `cards.json`
+/// would otherwise see a reread's old letters as new). Read only when a letter is new, and held to the store's own cap.
+fn ids_on_file(path: &Path) -> Result<HashSet<String>, String> {
+    #[derive(Deserialize)]
+    struct Id {
+        msgid: String,
+    }
+    let bytes = mail::read_tail(path, RECEIVED_CAP + REREAD_CAP as u64).map_err(|e| io_sentence("received.jsonl", &e))?;
+    Ok(mail::whole_lines(&bytes).filter_map(|line| serde_json::from_slice::<Id>(line).ok()).map(|id| id.msgid).collect())
 }
 
 /// The nodes the rows of `sent.jsonl` went to, by message id: what a receipt is held to.
@@ -546,14 +643,16 @@ fn sent_nodes(path: &Path) -> BTreeMap<String, String> {
 fn apply(state: &State, paths: &Paths, letters: &[Row], receipts: Vec<Receipt>) -> Result<usize, String> {
     let mut held = state.cards.lock().unwrap_or_else(|e| e.into_inner());
     if held.is_none() {
-        *held = Some(load_cards(&paths.cards)?);
+        *held = Some(load_cards(paths)?);
     }
     let current = held.clone().unwrap_or_default();
     let fresh: Vec<&Row> = letters.iter().filter(|row| !current.cards.contains_key(&row.msgid)).collect();
     let mut next = current.clone();
     let now = mail::now();
     for row in &fresh {
-        next.cards.insert(row.msgid.clone(), Slot { state: Mood::New, chat: None, at: now });
+        // A tombstone wins: a letter dismissed once is dismissed whatever the cards file held before.
+        let mood = if next.tombs.contains(&row.msgid) { Mood::Dismissed } else { Mood::New };
+        next.cards.insert(row.msgid.clone(), Slot { state: mood, chat: None, at: now });
     }
     if !receipts.is_empty() {
         let sent = sent_nodes(&paths.sent);
@@ -572,9 +671,14 @@ fn apply(state: &State, paths: &Paths, letters: &[Row], receipts: Vec<Receipt>) 
         return Ok(0);
     }
     if !fresh.is_empty() {
-        let lines: Vec<String> = fresh.iter().filter_map(|row| serde_json::to_string(row).ok()).collect();
+        // Each letter once in the file, whatever the cards say: a letter already on file (a cards file that was lost, a persist that
+        // failed after the append) is not written again. The append is synced before the cards are written.
         mail::ensure_dir(&paths.dir).map_err(|e| io_sentence("the mail folder", &e))?;
-        mail::append_lines(&paths.received, &lines).map_err(|e| io_sentence("received.jsonl", &e))?;
+        let on_file = ids_on_file(&paths.received)?;
+        let lines: Vec<String> = fresh.iter().filter(|row| !on_file.contains(&row.msgid)).filter_map(|row| serde_json::to_string(row).ok()).collect();
+        if !lines.is_empty() {
+            mail::append_lines(&paths.received, &lines).map_err(|e| io_sentence("received.jsonl", &e))?;
+        }
     }
     persist(paths, &mut next).map_err(|e| io_sentence("cards.json", &e))?;
     let added = fresh.len();
@@ -582,9 +686,10 @@ fn apply(state: &State, paths: &Paths, letters: &[Row], receipts: Vec<Receipt>) 
     Ok(added)
 }
 
-/// Whether the task may read: fewer than [`MAX_CARDS`] cards and less than [`RECEIVED_CAP`] of letters.
+/// Whether the task may read: fewer than [`MAX_CARDS`] live cards and less than [`RECEIVED_CAP`] of letters. Dismissed cards do not count,
+/// so dismissing cards lets the store go on, in the same run and without a restart (the cards are read from memory every tick).
 fn room(state: &State, paths: &Paths) -> Result<bool, String> {
-    let cards = with_cards(state, paths, |cards| cards.cards.len())?;
+    let cards = with_cards(state, paths, Cards::live)?;
     let len = std::fs::symlink_metadata(&paths.received).map(|meta| meta.len()).unwrap_or(0);
     Ok(cards < MAX_CARDS && len < RECEIVED_CAP)
 }
@@ -600,17 +705,22 @@ struct Snapshot {
     sent: Vec<Value>,
 }
 
-/// A card as the page gets it: the row, its state and the chat it was placed with.
+/// A card as the page gets it: the row, its state and the chat it was placed with. The sender is what the letter claims, so the card
+/// names the node beside it (`from_label`) and says the sender is claimed (`sender_claimed`); nothing here is gated on the sender.
 fn card(row: &Row, slot: &Slot) -> Value {
     let mut card = serde_json::to_value(row).unwrap_or_else(|_| json!({}));
     card["state"] = json!(slot.state);
     card["chat"] = json!(slot.chat);
+    card["from_label"] = json!(format!("{} on {}", row.mailbox.as_deref().unwrap_or("?"), row.node.as_deref().unwrap_or("?")));
+    card["sender_claimed"] = json!(true);
     card
 }
 
-/// A sent row as the page gets it: what was written, with the status it has now and why.
+/// A sent row as the page gets it: what was written, with the status it has now and why. A row with no message id that is still
+/// `unknown` says so, and where to look, and offers no retry.
 fn sent_view(row: &SentRow, delivered: &BTreeMap<String, u64>, outbox: Option<&Outbox>) -> Value {
     let (status, reason) = current(row, delivered, outbox);
+    let reason = if status == "unknown" && row.msgid.is_none() { Some(unknown_sentence(row)) } else { reason };
     let mut view = serde_json::to_value(row).unwrap_or_else(|_| json!({}));
     view["status"] = json!(status);
     view["reason"] = json!(reason);
@@ -645,19 +755,28 @@ fn snapshot(state: &State, paths: &Paths, outbox: Option<&Outbox>) -> Result<Sna
 
 const NO_AOIDE: &str = "Aoide is not available here, so nothing can be sent or read: start the perch with --aoide <absolute path>";
 
-/// `GET /hub/mail`: also the page saying it is looking, which is what lets the task read.
+/// `GET /hub/mail`: also the page saying it is looking, which is what lets the task read. It asks aoide nothing: the schema answer is the
+/// task's, and the outbox is the task's cached one.
 async fn list(ctx: &Ctx, paths: Paths) -> Response<BoxBody> {
     ctx.mail.look(mail::knob_ms(ctx, "mail_watch_ms", mail::WATCH));
-    let available = Aoide::from_options(&ctx.opts).is_ok();
-    let outbox = ctx.mail.recv.outbox.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let notice = ctx.mail.recv.notice.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let held = ctx.clone();
-    let read = blocking(move || snapshot(&held.mail.recv, &paths, outbox.as_deref())).await;
-    let (snap, error) = match read {
-        Ok(Ok(snap)) => (snap, notice),
-        Ok(Err(why)) | Err((_, why)) => (Snapshot::default(), Some(why)),
+    let schema = mail::schema_refusal(ctx).await;
+    let configured = Aoide::from_options(&ctx.opts).is_ok();
+    let available = configured && schema.is_none() && mail::refused(&ctx.mail).is_none();
+    let (snap, error) = if let Some(why) = mail::refused(&ctx.mail) {
+        (Snapshot::default(), Some(why))
+    } else if let Err(e) = mail::readable_dir(&paths.dir) {
+        (Snapshot::default(), Some(format!("{e}")))
+    } else {
+        let outbox = ctx.mail.recv.outbox.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let notice = ctx.mail.recv.notice.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let lost = ctx.mail.recv.lost.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let held = ctx.clone();
+        match blocking(move || snapshot(&held.mail.recv, &paths, outbox.as_deref())).await {
+            Ok(Ok(snap)) => (snap, lost.or(notice)),
+            Ok(Err(why)) | Err((_, why)) => (Snapshot::default(), Some(why)),
+        }
     };
-    let error = error.or_else(|| (!available).then(|| NO_AOIDE.to_string()));
+    let error = error.or(schema).or_else(|| (!configured).then(|| NO_AOIDE.to_string()));
     json(
         StatusCode::OK,
         &json!({ "available": available, "received": snap.received, "more": snap.more, "sent": snap.sent, "error": error }),
@@ -738,6 +857,11 @@ fn failed(fail: Fail) -> Response<BoxBody> {
 pub async fn route(ctx: &Ctx, req: Request<Incoming>, rest: &str) -> Response<BoxBody> {
     let Some(paths) = paths(ctx) else { return status(StatusCode::NOT_FOUND) };
     let (method, query) = (req.method().clone(), req.uri().query().unwrap_or("").to_string());
+    // Another perch keeps this home's mail: a change of the cards is refused here, and the listing says why (see `list`).
+    if method != Method::GET && let Some(why) = mail::refused(&ctx.mail) {
+        drop(req);
+        return problem(StatusCode::SERVICE_UNAVAILABLE, &why);
+    }
     match target_of(rest) {
         Target::List if method == Method::GET => {
             drop(req);
@@ -791,8 +915,15 @@ async fn card_verb(ctx: &Ctx, req: Request<Incoming>, paths: Paths, msgid: &str,
             }
             let dismissed = blocking(move || {
                 change(&held.mail.recv, &paths, |cards| {
-                    let slot = cards.cards.get_mut(&id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such card"))?;
-                    *slot = Slot { state: Mood::Dismissed, chat: None, at: mail::now() };
+                    if !cards.cards.contains_key(&id) {
+                        return Err(fail(StatusCode::NOT_FOUND, "no such card"));
+                    }
+                    // The tombstone first: once it is on file, the card stays dismissed whatever `cards.json` later holds.
+                    mail::ensure_dir(&paths.dir).map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, io_sentence("the mail folder", &e)))?;
+                    mail::append_lines(&paths.tombs, std::slice::from_ref(&id))
+                        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, io_sentence("dismissed.jsonl", &e)))?;
+                    cards.tombs.insert(id.clone());
+                    cards.cards.insert(id.clone(), Slot { state: Mood::Dismissed, chat: None, at: mail::now() });
                     Ok(())
                 })
             })
@@ -835,10 +966,63 @@ async fn card_verb(ctx: &Ctx, req: Request<Incoming>, paths: Paths, msgid: &str,
 // The receive task
 // ---------------------------------------------------------------------------
 
-/// The receive task, started after the bind. It does nothing until a page has looked, and nothing at all for a perch with no home.
+/// The sentence every mail route answers with while another perch keeps this home's mail (its lock is held).
+const HELD: &str = "another perch keeps this home's mail (a running perch holds its lock): mail is off here until that perch stops";
+
+/// What a reread too big to print leaves behind: the letters a plain read took and could not keep are gone, and the page says how to read
+/// them. It stays until the perch restarts.
+fn lost_sentence() -> String {
+    format!(
+        "letters for minerva could not be read here: a reread of the whole mailbox is over {} MiB, so the perch keeps none of them; run `aoide mail read --for=minerva --reread` in a terminal to read them",
+        REREAD_CAP / MIB
+    )
+}
+
+/// The notice while the card store is full: nothing new is read, and the receipts wait with it. Moving `cards.json` aside is read at
+/// start only, so that one needs a restart; the other two go on in the same run.
+fn full_sentence() -> String {
+    format!(
+        "the card store is full ({MAX_CARDS} live cards, or {} MiB of letters): nothing new is read and receipts wait; dismiss cards, or move received.jsonl aside, to go on (moving cards.json aside needs a restart)",
+        RECEIVED_CAP / (MIB as u64)
+    )
+}
+
+/// The receive task, started after the bind. A perch takes the folder's lock first ([`take_lock`]): one that cannot take it runs no task,
+/// and every mail route answers with the sentence that says why. Nothing runs at all for a perch with no home.
 pub fn start(ctx: &Ctx) {
-    if paths(ctx).is_some() {
-        tokio::spawn(task(ctx.clone()));
+    let Some(paths) = paths(ctx) else { return };
+    match take_lock(&paths.dir) {
+        Ok(lock) => {
+            // Kept for as long as the perch runs: it is what makes this perch the one that keeps this home's mail.
+            let _ = ctx.mail.lock.set(lock);
+            tokio::spawn(task(ctx.clone()));
+        }
+        Err(why) => {
+            let _ = ctx.mail.refusal.set(why);
+        }
+    }
+}
+
+/// `<dir>/.lock`, held exclusively (a `flock`, released when the process exits). The folder is made first, as a send would make it. A
+/// second perch on the same home cannot take the lock, so it gets [`HELD`] and no task.
+fn take_lock(dir: &Path) -> Result<std::fs::File, String> {
+    mail::ensure_dir(dir).map_err(|e| io_sentence("the mail folder", &e))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir.join(".lock"))
+        .map_err(|e| io_sentence("the mail lock", &e))?;
+    let meta = file.metadata().map_err(|e| io_sentence("the mail lock", &e))?;
+    if !meta.is_file() || !mail::ours(&meta) {
+        return Err("the mail lock is not a plain file of this user's".to_string());
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(HELD.to_string()),
+        Err(std::fs::TryLockError::Error(e)) => Err(io_sentence("the mail lock", &e)),
     }
 }
 
@@ -846,10 +1030,16 @@ pub fn start(ctx: &Ctx) {
 struct Task {
     /// The stat of `base.jsonl` when it was last read: `None` before the first look, `Some(None)` for a file that is not there.
     last: Option<Option<Stat>>,
-    /// A `--reread` is due: the first time, and after a read that may have lost letters.
+    /// A `--reread` is due: the first time, and after a plain read that failed. While one is due no plain read runs, so the reread can
+    /// print the letters a plain read would otherwise move the cursor past.
     reread: bool,
+    /// A reread that failed for another reason waits until this, and is tried again then.
+    reread_after: Option<Instant>,
+    /// A reread was too big to print. The history only grows, so it is never armed again.
+    reread_dead: bool,
     /// Reads rest until then (after a failure).
     quiet_until: Option<Instant>,
+    /// The outbox is not asked again until then (after a failure).
     outbox_pause: Option<Instant>,
 }
 
@@ -871,7 +1061,7 @@ async fn task(ctx: Ctx) {
     let Some(paths) = paths(&ctx) else { return };
     let tick = mail::knob_ms(&ctx, "mail_tick_ms", mail::TICK);
     let watch = mail::knob_ms(&ctx, "mail_watch_ms", mail::WATCH);
-    let mut task = Task { last: None, reread: true, quiet_until: None, outbox_pause: None };
+    let mut task = Task { last: None, reread: true, reread_after: None, reread_dead: false, quiet_until: None, outbox_pause: None };
     loop {
         tokio::select! {
             _ = ctx.stop.cancelled() => return,
@@ -889,20 +1079,29 @@ async fn task(ctx: Ctx) {
     }
 }
 
+/// The task's complaint, one line of at most [`NOTICE_MAX`] characters. `None` clears it.
 fn set_notice(ctx: &Ctx, why: Option<String>) {
+    let why = why.map(|text| mail::line_safe(&text, NOTICE_MAX)).filter(|text| !text.is_empty());
     *ctx.mail.recv.notice.lock().unwrap_or_else(|e| e.into_inner()) = why;
 }
 
-/// One look: the outbox if a row waits on it, then the gate, then (only when the mailbox changed) the read.
+/// The complaint that stays until the perch restarts (see [`lost_sentence`]).
+fn set_lost(ctx: &Ctx, why: String) {
+    *ctx.mail.recv.lost.lock().unwrap_or_else(|e| e.into_inner()) = Some(mail::line_safe(&why, NOTICE_MAX));
+}
+
+/// One look: the outbox if a row waits on it, then the gate, then the room, then the reread if one is due, then a plain read when the
+/// mailbox changed (or a reread was just made, so that the look ends on a plain read as well).
 async fn tick_once(ctx: &Ctx, paths: &Paths, task: &mut Task) {
-    let Ok(aoide) = Aoide::from_options(&ctx.opts) else { return };
+    let Ok(aoide) = mail::usable(ctx).await else { return };
     let Some(home) = mesh::home(&ctx.opts) else { return };
     refresh_outbox(ctx, &aoide, paths, task).await;
+    let pause = mail::knob_ms(ctx, "mail_pause_ms", PAUSE);
     if task.quiet_until.is_some_and(|until| Instant::now() < until) {
         return;
     }
     let stat = stat_of(&home.join("state").join("mail").join("base.jsonl"));
-    if task.last == Some(stat) && !task.reread {
+    if !task.reread && task.last == Some(stat) {
         return;
     }
     if stat.is_none() {
@@ -910,12 +1109,12 @@ async fn tick_once(ctx: &Ctx, paths: &Paths, task: &mut Task) {
         task.last = Some(None);
         return;
     }
-    let pause = mail::knob_ms(ctx, "mail_pause_ms", PAUSE);
     let (held, kept) = (ctx.clone(), paths.clone());
     match blocking(move || room(&held.mail.recv, &kept)).await {
         Ok(Ok(true)) => {}
         Ok(Ok(false)) => {
-            set_notice(ctx, Some("the card store is full (5000 cards or 32 MiB of letters): move received.jsonl and cards.json aside to go on".to_string()));
+            // Nothing is read while the store is full, so aoide keeps the letters and the cursor stays where it is.
+            set_notice(ctx, Some(full_sentence()));
             return;
         }
         Ok(Err(why)) | Err((_, why)) => {
@@ -925,11 +1124,29 @@ async fn tick_once(ctx: &Ctx, paths: &Paths, task: &mut Task) {
         }
     }
     if task.reread {
-        task.reread = false;
-        if let Err(failure) = read(ctx, &aoide, paths, true).await {
-            set_notice(ctx, Some(failure.why));
-            task.quiet_until = Some(Instant::now() + pause);
+        if task.reread_after.is_some_and(|after| Instant::now() < after) {
             return;
+        }
+        match read(ctx, &aoide, paths, true).await {
+            Ok(()) => {
+                // Its letters are kept; the plain read that follows finds what came after them.
+                task.reread = false;
+                task.reread_after = None;
+            }
+            Err(failure) if failure.too_big => {
+                // Too big to print, and the history only grows: this reread can never succeed, so it is not armed again. The letters it
+                // would have brought are gone from this perch, and the page says so until a restart. Plain reads go on for new letters.
+                task.reread = false;
+                task.reread_dead = true;
+                set_lost(ctx, lost_sentence());
+                set_notice(ctx, Some(failure.why));
+            }
+            Err(failure) => {
+                // Any other failure: tried again after the gap, and no plain read runs in the meantime.
+                task.reread_after = Some(Instant::now() + mail::knob_ms(ctx, "mail_reread_ms", REREAD_GAP));
+                set_notice(ctx, Some(failure.why));
+                return;
+            }
         }
     }
     match read(ctx, &aoide, paths, false).await {
@@ -938,34 +1155,43 @@ async fn tick_once(ctx: &Ctx, paths: &Paths, task: &mut Task) {
             set_notice(ctx, None);
         }
         Err(failure) => {
-            // A read that may have moved the cursor without the letters being kept is made up for by a reread, after the pause.
-            task.reread = failure.lost;
+            // A plain read that failed may have moved the cursor past letters it did not keep: a reread is due after the pause, unless
+            // a reread can never succeed.
+            if !task.reread_dead {
+                task.reread = true;
+            }
             set_notice(ctx, Some(failure.why));
             task.quiet_until = Some(Instant::now() + pause);
         }
     }
 }
 
+/// A read that did not go through: what the page says, and whether it was a reread too big to print.
 struct Failure {
     why: String,
-    /// The cursor may have moved without the letters being written down.
-    lost: bool,
+    too_big: bool,
 }
 
-/// One `mail read` and what it found, written down. The log line has counts and never a word of a letter.
+/// One `mail read` and what it found, written down. A plain read is capped at [`PLAIN_CAP`], a reread at [`REREAD_CAP`] and [`REREAD_TIMEOUT`].
+/// The log line has counts and never a word of a letter.
 async fn read(ctx: &Ctx, aoide: &Aoide, paths: &Paths, reread: bool) -> Result<(), Failure> {
-    let aoide = if reread { aoide.clone().limits(Limits { stdout_cap: REREAD_CAP, ..Limits::default() }) } else { aoide.clone() };
-    let reply = aoide.run(&Shape::MailRead { reread }).await.map_err(|e| Failure {
-        lost: !reread && matches!(e, Error::Timeout(_) | Error::TooBig(_) | Error::NotJson),
+    let limits = if reread {
+        Limits { timeout: REREAD_TIMEOUT, stdout_cap: REREAD_CAP }
+    } else {
+        Limits { stdout_cap: PLAIN_CAP, ..Limits::default() }
+    };
+    let reply = aoide.clone().limits(limits).run(&Shape::MailRead { reread }).await.map_err(|e| Failure {
+        too_big: reread && matches!(e, Error::TooBig(_)),
         why: format!("mail could not be read: {e}"),
     })?;
     let Some(data) = reply.data().cloned() else {
-        return Err(Failure { why: "mail could not be read: aoide printed no data".to_string(), lost: !reread });
+        return Err(Failure { why: "mail could not be read: aoide printed no data".to_string(), too_big: false });
     };
     let (held, kept) = (ctx.clone(), paths.clone());
     let applied = blocking(move || {
         let (letters, receipts, skipped) = parse_entries(&data, mail::now());
-        apply(&held.mail.recv, &kept, &letters, receipts).map(|added| (added, letters.len(), skipped))
+        let count = letters.len();
+        apply(&held.mail.recv, &kept, &letters, receipts).map(|added| (added, count, skipped))
     })
     .await;
     match applied {
@@ -973,7 +1199,7 @@ async fn read(ctx: &Ctx, aoide: &Aoide, paths: &Paths, reread: bool) -> Result<(
             tracing::info!(reread, letters, added, skipped, "perch: mail was read");
             Ok(())
         }
-        Ok(Err(why)) | Err((_, why)) => Err(Failure { why, lost: !reread }),
+        Ok(Err(why)) | Err((_, why)) => Err(Failure { why, too_big: false }),
     }
 }
 
@@ -1167,7 +1393,7 @@ mod tests {
 
         let mut entries = BTreeMap::new();
         entries.insert(a.clone(), OutboxEntry { status: "retrying".to_string(), reason: Some("connection refused".to_string()) });
-        let outbox = Outbox { at: None, fetched: 200, entries };
+        let outbox = Outbox { at: None, fetched: 200, entries, complete: true };
         assert_eq!(current(&row, &none, Some(&outbox)), ("retrying".to_string(), Some("connection refused".to_string())));
         let gone = sent(Some(&b), "spooled", "queued", 100);
         assert_eq!(current(&gone, &none, Some(&outbox)).0, "accepted", "it left the outbox after it was sent");
@@ -1188,7 +1414,7 @@ mod tests {
         let mut entries = BTreeMap::new();
         entries.insert(a.clone(), OutboxEntry { status: "retrying".to_string(), reason: None });
         entries.insert(b.clone(), OutboxEntry { status: "refused".to_string(), reason: None });
-        let outbox = Outbox { at: None, fetched: now - 5, entries };
+        let outbox = Outbox { at: None, fetched: now - 5, entries, complete: true };
         assert!(waiting(&row, &none, Some(&outbox), now), "still in the outbox: it can change");
         assert!(!waiting(&sent(Some(&b), "spooled", "queued", now - 10), &none, Some(&outbox), now), "refused is the end of it");
         assert!(!waiting(&sent(Some(&"c".repeat(64)), "spooled", "queued", now - 50), &none, Some(&outbox), now), "gone from the outbox: accepted");
@@ -1217,6 +1443,48 @@ mod tests {
         assert_eq!(outbox.entries[&"b".repeat(64)].status, "refused");
         assert_eq!(outbox.entries[&"c".repeat(64)].status, "queued");
         assert!(outbox_of(&json!(null), 1).entries.is_empty());
+    }
+
+    #[test]
+    fn a_cut_outbox_cannot_say_that_a_row_left_it() {
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let mut entries = BTreeMap::new();
+        entries.insert(a, OutboxEntry { status: "retrying".to_string(), reason: None });
+        let cut = Outbox { at: None, fetched: 200, entries, complete: false };
+        assert_eq!(current(&sent(Some(&b), "spooled", "queued", 100), &BTreeMap::new(), Some(&cut)).0, "unknown", "absent from a cut outbox is not gone");
+        let many: Vec<Value> = (0..=OUTBOX_MAX).map(|i| json!({ "msgid": format!("{i:064x}") })).collect();
+        assert!(!outbox_of(&json!({ "entries": many }), 1).complete, "more than the cut is incomplete");
+        assert!(outbox_of(&json!({ "entries": [] }), 1).complete, "an empty outbox is whole");
+    }
+
+    #[test]
+    fn a_second_lock_on_the_same_folder_is_held_out_and_a_lock_given_back_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("mail");
+        let first = take_lock(&folder).expect("the first perch takes the lock");
+        assert_eq!(take_lock(&folder).unwrap_err(), HELD);
+        drop(first);
+        assert!(take_lock(&folder).is_ok());
+    }
+
+    #[test]
+    fn a_tombstone_keeps_a_letter_dismissed_when_cards_json_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("mail");
+        mail::ensure_dir(&folder).unwrap();
+        let paths = Paths {
+            dir: folder.clone(),
+            received: folder.join("received.jsonl"),
+            cards: folder.join("cards.json"),
+            sent: folder.join("sent.jsonl"),
+            tombs: folder.join("dismissed.jsonl"),
+        };
+        mail::append_lines(&paths.tombs, &[ID.to_string()]).unwrap();
+        // No cards.json: a fresh store that the letter is read into, and the tombstone still says dismissed.
+        let state = State::default();
+        let row = letter(parse_entry(&entry("letter", "osaka", "minerva", ID, "back again"), 1));
+        assert_eq!(apply(&state, &paths, &[row], vec![]), Ok(1));
+        assert_eq!(with_cards(&state, &paths, |cards| cards.cards[ID].state).unwrap(), Mood::Dismissed);
     }
 
     #[test]

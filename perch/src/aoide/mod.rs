@@ -16,10 +16,19 @@
 //! a command word, so `--subject status` is not safe and `--subject=status` is), and `--` stands before the text, so a letter that
 //! starts with `--` or says `--help` is a letter and not a flag.
 //!
-//! **The child's environment** is the perch's with every `AOIDE_*` variable removed, and then only what the perch means set: the four
-//! paths of [`Aoide`] and, for `mail read` alone, the reader identity [`READER`]. A perch started from inside a conducted session would
-//! otherwise hand its `AOIDE_SESSION_ID` to every call (and read mail as that session), and an ambient `AOIDE_STATE_DIR` would move the
-//! mailbase away from `<root>/state/mail/base.jsonl`, which is the file the receive loop stats to decide whether to read at all.
+//! **The child's environment** is empty, then the few variables a program needs to run ([`ENV_KEEP`]: `PATH`, `HOME`, `LANG`, `TZ` and
+//! every `LC_*`), then only what the perch means set: the four paths of [`Aoide`] and, for `mail read` alone, the reader identity
+//! [`READER`]. Nothing else reaches the child: not a proxy variable (a letter deposit must not go through an operator's proxy), not a
+//! provider key, and not an `AOIDE_*` variable of the perch's (a perch started from inside a conducted session would otherwise hand its
+//! `AOIDE_SESSION_ID` to every call, and an ambient `AOIDE_STATE_DIR` would move the mailbase away from `<root>/state/mail/base.jsonl`,
+//! which is the file the receive loop stats to decide whether to read at all).
+//!
+//! **Its death.** The child gets `PR_SET_PDEATHSIG(SIGKILL)` before it execs, so a perch that dies takes it along; the `mail send` text
+//! is in its argv while it runs, and that is the reason for the bound.
+//!
+//! **Versions.** aoide 0.0.26 has no `--version` flag: `aoide --version` exits 2 with usage. The version and the commands the perch
+//! sends are read from `aoide schema` ([`Shape::Schema`], a JSON document whose top-level `aoide` is the version and whose `commands`
+//! list every command and flag), and [`Aoide::schema_check`] refuses mail when the schema does not list one the perch sends.
 //!
 //! **Bounded.** stdin is closed, stdout is capped ([`STDOUT_CAP`]), stderr keeps only its first [`STDERR_KEEP`] bytes (the rest is read
 //! and dropped, so a chatty child never blocks on a full pipe), and the whole call has [`TIMEOUT`], after which the child and its
@@ -46,8 +55,18 @@ pub const MAILBOX: &str = "minerva";
 pub const READER: &str = "minerva-perch";
 /// How long a call may take before the child is killed. Mail reads block on `.stage.lock`, so a held lock ends here.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a `mail send` may take. aoide itself spools the letter and then POSTs for up to about 15 s, so the perch waits longer than
+/// aoide does: a perch that gave up first would answer "did not answer" for a letter that was spooled, and the page would invite a resend.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(45);
 /// How much stdout is taken. One byte more is [`Error::TooBig`], and the child is killed.
 pub const STDOUT_CAP: usize = 1024 * 1024;
+/// How much stdout `aoide schema` may take: the 0.0.26 schema is about 148 KB, and the cap leaves room for the commands to grow.
+pub const SCHEMA_CAP: usize = 512 * 1024;
+/// The environment a child keeps from the perch's: these names, and every name that starts with `LC_`. Everything else is removed,
+/// and the call's own variables are added after. One list, so a new variable a call needs is one line here or one entry in `env_for`.
+pub const ENV_KEEP: [&str; 4] = ["PATH", "HOME", "LANG", "TZ"];
+/// The prefix of the locale variables a child keeps (`LC_ALL`, `LC_CTYPE`, ...).
+const ENV_KEEP_PREFIX: &str = "LC_";
 /// How much of stderr is kept, for the sentence of a failure that printed no envelope. The rest is read and dropped.
 pub const STDERR_KEEP: usize = 8 * 1024;
 /// A subject is one line of at most this many characters.
@@ -142,14 +161,34 @@ impl Aoide {
         self
     }
 
-    /// Runs `aoide --version` and reads the version out of what it printed, defensively: the last word that starts with a digit of the
-    /// first line (`aoide 0.0.26` gives `0.0.26`), else that whole line; `None` when it printed nothing.
+    /// aoide's version, from `aoide schema` (there is no `--version` flag): its top-level `aoide` string, `None` when the schema has none.
     pub async fn version(&self) -> Result<Option<String>, Error> {
-        Ok(parse_version(&self.run(&Shape::Version).await?.stdout))
+        let reply = self.schema_reply().await?;
+        Ok(version_of(reply.json.as_ref()))
     }
 
-    /// Runs one call. `Ok` is an exit 0 whose `--json` envelope says `ok` (or, for [`Shape::Version`], plain text); everything else is an
-    /// [`Error`], and an aoide that ran and said no is [`Error::Failed`] with its whole reply, so a caller can read `data.reason`.
+    /// `aoide schema`, and whether it lists every command and flag the perch sends ([`USED`]). `Ok` is the version. `Err` is
+    /// [`Error::Refused`] with a sentence that names the command or flag, which turns mail off.
+    pub async fn schema_check(&self) -> Result<Option<String>, Error> {
+        let reply = self.schema_reply().await?;
+        match missing(reply.json.as_ref().unwrap_or(&Value::Null)) {
+            Some(why) => Err(Error::Refused(why)),
+            None => Ok(version_of(reply.json.as_ref())),
+        }
+    }
+
+    /// The schema reply, read under [`SCHEMA_CAP`] and the usual timeout.
+    async fn schema_reply(&self) -> Result<Reply, Error> {
+        self.clone().limits(Limits { stdout_cap: SCHEMA_CAP, ..self.limits }).run(&Shape::Schema).await
+    }
+
+    /// The same runner with the send's own timeout, which is longer than aoide's ([`SEND_TIMEOUT`]). A test shortens it with a knob.
+    pub fn for_send(&self, timeout: Duration) -> Self {
+        self.clone().limits(Limits { timeout, ..self.limits })
+    }
+
+    /// Runs one call. `Ok` is an exit 0 whose answer says `ok` (or does not say otherwise); everything else is an [`Error`], and an aoide
+    /// that ran and said no is [`Error::Failed`] with its whole reply, so a caller can read `data.reason`.
     pub async fn run(&self, shape: &Shape) -> Result<Reply, Error> {
         let verb = shape.verb();
         let outcome = self.launch(shape).await;
@@ -172,12 +211,27 @@ impl Aoide {
         let mut command = Command::new(&self.bin);
         // Its own process group, so a timeout takes whatever it started with it; and `kill_on_drop` for a caller that goes away first.
         command.args(&argv).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
-        for (key, _) in std::env::vars_os() {
-            if is_aoide_var(&key) {
-                command.env_remove(key);
+        // Nothing of the perch's environment but the kept names, and then the call's own.
+        command.env_clear();
+        for (key, value) in std::env::vars_os() {
+            if kept_env(&key) {
+                command.env(key, value);
             }
         }
         command.envs(env);
+        // The child dies with the perch: PR_SET_PDEATHSIG is set before the exec, and a perch that is already gone by then is an error.
+        let perch = std::process::id() as libc::pid_t;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != perch {
+                    return Err(std::io::Error::other("the perch that started aoide is gone"));
+                }
+                Ok(())
+            });
+        }
         let mut child = command.spawn().map_err(|e| Error::Spawn(format!("{}: {e}", self.bin.display())))?;
         let group = child.id();
         let begun = Instant::now();
@@ -203,7 +257,7 @@ impl Aoide {
         if !reply.is_ok() {
             return Err(Error::Failed(reply));
         }
-        if shape.json() && reply.json.is_none() {
+        if reply.json.is_none() {
             return Err(Error::NotJson);
         }
         Ok(reply)
@@ -241,6 +295,44 @@ impl Aoide {
 /// Whether an environment variable is one of aoide's: `AOIDE_` and then anything. Exact case, as the environment is.
 fn is_aoide_var(key: &OsStr) -> bool {
     key.as_bytes().starts_with(b"AOIDE_")
+}
+
+/// Whether the perch's variable goes on to a child: one of [`ENV_KEEP`], or a locale. Exact case, as the environment is.
+fn kept_env(key: &OsStr) -> bool {
+    ENV_KEEP.iter().any(|kept| key == OsStr::new(kept)) || key.as_bytes().starts_with(ENV_KEEP_PREFIX.as_bytes())
+}
+
+/// The commands and flags the perch sends, as aoide's `schema` names them: the command's path, and the flags the perch passes to it.
+/// [`missing`] names the first one the schema does not list.
+pub const USED: [(&[&str], &[&str]); 4] = [
+    (&["mail", "send"], &["json", "to", "from", "subject", "mesh", "hold"]),
+    (&["mail", "read"], &["json", "for", "reread"]),
+    (&["mail", "outbox"], &["json"]),
+    (&["mesh"], &["json"]),
+];
+
+/// The first command or flag of [`USED`] that the schema does not list, as the sentence that turns mail off. `None` when it lists them all.
+pub fn missing(schema: &Value) -> Option<String> {
+    let commands = schema.get("commands").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    for (path, flags) in USED {
+        let name = path.join(" ");
+        let listed = commands.iter().find(|command| command.get("path").and_then(Value::as_array).is_some_and(|words| {
+            words.len() == path.len() && words.iter().zip(path.iter().copied()).all(|(word, want)| word.as_str() == Some(want))
+        }));
+        let Some(command) = listed else {
+            return Some(format!("aoide's schema does not list `aoide {name}`, which the perch runs: mail is off until aoide is one that does"));
+        };
+        let have: Vec<&str> = command.get("flags").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default().iter().filter_map(|flag| flag.get("name")?.as_str()).collect();
+        if let Some(flag) = flags.iter().find(|flag| !have.contains(flag)) {
+            return Some(format!("aoide's `{name}` has no --{flag} flag, which the perch sends: mail is off until aoide is one that does"));
+        }
+    }
+    None
+}
+
+/// The version in a schema: its top-level `aoide` string, clipped.
+fn version_of(schema: Option<&Value>) -> Option<String> {
+    schema.and_then(|schema| schema.get("aoide")).and_then(Value::as_str).map(|version| clip(version.trim(), 64)).filter(|version| !version.is_empty())
 }
 
 /// Kills the child's whole process group and then the child, and waits a moment for it to be reaped.
@@ -289,8 +381,8 @@ impl Sender {
 /// `pair`, `spawn`, `allow`, `pull`, `dispatch` or anything on the A2A door has a variant, so none can be built.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Shape {
-    /// `--version`.
-    Version,
+    /// `schema`: aoide's own description of its commands, a JSON document (no envelope) that names the version.
+    Schema,
     /// `mesh --json`: what the mesh declares and where the registry drifts from it.
     MeshJson,
     /// `mail outbox --json`: what is spooled toward a node, with each entry's delivery status. Reads only.
@@ -306,7 +398,7 @@ impl Shape {
     /// The words a log line says, never an argument.
     pub fn verb(&self) -> &'static str {
         match self {
-            Self::Version => "version",
+            Self::Schema => "schema",
             Self::MeshJson => "mesh",
             Self::MailOutboxJson => "mail outbox",
             Self::MailRead { .. } => "mail read",
@@ -314,16 +406,11 @@ impl Shape {
         }
     }
 
-    /// Whether the call is asked for `--json` and so answers with an envelope.
-    fn json(&self) -> bool {
-        !matches!(self, Self::Version)
-    }
-
     /// The argv after the program name, or the sentence it was refused with. Pure: nothing is run, so a test can pin every shape.
     pub fn argv(&self) -> Result<Vec<String>, Error> {
         let words = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
         Ok(match self {
-            Self::Version => words(&["--version"]),
+            Self::Schema => words(&["schema"]),
             Self::MeshJson => words(&["mesh", "--json"]),
             Self::MailOutboxJson => words(&["mail", "outbox", "--json"]),
             Self::MailRead { reread } => {
@@ -379,7 +466,7 @@ impl Shape {
 impl std::fmt::Debug for Shape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Version => f.write_str("Version"),
+            Self::Schema => f.write_str("Schema"),
             Self::MeshJson => f.write_str("MeshJson"),
             Self::MailOutboxJson => f.write_str("MailOutboxJson"),
             Self::MailRead { reread } => f.debug_struct("MailRead").field("reread", reread).finish(),
@@ -548,13 +635,6 @@ fn envelope(stdout: &str) -> Option<Value> {
     serde_json::from_str::<Value>(stdout.trim()).ok().filter(Value::is_object)
 }
 
-/// `aoide 0.0.26` and `v0.0.26` give `0.0.26`, and a line with no such word is the line (clipped).
-fn parse_version(stdout: &str) -> Option<String> {
-    let line = stdout.lines().map(str::trim).find(|line| !line.is_empty())?;
-    let word = line.split_whitespace().rev().map(|word| word.trim_start_matches('v')).find(|word| word.starts_with(|c: char| c.is_ascii_digit()));
-    Some(clip(word.unwrap_or(line), 64))
-}
-
 /// What a child left behind: its exit code and what it printed, and whether a pipe was still held open after it exited.
 struct Done {
     code: i32,
@@ -613,6 +693,7 @@ async fn drive(child: &mut Child, cap: usize) -> Result<Done, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn send(to: To, mesh: Option<&str>, subject: &str, hold: bool, text: &str) -> Shape {
         Shape::MailSend { to, from: Sender::Minerva, mesh: mesh.map(str::to_string), subject: subject.to_string(), hold, text: text.to_string() }
@@ -635,7 +716,7 @@ mod tests {
 
     #[test]
     fn every_shape_spells_its_argv_one_way() {
-        assert_eq!(argv(&Shape::Version), ["--version"]);
+        assert_eq!(argv(&Shape::Schema), ["schema"]);
         assert_eq!(argv(&Shape::MeshJson), ["mesh", "--json"]);
         assert_eq!(argv(&Shape::MailOutboxJson), ["mail", "outbox", "--json"]);
         assert_eq!(argv(&Shape::MailRead { reread: false }), ["mail", "read", "--for=minerva", "--json"]);
@@ -736,7 +817,7 @@ mod tests {
         for reread in [false, true] {
             assert_eq!(envs(&aoide, &Shape::MailRead { reread }), vec![reader.clone()]);
         }
-        for shape in [Shape::Version, Shape::MeshJson, Shape::MailOutboxJson, send(node("osaka"), None, "s", false, "t")] {
+        for shape in [Shape::Schema, Shape::MeshJson, Shape::MailOutboxJson, send(node("osaka"), None, "s", false, "t")] {
             assert_eq!(envs(&aoide, &shape), Vec::<(String, String)>::new(), "{shape:?} runs with no identity of its own");
         }
     }
@@ -783,15 +864,62 @@ mod tests {
         }
     }
 
+    /// A schema of the shape aoide 0.0.26 prints, with only the commands and flags the perch sends (made-up summaries). `extra` adds a
+    /// flag to every command; `drop` removes one flag of one command, or the whole command when the flag is empty.
+    fn schema(extra: Option<&str>, drop: Option<(&str, &str)>) -> Value {
+        let mut commands = Vec::new();
+        for (path, flags) in USED {
+            let name = path.join(" ");
+            if drop.is_some_and(|(command, flag)| command == name && flag.is_empty()) {
+                continue;
+            }
+            let mut listed: Vec<Value> = flags
+                .iter()
+                .filter(|flag| !drop.is_some_and(|(command, gone)| command == name && gone == **flag))
+                .map(|flag| json!({ "name": flag, "type": "bool", "description": "a flag" }))
+                .collect();
+            listed.extend(extra.map(|flag| json!({ "name": flag, "type": "bool", "description": "a flag" })));
+            commands.push(json!({ "path": path, "summary": "a command", "args": [], "flags": listed }));
+        }
+        json!({ "schemaVersion": "0", "aoide": "0.0.26", "commands": commands })
+    }
+
     #[test]
-    fn a_version_is_read_out_of_whatever_was_printed() {
-        assert_eq!(parse_version("aoide 0.0.26\n").as_deref(), Some("0.0.26"));
-        assert_eq!(parse_version("\n  aoide v0.0.26 (abc123)  \nsecond line").as_deref(), Some("0.0.26"));
-        assert_eq!(parse_version("0.0.26").as_deref(), Some("0.0.26"));
-        assert_eq!(parse_version("no digits here").as_deref(), Some("no digits here"));
-        assert_eq!(parse_version(""), None);
-        assert_eq!(parse_version("  \n \n"), None);
-        assert_eq!(parse_version(&"w".repeat(500)).map(|v| v.len()), Some(64));
+    fn the_version_is_the_schemas_own_field_and_nothing_else_is_read() {
+        assert_eq!(version_of(Some(&schema(None, None))).as_deref(), Some("0.0.26"));
+        assert_eq!(version_of(Some(&json!({ "aoide": "  " }))), None);
+        assert_eq!(version_of(Some(&json!({ "aoide": 7 }))), None);
+        assert_eq!(version_of(Some(&json!({ "version": "0.0.26" }))), None);
+        assert_eq!(version_of(None), None);
+        assert_eq!(version_of(Some(&json!({ "aoide": "w".repeat(500) }))).map(|v| v.len()), Some(64));
+    }
+
+    #[test]
+    fn a_schema_that_lists_every_command_and_flag_the_perch_sends_is_missing_nothing() {
+        assert_eq!(missing(&schema(None, None)), None);
+        assert_eq!(missing(&schema(Some("extra"), None)), None, "more than the perch needs is fine");
+    }
+
+    #[test]
+    fn a_missing_command_or_flag_is_named_in_the_sentence() {
+        let no_reread = missing(&schema(None, Some(("mail read", "reread")))).expect("a missing flag");
+        assert!(no_reread.contains("--reread") && no_reread.contains("mail read"), "{no_reread}");
+        let no_subject = missing(&schema(None, Some(("mail send", "subject")))).expect("a missing flag");
+        assert!(no_subject.contains("--subject") && no_subject.contains("mail send"), "{no_subject}");
+        let no_outbox = missing(&schema(None, Some(("mail outbox", "")))).expect("a missing command");
+        assert!(no_outbox.contains("aoide mail outbox"), "{no_outbox}");
+        assert!(missing(&json!({ "aoide": "0.0.26" })).is_some(), "no commands at all");
+        assert!(missing(&json!("not an object")).is_some());
+    }
+
+    #[test]
+    fn the_children_environment_is_the_kept_names_and_the_locale() {
+        for kept in ["PATH", "HOME", "LANG", "TZ", "LC_ALL", "LC_CTYPE"] {
+            assert!(kept_env(OsStr::new(kept)), "{kept}");
+        }
+        for dropped in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "ALL_PROXY", "OPENAI_API_KEY", "AOIDE_SESSION_ID", "LC", "XDG_RUNTIME_DIR", "path"] {
+            assert!(!kept_env(OsStr::new(dropped)), "{dropped}");
+        }
     }
 
     #[test]
@@ -849,7 +977,7 @@ mod tests {
         // The whole vocabulary, as its argv: the words before the first flag are the verb, and the verb is one of these. `node list`,
         // `session`, `pair`, `spawn`, `allow`, `node status`, `node pull` and `dispatch` are not among them and have no variant.
         let all = [
-            Shape::Version,
+            Shape::Schema,
             Shape::MeshJson,
             Shape::MailOutboxJson,
             Shape::MailRead { reread: true },
@@ -860,7 +988,7 @@ mod tests {
             let words = argv(shape);
             let verb: Vec<&str> = words.iter().map(String::as_str).take_while(|word| !word.starts_with('-')).collect();
             assert!(
-                matches!(verb.as_slice(), [] | ["mesh"] | ["mail", "outbox"] | ["mail", "read"] | ["mail", "send"]),
+                matches!(verb.as_slice(), ["schema"] | ["mesh"] | ["mail", "outbox"] | ["mail", "read"] | ["mail", "send"]),
                 "{shape:?} runs {verb:?}: {words:?}"
             );
         }
@@ -869,14 +997,14 @@ mod tests {
     #[tokio::test]
     async fn a_relative_binary_is_refused_and_nothing_is_looked_up() {
         for bin in ["aoide", "./aoide", "bin/aoide", ""] {
-            let outcome = Aoide::new(bin).run(&Shape::Version).await;
+            let outcome = Aoide::new(bin).run(&Shape::Schema).await;
             assert!(matches!(&outcome, Err(Error::Refused(why)) if why.contains("PATH")), "{bin:?}: {outcome:?}");
         }
     }
 
     #[tokio::test]
     async fn a_missing_binary_is_a_sentence_and_not_a_panic() {
-        let outcome = Aoide::new("/nonexistent/aoide").run(&Shape::Version).await;
+        let outcome = Aoide::new("/nonexistent/aoide").run(&Shape::Schema).await;
         assert!(matches!(&outcome, Err(Error::Spawn(why)) if why.contains("/nonexistent/aoide")), "{outcome:?}");
         assert!(outcome.unwrap_err().to_string().starts_with("aoide could not be started"));
     }

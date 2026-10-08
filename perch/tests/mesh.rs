@@ -88,13 +88,12 @@ impl Setup {
         }
         let mut builder = Perch::builder()
             .env("HOME", user.to_str().unwrap())
-            .env("FAKE_AOIDE_DIR", self.fake_dir.to_str().unwrap())
-            .env("FAKE_AOIDE_LOG", log.to_str().unwrap())
             // What a perch started from inside a conducted session has in its environment: none of it may reach a call.
             .env("AOIDE_SESSION_ID", "a-conducted-session")
             .env("AOIDE_STATE_DIR", "/nonexistent/ambient-state");
         if self.aoide {
-            builder = builder.arg("--aoide").arg(fake_aoide().expect("the stand-in aoide"));
+            // Steered through a script: a perch hands its children only its allowlist, so the settings cannot ride on its environment.
+            builder = builder.arg("--aoide").arg(wrapper(root.join("aoide-bin"), &self.fake_dir, Some(&log)));
         }
         if self.home {
             builder = builder.arg("--aoide-home").arg(&home);
@@ -109,7 +108,7 @@ impl Setup {
             builder = builder.arg("--knob").arg(format!("mesh_ttl_ms={ms}"));
         }
         let perch = builder.hold(dir).start();
-        Rig { perch, home, state, events, socket, log }
+        Rig { perch, home, state, events, socket, log, aoide_bin: root.join("aoide-bin") }
     }
 }
 
@@ -121,6 +120,8 @@ struct Rig {
     events: PathBuf,
     socket: PathBuf,
     log: PathBuf,
+    /// The script the perch was given as `--aoide` (it sets the stand-in's steering and runs it).
+    aoide_bin: PathBuf,
 }
 
 fn json_of(answer: &Answer, what: &str) -> Value {
@@ -189,7 +190,8 @@ fn names(snapshot: &Value, part: &str) -> Vec<String> {
 fn a_snapshot_runs_version_mesh_and_outbox_and_nothing_else() {
     let rig = Setup::all().start();
     let snapshot = rig.snapshot();
-    assert_eq!(rig.argvs(), vec![words(&["--version"]), words(&["mail", "outbox", "--json"]), words(&["mesh", "--json"])]);
+    // The snapshot asks for the mesh and the outbox, and then the version (the schema), which it reads from the same call as the rest.
+    assert_eq!(rig.argvs(), vec![words(&["mail", "outbox", "--json"]), words(&["mesh", "--json"]), words(&["schema"])]);
     let calls = rig.calls();
     assert_eq!(calls.len(), 3);
     for call in &calls {
@@ -206,7 +208,7 @@ fn a_snapshot_runs_version_mesh_and_outbox_and_nothing_else() {
         assert_eq!(call["xdg_runtime_dir"], rig.perch.runtime.path().to_str().unwrap());
     }
     assert_eq!(snapshot["available"], true);
-    assert_eq!(snapshot["aoide"], json!({"path": fake_aoide().unwrap(), "version": "0.0.26"}));
+    assert_eq!(snapshot["aoide"], json!({"path": rig.aoide_bin.to_str().unwrap(), "version": "0.0.26"}));
     assert_eq!(snapshot["daemon"], json!({"socket": rig.socket.to_str().unwrap(), "ping_ms": null}), "nothing listens");
     assert_eq!(snapshot["errors"], json!([]));
     let sections = snapshot["mesh"]["report"]["sections"].as_array().unwrap();
@@ -240,7 +242,7 @@ fn a_run_is_asked_for_again_once_its_ttl_has_passed() {
 fn a_failed_run_is_a_sentence_and_is_not_cached() {
     let dir = tempfile::tempdir().unwrap();
     // The fake exits 99 for a fixture that is not there.
-    for name in ["version.txt", "outbox.json"] {
+    for name in ["version.txt", "schema.json", "outbox.json"] {
         std::fs::copy(fixtures().join(name), dir.path().join(name)).unwrap();
     }
     let rig = Setup { fake_dir: dir.path().to_path_buf(), ..Setup::all() }.start();

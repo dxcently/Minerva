@@ -5,37 +5,32 @@
     "stdout": {
       "status": "ok",
       "command": "mail.send",
-      "message": "filed to self/minerva (msgid 5555555555555555555555555555555555555555555555555555555555555555)",
+      "message": "1/1 recipient copies filed or spooled; inspect recipient delivery status before retrying",
       "gated": false,
       "changed": [
         "state/mail/base.jsonl: +1 letter to minerva"
       ],
       "data": {
-        "seq": 9,
-        "receivedAt": "2026-10-07T10:00:00Z",
-        "type": "letter",
-        "via": "self",
-        "envelope": {
-          "header": {
-            "version": "1",
-            "from": {
-              "node": "workbench",
-              "name": "minerva"
+        "accepted": 1,
+        "complete": true,
+        "recipients": [
+          {
+            "accepted": true,
+            "address": {
+              "name": "minerva",
+              "node": "self"
             },
-            "to": {
-              "node": "workbench",
-              "name": "minerva"
-            },
-            "type": "letter",
-            "mintedAt": "2026-10-07T10:00:00Z",
-            "originMesh": ""
-          },
-          "text": "(scripted)",
-          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
-          "msgid": "5555555555555555555555555555555555555555555555555555555555555555"
-        },
-        "disposition": "filed",
-        "ring": "no-daemon"
+            "delivery": null,
+            "error": null,
+            "msgid": "5555555555555555555555555555555555555555555555555555555555555555",
+            "ring": "no-daemon",
+            "role": "to",
+            "status": "filed"
+          }
+        ],
+        "replyTo": null,
+        "subject": "a made-up subject",
+        "threadId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
       }
     }
   },
@@ -44,37 +39,38 @@
     "stdout": {
       "status": "ok",
       "command": "mail.send",
-      "message": "spooled to osaka/minerva (msgid 6666666666666666666666666666666666666666666666666666666666666666)",
+      "message": "1/1 recipient copies filed or spooled; inspect recipient delivery status before retrying",
       "gated": false,
       "changed": [
         "state/outbox/osaka/: +1 entry"
       ],
       "data": {
-        "header": {
-          "version": "1",
-          "from": {
-            "node": "workbench",
-            "name": "minerva"
-          },
-          "to": {
-            "node": "osaka",
-            "name": "minerva"
-          },
-          "type": "letter",
-          "mintedAt": "2026-10-07T10:00:00Z",
-          "originMesh": ""
-        },
-        "text": "(scripted)",
-        "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
-        "msgid": "6666666666666666666666666666666666666666666666666666666666666666",
-        "disposition": "spooled",
-        "delivery": {
-          "status": "queued",
-          "reason": null,
-          "reasonScope": null,
-          "nextAttemptAt": null,
-          "ackPending": false
-        }
+        "accepted": 1,
+        "complete": true,
+        "recipients": [
+          {
+            "accepted": true,
+            "address": {
+              "name": "minerva",
+              "node": "osaka"
+            },
+            "delivery": {
+              "status": "queued",
+              "reason": null,
+              "reasonScope": null,
+              "nextAttemptAt": null,
+              "ackPending": false
+            },
+            "error": null,
+            "msgid": "6666666666666666666666666666666666666666666666666666666666666666",
+            "ring": "no-daemon",
+            "role": "to",
+            "status": "spooled"
+          }
+        ],
+        "replyTo": null,
+        "subject": "a made-up subject",
+        "threadId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
       }
     },
     "with_hold": {
@@ -82,37 +78,38 @@
       "stdout": {
         "status": "ok",
         "command": "mail.send",
-        "message": "held for osaka/minerva (msgid 7777777777777777777777777777777777777777777777777777777777777777)",
+        "message": "1/1 recipient copies filed or spooled; inspect recipient delivery status before retrying",
         "gated": false,
         "changed": [
           "state/outbox/osaka/: +1 entry"
         ],
         "data": {
-          "header": {
-            "version": "1",
-            "from": {
-              "node": "workbench",
-              "name": "minerva"
-            },
-            "to": {
-              "node": "osaka",
-              "name": "minerva"
-            },
-            "type": "letter",
-            "mintedAt": "2026-10-07T10:00:00Z",
-            "originMesh": ""
-          },
-          "text": "(scripted)",
-          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
-          "msgid": "7777777777777777777777777777777777777777777777777777777777777777",
-          "disposition": "held",
-          "delivery": {
-            "status": "held",
-            "reason": null,
-            "reasonScope": null,
-            "nextAttemptAt": null,
-            "ackPending": false
-          }
+          "accepted": 1,
+          "complete": true,
+          "recipients": [
+            {
+              "accepted": true,
+              "address": {
+                "name": "minerva",
+                "node": "osaka"
+              },
+              "delivery": {
+                "status": "held",
+                "reason": null,
+                "reasonScope": null,
+                "nextAttemptAt": null,
+                "ackPending": false
+              },
+              "error": null,
+              "msgid": "7777777777777777777777777777777777777777777777777777777777777777",
+              "ring": "no-daemon",
+              "role": "to",
+              "status": "held"
+            }
+          ],
+          "replyTo": null,
+          "subject": "a made-up subject",
+          "threadId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
         }
       }
     }
@@ -151,12 +148,58 @@
       "stdout": {
         "status": "ok",
         "command": "mail.send",
-        "message": "spooled to multi/minerva (msgid 8888888888888888888888888888888888888888888888888888888888888888)",
+        "message": "1/1 recipient copies filed or spooled; inspect recipient delivery status before retrying",
         "gated": false,
         "changed": [
           "state/outbox/multi/: +1 entry"
         ],
         "data": {
+          "accepted": 1,
+          "complete": true,
+          "recipients": [
+            {
+              "accepted": true,
+              "address": {
+                "name": "minerva",
+                "node": "multi"
+              },
+              "delivery": {
+                "status": "queued",
+                "reason": null,
+                "reasonScope": null,
+                "nextAttemptAt": null,
+                "ackPending": false
+              },
+              "error": null,
+              "msgid": "8888888888888888888888888888888888888888888888888888888888888888",
+              "ring": "no-daemon",
+              "role": "to",
+              "status": "spooled"
+            }
+          ],
+          "replyTo": null,
+          "subject": "a made-up subject",
+          "threadId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      }
+    }
+  },
+  "nosubject": {
+    "code": 0,
+    "stdout": {
+      "status": "ok",
+      "command": "mail.send",
+      "message": "filed to nosubject/minerva (msgid 5555555555555555555555555555555555555555555555555555555555555555)",
+      "gated": false,
+      "changed": [
+        "state/mail/base.jsonl: +1 letter to minerva"
+      ],
+      "data": {
+        "seq": 9,
+        "receivedAt": "2026-10-07T10:00:00Z",
+        "type": "letter",
+        "via": "self",
+        "envelope": {
           "header": {
             "version": "1",
             "from": {
@@ -164,7 +207,7 @@
               "name": "minerva"
             },
             "to": {
-              "node": "multi",
+              "node": "workbench",
               "name": "minerva"
             },
             "type": "letter",
@@ -173,16 +216,10 @@
           },
           "text": "(scripted)",
           "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
-          "msgid": "8888888888888888888888888888888888888888888888888888888888888888",
-          "disposition": "spooled",
-          "delivery": {
-            "status": "queued",
-            "reason": null,
-            "reasonScope": null,
-            "nextAttemptAt": null,
-            "ackPending": false
-          }
-        }
+          "msgid": "5555555555555555555555555555555555555555555555555555555555555555"
+        },
+        "disposition": "filed",
+        "ring": "no-daemon"
       }
     }
   }
