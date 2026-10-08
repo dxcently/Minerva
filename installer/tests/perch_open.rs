@@ -1,4 +1,4 @@
-//! `bin/perch-open.sh` and `nix/minerva.sh`: the key arm (`--keys-arm`) against a stub HTTP server on 127.0.0.1:48110, and the
+//! `bin/perch-open.sh` and `nix/minerva.sh`: the key arm (`--keys-arm`) against a stub HTTP server on a loopback port the OS picks, and the
 //! start-up flags that only a newer perch knows. Both scripts get the start-up cases; only the Linux script arms a key (a Nix install
 //! refuses `keys allow-web`, see nix_allow_web.rs). Every run has a cleared
 //! environment, a temp HOME holding DECOY tokens at the default places, and a `curl` shim that logs argv and refuses 47820.
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{DECOY, Env, GIVEN, STUB_PORT, Stub, mkdir, port_lock, repo_root, text, write};
+use common::{DECOY, Env, GIVEN, STUB_PORT, Stub, mkdir, port_lock, repo_root, stub_port, text, write};
 use serde_json::{Value, json};
 
 const MINERVA: &str = env!("CARGO_BIN_EXE_minerva");
@@ -77,6 +77,8 @@ fn the_scripts_parse() {
 
 #[test]
 fn perch_open_help_lists_the_arm_and_old_flags_still_parse() {
+    // the --status and --stop checks below ask what is on the stub's port, so no stub of another test may be up while they run
+    let _g = port_lock();
     let env = Env::new();
     let out = run_script(&env, Which::PerchOpen, &["--help".into()]);
     let (o, _) = text(&out);
@@ -108,11 +110,11 @@ fn perch_open_help_lists_the_arm_and_old_flags_still_parse() {
     assert_eq!(sp.status.code(), Some(0));
     assert!(text(&sp).0.contains("not running on port 47820"));
     // --port moves them to another perch's files
-    let st = run_script(&env, Which::PerchOpen, &["--status".into(), "--port".into(), "48110".into()]);
+    let st = run_script(&env, Which::PerchOpen, &["--status".into(), "--port".into(), STUB_PORT.to_string()]);
     assert_eq!(st.status.code(), Some(1));
-    assert!(text(&st).0.contains("down: nothing of ours on port 48110"));
-    let sp = run_script(&env, Which::PerchOpen, &["--stop".into(), "--port".into(), "48110".into()]);
-    assert!(text(&sp).0.contains("not running on port 48110"));
+    assert!(text(&st).0.contains(&format!("down: nothing of ours on port {STUB_PORT}")));
+    let sp = run_script(&env, Which::PerchOpen, &["--stop".into(), "--port".into(), STUB_PORT.to_string()]);
+    assert!(text(&sp).0.contains(&format!("not running on port {STUB_PORT}")));
     assert_eq!(env.argv_log(), "", "none of them touched the network");
 }
 
@@ -124,7 +126,7 @@ fn the_arm_sends_the_given_token_only_through_a_0600_header_file() {
     for w in ARMS {
         let env = Env::new();
         let tok = token_file(&env, GIVEN, 0o600);
-        let stub = Stub::start(STUB_PORT, 200, r#"{"armed":true}"#);
+        let stub = Stub::start(stub_port(), 200, r#"{"armed":true}"#);
         let out = run_script(&env, w, &arm_args(w, "0f7a 3a5c 447e c7ef", &STUB_PORT.to_string(), &tok));
         let (o, e) = text(&out);
         assert!(out.status.success(), "{w:?}: {o}{e}");
@@ -166,7 +168,7 @@ fn the_arm_refuses_bad_input_before_it_calls_curl() {
     let _g = port_lock();
     for w in ARMS {
         let env = Env::new();
-        let stub = Stub::start(STUB_PORT, 200, "{}");
+        let stub = Stub::start(stub_port(), 200, "{}");
         let good = token_file(&env, GIVEN, 0o600);
         let port = STUB_PORT.to_string();
         let mut cases: Vec<(String, Vec<String>)> = Vec::new();
@@ -231,7 +233,7 @@ fn the_arm_says_what_the_perch_answered() {
         let tok = token_file(&env, GIVEN, 0o600);
         let args = arm_args(w, FP, &STUB_PORT.to_string(), &tok);
         for (status, want) in [(403, "answered 403"), (409, "answered 409"), (401, "answered 401"), (500, "answered 500"), (404, "no update-key routes")] {
-            let stub = Stub::start(STUB_PORT, status, r#"{"why":"x"}"#);
+            let stub = Stub::start(stub_port(), status, r#"{"why":"x"}"#);
             let out = run_script(&env, w, &args);
             let (o, e) = text(&out);
             assert_eq!(out.status.code(), Some(1), "{w:?} {status}: {o}{e}");
@@ -253,8 +255,8 @@ fn without_a_token_file_the_arm_needs_a_perch_of_ours_and_never_reads_the_decoys
     let _g = port_lock();
     for w in ARMS {
         let env = Env::new();
-        let stub = Stub::start(STUB_PORT, 200, "{}");
-        for port in [None, Some(STUB_PORT)] {
+        let stub = Stub::start(stub_port(), 200, "{}");
+        for port in [None, Some(stub_port())] {
             let mut c = env.cmd("bash");
             c.arg(script(w));
             match w {
@@ -283,7 +285,7 @@ fn with_our_perch_running_the_arm_uses_its_own_token_on_its_own_port() {
         // "our perch": a live process in the pid file, a token file at the default place, a server that answers 200
         let mut alive = Command::new("sleep").arg("30").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         write(&env.run.join(format!("minerva/perch-{STUB_PORT}.pid")), &format!("{}\n", alive.id()), 0o600);
-        let stub = Stub::start(STUB_PORT, 200, r#"{"armed":true}"#);
+        let stub = Stub::start(stub_port(), 200, r#"{"armed":true}"#);
         let mut c = env.cmd("bash");
         c.arg(script(w)).env("MINERVA_PERCH_PORT", STUB_PORT.to_string());
         match w {
@@ -328,7 +330,7 @@ fn a_token_file_that_is_not_the_perchs_is_never_sent_anywhere_on_any_path() {
                 2 => write(&tokf, "x y\nX-Evil: 1", 0o600),
                 _ => mkdir(&tokf, 0o700),
             }
-            let stub = Stub::start(STUB_PORT, 200, "{}");
+            let stub = Stub::start(stub_port(), 200, "{}");
             let mut runs: Vec<Vec<&str>> = vec![match w {
                 Which::PerchOpen => vec!["--keys-arm", FP],
                 Which::Nix => vec!["keys", "allow-web", FP],
@@ -375,7 +377,7 @@ fn the_token_goes_neither_through_a_proxy_nor_into_a_curlrc_listing() {
         write(&env.home.join(".curlrc"), "verbose\n", 0o600);
         let hdr = env.dir.path().join("hdr");
         write(&hdr, &format!("Authorization: Bearer {GIVEN}\n"), 0o600);
-        let stub = Stub::start(STUB_PORT, 200, "{}");
+        let stub = Stub::start(stub_port(), 200, "{}");
         let mut c = env.cmd(env.shim.join("curl"));
         with_proxy_env(&mut c, &proxy);
         let out = c.args(["-sS", "-H"]).arg(format!("@{}", hdr.display())).arg(format!("http://127.0.0.1:{STUB_PORT}/control")).output().unwrap();
@@ -390,7 +392,7 @@ fn the_token_goes_neither_through_a_proxy_nor_into_a_curlrc_listing() {
             write(&env.home.join(".curlrc"), "verbose\n", 0o600);
             let tok = token_file(&env, GIVEN, 0o600);
             let mut alive = Command::new("sleep").arg("30").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-            let stub = Stub::start(STUB_PORT, 200, r#"{"armed":true}"#);
+            let stub = Stub::start(stub_port(), 200, r#"{"armed":true}"#);
             let mut c = env.cmd("bash");
             c.arg(script(w));
             if own_perch {
@@ -430,6 +432,19 @@ fn the_token_goes_neither_through_a_proxy_nor_into_a_curlrc_listing() {
     }
 }
 
+/// Give a child the default SIGINT disposition (it may have inherited SIG_IGN from a background job). Called between fork and exec only:
+/// `signal` is async-signal-safe.
+fn reset_sigint() {
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    const SIGINT: i32 = 2;
+    const SIG_DFL: usize = 0;
+    unsafe {
+        signal(SIGINT, SIG_DFL);
+    }
+}
+
 #[test]
 fn an_interrupt_while_the_perch_is_being_probed_leaves_no_header_file_behind() {
     // the Linux arm only: see ARMS
@@ -439,13 +454,21 @@ fn an_interrupt_while_the_perch_is_being_probed_leaves_no_header_file_behind() {
         let mut alive = Command::new("sleep").arg("30").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         write(&env.run.join(format!("minerva/perch-{STUB_PORT}.pid")), &format!("{}\n", alive.id()), 0o600);
         // a perch that takes 3 s to answer, so the script is inside its first curl when the signal comes
-        let stub = Stub::start_slow(STUB_PORT, 200, "{}", Duration::from_secs(3));
+        let stub = Stub::start_slow(stub_port(), 200, "{}", Duration::from_secs(3));
         let mut c = env.cmd("bash");
         c.arg(script(w)).env("MINERVA_PERCH_PORT", STUB_PORT.to_string());
         match w {
             Which::PerchOpen => c.args(["--keys-arm", FP]),
             Which::Nix => c.args(["keys", "allow-web", FP]),
         };
+        // a terminal's ^C is not ignored, even when this suite runs as a background job: a shell starts background jobs with SIGINT
+        // ignored, and that disposition would pass on to the script and make the interrupt a no-op
+        unsafe {
+            c.pre_exec(|| {
+                reset_sigint();
+                Ok(())
+            });
+        }
         // its own process group, so the ^C reaches the script, the shell it forked for the probe and curl, as a terminal's does
         let mut child = c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).process_group(0).spawn().unwrap();
         let started = Instant::now();
@@ -482,7 +505,7 @@ fn minerva_web_keys_arm_hands_the_fingerprint_to_the_script_beside_it() {
     fs::set_permissions(inst.join("minerva"), fs::Permissions::from_mode(0o755)).unwrap();
     fs::copy(script(Which::PerchOpen), inst.join("perch-open.sh")).unwrap();
     let tok = token_file(&env, GIVEN, 0o600);
-    let stub = Stub::start(STUB_PORT, 200, r#"{"armed":true}"#);
+    let stub = Stub::start(stub_port(), 200, r#"{"armed":true}"#);
     let out = env
         .cmd(inst.join("minerva"))
         .args(["web", "--keys-arm", "0f7a3a5c447ec7ef", "--port", &STUB_PORT.to_string(), "--token-file", tok.to_str().unwrap()])
@@ -763,7 +786,7 @@ fn colour_forced_in_the_environment_does_not_hide_the_flags_from_the_probe() {
 fn a_perch_on_another_port_than_the_default_gets_no_agent_files() {
     let _g = port_lock();
     for w in BOTH {
-        // the default (MINERVA_PERCH_PORT) is 48111; this perch is started on 48110 with --port: a second perch
+        // the default (MINERVA_PERCH_PORT) is 48111; this perch is started on the stub port with --port: a second perch
         let s = Start::new(w, HELP_NEW);
         write(&s.env.home.join(".local/bin/aoide"), "#!/bin/sh\n", 0o755);
         let out = s.cmd("--no-browser").env("MINERVA_PERCH_PORT", "48111").args(["--port", &STUB_PORT.to_string()]).output().unwrap();

@@ -10,7 +10,7 @@ cd installer && MINERVA_ALLOW_PLACEHOLDER_KEY=1 CARGO_TARGET_DIR=$HOME/.cache/mi
 
 ```text
 common/mod.rs         the fixture Env (temp HOME with DECOY tokens at every default place a script could read one), the stub HTTP
-                      server on 127.0.0.1:48110, and the curl shim
+                      server on a loopback port the OS picks, and the curl shim
 cli.rs                `status --json` over fixture prefixes; `keys add|remove --json` (every error kind, keys dir unchanged on a
                       refusal); `keys list|inspect --json` failing in the same shape; a revoked key under a fresh id; the
                       `web --keys-arm` checks that need no perch
@@ -21,13 +21,14 @@ fixtures/             `perch --help` as printed by the perch an operator has ins
                       master (perch-help-new.txt); the start tests probe against these, not against a hand-written imitation
 ```
 
-**Nothing here can reach the operator's perch.** The stub listens on 48110 only, and refuses to start on 47820. A `curl` shim is first
+**Nothing here can reach the operator's perch.** The stub listens on a loopback port the OS picks for this process, never 47820. A `curl` shim is first
 on `PATH` for every script: it logs each call's argv, the mode of every `-H @file` header file and what it held, and exits 7 without
 making any call aimed at `:47820`. So a script that ignored `--port` would be seen (and stopped), and "the token is not in argv" is
 checked against what curl was really given. The decoy tokens (`DECOY`) sit where the scripts would find a default; the test hands over
 a different one (`GIVEN`), and the stub must receive exactly that.
 
-Tests that listen on 48110 hold a `flock` on a file in the cargo target dir, so they take turns across threads and across processes.
+Tests that use the stub port, or ask what is on it, hold a `flock` on `minerva-installer-stub.lock` in the temp dir (the host's, not the
+target dir's), so they take turns across threads, across processes and across worktrees on this host.
 The start tests run a stub perch that is a shell script: its `--help` is a fixture (coloured when `CLICOLOR_FORCE` or `FORCE_COLOR`
 is in its environment, as clap's is), it records the argv it was started with, and it writes its own pid, which is the one process the
 test kills afterwards (and only while that pid is still the stub).

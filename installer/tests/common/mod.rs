@@ -9,26 +9,57 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// The loopback port of this slice's stub (the plan's PORTS list: I1 = 48110). The operator's perch is on 47820 and is never touched.
-pub const STUB_PORT: u16 = 48110;
+/// The operator's perch. No test listens there, and the curl shim refuses any call aimed at it.
 pub const OPERATORS_PORT: u16 = 47820;
 
-/// Holding the stub's port. One holder at a time, across threads AND across processes (two `cargo test` runs, or the two test
-/// binaries of one run started together): the lock is a `flock` on a file in the target directory, which the system lets go of when
-/// the holder exits, however it exits.
+/// This process's stub port: a loopback port the OS hands out, picked once per process, never the operator's. A fixed number (48110
+/// before) is shared by every run of this suite on the host, from every worktree, and a stranger's listener on it made tests fail with
+/// "already in use by something that is not our perch" or met requests that were not theirs. A port the OS picks is free when it is
+/// chosen, and this process's tests are the only ones that bind it.
+pub fn stub_port() -> u16 {
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(|| {
+        for _ in 0..100 {
+            let probe = TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port for the stub");
+            let port = probe.local_addr().expect("the probe's address").port();
+            drop(probe);
+            if port != OPERATORS_PORT {
+                return port;
+            }
+        }
+        panic!("the OS gave no loopback port for the stub");
+    })
+}
+
+/// `STUB_PORT` is the stub's port wherever a test writes it: in a format string, or with `.to_string()`. `stub_port()` is the number.
+pub struct StubPort;
+pub const STUB_PORT: StubPort = StubPort;
+
+impl std::fmt::Display for StubPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", stub_port())
+    }
+}
+
+/// Holding the stub's port (and the right to ask what is on it). One holder at a time, across threads and across processes: the tests of
+/// one process share `stub_port()`, so they take turns. The lock is a `flock` on a file in the temp dir, which the system lets go of
+/// when the holder exits, however it exits.
 pub struct PortGuard {
     _file: File,
 }
 
 pub fn port_lock() -> PortGuard {
-    // CARGO_TARGET_TMPDIR is <target dir>/tmp, made by cargo for integration tests to put things in
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    std::fs::create_dir_all(dir).unwrap();
-    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(dir.join(format!("minerva-installer-port-{STUB_PORT}.lock"))).unwrap();
+    let path = std::env::temp_dir().join("minerva-installer-stub.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("cannot open the port lock {}: {e}", path.display()));
     // each call opens its own file description, so threads of one process wait for each other just as processes do
     file.lock().unwrap();
     PortGuard { _file: file }
@@ -195,7 +226,7 @@ impl Env {
         mkdir(&shim, 0o700);
         mkdir(&run.join("minerva"), 0o700);
         // decoys: the perch's own token files for the stub's port AND the operator's port, and the agent tokens
-        for port in [STUB_PORT, OPERATORS_PORT] {
+        for port in [stub_port(), OPERATORS_PORT] {
             write(&run.join(format!("minerva/perch-{port}.token")), DECOY, 0o600);
         }
         for name in ["minerva-term.token", "minerva-mail.token", "jev.token", "browser.token"] {
@@ -241,6 +272,7 @@ exec {curl} "$@"
         c.env_clear()
             .env("PATH", self.path())
             .env("HOME", &self.home)
+            .env("MINERVA_HOME", self.home.join("Minerva"))
             .env("XDG_RUNTIME_DIR", &self.run)
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("LC_ALL", "C");

@@ -367,8 +367,14 @@ impl Trust {
         };
         st.check_fingerprints(&self.dir)?;
         for r in &self.mem_revoked {
-            if !st.revoked.iter().any(|x| x.id == r.id) {
-                st.revoked.push(r.clone());
+            match st.revoked.iter_mut().find(|x| x.id.eq_ignore_ascii_case(&r.id)) {
+                // a preview that knows the fingerprint keeps it, even where the record has the id without one
+                Some(x) => {
+                    if x.fp.is_none() {
+                        x.fp = r.fp.clone();
+                    }
+                }
+                None => st.revoked.push(r.clone()),
             }
         }
         st.serial = st.serial.max(self.mem_serial);
@@ -600,6 +606,17 @@ struct Rotation {
     add: Vec<AddEntry>,
     #[serde(default)]
     revoke: Vec<String>,
+    /// Revoked keys with their fingerprints, for a key this machine may never have held: its bytes then refuse the same key under a
+    /// fresh id. Additive: an installer built before this field ignores it (serde takes no unknown-field error here) and revokes by id
+    /// only, as it always did, so a file that carries it still applies everywhere.
+    #[serde(default)]
+    revoke_fp: Vec<RevokeFp>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RevokeFp {
+    id: String,
+    fp: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -651,10 +668,30 @@ impl Plan {
     }
 }
 
+/// Add a revocation; a second one for the same id only fills in a fingerprint the first did not have.
 fn push_revoke(revokes: &mut Vec<Revoke>, id: &str, fp: Option<String>) {
-    if !revokes.iter().any(|r| r.id == id) {
-        revokes.push(Revoke { id: id.to_string(), fp });
+    match revokes.iter_mut().find(|r| r.id == id) {
+        Some(r) => {
+            if r.fp.is_none() {
+                r.fp = fp;
+            }
+        }
+        None => revokes.push(Revoke { id: id.to_string(), fp }),
     }
+}
+
+/// Collect the ids a file revokes, each with the fingerprint the file gives for it (if any). One id twice is one entry; two different
+/// fingerprints for one id refuse the file.
+fn want_revoke(wanted: &mut Vec<(String, Option<String>)>, id: String, given: Option<String>) -> Result<()> {
+    match wanted.iter_mut().find(|(x, _)| *x == id) {
+        Some((_, held)) => match (held.clone(), given) {
+            (Some(a), Some(b)) if a != b => bail!("keys.json gives two different fingerprints for key {id}; refusing the whole file, nothing changed"),
+            (None, b) => *held = b,
+            _ => {}
+        },
+        None => wanted.push((id, given)),
+    }
+    Ok(())
 }
 
 pub enum Planned {
@@ -710,17 +747,37 @@ pub fn plan_rotation(trust: &Trust, json: &[u8], sig: Option<&str>, today: &str)
         }
         adds.push((k, a.expires.clone()));
     }
-    // The fingerprint of each key revoked: from this file's own adds (a key that is only in this file), else from the keys dir or the
-    // compiled-in key. A revocation without one still refuses by id.
+    // The fingerprint of each key revoked: the one the file gives in `revoke_fp`; else this file's own adds (a key that is only in this
+    // file); else the keys dir or the compiled-in key. A revocation with none still refuses by id. A given fingerprint that is not the
+    // one this machine holds under that id names another key, so the whole file is refused.
     let known: Vec<KeyInfo> = adds.iter().map(|(k, _)| k.clone()).chain(trust.all()).collect();
     let fp_of = |id: &str| known.iter().find(|k| k.id.eq_ignore_ascii_case(id)).map(|k| fp_hex(&k.fingerprint));
-    let mut revokes: Vec<Revoke> = Vec::new();
+    let mut wanted: Vec<(String, Option<String>)> = Vec::new();
     for r in &rot.revoke {
         if !valid_id(r) {
             bail!("keys.json: {r:?} is not a key id");
         }
-        let id = r.to_ascii_uppercase();
-        push_revoke(&mut revokes, &id, fp_of(&id));
+        want_revoke(&mut wanted, r.to_ascii_uppercase(), None)?;
+    }
+    for r in &rot.revoke_fp {
+        if !valid_id(&r.id) {
+            bail!("keys.json: {:?} is not a key id", r.id);
+        }
+        let fp = fp_hex(&r.fp);
+        if !valid_fp(&fp) {
+            bail!("keys.json: the fingerprint given for key {} is not 16 hex digits; refusing the whole file, nothing changed", r.id);
+        }
+        want_revoke(&mut wanted, r.id.to_ascii_uppercase(), Some(fp))?;
+    }
+    let mut revokes: Vec<Revoke> = Vec::new();
+    for (id, given) in wanted {
+        let fp = match (given, fp_of(&id)) {
+            (Some(g), Some(h)) if g != h => {
+                bail!("keys.json revokes key {id} with fingerprint {g}, but this machine holds key {id} with fingerprint {h}; refusing the whole file, nothing changed")
+            }
+            (g, h) => g.or(h),
+        };
+        push_revoke(&mut revokes, &id, fp);
         // what the revoked key added before this file goes with it (keys added by this very file are the signer's
         // own succession, e.g. "A adds B and revokes A", and stay)
         for d in trust.descendants(&id) {
@@ -959,6 +1016,78 @@ pub mod tests {
         let claim = sig_claiming(&sign(&leaked_sk, b"x"), &id_of(&fresh));
         let e = format!("{:#}", tr.verify(b"x", &claim, "2026-10-06").unwrap_err());
         assert!(e.contains("not one this program trusts") || e.contains("revoked"), "{e}");
+    }
+
+    #[test]
+    fn a_revocation_fingerprint_in_the_file_refuses_a_key_this_machine_never_held() {
+        // arm-2 for a key whose bytes were never on this machine: the record has no fingerprint of its own, so the signed file gives one
+        let (pk, sk) = keypair();
+        let (leaked, _) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        let fp = fp_hex(&parse_pub(&leaked, Source::Manual).unwrap().fingerprint);
+        let revoke = format!(r#"{{"schema":1,"serial":1,"expires":"2030-01-01","add":[],"revoke":[],"revoke_fp":[{{"id":"{}","fp":"{fp}"}}]}}"#, id_of(&leaked));
+        apply_rotation(&tr, revoke.as_bytes(), &sign(&sk, revoke.as_bytes()), "2026-10-06").unwrap();
+        assert_eq!(tr.state().unwrap().revoked.iter().find(|r| r.id == id_of(&leaked)).and_then(|r| r.fp.as_deref()), Some(fp.as_str()));
+        let fresh = with_fresh_id(&leaked);
+        assert_eq!(kind_of(tr.add_manual(&fresh)), "revoked");
+        assert!(!tr.dir.join(format!("{}.pub", id_of(&fresh))).exists());
+        let back = rotation(2, "2030-01-01", &[&fresh], &[]);
+        let e = apply_rotation(&tr, back.as_bytes(), &sign(&sk, back.as_bytes()), "2026-10-06").unwrap_err();
+        assert_eq!(refusal(&e).map(|r| r.why.kind()), Some("revoked"), "{e:#}");
+        assert_eq!(tr.state().unwrap().serial, 1, "a refused file records nothing");
+    }
+
+    #[test]
+    fn a_revocation_fingerprint_that_names_another_key_refuses_the_whole_file() {
+        let (pk, sk) = keypair();
+        let (known, _) = keypair();
+        let (other, _) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        let add = rotation(1, "2030-01-01", &[&known], &[]);
+        apply_rotation(&tr, add.as_bytes(), &sign(&sk, add.as_bytes()), "2026-10-06").unwrap();
+        let other_fp = fp_hex(&parse_pub(&other, Source::Manual).unwrap().fingerprint);
+        let wrong = format!(r#"{{"schema":1,"serial":2,"expires":"2030-01-01","add":[],"revoke":[],"revoke_fp":[{{"id":"{}","fp":"{other_fp}"}}]}}"#, id_of(&known));
+        let e = apply_rotation(&tr, wrong.as_bytes(), &sign(&sk, wrong.as_bytes()), "2026-10-06").unwrap_err();
+        assert!(format!("{e:#}").contains("fingerprint"), "{e:#}");
+        assert_eq!(tr.state().unwrap().serial, 1, "a refused file records nothing");
+        assert!(tr.trusted("2026-10-06").unwrap().iter().any(|k| k.id == id_of(&known)), "the key it names is still trusted");
+        // two different fingerprints for one id in one file: refused whole, whichever one is right
+        let known_fp = fp_hex(&parse_pub(&known, Source::Manual).unwrap().fingerprint);
+        let two = format!(
+            r#"{{"schema":1,"serial":2,"expires":"2030-01-01","add":[],"revoke":[],"revoke_fp":[{{"id":"{k}","fp":"{known_fp}"}},{{"id":"{k}","fp":"{other_fp}"}}]}}"#,
+            k = id_of(&known)
+        );
+        let e = apply_rotation(&tr, two.as_bytes(), &sign(&sk, two.as_bytes()), "2026-10-06").unwrap_err();
+        assert!(format!("{e:#}").contains("two different fingerprints"), "{e:#}");
+        assert_eq!(tr.state().unwrap().serial, 1, "a refused file records nothing");
+        // a fingerprint that is not 16 hex digits is refused whole too, under any spelling
+        for bad in ["0F7A 3A5C", "zzzzzzzzzzzzzzzz", "0F7A3A5C447EC7EF00"] {
+            let json = format!(r#"{{"schema":1,"serial":2,"expires":"2030-01-01","add":[],"revoke":[],"revoke_fp":[{{"id":"{}","fp":"{bad}"}}]}}"#, id_of(&known));
+            let e = apply_rotation(&tr, json.as_bytes(), &sign(&sk, json.as_bytes()), "2026-10-06").unwrap_err();
+            assert!(format!("{e:#}").contains("16 hex digits"), "{bad}: {e:#}");
+            assert_eq!(tr.state().unwrap().serial, 1, "{bad}: a refused file records nothing");
+        }
+    }
+
+    #[test]
+    fn a_fingerprint_given_later_reaches_the_record_and_the_preview() {
+        // a revocation with no fingerprint (the key was never here), then a later signed file gives it: the in-memory preview and the
+        // record both keep the fingerprint, and the revocation of the id is not repeated
+        let (pk, sk) = keypair();
+        let (leaked, _) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        let first = rotation(1, "2030-01-01", &[], &[&id_of(&leaked)]);
+        apply_rotation(&tr, first.as_bytes(), &sign(&sk, first.as_bytes()), "2026-10-06").unwrap();
+        assert!(tr.state().unwrap().revoked.iter().all(|r| r.fp.is_none()));
+        let fp = fp_hex(&parse_pub(&leaked, Source::Manual).unwrap().fingerprint);
+        let second = format!(r#"{{"schema":1,"serial":2,"expires":"2030-01-01","add":[],"revoke":[],"revoke_fp":[{{"id":"{}","fp":"{fp}"}}]}}"#, id_of(&leaked));
+        let Planned::Apply(plan) = plan_rotation(&tr, second.as_bytes(), Some(&sign(&sk, second.as_bytes())), "2026-10-06").unwrap() else {
+            panic!("the second file was taken for already applied");
+        };
+        assert_eq!(tr.with_plan(&plan).state().unwrap().revoked[0].fp.as_deref(), Some(fp.as_str()), "the preview keeps the fingerprint");
+        assert_eq!(commit_rotation(&tr, &plan).unwrap(), Rotated::Applied(vec![], vec![]), "the id was revoked already: nothing new");
+        let rec = tr.state().unwrap();
+        assert_eq!((rec.serial, rec.revoked.len(), rec.revoked[0].fp.as_deref()), (2, 1, Some(fp.as_str())));
     }
 
     #[test]

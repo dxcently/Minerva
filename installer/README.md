@@ -198,9 +198,15 @@ the manifest and the bundle:
 
 ```json
 { "schema": 1, "serial": 3, "expires": "2027-01-01",
-  "add":    [ { "key": "RWQ...the second line of the new .pub...", "expires": "2028-01-01", "comment": "release key 2" } ],
-  "revoke": [ "0F7A3A5C447EC7EF" ] }
+  "add":       [ { "key": "RWQ...the second line of the new .pub...", "expires": "2028-01-01", "comment": "release key 2" } ],
+  "revoke":    [ "0F7A3A5C447EC7EF" ],
+  "revoke_fp": [ { "id": "0F7A3A5C447EC7EF", "fp": "0f7a3a5c447ec7ef" } ] }
 ```
+
+`revoke_fp` names the fingerprint of each revoked key (the 16 hex digits `minerva keys inspect` prints; spaces and case do not matter). It is
+what refuses the key's bytes under a fresh id on a machine that never held the key. The fingerprint must be the one this machine holds
+under that id, if it holds one; a different one refuses the whole file. An installer built before `revoke_fp` ignores the field and
+revokes by id only, as it always did, so a release can carry it without breaking an older install.
 
 Rules: `serial` must be higher than the last applied but at most 16 higher (a leaked key cannot burn the counter with a huge
 serial); a serial that is not higher is "already applied" and is answered BEFORE the signature or expiry is looked at, so
@@ -222,10 +228,13 @@ be removed by hand; only a signed rotation revokes it. `hoot keys ...` passes th
 **What `add` refuses** (nothing is written, and the keys dir is left as it was): a key whose id, or whose key bytes under any other id,
 was revoked (`revoked`); a key whose id a DIFFERENT key uses (`collision`); a key already in the list, under its id or under another id
 with the same bytes (`collision`: a key's record is never rewritten, so a rotation key keeps its source, its expiry and who added it);
-the compiled-in key, under its id or its bytes (`compiled`). A revocation keeps the key's fingerprint, and the fingerprint is the sha-256
-of the 32 key bytes, so the same bytes under a fresh id are refused too. A revocation has no `fp` and refuses by id only when it was written
-before fingerprints were kept, or when the key's bytes were not on this machine at the revocation (a revoked key's file is removed, so
-its bytes are not known afterwards). Such a revocation does not refuse the same bytes under a fresh id.
+the compiled-in key, under its id or its bytes (`compiled`; once that key was revoked it is refused as `revoked`, not `compiled`). A revocation
+keeps the key's fingerprint, and the fingerprint is the sha-256 of the 32 key bytes, so the same bytes under a fresh id are refused too.
+The fingerprint comes from this machine's own copy of the key when it had one, or from the signed file (`revoke_fp`, below). A revocation
+with no fingerprint refuses by id only. That is a record written before fingerprints were kept, or a revocation for a key this machine
+never held whose file gave no `revoke_fp`: its bytes are not known here, so they cannot be checked, and the same bytes under a fresh id
+are accepted by hand and by a rotation. This is an accepted residual, not a closed hole; the fix for new revocations is to name the
+fingerprint in `revoke_fp`.
 
 **For the perch.** A perch route that adds a key runs `minerva keys inspect - --json` with the public key on stdin (answer
 `{"id","fingerprint","comment"}`), shows the fingerprint to the person, and when they have typed the FINGERPRINT back runs
@@ -237,7 +246,8 @@ itself. The answers and the step-up that allows the page to do this at all are i
 
 ```sh
 minisign -G -p new.pub -s ~/.minisign/minerva-2.key                  # 1. the new key pair
-# 2. write keys.json: add new.pub's second line (serial = last + 1, an expiry date); put the old key's id in "revoke" if it leaked
+# 2. write keys.json: add new.pub's second line (serial = last + 1, an expiry date); if the old key leaked, put its id in "revoke"
+#    and its fingerprint (minerva keys inspect old.pub) in "revoke_fp"
 minisign -S -s ~/.minisign/minerva.key -m keys.json                   # 3. sign it with a key members already trust (the OLD one)
 minisign -S -s ~/.minisign/minerva-2.key -m latest.json minerva-*.tar.gz   # 4. the release itself, signed by the NEW key
 #    release assets: latest.json, latest.json.minisig, the bundle, its .minisig, keys.json, keys.json.minisig
@@ -435,7 +445,7 @@ shortcut, WSL calls) are exercised by running the exe with the test options abov
 
 `tests/` (see `tests/README.md`) holds the perch contract's tests: `status --json` over fixture prefixes (cache present, stale, corrupt,
 absent; no `plugins.json`; every jev state), `keys add|remove --json` (every error kind, and the keys dir byte for byte unchanged on a
-refusal), `bin/perch-open.sh`'s arm against the stub HTTP server on 127.0.0.1:48110 (the arm sends exactly the given token, only through a
+refusal), `bin/perch-open.sh`'s arm against the stub HTTP server on a loopback port the OS picks (the arm sends exactly the given token, only through a
 0600 header file, never in argv, through no proxy and no `~/.curlrc`, and nothing is aimed at 47820; a ^C leaves no header file), both
 scripts' start-up flags (the perch start with `--help` outputs captured from an old and a current perch, also with colour forced in the
 environment, and a second perch on another port), and `bash -n` on both scripts. `nix_allow_web.rs` checks that `nix/minerva.sh keys
