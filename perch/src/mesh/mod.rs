@@ -206,6 +206,7 @@ fn default_socket() -> Option<PathBuf> {
 /// `CLI-Reference.md`). The runner removes every ambient `AOIDE_*` from its calls and gives `AOIDE_ROOT` = `--aoide-home`, so under the perch
 /// the `$AOIDE_AUDIT_LOG` step is the flag alone, and the file aoide appends to is the one this names. Absolute only: a relative flag names no
 /// file, and `main.rs` refuses one at the start. The flag is read through [`crate::aoide::audit_flag`], the one reader the runner shares.
+/// CONTRACTS.md gives no precedence for this path (its line 985 is a migration note); the order above is the wiki's, cited in the README.
 pub fn audit_path(opts: &Options) -> Option<PathBuf> {
     audit_file(crate::aoide::audit_flag(opts).as_deref(), home(opts))
 }

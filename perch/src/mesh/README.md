@@ -65,8 +65,9 @@ Two streams, one answer. Each stream has its own file, cursor, reset and error, 
 
 - **`audit`** is `--aoide-audit-log` (absolute only), else `<--aoide-home or ~/.aoide>/log`. Aoide's own rule for the file it appends to
   is `$AOIDE_AUDIT_LOG`, else `$AOIDE_ROOT/log` (absolute `$AOIDE_ROOT`), else `<home>/.aoide/log` (`docs/Aoide-Wiki/concepts/cli/
-  Doors-and-Nodes.md`, `CLI-Reference.md`; aoide's `protocol/src/audit.rs::default_audit_log`). Under the perch the first step is the flag
-  alone: the runner gives aoide the flag's path as `AOIDE_AUDIT_LOG` **only when the flag was given**, sets `AOIDE_ROOT` to `--aoide-home`,
+  Doors-and-Nodes.md`, `CLI-Reference.md`; aoide's `protocol/src/audit.rs::default_audit_log`). CONTRACTS.md gives no precedence for this
+  path (its line 985 is a migration note), so the order is the wiki's; the lines cited are listed under **The sources** below. Under the perch the
+  first step is the flag alone: the runner gives aoide the flag's path as `AOIDE_AUDIT_LOG` **only when the flag was given**, sets `AOIDE_ROOT` to `--aoide-home`,
   and strips every ambient `AOIDE_*` from its call, so a `$AOIDE_AUDIT_LOG` in the perch's own environment does not reach aoide. Without a
   flag, `--aoide-home` is `AOIDE_ROOT`, so aoide's default and `<home>/log` are the same file; without `--aoide-home` both are `~/.aoide/log`.
   The two readers are one function, `aoide::audit_flag`, so the runner and this view cannot disagree about the flag. With no home at all
@@ -110,6 +111,13 @@ Two streams, one answer. Each stream has its own file, cursor, reset and error, 
   `file` (`docs/architecture/AOIDED.md`, "The first producer: the hand-edit watcher"). Everything else is dropped, so a field a later aoided
   adds never reaches the page: a free-text field at either level, a gate's `sas`, a `node` or `note`, all of them. `secret`, `notification`,
   `rice` and `content` records, records with no class, records with no `ts`, and lines that are not objects are dropped as well.
+- **The sources** (under `docs/Aoide-Wiki/` unless marked). `concepts/cli/Doors-and-Nodes.md`: line 29 (`$AOIDE_ROOT`, default `~/.aoide`),
+  37-39 (the audit log's order), 87-89 (the audit path's order as the `audit` bullet states it), 91 (aoided's `daemon started`, a start record),
+  213 (`adapter.melete started`, a start record), 238 and 245-246 (`aoide events tail`: `$AOIDE_DAEMON_EVENTS`, else a sibling of the socket).
+  `concepts/cli/CLI-Reference.md`: 23-26 (the audit flag, `$AOIDE_AUDIT_LOG`, `$AOIDE_ROOT/log`, the default). `concepts/orchestration/Secrets-Broker.md`:
+  46-47 (the broker's audit lines, mirrored to the aoide audit log) and 122 (audits name only). `docs/architecture/AOIDED.md`: 88-89 (aoided's feed
+  path) and 164 (the hand-edit watcher, the audit payload's `file`). `CONTRACTS.md` (the Aoide repository's root): 6777-6783 (the P-P5 feed, under
+  `$XDG_RUNTIME_DIR/aoide/events.jsonl`); 985 is a migration note and names no precedence for the audit path.
 - The two are merged by `ts`, at a tie the audit log first, then each file's order. A record with no numeric `ts` in either stream is not
   shown. Against a real aoide the audit stream reads by the same integer `ts` the log writes (observed), so it is not empty for want of one.
 - `next.<stream>` is that stream's next cursor: the end of its last **whole** line read, so a line still being written is read again once

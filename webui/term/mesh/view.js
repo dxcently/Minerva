@@ -287,7 +287,9 @@ export function eventLine(entry) {
   };
 }
 
-export const emptyFeed = () => ({ lines: [], next: { audit: null, daemon: null }, files: { audit: '', daemon: '' }, err: { audit: '', daemon: '' }, why: '', at: 0 });
+export const emptyFeed = () => ({
+  lines: [], next: { audit: null, daemon: null }, files: { audit: '', daemon: '' }, err: { audit: '', daemon: '' }, why: '', at: 0,
+});
 
 // Take one answer of /hub/mesh/events into what is held. A stream's `reset` clears what that stream held first; its cursor is the answer's
 // `next` for it, and its file is the answer's `files` for it. Its `error`, when it has one, is what that stream's label says (feedView). An
@@ -327,7 +329,9 @@ export function feedPath(feed) {
 export function feedView(feed) {
   const shown = feed.lines.slice(-SHOWN).reverse();
   const older = Math.max(0, feed.lines.length - shown.length);
-  const errors = feed.at ? STREAMS.filter((s) => feed.err && feed.err[s]).map((s) => ({ at: clock(feed.at), cls: s, text: `could not be read: ${feed.err[s]}` })) : [];
+  const errors = feed.at
+    ? STREAMS.filter((s) => feed.err && feed.err[s]).map((s) => ({ at: clock(feed.at), cls: s, text: `could not be read: ${feed.err[s]}` }))
+    : [];
   const lines = [...errors, ...shown];
   if (feed.why) return { lines, older, sentence: `the events feed could not be read: ${feed.why}`, cls: 'o' };
   if (!feed.at) return { lines, older, sentence: 'reading the events feed…', cls: 'faint' };
