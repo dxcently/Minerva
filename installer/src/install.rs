@@ -189,11 +189,11 @@ pub fn uninstall(layout: &Layout) -> Result<Vec<PathBuf>> {
         bail!("refusing to remove {}", opt.display());
     }
     let link = layout.bin_link();
-    if let Ok(t) = fs::read_link(&link) {
-        if t.to_string_lossy().contains("opt/minerva/") {
-            fs::remove_file(&link)?;
-            gone.push(link);
-        }
+    if let Ok(t) = fs::read_link(&link)
+        && t.to_string_lossy().contains("opt/minerva/")
+    {
+        fs::remove_file(&link)?;
+        gone.push(link);
     }
     if opt.exists() {
         fs::remove_dir_all(&opt).with_context(|| format!("removing {}", opt.display()))?;

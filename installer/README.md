@@ -108,7 +108,7 @@ two scorer tools; `minerva services start` then runs the service on port 8091. T
 plugin tree from `nix/plugins.nix` and the Nix `eidolon-browser` (Chromium from nixpkgs): `minerva web` runs
 `minerva-core plugins sync --if-needed --quiet --eidolon ... --src ... --bin-dir ... --prefix ~/.local/state/minerva-nix`. The
 store is never written; the record of what is ours lives in that state dir. `minerva plugins` and `minerva services` are the same verbs.
-`minerva keys allow-web <FP>` is the same arm as `hoot keys allow-web` (the other `keys` verbs are not in this script), and the start
+`minerva keys allow-web <FP>` is refused and arms nothing: a Nix install's update keys change with nix, not from a terminal or the page (the perch answers its key routes with 404 kind `nix` for the same reason). The other `keys` verbs are not in this script. The start
 passes the perch the same newer flags only when its `--help` lists them.
 
 ## Windows flow
@@ -187,8 +187,8 @@ the same way, cached in `~/.local/state/minerva/update-check`, and print one lin
 A leaked or retired signing key can be replaced without anyone reinstalling.
 
 ```text
- trusted set = compiled-in key  +  ~/.config/minerva/update-keys/<ID>.pub   -  revoked ids
- state       = ~/.config/minerva/update-keys/state.json   {serial, revoked:[{id,on,by}]}
+ trusted set = compiled-in key  +  ~/.config/minerva/update-keys/<ID>.pub   -  revoked ids and revoked fingerprints
+ state       = ~/.config/minerva/update-keys/state.json   {serial, revoked:[{id,on,by,fp}]}   (fp: the key's 16 hex digits, when known)
  the dir     = mode 0700 and owned by you (else ignored, with a warning); files 0600
 ```
 
@@ -209,7 +209,7 @@ or it expired. Every key records who added it (`by`); revoking a key also revoke
 cannot leave a backdoor behind), except keys added by that very file. `expires` is the date after which the file
 is no longer accepted; a key that was ever revoked is never accepted again, even if a later file adds it, **and that includes the
 compiled-in key** (after revoking it, a release signed only by the old key is refused); a `keys.json` signed by an unknown or a
-revoked key is refused and nothing changes; a key with its own `expires` stops being trusted on that date.
+revoked key is refused and nothing changes; a `keys.json` that adds a key whose id or fingerprint was revoked is refused whole (its serial does not move); a key with its own `expires` stops being trusted on that date.
 
 **By hand.** `minerva keys list [--json]`, `keys inspect <pubfile|-> [--json]`, `keys add <pubfile|-> [--confirm FP]`,
 `keys remove <id> [--confirm FP]`. `add` and `remove` show the key's **fingerprint** (the first 16 hex characters of the sha-256
@@ -218,6 +218,13 @@ digest) and want it typed back (from the terminal, never a pipe; spaces and case
 program whose user already typed it. The key id alone does NOT pass: an id is only 8 bytes the file itself claims, a forged `.pub` can
 carry any id. `add` refuses a key id that already exists with different key bytes. The compiled-in key cannot
 be removed by hand; only a signed rotation revokes it. `hoot keys ...` passes through to WSL.
+
+**What `add` refuses** (nothing is written, and the keys dir is left as it was): a key whose id, or whose key bytes under any other id,
+was revoked (`revoked`); a key whose id a DIFFERENT key uses (`collision`); a key already in the list, under its id or under another id
+with the same bytes (`collision`: a key's record is never rewritten, so a rotation key keeps its source, its expiry and who added it);
+the compiled-in key, under its id or its bytes (`compiled`). A revocation keeps the key's fingerprint, and the fingerprint is the sha-256
+of the 32 key bytes, so the same bytes under a fresh id are refused too. A revocation written before fingerprints were kept has no `fp`
+and refuses by id only; the key's file is gone by then, so its bytes are not known.
 
 **For the perch.** A perch route that adds a key runs `minerva keys inspect - --json` with the public key on stdin (answer
 `{"id","fingerprint","comment"}`), shows the fingerprint to the person, and when they have typed the FINGERPRINT back runs
@@ -237,7 +244,11 @@ minisign -S -s ~/.minisign/minerva-2.key -m latest.json minerva-*.tar.gz   # 4. 
 
 `state.json` is required once the keys dir exists: an unreadable or corrupt one is a hard error with a sentence, and a missing one
 is a fresh start only when the keys dir does not exist either; if the dir exists but `state.json` is gone, update refuses and says to
-restore it or remove the dir by hand (silently resetting would forget revocations). `update --check` and the notice never write any
+restore it or remove the dir by hand (silently resetting would forget revocations). The keys dir is made all at once: a temp dir beside
+it (`.update-keys.new` for `update-keys`) gets its record, the record is fsynced, the temp dir is renamed into place and the parent is
+fsynced. A crash leaves either no keys dir (the next run removes the leftover and starts again) or a complete one, never a dir without
+its record. A rotation writes its revocations to the record before it removes any key file, so a crash in between leaves files the record
+already refuses. `update --check` and the notice never write any
 state: they preview a rotation in memory with the same rules.
 
 **Attach `keys.json` (re-signed before its `expires`) to every release from the rotation on**: a member who skipped versions has to
@@ -288,22 +299,22 @@ command's own notice is. Trust and service state are not recorded anywhere this 
 | kind | when |
 |---|---|
 | `mismatch` | the typed or passed fingerprint is not the key's (an id is not accepted either); the keys dir is untouched |
-| `revoked` | the key was revoked; never accepted again |
-| `collision` | the id is in use by a DIFFERENT key |
+| `revoked` | the key was revoked (its id, or its key bytes under any id); never accepted again |
+| `collision` | the id is in use by a DIFFERENT key, or this key is already in the list (under its id, or its bytes under another id) |
 | `compiled` | the compiled-in key: already trusted, and not removable by hand |
 | `unsafe` | the keys dir is not a private directory of yours, or `state.json` is missing, unreadable or corrupt |
 | `not-found` | `remove` of an id nobody has, or of something that is not a 16-hex-digit id at all (the sentence does not repeat it) |
 | `failed` | anything else (not a public key, a usage error such as `--confirm` with no value, no HOME, a disk error); the sentence says what |
 
 The kind is typed (`keys::Refusal`), never read back from the wording. Every failure of `add` and `remove` under `--json` is this one
-line, usage errors included. `keys list --json` and `keys inspect --json` are as before. Without `--json`, a key file's comment is
+line, usage errors included. `keys list --json` and `keys inspect --json` fail in that same shape too (one line on stdout, exit 1, nothing on stderr); their success output is as before. Without `--json`, a key file's comment is
 printed with its control characters (C0, DEL, C1) dropped; with `--json` it is escaped.
 
 **Allowing the page to change keys (`--keys-arm`).** The page may add or remove an update key only after a person, in a terminal, names
 that key's fingerprint:
 
 ```text
- hoot keys allow-web 0F7A 3A5C 447E C7EF     (nix: minerva keys allow-web ...; Linux: minerva web --keys-arm 0F7A3A5C447EC7EF)
+ hoot keys allow-web 0F7A 3A5C 447E C7EF     (Nix: refused, its keys change with nix; Linux: minerva web --keys-arm 0F7A3A5C447EC7EF)
 ```
 
 `bin/perch-open.sh --keys-arm FP [--port P [--token-file F]]` reads the perch's bearer token into a 0600 header file in the private
@@ -415,7 +426,8 @@ matter to the updater.
 keys): good signature installs, tampered bundle refused, wrong key refused, missing signature refused, swapped bundle
 refused, rollback and forward, Nix refused, notice once a day / silent on failure / bad signature gives no notice,
 install/rerun/upgrade/prune/uninstall layout, WSL list parsing, PATH list edits, key rotation (good, unknown signer, revoked
-signer, revoked compiled-in key, manual add/remove, expiry, replay, open keys dir), and the plugin lifecycle (install, trust, foreign
+signer, revoked compiled-in key, manual add/remove and the refusals of `add`, a revoked key under a fresh id by hand and in a rotation, a fingerprint
+that is not 16 hex digits, expiry, replay, open keys dir, a crash while the keys dir is made), and the plugin lifecycle (install, trust, foreign
 plugin kept, update keeps trust, uninstall removes only ours) when `MINERVA_TEST_EIDOLON` names an eidolon binary (otherwise that
 one test says it was skipped). The Windows pieces (registry,
 shortcut, WSL calls) are exercised by running the exe with the test options above, never against the real settings.
@@ -425,7 +437,8 @@ absent; no `plugins.json`; every jev state), `keys add|remove --json` (every err
 refusal), and the two scripts against a stub HTTP server on 127.0.0.1:48110 (the arm sends exactly the given token, only through a 0600
 header file, never in argv, through no proxy and no `~/.curlrc`, and nothing is aimed at 47820; a ^C leaves no header file), plus the perch
 start with `--help` outputs captured from an old and a current perch (also with colour forced in the environment, and a second perch
-on another port). `bash -n` runs on both scripts. Nothing in `cargo test` parses `hoot.ps1`: that is done by hand, from the
+on another port). `bash -n` runs on both scripts. `nix_allow_web.rs` runs `nix/minerva.sh keys allow-web` (under a temp HOME, with the curl shim): it
+prints the Nix sentence, exits 1, sends no request and makes no runtime file. Nothing in `cargo test` parses `hoot.ps1`: that is done by hand, from the
 Windows side (Windows PowerShell 5.1 is the parser that matters), from the repository root, and must print `0`, the number of parse
 errors:
 

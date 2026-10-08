@@ -1,5 +1,6 @@
-//! `bin/perch-open.sh` and `nix/minerva.sh`: the key arm (`--keys-arm` / `keys allow-web`) against a stub HTTP server on
-//! 127.0.0.1:48110, and the start-up flags that only a newer perch knows. Both scripts get the same cases. Every run has a cleared
+//! `bin/perch-open.sh` and `nix/minerva.sh`: the key arm (`--keys-arm`) against a stub HTTP server on 127.0.0.1:48110, and the
+//! start-up flags that only a newer perch knows. Both scripts get the start-up cases; only the Linux script arms a key (a Nix install
+//! refuses `keys allow-web`, see nix_allow_web.rs). Every run has a cleared
 //! environment, a temp HOME holding DECOY tokens at the default places, and a `curl` shim that logs argv and refuses 47820.
 #![cfg(unix)]
 
@@ -26,6 +27,10 @@ enum Which {
 }
 
 const BOTH: [Which; 2] = [Which::PerchOpen, Which::Nix];
+
+/// The cases that arm a key. Only the Linux arm (bin/perch-open.sh) arms: a Nix install's script refuses the verb and arms nothing,
+/// which nix_allow_web.rs checks.
+const ARMS: [Which; 1] = [Which::PerchOpen];
 
 fn script(w: Which) -> PathBuf {
     match w {
@@ -116,7 +121,7 @@ fn perch_open_help_lists_the_arm_and_old_flags_still_parse() {
 #[test]
 fn the_arm_sends_the_given_token_only_through_a_0600_header_file() {
     let _g = port_lock();
-    for w in BOTH {
+    for w in ARMS {
         let env = Env::new();
         let tok = token_file(&env, GIVEN, 0o600);
         let stub = Stub::start(STUB_PORT, 200, r#"{"armed":true}"#);
@@ -159,7 +164,7 @@ fn the_arm_sends_the_given_token_only_through_a_0600_header_file() {
 #[test]
 fn the_arm_refuses_bad_input_before_it_calls_curl() {
     let _g = port_lock();
-    for w in BOTH {
+    for w in ARMS {
         let env = Env::new();
         let stub = Stub::start(STUB_PORT, 200, "{}");
         let good = token_file(&env, GIVEN, 0o600);
@@ -221,7 +226,7 @@ fn the_arm_refuses_bad_input_before_it_calls_curl() {
 #[test]
 fn the_arm_says_what_the_perch_answered() {
     let _g = port_lock();
-    for w in BOTH {
+    for w in ARMS {
         let env = Env::new();
         let tok = token_file(&env, GIVEN, 0o600);
         let args = arm_args(w, FP, &STUB_PORT.to_string(), &tok);
@@ -246,7 +251,7 @@ fn the_arm_says_what_the_perch_answered() {
 #[test]
 fn without_a_token_file_the_arm_needs_a_perch_of_ours_and_never_reads_the_decoys() {
     let _g = port_lock();
-    for w in BOTH {
+    for w in ARMS {
         let env = Env::new();
         let stub = Stub::start(STUB_PORT, 200, "{}");
         for port in [None, Some(STUB_PORT)] {
@@ -273,7 +278,7 @@ fn without_a_token_file_the_arm_needs_a_perch_of_ours_and_never_reads_the_decoys
 #[test]
 fn with_our_perch_running_the_arm_uses_its_own_token_on_its_own_port() {
     let _g = port_lock();
-    for w in BOTH {
+    for w in ARMS {
         let env = Env::new();
         // "our perch": a live process in the pid file, a token file at the default place, a server that answers 200
         let mut alive = Command::new("sleep").arg("30").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
@@ -360,6 +365,7 @@ fn with_proxy_env(c: &mut Command, proxy: &str) {
 
 #[test]
 fn the_token_goes_neither_through_a_proxy_nor_into_a_curlrc_listing() {
+    // the Linux arm only: see ARMS
     let _g = port_lock();
     let proxy = format!("http://127.0.0.1:{STUB_PORT}");
     // The control: plain curl with this HOME and these variables DOES send the header through the "proxy" (the stub, which then sees
@@ -377,7 +383,7 @@ fn the_token_goes_neither_through_a_proxy_nor_into_a_curlrc_listing() {
         assert_eq!(stub.requests().first().map(|r| r.request_line.clone()), Some(format!("GET http://127.0.0.1:{STUB_PORT}/control HTTP/1.1")), "curl used the proxy");
         assert!(e.contains(GIVEN), "the verbose curlrc printed the Authorization header, as the review said it would");
     }
-    for w in BOTH {
+    for w in ARMS {
         // the arm with a given token file, and the arm on our own perch (the liveness probe and the arm)
         for own_perch in [false, true] {
             let env = Env::new();
@@ -426,8 +432,9 @@ fn the_token_goes_neither_through_a_proxy_nor_into_a_curlrc_listing() {
 
 #[test]
 fn an_interrupt_while_the_perch_is_being_probed_leaves_no_header_file_behind() {
+    // the Linux arm only: see ARMS
     let _g = port_lock();
-    for w in BOTH {
+    for w in ARMS {
         let env = Env::new();
         let mut alive = Command::new("sleep").arg("30").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         write(&env.run.join(format!("minerva/perch-{STUB_PORT}.pid")), &format!("{}\n", alive.id()), 0o600);

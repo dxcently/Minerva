@@ -480,6 +480,81 @@ fn without_json_nothing_about_add_and_remove_changed() {
     assert_eq!((code, out.trim()), (0, format!("removed {id}").as_str()));
 }
 
+#[test]
+fn keys_list_and_inspect_fail_in_the_json_shape_on_stdout_with_nothing_on_stderr() {
+    let env = Env::new();
+    let pubtext = keypair();
+    let (_, fp) = inspect(&env, &pubtext);
+    let (code, _, _) = run(&env, &["keys", "add", "-", "--confirm", &fp, "--json"], Some(&pubtext));
+    assert_eq!(code, 0);
+    // a record that is gone: an unsafe refusal, one line on stdout and exit 1
+    fs::remove_file(keys_dir(&env).join("state.json")).unwrap();
+    let (code, out, err) = run(&env, &["keys", "list", "--json"], None);
+    assert_eq!((code, err.as_str()), (1, ""));
+    let (kind, sentence) = error_of(&out);
+    assert_eq!(kind, "unsafe");
+    assert!(sentence.contains("To recover"), "{sentence}");
+    // a usage error is the same shape too, not a bare line
+    let (code, out, err) = run(&env, &["keys", "list", "extra", "--json"], None);
+    assert_eq!((code, err.as_str()), (1, ""));
+    assert_eq!(error_of(&out).0, "failed");
+    let (code, out, err) = run(&env, &["keys", "inspect", "-", "--json"], Some("this is not a key"));
+    assert_eq!((code, err.as_str()), (1, ""));
+    assert_eq!(error_of(&out).0, "failed");
+}
+
+#[test]
+fn a_revoked_fingerprint_refuses_the_same_bytes_under_a_fresh_id() {
+    use base64::Engine;
+    let env = Env::new();
+    let (anchor, victim) = (keypair(), keypair());
+    let (anchor_id, anchor_fp) = inspect(&env, &anchor);
+    let (victim_id, victim_fp) = inspect(&env, &victim);
+    assert_eq!(run(&env, &["keys", "add", "-", "--confirm", &anchor_fp, "--json"], Some(&anchor)).0, 0);
+    assert_eq!(run(&env, &["keys", "add", "-", "--confirm", &victim_fp, "--json"], Some(&victim)).0, 0);
+    // a record as a signed rotation writes it: the victim revoked with its fingerprint, and its file still in the dir
+    fs::write(
+        keys_dir(&env).join("state.json"),
+        format!(r#"{{"serial":1,"revoked":[{{"id":"{victim_id}","on":"2026-01-01","by":"{anchor_id}","fp":"{}"}}]}}"#, victim_fp.replace(' ', "")),
+    )
+    .unwrap();
+    // the victim's bytes with another id: the same key, so the same fingerprint
+    let b64 = |t: &str| t.lines().nth(1).unwrap().trim().to_string();
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut raw = engine.decode(b64(&victim)).unwrap();
+    for b in &mut raw[2..10] {
+        *b ^= 0x5a;
+    }
+    let fresh = format!("untrusted comment: fresh id\n{}\n", engine.encode(raw));
+    let (fresh_id, fresh_fp) = inspect(&env, &fresh);
+    assert_ne!(fresh_id, victim_id);
+    assert_eq!(fresh_fp, victim_fp, "the fingerprint is the key's, not the id's");
+    let before = snapshot(&keys_dir(&env));
+    let (code, out, err) = run(&env, &["keys", "add", "-", "--confirm", &fresh_fp, "--json"], Some(&fresh));
+    assert_eq!((code, err.as_str()), (1, ""));
+    let (kind, sentence) = error_of(&out);
+    assert_eq!(kind, "revoked");
+    assert!(sentence.contains("never accepted again"), "{sentence}");
+    assert_eq!(snapshot(&keys_dir(&env)), before);
+    // the listing says the victim is revoked, and the fresh id never appears
+    let (_, list, _) = run(&env, &["keys", "list", "--json"], None);
+    let rows = json_of(&list);
+    assert!(rows.as_array().unwrap().iter().all(|r| r["id"] != fresh_id.as_str() && !(r["id"] == victim_id.as_str() && r["state"] != "revoked")), "{rows}");
+}
+
+#[test]
+fn adding_a_key_already_in_the_list_is_a_collision_and_changes_nothing() {
+    let env = Env::new();
+    let pubtext = keypair();
+    let (_, fp) = inspect(&env, &pubtext);
+    assert_eq!(run(&env, &["keys", "add", "-", "--confirm", &fp, "--json"], Some(&pubtext)).0, 0);
+    let before = snapshot(&keys_dir(&env));
+    let (code, out, err) = run(&env, &["keys", "add", "-", "--confirm", &fp, "--json"], Some(&pubtext));
+    assert_eq!((code, err.as_str()), (1, ""));
+    assert_eq!(error_of(&out).0, "collision");
+    assert_eq!(snapshot(&keys_dir(&env)), before);
+}
+
 // ---- web --keys-arm: the checks that need no perch ------------------------------------------------------------------------
 
 #[test]

@@ -76,13 +76,13 @@ pub fn fetch_verified(src: &Source, trust: &Trust, now: u64, commit: bool, timeo
         .context("the manifest signature is not text")?;
     eff.verify(&json, &sig, &today).context("the release manifest")?;
     let m = manifest::parse(&json)?;
-    if let Some(need) = m.keys_serial {
-        if need > have_serial {
-            bail!(
-                "this release needs key rotation {need} (this machine has {have_serial}) and the release brings no keys.json for it; refusing. \
+    if let Some(need) = m.keys_serial
+        && need > have_serial
+    {
+        bail!(
+            "this release needs key rotation {need} (this machine has {have_serial}) and the release brings no keys.json for it; refusing. \
 The maintainer must attach keys.json and keys.json.minisig to the release"
-            );
-        }
+        );
     }
     let stale = m.stale(now);
     Ok(Verified { manifest: m, trust: eff, stale, rotated })

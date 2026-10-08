@@ -352,7 +352,7 @@ pub fn sync(env: &PluginEnv, mut o: SyncOpts) -> Result<Vec<String>> {
 pub fn remove_ours(env: &PluginEnv) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let st = load_state(&env.layout);
-    for (n, _) in st.plugins.iter() {
+    for n in st.plugins.keys() {
         let _ = env.eidolon(&["plugins", "service", "stop", n]);
         let _ = env.eidolon(&["plugins", "untrust", n]);
         if n == "browser" {

@@ -3,7 +3,7 @@
 //! ```text
 //!   the key compiled into this binary                      (build.rs; installer/minisign.pub)
 //! + <keys dir>/*.pub                                       (added by hand, or by a signed rotation)
-//! - every id in <keys dir>/state.json "revoked"            (a revoked key is never accepted again, compiled-in or not)
+//! - every id, and every key with a revoked fingerprint, in <keys dir>/state.json "revoked" (a revoked key is never accepted again, compiled-in or not)
 //! - keys past their expiry date
 //! ```
 //!
@@ -95,15 +95,54 @@ pub fn valid_id(s: &str) -> bool {
     s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// A fingerprint as state.json keeps it and as every comparison reads it: 16 lower-case hex digits, spaces and case ignored.
+fn fp_hex(fingerprint: &str) -> String {
+    fingerprint.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase()
+}
+
+fn valid_fp(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Are these the same key bytes, whatever their ids? The fingerprint is the sha-256 of the 32 key bytes, so a fresh id does not change it.
+fn same_key(a: &KeyInfo, b: &KeyInfo) -> bool {
+    fp_hex(&a.fingerprint) == fp_hex(&b.fingerprint)
+}
+
+/// Write `dir/name` through a temp file in `dir`: created 0600, fsynced, renamed over the name, then `dir` fsynced.
+fn write_private_in(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let _ = fs::remove_file(&tmp);
+    let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    fs::rename(&tmp, dir.join(name)).with_context(|| format!("replacing {name}"))?;
+    sync_dir(dir)
+}
+
+/// fsync a directory, so a rename made in it is on disk before anything relies on it.
+fn sync_dir(dir: &Path) -> Result<()> {
+    fs::File::open(dir).and_then(|d| d.sync_all()).with_context(|| format!("syncing {}", dir.display()))
+}
+
+/// The sentence for a key the record revokes: by its own id, or by its bytes under another id (the one the record names).
+fn revoked_sentence(k: &KeyInfo, r: &Revoked) -> String {
+    if r.id.eq_ignore_ascii_case(&k.id) {
+        format!("key {} was revoked and is never accepted again", k.id)
+    } else {
+        format!("key {} has the key bytes (fingerprint {}) of the revoked key {}; a revoked key is never accepted again, whatever its id", k.id, k.fingerprint, r.id)
+    }
+}
+
 /// Why a change to the trusted keys was refused, as a kind a program can branch on (`minerva keys add|remove --json`). The sentence a
 /// person reads is the error's message; the kind does not change when its wording does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     /// The fingerprint that was typed or passed is not the key's.
     Mismatch,
-    /// The key was revoked, and a revoked key is never accepted again.
+    /// The key was revoked (its id, or its key bytes under any id), and a revoked key is never accepted again.
     Revoked,
-    /// The key id is already used by a DIFFERENT key.
+    /// The id is already used by a DIFFERENT key, or this key is already in the list (under its id, or its bytes under another id).
     Collision,
     /// The compiled-in key: already trusted, and it cannot be removed by hand.
     Compiled,
@@ -176,6 +215,40 @@ pub struct Revoked {
     pub id: String,
     pub on: String,
     pub by: String,
+    /// The key's fingerprint (16 lower-case hex digits, no spaces) when its bytes were known at the revocation. It is what refuses the
+    /// same bytes under a fresh id. A record written before this field existed has none, and is matched by id only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fp: Option<String>,
+}
+
+impl State {
+    /// The revocation that covers `k`: one with its id, or one with its key bytes (its fingerprint), whatever id it was made under.
+    pub fn revocation_of(&self, k: &KeyInfo) -> Option<&Revoked> {
+        let fp = fp_hex(&k.fingerprint);
+        self.revoked.iter().find(|r| r.id.eq_ignore_ascii_case(&k.id) || r.fp.as_deref() == Some(fp.as_str()))
+    }
+
+    /// A revoked fingerprint must be 16 hex digits. Anything else in the record is refused, not guessed at.
+    fn check_fingerprints(&mut self, dir: &Path) -> Result<()> {
+        for r in &mut self.revoked {
+            if let Some(fp) = r.fp.take() {
+                let fp = fp_hex(&fp);
+                if !valid_fp(&fp) {
+                    return Err(refuse(
+                        Refusal::Unsafe,
+                        format!(
+                            "{} has a revoked fingerprint for {} that is not 16 hex digits; refusing to guess which keys are revoked. {}",
+                            dir.join("state.json").display(),
+                            r.id,
+                            RECOVER.replace("<dir>", &dir.display().to_string())
+                        ),
+                    ));
+                }
+                r.fp = Some(fp);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -231,6 +304,11 @@ impl Trust {
         parse_pub(&self.compiled, Source::Compiled).ok()
     }
 
+    /// Is `k` the compiled-in key, by its id or by its key bytes?
+    fn is_compiled(&self, k: &KeyInfo) -> bool {
+        self.compiled_key().is_some_and(|c| c.id.eq_ignore_ascii_case(&k.id) || same_key(&c, k))
+    }
+
     /// Is the keys dir ours and closed to others? `Ok(false)` when it does not exist yet.
     fn dir_safe(&self) -> Result<bool> {
         let m = match fs::metadata(&self.dir) {
@@ -281,6 +359,7 @@ impl Trust {
         } else {
             State::default()
         };
+        st.check_fingerprints(&self.dir)?;
         for r in &self.mem_revoked {
             if !st.revoked.iter().any(|x| x.id == r.id) {
                 st.revoked.push(r.clone());
@@ -339,7 +418,7 @@ impl Trust {
         Ok(self
             .all()
             .into_iter()
-            .filter(|k| !st.revoked.iter().any(|r| r.id.eq_ignore_ascii_case(&k.id)))
+            .filter(|k| st.revocation_of(k).is_none())
             .filter(|k| k.expires.as_deref().map(|e| e >= today).unwrap_or(true))
             .collect())
     }
@@ -349,10 +428,12 @@ impl Trust {
         let id = sig_key_id(sig)?;
         let trusted = self.trusted(today)?;
         let Some(k) = trusted.iter().find(|k| k.id.eq_ignore_ascii_case(&id)) else {
-            if self.is_revoked(&id)? {
+            let st = self.state()?;
+            let known = self.all().into_iter().find(|k| k.id.eq_ignore_ascii_case(&id));
+            if st.revoked.iter().any(|r| r.id.eq_ignore_ascii_case(&id)) || known.as_ref().is_some_and(|k| st.revocation_of(k).is_some()) {
                 bail!("signature check FAILED: the signing key {id} has been revoked; refusing");
             }
-            if self.all().iter().any(|k| k.id.eq_ignore_ascii_case(&id)) {
+            if known.is_some() {
                 bail!("signature check FAILED: the signing key {id} has expired; refusing");
             }
             bail!("signature check FAILED: the signing key {id} is not one this program trusts; refusing");
@@ -363,14 +444,26 @@ impl Trust {
         Ok(id)
     }
 
+    /// Make the keys dir all at once. It is built in a temp dir beside it with its record in it (fsynced), the temp dir is renamed into
+    /// place, and the parent is fsynced. A crash leaves either no keys dir (the next run removes the leftover and starts again) or a
+    /// complete one: a dir with no `state.json` is never a state a crash can leave, so it never reads as "no keys".
     fn ensure_dir(&self) -> Result<()> {
         if !self.dir.exists() {
-            if let Some(p) = self.dir.parent() {
-                fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))?;
+            let parent = self.dir.parent().context("the keys dir has no parent directory")?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+            let name = self.dir.file_name().context("the keys dir has no name")?.to_string_lossy().into_owned();
+            let tmp = parent.join(format!(".{name}.new"));
+            match fs::symlink_metadata(&tmp) {
+                Ok(m) if m.is_dir() => fs::remove_dir_all(&tmp).with_context(|| format!("removing a leftover {}", tmp.display()))?,
+                Ok(_) => fs::remove_file(&tmp).with_context(|| format!("removing a leftover {}", tmp.display()))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("reading {}", tmp.display())),
             }
-            fs::DirBuilder::new().mode(0o700).create(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
+            fs::DirBuilder::new().mode(0o700).create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
             // A directory always has its record, so a missing one later means something deleted it.
-            self.save_state(&State::default())?;
+            write_private_in(&tmp, "state.json", serde_json::to_string_pretty(&State::default())?.as_bytes())?;
+            fs::rename(&tmp, &self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
+            sync_dir(parent)?;
         }
         if !self.dir_safe()? {
             bail!("{} is missing", self.dir.display());
@@ -379,12 +472,7 @@ impl Trust {
     }
 
     fn write_private(&self, name: &str, bytes: &[u8]) -> Result<()> {
-        let tmp = self.dir.join(format!(".{name}.tmp"));
-        let _ = fs::remove_file(&tmp);
-        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        fs::rename(&tmp, self.dir.join(name)).with_context(|| format!("replacing {name}"))
+        write_private_in(&self.dir, name, bytes)
     }
 
     fn save_state(&self, st: &State) -> Result<()> {
@@ -404,15 +492,36 @@ impl Trust {
         Ok(())
     }
 
-    /// Add a key by hand (the caller has already had the person confirm the fingerprint).
+    /// Add a key by hand (the caller has already had the person confirm the fingerprint). Refused, with nothing written: a key whose id
+    /// or key bytes (under any id) were revoked; the compiled-in key; an id that a different key uses; a key already in the list, under
+    /// its id or under another id. An existing key's record (its source, its expiry, who added it) is never rewritten.
     pub fn add_manual(&self, text: &str) -> Result<KeyInfo> {
         let k = parse_pub(text, Source::Manual)?;
-        if self.is_revoked(&k.id)? {
-            return Err(refuse(Refusal::Revoked, format!("key {} was revoked and is never accepted again", k.id)));
+        // the record first: an unreadable one refuses before anything else is looked at
+        let st = self.state()?;
+        if let Some(r) = st.revocation_of(&k) {
+            return Err(refuse(Refusal::Revoked, revoked_sentence(&k, r)));
         }
         self.check_id_collision(&k)?;
-        if self.compiled_key().map(|c| c.id == k.id).unwrap_or(false) {
-            return Err(refuse(Refusal::Compiled, format!("key {} is already the compiled-in key", k.id)));
+        if let Some(c) = self.compiled_key().filter(|c| c.id.eq_ignore_ascii_case(&k.id) || same_key(c, &k)) {
+            if st.revoked.iter().any(|r| r.id.eq_ignore_ascii_case(&c.id)) {
+                return Err(refuse(Refusal::Revoked, format!("key {} is the compiled-in key, which was revoked and is never accepted again", c.id)));
+            }
+            let sentence = if c.id.eq_ignore_ascii_case(&k.id) {
+                format!("key {} is already the compiled-in key", k.id)
+            } else {
+                format!("key {} has the key bytes of the compiled-in key {}, which is already trusted", k.id, c.id)
+            };
+            return Err(refuse(Refusal::Compiled, sentence));
+        }
+        for o in self.all() {
+            // check_id_collision has refused any other bytes under this id, so a key with this id is this very key
+            if o.id.eq_ignore_ascii_case(&k.id) {
+                return Err(refuse(Refusal::Collision, format!("key {} is already in the list ({}); nothing changed", k.id, o.source.label())));
+            }
+            if same_key(&o, &k) {
+                return Err(refuse(Refusal::Collision, format!("these key bytes (fingerprint {}) are already in the list under id {}; nothing changed", k.fingerprint, o.id)));
+            }
         }
         self.ensure_dir()?;
         let body = format!("untrusted comment: {}\n{}\n", if k.comment.is_empty() { "minisign public key (added by hand)" } else { &k.comment }, k.b64);
@@ -506,6 +615,13 @@ pub enum Rotated {
     AlreadyApplied,
 }
 
+/// A key a plan revokes: its id, and its fingerprint when its bytes were known (the record keeps both).
+#[derive(Debug, Clone)]
+struct Revoke {
+    id: String,
+    fp: Option<String>,
+}
+
 /// A verified rotation, not yet written anywhere. `commit` writes it; `Trust::with_plan` applies it in memory only.
 #[derive(Debug)]
 pub struct Plan {
@@ -513,13 +629,25 @@ pub struct Plan {
     signer: String,
     today: String,
     adds: Vec<(KeyInfo, Option<String>)>,
-    /// Ids to revoke, including everything the revoked keys added earlier.
-    revokes: Vec<String>,
+    /// Keys to revoke, including everything the revoked keys added earlier.
+    revokes: Vec<Revoke>,
 }
 
 impl Plan {
     pub fn serial(&self) -> u64 {
         self.serial
+    }
+
+    /// Does this plan revoke `k`, by its id or by its key bytes?
+    fn revokes_key(&self, k: &KeyInfo) -> bool {
+        let fp = fp_hex(&k.fingerprint);
+        self.revokes.iter().any(|r| r.id.eq_ignore_ascii_case(&k.id) || r.fp.as_deref() == Some(fp.as_str()))
+    }
+}
+
+fn push_revoke(revokes: &mut Vec<Revoke>, id: &str, fp: Option<String>) {
+    if !revokes.iter().any(|r| r.id == id) {
+        revokes.push(Revoke { id: id.to_string(), fp });
     }
 }
 
@@ -558,10 +686,17 @@ pub fn plan_rotation(trust: &Trust, json: &[u8], sig: Option<&str>, today: &str)
     let mut adds: Vec<(KeyInfo, Option<String>)> = Vec::new();
     for a in &rot.add {
         let k = parse_pub(&a.key, Source::Rotation)?;
-        if let Some(e) = &a.expires {
-            if !valid_date(e) {
-                bail!("keys.json: bad expiry {e:?} for key {}", k.id);
-            }
+        if let Some(e) = &a.expires
+            && !valid_date(e)
+        {
+            bail!("keys.json: bad expiry {e:?} for key {}", k.id);
+        }
+        // a revoked key (its id, or its bytes under any id) is never accepted again: the whole file is refused, so nothing is half applied
+        if st.revocation_of(&k).is_some() {
+            return Err(refuse(
+                Refusal::Revoked,
+                format!("keys.json adds key {} (fingerprint {}), which was revoked and is never accepted again; refusing the whole file, nothing changed", k.id, k.fingerprint),
+            ));
         }
         trust.check_id_collision(&k)?;
         if adds.iter().any(|(o, _)| o.id == k.id && o.b64 != k.b64) {
@@ -569,21 +704,22 @@ pub fn plan_rotation(trust: &Trust, json: &[u8], sig: Option<&str>, today: &str)
         }
         adds.push((k, a.expires.clone()));
     }
-    let mut revokes: Vec<String> = Vec::new();
+    // The fingerprint of each key revoked: from this file's own adds (a key that is only in this file), else from the keys dir or the
+    // compiled-in key. A revocation without one still refuses by id.
+    let known: Vec<KeyInfo> = adds.iter().map(|(k, _)| k.clone()).chain(trust.all()).collect();
+    let fp_of = |id: &str| known.iter().find(|k| k.id.eq_ignore_ascii_case(id)).map(|k| fp_hex(&k.fingerprint));
+    let mut revokes: Vec<Revoke> = Vec::new();
     for r in &rot.revoke {
         if !valid_id(r) {
             bail!("keys.json: {r:?} is not a key id");
         }
         let id = r.to_ascii_uppercase();
-        if !revokes.contains(&id) {
-            revokes.push(id.clone());
-        }
+        push_revoke(&mut revokes, &id, fp_of(&id));
         // what the revoked key added before this file goes with it (keys added by this very file are the signer's
         // own succession, e.g. "A adds B and revokes A", and stay)
         for d in trust.descendants(&id) {
-            if !revokes.contains(&d) {
-                revokes.push(d);
-            }
+            let fp = fp_of(&d);
+            push_revoke(&mut revokes, &d, fp);
         }
     }
     Ok(Planned::Apply(Plan { serial: rot.serial, signer, today: today.to_string(), adds, revokes }))
@@ -594,11 +730,11 @@ impl Trust {
     /// anything.
     pub fn with_plan(&self, plan: &Plan) -> Trust {
         let mut t = self.clone();
-        for id in &plan.revokes {
-            t.mem_revoked.push(Revoked { id: id.clone(), on: plan.today.clone(), by: plan.signer.clone() });
+        for r in &plan.revokes {
+            t.mem_revoked.push(Revoked { id: r.id.clone(), on: plan.today.clone(), by: plan.signer.clone(), fp: r.fp.clone() });
         }
         for (k, exp) in &plan.adds {
-            if plan.revokes.contains(&k.id) || self.compiled_key().map(|c| c.id == k.id).unwrap_or(false) {
+            if plan.revokes_key(k) || self.is_compiled(k) {
                 continue;
             }
             let mut k = k.clone();
@@ -620,16 +756,28 @@ pub fn commit_rotation(trust: &Trust, plan: &Plan) -> Result<Rotated> {
     trust.ensure_dir()?;
     let mut added = Vec::new();
     let mut revoked = Vec::new();
-    for id in &plan.revokes {
-        if !st.revoked.iter().any(|r| &r.id == id) {
-            st.revoked.push(Revoked { id: id.clone(), on: plan.today.clone(), by: plan.signer.clone() });
-            revoked.push(id.clone());
+    for r in &plan.revokes {
+        match st.revoked.iter_mut().find(|x| x.id.eq_ignore_ascii_case(&r.id)) {
+            // a record from before fingerprints were kept gets the fingerprint now, when the key's bytes are known
+            Some(x) => {
+                if x.fp.is_none() {
+                    x.fp = r.fp.clone();
+                }
+            }
+            None => {
+                st.revoked.push(Revoked { id: r.id.clone(), on: plan.today.clone(), by: plan.signer.clone(), fp: r.fp.clone() });
+                revoked.push(r.id.clone());
+            }
         }
-        let _ = fs::remove_file(trust.dir.join(format!("{id}.pub")));
-        let _ = fs::remove_file(trust.dir.join(format!("{id}.json")));
+    }
+    // The revocations reach the record before any key file goes: a crash in between leaves files the record already refuses.
+    trust.save_state(&st)?;
+    for r in &plan.revokes {
+        let _ = fs::remove_file(trust.dir.join(format!("{}.pub", r.id)));
+        let _ = fs::remove_file(trust.dir.join(format!("{}.json", r.id)));
     }
     for (k, exp) in &plan.adds {
-        if st.revoked.iter().any(|r| r.id == k.id) || trust.compiled_key().map(|c| c.id == k.id).unwrap_or(false) {
+        if st.revocation_of(k).is_some() || trust.is_compiled(k) {
             continue; // revoked wins; the compiled-in key needs no file
         }
         let body = format!("untrusted comment: minisign public key (rotation {})\n{}\n", plan.serial, k.b64);
@@ -749,9 +897,165 @@ pub mod tests {
         let r = rotation(1, "2030-01-01", &[&k2], &[&id_of(&k2)]);
         apply_rotation(&tr, r.as_bytes(), &sign(&sk, r.as_bytes()), "2026-10-06").unwrap();
         assert!(tr.add_manual(&k2).unwrap_err().to_string().contains("revoked"));
+        // a later file that brings the revoked key back is refused whole, and records nothing (the serial stays at 1)
         let again = rotation(2, "2030-01-01", &[&k2], &[]);
-        apply_rotation(&tr, again.as_bytes(), &sign(&sk, again.as_bytes()), "2026-10-06").unwrap();
+        let e = apply_rotation(&tr, again.as_bytes(), &sign(&sk, again.as_bytes()), "2026-10-06").unwrap_err();
+        assert_eq!(refusal(&e).map(|r| r.why.kind()), Some("revoked"), "{e:#}");
+        assert_eq!(tr.state().unwrap().serial, 1);
         assert!(tr.trusted("2026-10-06").unwrap().iter().all(|k| k.id != id_of(&k2)));
+    }
+
+    /// `real`'s 32 key bytes under another id: the id bytes of the key file change, the key does not. What a person would be handed
+    /// as "a new key" when the old one was revoked.
+    pub fn with_fresh_id(real: &str) -> String {
+        let mut r = B64.decode(parse_pub(real, Source::Manual).unwrap().b64).unwrap();
+        for b in &mut r[2..10] {
+            *b ^= 0x5a;
+        }
+        format!("untrusted comment: same bytes, fresh id\n{}\n", B64.encode(r))
+    }
+
+    /// `sig` with its key id (bytes 2..10 of its second line) replaced: what a forger does with a signature a leaked key made.
+    fn sig_claiming(sig: &str, id: &str) -> String {
+        let mut lines: Vec<String> = sig.lines().map(str::to_string).collect();
+        let mut raw = B64.decode(&lines[1]).unwrap();
+        for (i, b) in raw[2..10].iter_mut().enumerate() {
+            *b = u8::from_str_radix(&id[2 * (7 - i)..2 * (7 - i) + 2], 16).unwrap();
+        }
+        lines[1] = B64.encode(raw);
+        lines.join("\n") + "\n"
+    }
+
+    #[test]
+    fn a_revoked_key_has_no_way_back_under_a_fresh_id() {
+        // arm-2: the record keeps the revoked key's fingerprint, so the same bytes under another id are refused by hand and in a rotation
+        let (pk, sk) = keypair();
+        let (leaked, leaked_sk) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        let add = rotation(1, "2030-01-01", &[&leaked], &[]);
+        apply_rotation(&tr, add.as_bytes(), &sign(&sk, add.as_bytes()), "2026-10-06").unwrap();
+        let revoke = rotation(2, "2030-01-01", &[], &[&id_of(&leaked)]);
+        apply_rotation(&tr, revoke.as_bytes(), &sign(&sk, revoke.as_bytes()), "2026-10-06").unwrap();
+        let fp = parse_pub(&leaked, Source::Manual).unwrap().fingerprint.replace(' ', "");
+        assert_eq!(tr.state().unwrap().revoked.iter().find(|r| r.id == id_of(&leaked)).unwrap().fp.as_deref(), Some(fp.as_str()));
+        // the key's file is gone, and its bytes come back under a fresh id
+        assert!(!tr.dir.join(format!("{}.pub", id_of(&leaked))).exists());
+        let fresh = with_fresh_id(&leaked);
+        assert_ne!(id_of(&fresh), id_of(&leaked));
+        assert_eq!(kind_of(tr.add_manual(&fresh)), "revoked");
+        assert!(!tr.dir.join(format!("{}.pub", id_of(&fresh))).exists());
+        let back = rotation(3, "2030-01-01", &[&fresh], &[]);
+        let e = apply_rotation(&tr, back.as_bytes(), &sign(&sk, back.as_bytes()), "2026-10-06").unwrap_err();
+        assert_eq!(refusal(&e).map(|r| r.why.kind()), Some("revoked"), "{e:#}");
+        assert_eq!(tr.state().unwrap().serial, 2, "a refused file records nothing");
+        assert!(!tr.dir.join(format!("{}.pub", id_of(&fresh))).exists());
+        // the leaked secret cannot sign under the fresh id either: the claim fails and the id is not trusted
+        let claim = sig_claiming(&sign(&leaked_sk, b"x"), &id_of(&fresh));
+        let e = format!("{:#}", tr.verify(b"x", &claim, "2026-10-06").unwrap_err());
+        assert!(e.contains("not one this program trusts") || e.contains("revoked"), "{e}");
+    }
+
+    #[test]
+    fn a_revoked_compiled_in_key_has_no_way_back_under_a_fresh_id() {
+        let (pk, sk) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        let r = rotation(1, "2030-01-01", &[], &[&id_of(&pk)]);
+        apply_rotation(&tr, r.as_bytes(), &sign(&sk, r.as_bytes()), "2026-10-06").unwrap();
+        assert_eq!(kind_of(tr.add_manual(&with_fresh_id(&pk))), "revoked");
+        assert_eq!(kind_of(tr.add_manual(&pk)), "revoked");
+    }
+
+    #[test]
+    fn trusted_never_lists_a_key_whose_fingerprint_is_revoked() {
+        // a key planted by hand under a fresh id, with its bytes' fingerprint in the record: refused by trusted() and by verify()
+        let (pk, _) = keypair();
+        let (leaked, leaked_sk) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        fs::create_dir_all(&tr.dir).unwrap();
+        fs::set_permissions(&tr.dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let fp = parse_pub(&leaked, Source::Manual).unwrap().fingerprint.replace(' ', "");
+        fs::write(
+            tr.dir.join("state.json"),
+            format!(r#"{{"serial":1,"revoked":[{{"id":"0123456789ABCDEF","on":"2026-01-01","by":"{}","fp":"{fp}"}}]}}"#, id_of(&pk)),
+        )
+        .unwrap();
+        let fresh = with_fresh_id(&leaked);
+        fs::write(tr.dir.join(format!("{}.pub", id_of(&fresh))), &fresh).unwrap();
+        let trusted = tr.trusted("2026-10-06").unwrap();
+        assert!(trusted.iter().all(|k| k.id != id_of(&fresh)), "{trusted:?}");
+        assert_eq!(trusted.len(), 1, "only the compiled-in key is left");
+        // the leaked key's real signature, claimed under the fresh id: the fresh id is not trusted, so it does not verify
+        let claim = sig_claiming(&sign(&leaked_sk, b"x"), &id_of(&fresh));
+        assert!(tr.verify(b"x", &claim, "2026-10-06").is_err());
+    }
+
+    #[test]
+    fn a_fingerprint_that_is_not_sixteen_hex_digits_refuses_the_record() {
+        let (pk, _) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        fs::create_dir_all(&tr.dir).unwrap();
+        fs::set_permissions(&tr.dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(tr.dir.join("state.json"), r#"{"serial":0,"revoked":[{"id":"0123456789ABCDEF","on":"x","by":"y","fp":"0F7A 3A5C"}]}"#).unwrap();
+        assert_eq!(kind_of(tr.state()), "unsafe");
+        // and a spelling with spaces and capitals is the same fingerprint
+        fs::write(tr.dir.join("state.json"), r#"{"serial":0,"revoked":[{"id":"0123456789ABCDEF","on":"x","by":"y","fp":"0F7A 3A5C 447E C7EF"}]}"#).unwrap();
+        assert_eq!(tr.state().unwrap().revoked[0].fp.as_deref(), Some("0f7a3a5c447ec7ef"));
+    }
+
+    #[test]
+    fn add_manual_refuses_a_key_already_in_the_list_and_never_rewrites_its_record() {
+        // a rotation key with an expiry, and a manual key: adding either again, under its id or under another id, is refused
+        let (pk, sk) = keypair();
+        let (rot_pk, _) = keypair();
+        let (manual, _) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        let json = format!(r#"{{"schema":1,"serial":1,"expires":"2030-01-01","add":[{{"key":"{}","expires":"2031-01-01"}}]}}"#, parse_pub(&rot_pk, Source::Manual).unwrap().b64);
+        apply_rotation(&tr, json.as_bytes(), &sign(&sk, json.as_bytes()), "2026-10-06").unwrap();
+        tr.add_manual(&manual).unwrap();
+        let rot_id = id_of(&rot_pk);
+        let meta_before = fs::read(tr.dir.join(format!("{rot_id}.json"))).unwrap();
+        let e = tr.add_manual(&rot_pk).unwrap_err();
+        assert_eq!(refusal(&e).map(|r| r.why.kind()), Some("collision"), "{e:#}");
+        assert!(format!("{e:#}").contains("already in the list"), "{e:#}");
+        assert_eq!(kind_of(tr.add_manual(&with_fresh_id(&rot_pk))), "collision");
+        assert_eq!(kind_of(tr.add_manual(&manual)), "collision");
+        assert_eq!(kind_of(tr.add_manual(&with_fresh_id(&manual))), "collision");
+        // the rotation key kept its source, its expiry and who added it
+        assert_eq!(fs::read(tr.dir.join(format!("{rot_id}.json"))).unwrap(), meta_before);
+        let row = tr.all().into_iter().find(|k| k.id == rot_id).unwrap();
+        assert_eq!((row.source, row.expires.as_deref()), (Source::Rotation, Some("2031-01-01")));
+        // the compiled-in key under another id: already trusted, not added
+        assert_eq!(kind_of(tr.add_manual(&with_fresh_id(&pk))), "compiled");
+    }
+
+    #[test]
+    fn a_crash_while_the_keys_dir_is_made_leaves_nothing_that_reads_as_a_keys_dir() {
+        // (a) a leftover temp dir from a crash before the rename: it holds a record that revokes something and it is not the keys dir
+        let (pk, sk) = keypair();
+        let (extra, _) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        let tmp = tr.dir.parent().unwrap().join(".keys.new");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(tmp.join("state.json"), r#"{"serial":9,"revoked":[{"id":"0123456789ABCDEF","on":"2026-01-01","by":"x"}]}"#).unwrap();
+        assert_eq!(tr.state().unwrap().serial, 0, "no keys dir: the leftover is not the record");
+        assert_eq!(tr.trusted("2026-10-06").unwrap().len(), 1, "trusts only the compiled-in key");
+        tr.add_manual(&extra).unwrap();
+        assert!(!tmp.exists(), "the leftover is removed when the dir is made");
+        assert_eq!(tr.state().unwrap().serial, 0);
+        assert!(tr.state().unwrap().revoked.is_empty(), "the leftover's revocation was never the record");
+        // (b) a leftover that is a plain file, the same name: removed, not trusted
+        fs::remove_dir_all(&tr.dir).unwrap();
+        fs::write(&tmp, "junk").unwrap();
+        tr.add_manual(&extra).unwrap();
+        assert!(!tmp.exists() && tr.dir.join("state.json").is_file());
+        // (c) a keys dir with no record (the shape a crash could leave before the rename existed): refused with the way out, and
+        // nothing is trusted or verified on the strength of it
+        fs::remove_file(tr.dir.join("state.json")).unwrap();
+        let e = format!("{:#}", tr.trusted("2026-10-06").unwrap_err());
+        assert!(e.contains("is missing although") && e.contains("To recover"), "{e}");
+        let json = rotation(1, "2030-01-01", &[], &[]);
+        assert!(apply_rotation(&tr, json.as_bytes(), &sign(&sk, json.as_bytes()), "2026-10-06").is_err());
     }
 
     #[test]

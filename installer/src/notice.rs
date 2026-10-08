@@ -39,10 +39,10 @@ pub fn check(layout: &Layout, base: &str, trust: &Trust, current: &str, cmd: &st
             cache.stale = stale;
         }
         // Written on failure too: an offline machine is asked once a day, not on every command.
-        if fs::create_dir_all(layout.state_dir()).is_ok() {
-            if let Ok(t) = serde_json::to_string(&cache) {
-                let _ = fs::write(&file, t);
-            }
+        if fs::create_dir_all(layout.state_dir()).is_ok()
+            && let Ok(t) = serde_json::to_string(&cache)
+        {
+            let _ = fs::write(&file, t);
         }
     }
     let latest = cache.latest?;

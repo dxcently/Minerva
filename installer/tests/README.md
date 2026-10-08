@@ -12,8 +12,11 @@ cd installer && MINERVA_ALLOW_PLACEHOLDER_KEY=1 CARGO_TARGET_DIR=$HOME/.cache/mi
 common/mod.rs         the fixture Env (temp HOME with DECOY tokens at every default place a script could read one), the stub HTTP
                       server on 127.0.0.1:48110, and the curl shim
 cli.rs                `status --json` over fixture prefixes; `keys add|remove --json` (every error kind, keys dir unchanged on a
-                      refusal); the `web --keys-arm` checks that need no perch
-perch_open.rs         the key arm in both scripts; the flags a newer perch gets and an older one does not
+                      refusal); `keys list|inspect --json` failing in the same shape; a revoked key under a fresh id; the
+                      `web --keys-arm` checks that need no perch
+perch_open.rs         the key arm of bin/perch-open.sh (the Linux arm: only the Linux script arms); the flags a newer perch gets and
+                      an older one does not, in both scripts
+nix_allow_web.rs      `nix/minerva.sh keys allow-web`: refused with the Nix sentence, nothing armed (no curl call, no runtime file)
 fixtures/             `perch --help` as printed by the perch an operator has installed today (perch-help-old.txt) and by a build of
                       master (perch-help-new.txt); the start tests probe against these, not against a hand-written imitation
 ```
@@ -30,5 +33,7 @@ is in its environment, as clap's is), it records the argv it was started with, a
 test kills afterwards (and only while that pid is still the stub).
 
 The unit tests of the same slice are next to the code: `src/status/tests.rs` (the JSON, the cache, the plugin record, the jev states,
-each held to the sentence the command itself would print) and `src/keys.rs` (`every_refusal_carries_its_kind_through_added_context`).
+each held to the sentence the command itself would print) and `src/keys.rs` (`every_refusal_carries_its_kind_through_added_context`,
+and the fingerprint, record and crash tests: `a_revoked_key_has_no_way_back_under_a_fresh_id`, `trusted_never_lists_a_key_whose_fingerprint_is_revoked`,
+`add_manual_refuses_a_key_already_in_the_list_and_never_rewrites_its_record`, `a_crash_while_the_keys_dir_is_made_leaves_nothing_that_reads_as_a_keys_dir`).
 The `compiled` kind is only reachable there: a test build compiles in the placeholder key, so the CLI has no compiled-in key to refuse.

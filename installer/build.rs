@@ -1,10 +1,10 @@
 //! Compiles the update public key, the version and (for the Windows exe) the bundle path into the crate.
 //!
 //! - key:     `MINERVA_UPDATE_PUBKEY` (a file path) or `installer/minisign.pub`. A missing file, or the committed
-//!            placeholder, FAILS the build, unless `MINERVA_ALLOW_PLACEHOLDER_KEY=1` (tests only: then every
-//!            signature check fails closed).
+//!   placeholder, FAILS the build, unless `MINERVA_ALLOW_PLACEHOLDER_KEY=1` (tests only: then every
+//!   signature check fails closed).
 //! - version: `MINERVA_VERSION_BASE`, else the repo-root `VERSION` file; plus the short git sha (`MINERVA_BUILD_SHA`,
-//!            else `git rev-parse --short HEAD`) as `<base>-g<sha>`.
+//!   else `git rev-parse --short HEAD`) as `<base>-g<sha>`.
 //! - bundle:  `MINERVA_BUNDLE` (a file path), embedded by the Windows exe; absent, an empty stand-in.
 
 use std::path::PathBuf;

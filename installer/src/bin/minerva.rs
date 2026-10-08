@@ -60,7 +60,8 @@ The trusted set is the key compiled into this program plus the .pub files in ~/.
 minus revoked keys. A release may carry a signed keys.json that adds and revokes keys; `minerva update` applies it.
 --confirm FP is for programs: the person typed the fingerprint (16 hex digits, spaces optional), the program passes it on.
 --json on add and remove prints {\"added\":ID} / {\"removed\":ID}, or {\"error\":{\"kind\":K,\"sentence\":S}} (exit 1 as without it), K being one of
-mismatch, revoked, collision, compiled, unsafe, not-found, failed.
+mismatch, revoked, collision, compiled, unsafe, not-found, failed. list and inspect take --json too, and fail in that same shape.
+A revoked key is refused by its id and by its fingerprint, so its bytes under another id are refused as well.
 ";
 
     pub fn run() -> i32 {
@@ -316,13 +317,13 @@ mismatch, revoked, collision, compiled, unsafe, not-found, failed.
         let mut out = std::io::stdout();
         match update::run(&update::Opts { base: &base, trust: &tr, now: now_secs(), current: &cur, exe: &exe, rollback, check_only }, &mut out) {
             Ok(outcome) => {
-                if let update::Outcome::Updated { .. } | update::Outcome::RolledBack { .. } = outcome {
-                    if let Ok(layout) = Layout::from_exe(&exe) {
-                        let v = layout.current_version().unwrap_or_default();
-                        sync_plugins(&layout, &v, false, false, false);
-                        if jev::is_set_up(&layout) {
-                            println!("jev is set up; its pinned requirements may have changed: minerva jev-setup refreshes it");
-                        }
+                if let update::Outcome::Updated { .. } | update::Outcome::RolledBack { .. } = outcome
+                    && let Ok(layout) = Layout::from_exe(&exe)
+                {
+                    let v = layout.current_version().unwrap_or_default();
+                    sync_plugins(&layout, &v, false, false, false);
+                    if jev::is_set_up(&layout) {
+                        println!("jev is set up; its pinned requirements may have changed: minerva jev-setup refreshes it");
                     }
                 }
                 Ok(0)
@@ -531,19 +532,27 @@ mismatch, revoked, collision, compiled, unsafe, not-found, failed.
                 }
                 (Err(e), false) => Err(e),
                 (Err(e), true) => {
-                    let (kind, sentence) = match keys::refusal(&e) {
-                        Some(r) => (r.why.kind(), r.sentence.clone()),
-                        None => ("failed", format!("{e:#}")),
-                    };
-                    println!(r#"{{"error":{{"kind":{},"sentence":{}}}}}"#, json_str(kind), json_str(&sentence));
+                    print_refusal(&e);
                     Ok(1)
                 }
             };
         }
+        // list, inspect and help: with --json a failure is the same one line as add and remove's, with the same exit code
+        match (keys_read(&sub, rest, json), json) {
+            (Err(e), true) => {
+                print_refusal(&e);
+                Ok(1)
+            }
+            (answer, _) => answer,
+        }
+    }
+
+    /// The read verbs of `minerva keys` (list, inspect, help) and the usage line for anything else.
+    fn keys_read(sub: &str, rest: &mut Vec<String>, json: bool) -> Result<i32> {
         take_opt(rest, "--confirm")?; // only add and remove use it; the others have always let it pass
         let tr = trust()?;
         let today = keys::today();
-        match sub.as_str() {
+        match sub {
             "help" | "-h" | "--help" => {
                 print!("{KEYS_HELP}");
                 Ok(0)
@@ -554,7 +563,7 @@ mismatch, revoked, collision, compiled, unsafe, not-found, failed.
                 let st = tr.state()?;
                 let mut rows = Vec::new();
                 for k in tr.all() {
-                    let state = if st.revoked.iter().any(|r| r.id.eq_ignore_ascii_case(&k.id)) {
+                    let state = if st.revocation_of(&k).is_some() {
                         "revoked"
                     } else if trusted.contains(&k.id) {
                         "trusted"
@@ -605,6 +614,16 @@ mismatch, revoked, collision, compiled, unsafe, not-found, failed.
             }
             _ => bail!("usage: minerva keys list|inspect|add|remove (minerva keys help)"),
         }
+    }
+
+    /// `{"error":{"kind":K,"sentence":S}}` on stdout: what a `--json` keys verb says when it refuses or fails. The kind is typed when the
+    /// failure is a refusal, `failed` otherwise.
+    fn print_refusal(e: &anyhow::Error) {
+        let (kind, sentence) = match keys::refusal(e) {
+            Some(r) => (r.why.kind(), r.sentence.clone()),
+            None => ("failed", format!("{e:#}")),
+        };
+        println!(r#"{{"error":{{"kind":{},"sentence":{}}}}}"#, json_str(kind), json_str(&sentence));
     }
 
     /// `keys add`: the id of the key now trusted. `quiet` (--json) leaves the human banner out of stderr; the prompt, when there is one,
@@ -785,10 +804,8 @@ mismatch, revoked, collision, compiled, unsafe, not-found, failed.
                 }
             }
         };
-        if matches!(cmd, "web" | "status") && !opted_out() {
-            if let Some(line) = notice_line(DEFAULT_BASE, "minerva") {
-                eprintln!("{line}");
-            }
+        if matches!(cmd, "web" | "status") && !opted_out() && let Some(line) = notice_line(DEFAULT_BASE, "minerva") {
+            eprintln!("{line}");
         }
         Ok(code)
     }
