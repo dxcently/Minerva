@@ -31,10 +31,18 @@ audit and gate events       newest first, at most 40 of the last 200 held
 ## Rules this tab keeps
 
 - **Nothing here says a node is up, down, online or present.** The perch is network-free; the only time it has is when a roster was last cached, so that is the only thing shown, as an age. The age moves on with the clock since the answer was got, and a roster cached more than a day ago says `old`. The one probe there is, the daemon's `ping`, is of Aoide's own daemon on a local socket and is worded as that (`aoided ● 3 ms`, `aoided ○ no answer`).
-- **The events may be absent.** The perch tails two files: the audit log (`--aoide-audit-log`, else aoide's own `log` under its home) and aoided's feed (`--aoide-daemon-events`, else `$XDG_RUNTIME_DIR/aoide/events.jsonl`, which is the perch's own default and not aoide's socket-relative rule). Either can be missing, empty or unreadable, and each stream says so on its own: the empty sentence names each file and how much of it was read (`no events to show. audit log ~/.aoide/log: nothing read yet (empty or missing); ... Nothing shown is not the same as nothing happening.`), never "no activity". A stream that has bytes but shows none of them says that, and a file that cannot be read is a line under its own label (`could not be read: <the perch's reason>`), with the other stream's lines still drawn. Each line is labelled `audit` or `daemon` by its stream, and its text starts with the record's own class (`audit` or `gate`).
+- **The events may be absent.** The perch tails two files: the audit log (`--aoide-audit-log`, else aoide's own `log` under its home) and
+  aoided's feed (`--aoide-daemon-events`, else `$XDG_RUNTIME_DIR/aoide/events.jsonl`, which is the perch's own default and not aoide's
+  socket-relative rule). Either can be missing, empty or unreadable, and each stream says so on its own: the empty sentence names each file
+  and how much of it was read (`no events to show. audit log ~/.aoide/log: nothing read yet (empty or missing); ... Nothing shown is not the
+  same as nothing happening.`), never "no activity". A stream that has bytes but shows none of them says that, and a file that cannot be
+  read is a line under its own label (`could not be read: <the perch's reason>`), with the other stream's lines still drawn. Each line is
+  labelled `audit` or `daemon` by its stream, and its text starts with the record's own class (`audit` or `gate`).
 - **Every remote string is text.** The registry, rosters, drift rows, outbox reasons, graph titles and event payloads are Aoide's or another node's. `view.js` runs each through `clean` (`renderers/jev.js`: control characters, bidi overrides and zero-width marks out, cut short) and returns it as a string; `index.js` puts it in a text node. No `innerHTML`, no markup, and no remote word is used as a class name or a key: the colour of a drift row comes from a table. The roster text itself (`cache[].text`) is not drawn at all, only its age.
 - **A failed refresh keeps the good answer** and says why above it (`showing the answer from 15:26:04`). An answer of `available: false` is a good answer and replaces what was held.
-- **Polls go through the lane**, one in flight across the page, only while the page is visible. The events poll never runs twice at once (two folds of one answer would hold the same events twice). A tab reopened after a minute starts the tail again from the newest events instead of catching up through a backlog. A `reset` from the perch (the feed shrank, or was replaced by another file) clears what is held.
+- **Polls go through the lane**, one in flight across the page, only while the page is visible. The events poll never runs twice at once
+  (two folds of one answer would hold the same events twice). A tab reopened after a minute starts the tail again from the newest events
+  instead of catching up through a backlog. A `reset` from the perch (the feed shrank, or was replaced by another file) clears what is held.
 - **The only paths asked for are `mesh` and `mesh/events`.** Nothing here sends, pairs, spawns or dials a node. Mail lives in the notes tab, not here.
 
 ## Tests

@@ -1,6 +1,8 @@
 # tests/fixtures/aoide: what the mesh tab is tested against
 
-Input for `tests/mesh.test.mjs` (the mesh tab, `mesh/view.js` and `mesh/index.js`). The files are LF on every checkout (this folder's `.gitattributes`). Nothing here is a copy of anything real: the state is made up. `snapshot.json` is what the perch's mesh snapshot answered in front of `fake_aoide` (R2b); `events.json` is what the perch's events route answered over `audit.log` and `daemon-events.jsonl` (R2c).
+Input for `tests/mesh.test.mjs` (the mesh tab, `mesh/view.js` and `mesh/index.js`). The files are LF on every checkout (this folder's
+`.gitattributes`). Nothing here is a copy of anything real: the state is made up. `snapshot.json` is what the perch's mesh snapshot answered
+in front of `fake_aoide` (R2b); `events.json` is what the perch's events route answered over `audit.log` and `daemon-events.jsonl` (R2c).
 
 | file | what it is |
 |---|---|
@@ -12,8 +14,23 @@ Input for `tests/mesh.test.mjs` (the mesh tab, `mesh/view.js` and `mesh/index.js
 | `snapshot.json` | `GET /hub/mesh` for that home with `fake_aoide` replaying `mesh.json` and `outbox.json`, as the perch answered it, in the documented key order |
 | `snapshot-none.json` | `GET /hub/mesh` on a perch with no aoide program and no state folder: `available: false` and the one sentence |
 
-`snapshot.json` was captured from a perch started by `perch/tests/live/fake-perch.sh` (a temp home, a python stand-in for `aoided` that only answers `ping`, and the flags `--aoide`, `--aoide-home` and `--aoide-daemon-socket` pointing at that home) and four values were set by hand, because they depend on the machine: `aoide.path` is `~/.local/bin/aoide`, the daemon is `/run/user/1000/aoide/aoided.sock` answering in 3 ms, and the two roster ages are 180 s and 172800 s. The fake's log held exactly `--version`, `mesh --json` and `mail outbox --json`, and the stand-in daemon was sent exactly `{"v":0,"op":"ping"}`.
+`snapshot.json` was captured from a perch started by `perch/tests/live/fake-perch.sh` (a temp home, a python stand-in for `aoided` that only
+answers `ping`, and the flags `--aoide`, `--aoide-home` and `--aoide-daemon-socket` pointing at that home) and four values were set by hand,
+because they depend on the machine: `aoide.path` is `~/.local/bin/aoide`, the daemon is `/run/user/1000/aoide/aoided.sock` answering in 3
+ms, and the two roster ages are 180 s and 172800 s. The fake's log held exactly `--version`, `mesh --json` and `mail outbox --json`, and the
+stand-in daemon was sent exactly `{"v":0,"op":"ping"}`.
 
-`events.json` is the first poll of the fix round's live check (port 48131, copies of this worktree's binaries, `fake_aoide` by explicit path). Copies of `audit.log` and `daemon-events.jsonl` were named with `--aoide-audit-log` and `--aoide-daemon-events`, `home/state` was copied to a temp `--aoide-home`, and the socket was a temp path with nothing on it. The live answer had these eight events, `next` 841 and 960, `reset` false and `error` null for both; its `files` were the copies' temp paths, and the file here carries made-up ones. The same run went on: one line was appended to each feed; the daemon feed was cut in place and written shorter (the daemon stream alone reset); the audit path was made a link (the audit stream got its own sentence, the daemon stream still answered, and the audit cursor stayed where it was asked); and the daemon feed was replaced by a new file longer than its cursor (the daemon stream started again, the audit stream did not). Six malformed `?` queries were each a 400, and the snapshot ran `--version`, `mesh --json` and `mail outbox --json` with `AOIDE_AUDIT_LOG` set and no daemon-feed variable.
+`events.json` is the first poll of the fix round's live check (port 48131, copies of this worktree's binaries, `fake_aoide` by explicit
+path). Copies of `audit.log` and `daemon-events.jsonl` were named with `--aoide-audit-log` and `--aoide-daemon-events`, `home/state` was
+copied to a temp `--aoide-home`, and the socket was a temp path with nothing on it. The live answer had these eight events, `next` 841 and
+960, `reset` false and `error` null for both; its `files` were the copies' temp paths, and the file here carries made-up ones. The same run
+went on: one line was appended to each feed; the daemon feed was cut in place and written shorter (the daemon stream alone reset); the audit
+path was made a link (the audit stream got its own sentence, the daemon stream still answered, and the audit cursor stayed where it was
+asked); and the daemon feed was replaced by a new file longer than its cursor (the daemon stream started again, the audit stream did not).
+Six malformed `?` queries were each a 400, and the snapshot ran `--version`, `mesh --json` and `mail outbox --json` with `AOIDE_AUDIT_LOG`
+set and no daemon-feed variable.
 
-The shapes are the perch's, and the perch's per-mesh `grants` form is modelled from P-CHARTER's announcement, not observed (`perch/src/mesh/README.md`). The audit records' `ts` values are made up: the real aoide 0.0.26 log writes it as an integer (observed), and no doc the perch reads gives its unit. `X0` is where a real aoide's output is compared; a fixture that disagrees with it is a fixture to fix.
+The shapes are the perch's, and the perch's per-mesh `grants` form is modelled from P-CHARTER's announcement, not observed
+(`perch/src/mesh/README.md`). The audit records' `ts` values are made up: the real aoide 0.0.26 log writes it as an integer (observed), and
+no doc the perch reads gives its unit. `X0` is where a real aoide's output is compared; a fixture that disagrees with it is a fixture to
+fix.

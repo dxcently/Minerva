@@ -641,9 +641,9 @@ fn the_feed_keeps_two_classes_and_survives_a_truncate_in_place() {
 
 /// The audit log's allowlist, end to end: a record with no `ts`, a `class` that is not the mesh's, a door, command or status that is not a
 /// word the docs give, a command with an argument in it, and a line that is not an object are dropped. What is kept is `ts`, `class`, `door`,
-/// `command` and `status`, and no text of theirs is in the answer.
+/// `command` and `status`, and a `message` only on aoided's start record (see `a_message_is_forwarded_for_a_start_record_and_for_no_other_record`).
 #[test]
-fn the_audit_allowlist_drops_what_it_cannot_pin_and_forwards_no_text() {
+fn the_audit_allowlist_drops_unpinnable_fields_and_forwards_only_start_messages() {
     let rig = Setup::all().start();
     for line in [
         concat!(
@@ -917,6 +917,15 @@ fn a_start_with_both_feeds_at_one_file_is_refused_with_a_sentence() {
     assert!(at_default.contains("same file"), "{at_default}");
     let by_env = start(&["--aoide-audit-log", same.to_str().unwrap()], &[("AOIDE_DAEMON_EVENTS", same.to_str().unwrap())]);
     assert!(by_env.contains("same file") && by_env.contains("AOIDE_DAEMON_EVENTS"), "{by_env}");
+    // A dangling relative link at the audit flag names the feed that aoided has not written yet, resolved from the link's own folder and not
+    // from the perch's working directory. Mutation: resolve a relative target as it is, and this start is not refused.
+    let later = dir.path().join("later.log");
+    std::os::unix::fs::symlink("later.log", dir.path().join("relative-link")).unwrap();
+    let by_relative_link = start(
+        &["--aoide-audit-log", dir.path().join("relative-link").to_str().unwrap(), "--aoide-daemon-events", later.to_str().unwrap()],
+        &[],
+    );
+    assert!(by_relative_link.contains("same file"), "{by_relative_link}");
 }
 
 /// A feed file replaced by another (a new inode) while its cursor is still inside the new one starts that stream again: the page is told it is

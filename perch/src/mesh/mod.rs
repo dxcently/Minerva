@@ -928,9 +928,9 @@ fn scrubbed(name: &str, value: &Value) -> Option<Value> {
 /// - what is kept is `ts`, `class`, `door`, `command` and `status`, and a `message` only for aoided's start records ([`start_record`]: `daemon` and
 ///   `adapter.melete` with status `started`, Doors-and-Nodes.md lines 91 and 213). `untrusted_data` is another's text and is never forwarded.
 ///   Every other record's `message` is left out, because it is text the docs do not promise to be free of a secret or a letter: `mail.read` writes
-///   the letter's body into it (observed, cut at about 526 characters), and the secrets broker writes its resolve, put and admin lines to this same
-///   log, each naming a secret (Secrets-Broker.md lines 46-47 and 122). A record with no command or status, or a `message` that is not a string,
-///   keeps no `message`.
+///   the letter's body into it (observed, cut at about 526 characters), and the secrets broker's own audit lines go to this same log, and they name
+///   what they audit and never a value (Secrets-Broker.md lines 46-48 and 122). A record with no command or status, or a `message` that is not a
+///   string, keeps no `message`.
 fn audit_keep(record: &Value) -> Option<Value> {
     let object = record.as_object()?;
     let ts = object.get("ts")?.as_u64()?;
@@ -1448,6 +1448,21 @@ mod tests {
         std::os::unix::fs::symlink(&hop, &two).unwrap();
         assert!(feeds_apart(None, Some(two.as_path()), Some(unwritten.as_path())).is_err(), "a chain of two links to the feed");
         assert!(feeds_apart(None, Some(two.as_path()), Some(later.as_path())).is_ok(), "a chain to another path is another file");
+        // A relative link is relative to its own folder, not to the working directory: a dangling one beside the feed, one in a sub-folder that
+        // reaches up a level, and a chain of two relative links. Mutation: resolve a relative target as it is (against the working directory), and
+        // the three `is_err` cases below answer `Ok` instead.
+        let rel = dir.path().join("rel");
+        std::os::unix::fs::symlink("unwritten.jsonl", &rel).unwrap();
+        assert!(feeds_apart(None, Some(rel.as_path()), Some(unwritten.as_path())).is_err(), "a relative dangling link names the feed in its folder");
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let up = sub.join("up");
+        std::os::unix::fs::symlink("../unwritten.jsonl", &up).unwrap();
+        assert!(feeds_apart(None, Some(up.as_path()), Some(unwritten.as_path())).is_err(), "../ counts from the link's own folder");
+        assert!(feeds_apart(None, Some(up.as_path()), Some(later.as_path())).is_ok(), "a relative link to another path is another file");
+        let rel_hop = dir.path().join("rel-hop");
+        std::os::unix::fs::symlink("rel", &rel_hop).unwrap();
+        assert!(feeds_apart(None, Some(rel_hop.as_path()), Some(unwritten.as_path())).is_err(), "a chain of two relative links is followed");
         let chain = |name: &str, links: usize, end: &Path| -> PathBuf {
             let mut target = end.to_path_buf();
             for n in (0..links).rev() {

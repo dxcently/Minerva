@@ -46,9 +46,9 @@ Nothing that touches a node has a variant: no `node list`, `session`, `send`, `p
   none, so the runner gives no call one and the view takes no default from it (`absolute_dir`, unit test
   `a_relative_or_empty_runtime_dir_is_none_as_an_unset_one_is`). The other three that are given must be absolute: a relative one is
   `Error::Refused` on every call, so nothing runs with it (and `main.rs` refuses a relative `--aoide-audit-log` and `--aoide-daemon-events`
-  at the start, and the two feeds at one file, `mesh::feeds_apart`). The mesh view reads the same flag through the same `audit_flag`, so the file aoide appends to and
-  the file the view tails are one file. The daemon's events feed (`--aoide-daemon-events`) is not a field of the runner: no call is ever
-  given its path, under any name. Why the removal: a perch started inside a conducted session would hand its
+  at the start, and the two feeds at one file, `mesh::feeds_apart`). The mesh view reads the same flag through the same `audit_flag`, so the
+  file aoide appends to and the file the view tails are one file. The daemon's events feed (`--aoide-daemon-events`) is not a field of the
+  runner: no call is ever given its path, under any name. Why the removal: a perch started inside a conducted session would hand its
   `AOIDE_SESSION_ID` to every call, and an ambient `AOIDE_STATE_DIR` moves the mailbase away from `<root>/state/mail/base.jsonl`, the file
   M2's receive loop stats. Everything else (`HOME`, `PATH`, `LANG`, the tests' `FAKE_*`) passes through.
 - **Bounded.** stdin is `/dev/null`. stdout is capped at 1 MiB (one byte more is `Error::TooBig` and the child is killed). stderr keeps
