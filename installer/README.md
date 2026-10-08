@@ -218,6 +218,12 @@ the file: this machine revokes it with its parent. A machine that still holds it
 the id alone, and does not trust it either, since its bytes are gone from it. A fingerprint the file gives, or that this machine's bytes give,
 must be the one its record already has for that id, when the record has one; a different one refuses the whole file.
 
+A fingerprint a machine records is kept: no signed file replaces it, and a file that gives a different one for that id is refused whole.
+So a wrong one, a typo in `revoke_fp` for an id that machine never held, stays on every machine that applied it. From then on each later
+file that names that id with its real fingerprint is refused whole on that machine, serial and adds included, until a later file that
+leaves the id out of `revoke` and `revoke_fp` is applied there. Meanwhile the id stays revoked, but the key's bytes under another id are
+not refused by fingerprint on that machine. Check the fingerprint with `minerva keys inspect` before you sign.
+
 Rules: `serial` must be higher than the last applied but at most 16 higher (a leaked key cannot burn the counter with a huge
 serial); a serial that is not higher is "already applied" and is answered BEFORE the signature or expiry is looked at, so
 re-fetching a file you already applied (the release still carries it) never blocks an update, even after its signer was revoked
@@ -271,7 +277,8 @@ itself. The answers and the step-up that allows the page to do this at all are i
 minisign -G -p new.pub -s ~/.minisign/minerva-2.key                  # 1. the new key pair
 # 2. write keys.json: add new.pub's second line (serial = last + 1, an expiry date); if the old key leaked, put its id in "revoke"
 #    AND its fingerprint (minerva keys inspect old.pub) in "revoke_fp". Every id in "revoke" needs its fingerprint there: a client that
-#    does not hold that key refuses the whole file without it, with "keys.json revokes <id> without its fingerprint", and changes nothing.
+#    does not hold that key and has no record of its fingerprint refuses the whole file without it, with
+#    "keys.json revokes <id> without its fingerprint", and changes nothing.
 #    release-files.sh refuses that file first, before anything is written: fix it there. A file a client refuses changes nothing on that
 #    machine, so a leaked key that machine holds STAYS trusted there until a corrected file is signed and out: publish it promptly.
 minisign -S -s ~/.minisign/minerva.key -m keys.json                   # 3. sign it with a key members already trust (the OLD one)
