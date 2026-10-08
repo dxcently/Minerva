@@ -435,7 +435,7 @@ gh release create v$(cat ../../VERSION) --repo dxcently/Minerva --title "Minerva
 once-a-day notice still work but print "release info is stale (signed <date>) -- the maintainer should re-sign" (a replayed old
 manifest is the thing this exposes). **Re-sign at least every 30 days**, without rebuilding: `installer/release-files.sh resign DIR`
 re-stamps `latest.json`, then `minisign -S -s KEY -m latest.json` and re-upload both files. Also re-sign `keys.json` before its own
-`expires`.
+`expires`. A re-signed `keys.json` keeps its `revoke_fp` entry for every id in `revoke` (operator step 2).
 
 The updater fetches `https://github.com/dxcently/Minerva/releases/latest/download/latest.json` (+ `.minisig`, then the
 bundle named in it). The exe and `install.sh` are for people; only `latest.json`, the bundle and their signatures
