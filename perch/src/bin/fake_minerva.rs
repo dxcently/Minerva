@@ -275,7 +275,8 @@ fn log(dir: &Path, argv: &[String], stdin: Option<&str>, refused: bool) {
     let mut names: Vec<String> = std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()).collect();
     names.sort();
     let line = json!({"argv": argv, "stdin": stdin, "env": names, "refused": refused, "pid": std::process::id()});
+    // one write of the whole line and its newline: a reader never sees half of a call (writeln! is several writes)
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log")) {
-        let _ = writeln!(file, "{line}");
+        let _ = file.write_all(format!("{line}\n").as_bytes());
     }
 }

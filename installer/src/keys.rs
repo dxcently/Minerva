@@ -748,8 +748,8 @@ pub fn plan_rotation(trust: &Trust, json: &[u8], sig: Option<&str>, today: &str)
         adds.push((k, a.expires.clone()));
     }
     // The fingerprint of each key revoked: the one the file gives in `revoke_fp`; else this file's own adds (a key that is only in this
-    // file); else the keys dir or the compiled-in key. A revocation with none still refuses by id. A given fingerprint that is not the
-    // one this machine holds under that id names another key, so the whole file is refused.
+    // file); else the keys dir or the compiled-in key. A key the file names with none of those is refused, the whole file with it. A given
+    // fingerprint that is not the one this machine holds under that id names another key, so the whole file is refused.
     let known: Vec<KeyInfo> = adds.iter().map(|(k, _)| k.clone()).chain(trust.all()).collect();
     let fp_of = |id: &str| known.iter().find(|k| k.id.eq_ignore_ascii_case(id)).map(|k| fp_hex(&k.fingerprint));
     let mut wanted: Vec<(String, Option<String>)> = Vec::new();
@@ -775,6 +775,9 @@ pub fn plan_rotation(trust: &Trust, json: &[u8], sig: Option<&str>, today: &str)
             (Some(g), Some(h)) if g != h => {
                 bail!("keys.json revokes key {id} with fingerprint {g}, but this machine holds key {id} with fingerprint {h}; refusing the whole file, nothing changed")
             }
+            // Named, with no fingerprint from the file and no key here: its bytes cannot be checked, so the same bytes under a fresh id
+            // would pass. Refused whole. (Keys this file revokes only because a revoked key added them are not named, and stay id-only.)
+            (None, None) => bail!("keys.json revokes {id} without its fingerprint; the maintainer lists every revoked key in revoke_fp"),
             (g, h) => g.or(h),
         };
         push_revoke(&mut revokes, &id, fp);
@@ -1071,13 +1074,14 @@ pub mod tests {
 
     #[test]
     fn a_fingerprint_given_later_reaches_the_record_and_the_preview() {
-        // a revocation with no fingerprint (the key was never here), then a later signed file gives it: the in-memory preview and the
-        // record both keep the fingerprint, and the revocation of the id is not repeated
+        // a record from before fingerprints were kept revokes the id with none (the one residual, and this machine never held the key);
+        // a later signed file gives it: the in-memory preview and the record both keep the fingerprint, and the id is not revoked again
         let (pk, sk) = keypair();
         let (leaked, _) = keypair();
         let (_t, tr) = trust_with(&pk);
-        let first = rotation(1, "2030-01-01", &[], &[&id_of(&leaked)]);
-        apply_rotation(&tr, first.as_bytes(), &sign(&sk, first.as_bytes()), "2026-10-06").unwrap();
+        fs::create_dir_all(&tr.dir).unwrap();
+        fs::set_permissions(&tr.dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(tr.dir.join("state.json"), format!(r#"{{"serial":1,"revoked":[{{"id":"{}","on":"2026-01-01","by":"{}"}}]}}"#, id_of(&leaked), id_of(&pk))).unwrap();
         assert!(tr.state().unwrap().revoked.iter().all(|r| r.fp.is_none()));
         let fp = fp_hex(&parse_pub(&leaked, Source::Manual).unwrap().fingerprint);
         let second = format!(r#"{{"schema":1,"serial":2,"expires":"2030-01-01","add":[],"revoke":[],"revoke_fp":[{{"id":"{}","fp":"{fp}"}}]}}"#, id_of(&leaked));
@@ -1088,6 +1092,40 @@ pub mod tests {
         assert_eq!(commit_rotation(&tr, &plan).unwrap(), Rotated::Applied(vec![], vec![]), "the id was revoked already: nothing new");
         let rec = tr.state().unwrap();
         assert_eq!((rec.serial, rec.revoked.len(), rec.revoked[0].fp.as_deref()), (2, 1, Some(fp.as_str())));
+    }
+
+    #[test]
+    fn a_rotation_that_revokes_a_key_this_machine_never_held_needs_its_fingerprint() {
+        // a named id with no revoke_fp and no copy of its key here: the whole file is refused, and the record does not move
+        let (pk, sk) = keypair();
+        let (known, _) = keypair();
+        let (never, _) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        let add = rotation(1, "2030-01-01", &[&known], &[]);
+        apply_rotation(&tr, add.as_bytes(), &sign(&sk, add.as_bytes()), "2026-10-06").unwrap();
+        let bare = rotation(2, "2030-01-01", &[], &[&id_of(&never)]);
+        let e = apply_rotation(&tr, bare.as_bytes(), &sign(&sk, bare.as_bytes()), "2026-10-06").unwrap_err();
+        assert!(format!("{e:#}").contains(&format!("keys.json revokes {} without its fingerprint; the maintainer lists every revoked key in revoke_fp", id_of(&never))), "{e:#}");
+        let st = tr.state().unwrap();
+        assert_eq!((st.serial, st.revoked.len()), (1, 0), "a refused file records nothing");
+        assert!(tr.trusted("2026-10-06").unwrap().iter().any(|k| k.id == id_of(&known)), "the key the file did not name is still trusted");
+        // the same revocation with its fingerprint in revoke_fp is applied, the record keeps it, and the same bytes under a fresh id are refused
+        let fp = fp_hex(&parse_pub(&never, Source::Manual).unwrap().fingerprint);
+        let with_fp = format!(r#"{{"schema":1,"serial":2,"expires":"2030-01-01","add":[],"revoke":[],"revoke_fp":[{{"id":"{}","fp":"{fp}"}}]}}"#, id_of(&never));
+        assert_eq!(apply_rotation(&tr, with_fp.as_bytes(), &sign(&sk, with_fp.as_bytes()), "2026-10-06").unwrap(), Rotated::Applied(vec![], vec![id_of(&never)]));
+        assert_eq!(tr.state().unwrap().revoked.iter().find(|r| r.id == id_of(&never)).and_then(|r| r.fp.as_deref()), Some(fp.as_str()));
+        assert_eq!(kind_of(tr.add_manual(&with_fresh_id(&never))), "revoked");
+    }
+
+    #[test]
+    fn a_held_key_revoked_without_a_fingerprint_is_recorded_with_its_own() {
+        // the compiled-in key is on this machine: revoked by its id alone, the record still gets the fingerprint computed here
+        let (pk, sk) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        let json = rotation(1, "2030-01-01", &[], &[&id_of(&pk)]);
+        apply_rotation(&tr, json.as_bytes(), &sign(&sk, json.as_bytes()), "2026-10-06").unwrap();
+        let fp = fp_hex(&parse_pub(&pk, Source::Manual).unwrap().fingerprint);
+        assert_eq!(tr.state().unwrap().revoked.iter().find(|r| r.id == id_of(&pk)).and_then(|r| r.fp.as_deref()), Some(fp.as_str()));
     }
 
     #[test]

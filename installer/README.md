@@ -208,6 +208,12 @@ what refuses the key's bytes under a fresh id on a machine that never held the k
 under that id, if it holds one; a different one refuses the whole file. An installer built before `revoke_fp` ignores the field and
 revokes by id only, as it always did, so a release can carry it without breaking an older install.
 
+**Every id in `revoke` needs its fingerprint.** A client that holds the key takes the fingerprint from its own copy and records it. A
+client that does not hold it needs `revoke_fp` for it. Without that, `minerva update` refuses the whole file and nothing is written (the
+serial does not move): `keys.json revokes <id> without its fingerprint; the maintainer lists every revoked key in revoke_fp`. A key a
+revoked key added is not named in the file; it is recorded by id alone, and it is not trusted on that machine either, since its bytes
+are gone from it.
+
 Rules: `serial` must be higher than the last applied but at most 16 higher (a leaked key cannot burn the counter with a huge
 serial); a serial that is not higher is "already applied" and is answered BEFORE the signature or expiry is looked at, so
 re-fetching a file you already applied (the release still carries it) never blocks an update, even after its signer was revoked
@@ -230,11 +236,12 @@ was revoked (`revoked`); a key whose id a DIFFERENT key uses (`collision`); a ke
 with the same bytes (`collision`: a key's record is never rewritten, so a rotation key keeps its source, its expiry and who added it);
 the compiled-in key, under its id or its bytes (`compiled`; once that key was revoked it is refused as `revoked`, not `compiled`). A revocation
 keeps the key's fingerprint, and the fingerprint is the sha-256 of the 32 key bytes, so the same bytes under a fresh id are refused too.
-The fingerprint comes from this machine's own copy of the key when it had one, or from the signed file (`revoke_fp`, below). A revocation
-with no fingerprint refuses by id only. That is a record written before fingerprints were kept, or a revocation for a key this machine
-never held whose file gave no `revoke_fp`: its bytes are not known here, so they cannot be checked, and the same bytes under a fresh id
-are accepted by hand and by a rotation. This is an accepted residual, not a closed hole; the fix for new revocations is to name the
-fingerprint in `revoke_fp`.
+The fingerprint comes from this machine's own copy of the key when it had one, or from the signed file (`revoke_fp`, above). A
+revocation with no fingerprint refuses by id only. There are two ways to get one. A record written before fingerprints were kept (a
+development install; nothing was released): its bytes are not known here, so the same bytes under a fresh id are accepted by hand and by
+a rotation, until a signed file names that key in `revoke_fp` and the record takes its fingerprint. And a key that a revoked key added,
+whose bytes this machine no longer has: it is not trusted here, so only its id is blocked. The first is the accepted residual, not a
+closed hole; the maintainer closes it with one rotation that names the old key's fingerprint (`minerva keys inspect old.pub`).
 
 **For the perch.** A perch route that adds a key runs `minerva keys inspect - --json` with the public key on stdin (answer
 `{"id","fingerprint","comment"}`), shows the fingerprint to the person, and when they have typed the FINGERPRINT back runs
@@ -247,7 +254,8 @@ itself. The answers and the step-up that allows the page to do this at all are i
 ```sh
 minisign -G -p new.pub -s ~/.minisign/minerva-2.key                  # 1. the new key pair
 # 2. write keys.json: add new.pub's second line (serial = last + 1, an expiry date); if the old key leaked, put its id in "revoke"
-#    and its fingerprint (minerva keys inspect old.pub) in "revoke_fp"
+#    AND its fingerprint (minerva keys inspect old.pub) in "revoke_fp". Every id in "revoke" needs its fingerprint there: a client that
+#    does not hold that key refuses the whole file without it, with "keys.json revokes <id> without its fingerprint", and changes nothing
 minisign -S -s ~/.minisign/minerva.key -m keys.json                   # 3. sign it with a key members already trust (the OLD one)
 minisign -S -s ~/.minisign/minerva-2.key -m latest.json minerva-*.tar.gz   # 4. the release itself, signed by the NEW key
 #    release assets: latest.json, latest.json.minisig, the bundle, its .minisig, keys.json, keys.json.minisig
@@ -334,7 +342,8 @@ one add or remove of exactly that key within 120 s. The token is never in argv, 
 stops nothing and, with no `--token-file`, only talks to a perch of ours that is running and answering on its own port. `--port`
 defaults to `MINERVA_PERCH_PORT`, else 47820, and takes one spelling only: 1 to 65535, digits, no leading zero. `--token-file` is for
 a test to aim the script at a stub with its own token, is refused without `--port`, and, like the perch's own file, is read only if it is
-a plain file of yours with mode 0600 or 0400 holding a plain token.
+a plain file of yours with mode 0600 or 0400 holding a plain token. A 404 whose body has `"kind":"nix"` is a Nix install's perch: the script
+says its update keys change through nix, and arms nothing. Any other 404 means this perch has no key routes.
 
 How the scripts handle the token, everywhere they handle it (the arm, the liveness probe, the status line, the login code):
 
@@ -437,8 +446,8 @@ matter to the updater.
 keys): good signature installs, tampered bundle refused, wrong key refused, missing signature refused, swapped bundle
 refused, rollback and forward, Nix refused, notice once a day / silent on failure / bad signature gives no notice,
 install/rerun/upgrade/prune/uninstall layout, WSL list parsing, PATH list edits, key rotation (good, unknown signer, revoked
-signer, revoked compiled-in key, manual add/remove and the refusals of `add`, a revoked key under a fresh id by hand and in a rotation, a fingerprint
-that is not 16 hex digits, expiry, replay, open keys dir, a crash while the keys dir is made, a fault between its record and its rename leaving no keys dir), and the plugin lifecycle (install, trust, foreign
+signer, revoked compiled-in key, manual add/remove and the refusals of `add`, a revoked key under a fresh id by hand and in a rotation, a rotation that revokes a key with no fingerprint (refused whole,
+nothing written), a fingerprint that is not 16 hex digits, expiry, replay, open keys dir, a crash while the keys dir is made, a fault between its record and its rename leaving no keys dir), and the plugin lifecycle (install, trust, foreign
 plugin kept, update keeps trust, uninstall removes only ours) when `MINERVA_TEST_EIDOLON` names an eidolon binary (otherwise that
 one test says it was skipped). The Windows pieces (registry,
 shortcut, WSL calls) are exercised by running the exe with the test options above, never against the real settings.

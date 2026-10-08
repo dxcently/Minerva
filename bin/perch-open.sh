@@ -190,12 +190,19 @@ if [ "$mode" = arm ]; then
     exit 1
   }
   status=${reply##*$'\n'}
+  rbody=${reply%$'\n'*}
   groups=$(printf '%s' "$fp" | sed 's/.\{4\}/& /g; s/ $//')
   case "$status" in
     200)
       echo "allowed: the web page may add or remove the key $groups once in the next 2 minutes"
       exit 0 ;;
-    404) echo "perch-open: this perch has no update-key routes (404): stop it and start it again from the new build" >&2 ;;
+    404)
+      # a Nix install's perch answers its key routes with kind "nix" (perch/src/install): its keys change through nix, not from here
+      if [[ $rbody == *'"kind":"nix"'* ]]; then
+        echo "perch-open: managed by Nix: update through nix. A Nix install's update keys are not changed from a terminal or the page; nothing was armed" >&2
+      else
+        echo "perch-open: this perch has no update-key routes (404): stop it and start it again from the new build" >&2
+      fi ;;
     *) echo "perch-open: POST /hub/install/keys/arm answered $status" >&2 ;;
   esac
   exit 1

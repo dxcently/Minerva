@@ -19,6 +19,8 @@ use serde_json::{Value, json};
 const MINERVA: &str = env!("CARGO_BIN_EXE_minerva");
 const FP: &str = "0F7A3A5C447EC7EF";
 const FP_GROUPS: &str = "0F7A 3A5C 447E C7EF";
+/// What the arm says to a Nix install's perch (its 404 has kind "nix"): the same sentence in the script, which must not drift from it.
+const NIX_ARM: &str = "perch-open: managed by Nix: update through nix. A Nix install's update keys are not changed from a terminal or the page; nothing was armed";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Which {
@@ -246,6 +248,15 @@ fn the_arm_says_what_the_perch_answered() {
         let (o, e) = text(&out);
         assert_eq!(out.status.code(), Some(1), "{w:?}: {o}{e}");
         assert!(e.contains("did not answer"), "{w:?}: {e}");
+        assert_eq!(env.leftover_headers(), Vec::<String>::new());
+        // a Nix install's perch: a 404 whose body says kind "nix" is the Nix sentence, exactly, and nothing is armed
+        let stub = Stub::start(stub_port(), 404, r#"{"kind":"nix","why":"x"}"#);
+        let out = run_script(&env, w, &args);
+        let (o, e) = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{w:?}: {o}{e}");
+        assert_eq!(e, format!("{NIX_ARM}\n"), "{w:?}");
+        assert!(o.is_empty(), "{w:?}: {o}");
+        assert_eq!(stub.requests().len(), 1, "{w:?}: one request, and no second call to arm");
         assert_eq!(env.leftover_headers(), Vec::<String>::new());
     }
 }

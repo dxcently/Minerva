@@ -175,10 +175,13 @@ mod fake {
             std::fs::write(self.fixture().join("behave"), word).unwrap();
         }
 
-        /// Every call the perch made to the stand-in, in order.
+        /// Every call the perch made to the stand-in, in order. A line still being written has no newline yet, so only whole lines count.
         fn calls(&self) -> Vec<Value> {
             let text = std::fs::read_to_string(self.fixture().join("log")).unwrap_or_default();
-            text.lines().map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("a log line: {e}: {line:?}"))).collect()
+            text.split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+                .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("a log line: {e}: {line:?}")))
+                .collect()
         }
 
         /// The calls whose argv starts with these words.
