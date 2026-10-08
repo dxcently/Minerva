@@ -394,13 +394,14 @@ async fn deliver(ctx: &Ctx, aoide: &Aoide, dir: &std::path::Path, letter: Letter
             Err(unknown(why))
         }
         Err(Error::Refused(why)) => Err(Refusal::bad(why)),
-        Err(e @ Error::NoBinary) => Err(Refusal::new(StatusCode::SERVICE_UNAVAILABLE, e.to_string())),
-        // Not started: nothing was spooled, so there is no row and nothing to check.
-        Err(e @ Error::Spawn(_)) => Err(Refusal::new(StatusCode::BAD_GATEWAY, e.to_string())),
-        Err(e @ (Error::Timeout(_) | Error::TooBig(_) | Error::NotJson | Error::Started(_))) => {
+        Err(e) if unknown_row_after_spawn(&e) => {
             let _ = record(ctx, dir, row_of(&letter, &sha, &address, None, "unknown", "unknown")).await;
             Err(unknown(e.to_string()))
         }
+        // No binary configured: aoide never ran, so nothing was spooled and there is no row.
+        Err(e @ Error::NoBinary) => Err(Refusal::new(StatusCode::SERVICE_UNAVAILABLE, e.to_string())),
+        // Spawn: the binary could not be started, so nothing was spooled and there is no row. Every run that did start is above.
+        Err(e) => Err(Refusal::new(StatusCode::BAD_GATEWAY, e.to_string())),
     }
 }
 
@@ -414,6 +415,16 @@ fn certain(reply: &Reply) -> bool {
     let named = data.and_then(|data| data.get("reason")).and_then(Value::as_str);
     let meshes = data.and_then(|data| data.get("meshes")).and_then(Value::as_array).is_some_and(|list| !list.is_empty());
     matches!(named, Some("unknown-node" | "unpaired-node" | "ambiguous-mesh")) || meshes
+}
+
+/// Whether a run that gave no answer may have spooled the letter, so its row is kept as `unknown`. A child that started may have: it timed
+/// out, printed too much or what is not JSON, or started and could not be followed ([`Error::Started`]). `Failed` is read by the arms above,
+/// `Refused` and `NoBinary` never ran, and `Spawn` never started. The match has no wildcard, so a new [`Error`] is decided here.
+fn unknown_row_after_spawn(e: &Error) -> bool {
+    match e {
+        Error::Timeout(_) | Error::TooBig(_) | Error::NotJson | Error::Started(_) => true,
+        Error::NoBinary | Error::Refused(_) | Error::Spawn(_) | Error::Failed(_) => false,
+    }
 }
 
 /// What aoide said it did with the letter, from its `--subject` shape: the one recipient's `msgid`, `status` (the word `disposition` is
@@ -704,5 +715,21 @@ mod tests {
         assert_eq!(row["mesh"], json!("alpha"));
         let nameless = row_of(&letter("self", None, false, "s", "t"), "b", "self/minerva", None, "unknown", "unknown");
         assert!(nameless.get("mesh").is_none());
+    }
+
+    #[test]
+    fn a_run_that_may_have_spooled_is_an_unknown_row_and_one_that_never_started_is_not() {
+        let timeout = std::time::Duration::from_secs(45);
+        for e in [Error::Timeout(timeout), Error::TooBig(1024), Error::NotJson, Error::Started("waiting for aoide: gone".to_string())] {
+            assert!(unknown_row_after_spawn(&e), "{e} may have spooled, so its row is unknown");
+        }
+        for e in [
+            Error::NoBinary,
+            Error::Refused("the aoide binary must be an absolute path".to_string()),
+            Error::Spawn("/nonexistent/aoide: No such file or directory".to_string()),
+            Error::Failed(reply(1, json!({"status": "error", "message": "x"}))),
+        ] {
+            assert!(!unknown_row_after_spawn(&e), "{e} did not start, so there is no row");
+        }
     }
 }

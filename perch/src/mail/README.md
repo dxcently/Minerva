@@ -77,6 +77,8 @@ sent.jsonl      one line per send, appended under a lock: {ts, origin, from, not
                 origin is `operator`, or `agent:<chat>` (M3). The text is not kept, only its sha256. A row that cannot be written does not
                 undo the send: the answer is the 202 with a `warning` sentence. The msgid is the recipient's copy (`--subject` shape).
                 `disposition` is the recipient's `status` word (`filed`, `spooled`, `held`) as the perch kept it; aoide has no such key.
+                The perch sends one recipient per letter, so `data.recipients[0]` is the whole send's answer: its `accepted` (false is a
+                refusal, nothing spooled) and `data.complete` (every copy filed or spooled).
 received.jsonl  one line per letter read from the mailbox, appended, text at most 64 KiB (cut at a character). A message id already on file
                 is not written again, whatever cards.json holds. A torn last line (no newline) is never read as a record.
 cards.json      message id -> {state, chat?, at}, and sent message id -> when its receipt was read. Rewritten whole, atomically. One that

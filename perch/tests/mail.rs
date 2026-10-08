@@ -71,6 +71,8 @@
 //!                                                 a_reread_that_fails_for_another_reason_is_tried_again_after_the_gap
 //!   recv.rs `lost.or(notice)` in list (the GET error shows one sentence)
 //!                                                 a_full_store_is_shown_beside_the_loss_of_a_reread_too_big_to_print
+//!   recv.rs list(), the snapshot-error arm `Some(why)` alone (the loss is dropped when the store cannot be read)
+//!                                                 a_loss_is_still_shown_when_the_store_cannot_be_read
 //!   aoide/mod.rs drive(): a wait error back to Spawn (a unit test, src/aoide/mod.rs)
 //!                                                 aoide::tests::a_child_that_started_and_cannot_be_followed_is_started_and_not_spawn
 //! ```
@@ -1581,6 +1583,26 @@ fn a_full_store_is_shown_beside_the_loss_of_a_reread_too_big_to_print() {
         let error = rig.mail()["error"].as_str().unwrap_or_default().to_string();
         (error.contains("could not be read here") && error.contains("card store is full")).then_some(error)
     });
+    assert!(error.chars().count() <= 600 && !error.chars().any(char::is_control), "{error}");
+}
+
+/// The GET error keeps the loss when the store cannot be read. A too-big reread leaves the loss for good; then the store is made unreadable,
+/// so the snapshot fails, and the error still says both (the line in `recv.rs` that joins the loss with a failed snapshot is the one this
+/// test needs: `Some(why)` alone drops the loss).
+#[test]
+fn a_loss_is_still_shown_when_the_store_cannot_be_read() {
+    let rig = Setup::new().env("FAKE_AOIDE_FLOOD", &(20 * 1024 * 1024).to_string()).env("FAKE_AOIDE_SPARES_SCHEMA", "1").start();
+    until(Duration::from_secs(10), "the loss", || {
+        rig.mail()["error"].as_str().unwrap_or_default().contains("could not be read here").then_some(())
+    });
+    let received = rig.mail_dir().join("received.jsonl");
+    std::fs::write(&received, "").unwrap();
+    std::fs::set_permissions(&received, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let error = until(Duration::from_secs(10), "the loss and the unreadable store", || {
+        let error = rig.mail()["error"].as_str().unwrap_or_default().to_string();
+        (error.contains("could not be read here") && error.contains("could not be used as a plain file")).then_some(error)
+    });
+    std::fs::set_permissions(&received, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert!(error.chars().count() <= 600 && !error.chars().any(char::is_control), "{error}");
 }
 

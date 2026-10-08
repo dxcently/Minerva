@@ -796,7 +796,7 @@ async fn list(ctx: &Ctx, paths: Paths) -> Response<BoxBody> {
         let held = ctx.clone();
         match blocking(move || snapshot(&held.mail.recv, &paths, outbox.as_deref())).await {
             Ok(Ok(snap)) => (snap, sentences(&[lost, notice])),
-            Ok(Err(why)) | Err((_, why)) => (Snapshot::default(), Some(why)),
+            Ok(Err(why)) | Err((_, why)) => (Snapshot::default(), sentences(&[lost, notice, Some(why)])),
         }
     };
     let error = error.or(schema).or_else(|| (!configured).then(|| NO_AOIDE.to_string()));
