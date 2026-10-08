@@ -122,13 +122,15 @@ impl Perch {
         Self::launch(true, Some(knobs.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect()), &[])
     }
 
-    /// The perch binary asked to start with `args` and expected to refuse: its whole output.
+    /// The perch binary asked to start with `args` and expected to refuse: its whole output. A perch that starts when it should not serves forever,
+    /// so `output()` would never return and the suite would hang. This polls for the exit and, at 10 s, kills the child and fails with what it
+    /// printed: the bound `refusal_of` in tests/mesh.rs uses too.
     pub fn refused_start(args: &[std::ffi::OsString]) -> std::process::Output {
         let runtime = tempfile::tempdir().unwrap();
         own(runtime.path(), 0o700);
         let xdg = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        Command::new(env!("CARGO_BIN_EXE_perch"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_perch"))
             .arg("--bind")
             .arg("127.0.0.1:0")
             .args(args)
@@ -136,8 +138,20 @@ impl Perch {
             .env("XDG_RUNTIME_DIR", runtime.path())
             .env("XDG_CONFIG_HOME", xdg.path())
             .stdin(Stdio::null())
-            .output()
-            .expect("running the perch binary")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("running the perch binary");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().expect("polling the perch").is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let out = child.wait_with_output().expect("collecting the perch's output");
+                panic!("the perch started, and was killed after 10 s; it should have refused. Its stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child.wait_with_output().expect("collecting the perch's output")
     }
 
     pub fn launch(ui_dir: bool, hub: Option<Vec<(String, String)>>, extra: &[std::ffi::OsString]) -> Self {

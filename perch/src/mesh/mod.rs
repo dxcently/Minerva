@@ -238,7 +238,9 @@ pub fn daemon_file(flag: Option<&Path>) -> Option<PathBuf> {
 /// when the runtime dir is absolute. A relative value of either, and an empty one, names no file, so a path under the working directory is never
 /// opened. The two readers are [`crate::aoide::runtime_dir`] and this function.
 fn daemon_default(env_daemon: Option<PathBuf>, runtime_dir: Option<PathBuf>) -> Option<PathBuf> {
-    env_daemon.filter(|path| path.is_absolute()).or_else(|| runtime_dir.filter(|dir| dir.is_absolute()).map(|dir| dir.join("aoide").join("events.jsonl")))
+    env_daemon
+        .filter(|path| path.is_absolute())
+        .or_else(|| runtime_dir.filter(|dir| dir.is_absolute()).map(|dir| dir.join("aoide").join("events.jsonl")))
 }
 
 #[cfg(not(test))]
@@ -252,7 +254,7 @@ fn default_daemon_path() -> Option<PathBuf> {
 /// no file is opened.
 pub fn feeds_apart(aoide_home: Option<&Path>, audit_flag: Option<&Path>, daemon_flag: Option<&Path>) -> Result<(), String> {
     let (Some(audit), Some(daemon)) = (audit_file(audit_flag, home_of(aoide_home)), daemon_file(daemon_flag)) else { return Ok(()) };
-    if same_file(&audit, &daemon) {
+    if same_file(&audit, &daemon)? {
         return Err(format!(
             "the audit log and aoided's events feed are the same file ({}): aoide would append its audit records into the feed aoided writes; \
              give one of them another path (--aoide-audit-log, --aoide-daemon-events, or AOIDE_DAEMON_EVENTS)",
@@ -262,22 +264,44 @@ pub fn feeds_apart(aoide_home: Option<&Path>, audit_flag: Option<&Path>, daemon_
     Ok(())
 }
 
-/// Whether two paths name one file: the same path once symlinks and `..` are resolved, or the same device and inode when both exist (a hard link).
-fn same_file(a: &Path, b: &Path) -> bool {
-    if resolved(a) == resolved(b) {
-        return true;
+/// Whether two paths name one file: the same path once every link on the way is followed ([`resolved`]), or the same device and inode when both
+/// exist (a hard link). A chain of links too long to follow is an error, and the start refuses on it.
+fn same_file(a: &Path, b: &Path) -> Result<bool, String> {
+    if resolved(a)? == resolved(b)? {
+        return Ok(true);
     }
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
+    Ok(match (std::fs::metadata(a), std::fs::metadata(b)) {
         (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
         _ => false,
-    }
+    })
 }
 
-/// A path with its symlinks followed. A file that is not there yet is resolved through its folder, which must be.
-fn resolved(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| match (path.parent().and_then(|dir| std::fs::canonicalize(dir).ok()), path.file_name()) {
-        (Some(dir), Some(name)) => dir.join(name),
-        _ => path.to_path_buf(),
+/// How many links a path may pass through before the start refuses it: a longer chain, or a loop, names no file the perch can tell apart.
+const LINK_HOPS: usize = 40;
+
+/// A path with its links followed, one at a time. A link that dangles is followed to the path it names, so a link to a feed that aoided has not
+/// written yet is that path, and a relative target is relative to the link's own folder. Past [`LINK_HOPS`] links it is an error. The file at the
+/// end is canonicalized, or, when it is not there, its folder is (which must be) and the name is joined to it.
+fn resolved(path: &Path) -> Result<PathBuf, String> {
+    let mut at = path.to_path_buf();
+    let mut hops = 0;
+    while std::fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_symlink()) {
+        if hops == LINK_HOPS {
+            return Err(format!("{} is a chain of more than {LINK_HOPS} links, or a loop: the perch cannot tell which file it names", path.display()));
+        }
+        hops += 1;
+        let target = std::fs::read_link(&at).map_err(|e| format!("{} is a link that cannot be read: {e}", at.display()))?;
+        at = match at.parent() {
+            Some(dir) if target.is_relative() => dir.join(&target),
+            _ => target,
+        };
+    }
+    Ok(match std::fs::canonicalize(&at) {
+        Ok(real) => real,
+        Err(_) => match (at.parent().and_then(|dir| std::fs::canonicalize(dir).ok()), at.file_name()) {
+            (Some(dir), Some(name)) => dir.join(name),
+            _ => at,
+        },
     })
 }
 
@@ -376,7 +400,9 @@ fn clip_str(value: Option<&Value>, max: usize) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct NodeView {
     pub name: String,
-    pub url: String,
+    /// The url without its `user:pass@`, or absent: none in the file, or one that still has an `@` after the cut ([`without_userinfo`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     pub verified: bool,
     pub autogate: bool,
     #[serde(rename = "addedAt")]
@@ -396,15 +422,22 @@ struct Registry {
     unread: usize,
 }
 
-/// `url` without a `user:pass@` in front of the host.
-fn without_userinfo(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
-    match authority.rfind('@') {
-        Some(at) => format!("{scheme}://{}{tail}", &authority[at + 1..]),
+/// `url` without the `user:pass@` in front of its host, or `None` when an `@` is still in it after the cut. The cut is at the authority's last `@`
+/// (the text after `://`, up to the first `/`, `?` or `#`). Fail closed: a value with no `://`, and one whose password has a `/` in it (which ends
+/// the authority before the `@`), still has an `@` after the cut, so it is none. Nothing says which part before an `@` is a credential.
+fn without_userinfo(url: &str) -> Option<String> {
+    let cut = match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            let (authority, tail) = rest.split_at(end);
+            match authority.rfind('@') {
+                Some(at) => format!("{scheme}://{}{tail}", &authority[at + 1..]),
+                None => url.to_string(),
+            }
+        }
         None => url.to_string(),
-    }
+    };
+    (!cut.contains('@')).then_some(cut)
 }
 
 fn word_ok(word: &str) -> bool {
@@ -455,7 +488,8 @@ fn project_registry(text: &str) -> Result<Registry, String> {
         let flag = |key: &str| entry.get(key).and_then(Value::as_bool).unwrap_or(false);
         let mut view = NodeView {
             name: name.to_string(),
-            url: without_userinfo(&clip_or_empty(entry.get("url"), 300)),
+            // The cut is made on the whole value and the clip after it, so a `@` past the 300th character is still cut away with its credential.
+            url: entry.get("url").and_then(Value::as_str).and_then(without_userinfo).map(|url| url.chars().take(300).collect()),
             verified: flag("verified"),
             autogate: flag("autogate"),
             added_at: clip_or_empty(entry.get("addedAt"), 64),
@@ -633,7 +667,7 @@ fn read_files(dir: &Path) -> Files {
 ///   available  bool        an aoide program is configured, or there is a state folder to read
 ///   aoide      {path, version}|null      the program as a `~` path, and its --version (null when it did not say)
 ///   daemon     {socket, ping_ms}         the socket as a `~` path or null; milliseconds when aoided answered a ping, else null
-///   registry   [{name, url, verified, autogate, addedAt, via, allows, grants}]      the allowlist, in the file's order
+///   registry   [{name, url?, verified, autogate, addedAt, via, allows, grants}]    the allowlist, in the file's order; `url` absent when none
 ///   cache      [{name, age_secs, text, cut}]       node-cache/*.json as text, by name
 ///   graph      {nodes, total, kinds, edges}|null   the stage graph, counted and listed
 ///   mesh       `data` of `aoide mesh --json`|null     outbox   `data` of `aoide mail outbox --json`|null
@@ -840,7 +874,8 @@ struct Answer {
 
 /// The fields of the daemon's feed that aoide's docs name, and so the only ones the page is ever given. At the top level: `v`, `kind` and
 /// `source` (with `ts` and `class`, which are always kept). The payload of a `gate` record: `id`, `name`, `originAddr`, `url` and `direction`
-/// (Aoide's CONTRACTS.md, at its repository root, "Pairing events feed (P-P5)": "payload carries fields BY NAME ONLY"). The payload of an `audit` record:
+/// (Aoide's CONTRACTS.md, at its repository root, "Pairing events feed (P-P5)": "payload carries fields BY NAME ONLY"). The payload of an
+/// `audit` record:
 /// `file` (docs/architecture/AOIDED.md, "The first producer: the hand-edit watcher"). Anything else, at either level, is dropped, so a field a
 /// later aoided adds never reaches the page. A `url` is kept without its `user:pass@` ([`scrubbed`]).
 const FEED_TOP: [&str; 3] = ["v", "kind", "source"];
@@ -863,19 +898,22 @@ fn feed_keep(record: &Value) -> Option<Value> {
     }
     if let Some(payload) = object.get("payload").and_then(Value::as_object) {
         let names: &[&str] = if class == "gate" { &GATE_PAYLOAD } else { &AUDIT_PAYLOAD };
-        let shown: serde_json::Map<String, Value> =
-            names.iter().filter_map(|name| payload.get(*name).map(|value| (name.to_string(), scrubbed(name, value)))).collect();
+        let shown: serde_json::Map<String, Value> = names
+            .iter()
+            .filter_map(|name| payload.get(*name).and_then(|value| scrubbed(name, value)).map(|value| (name.to_string(), value)))
+            .collect();
         kept.insert("payload".into(), Value::Object(shown));
     }
     Some(Value::Object(kept))
 }
 
-/// A payload field as the answer is given it. A `url` is taken out of its `user:pass@` the way the registry's is ([`without_userinfo`]), so a
-/// gate's credentials never reach the page; every other field is as the record has it.
-fn scrubbed(name: &str, value: &Value) -> Value {
-    match (name, value.as_str()) {
-        ("url", Some(url)) => Value::String(without_userinfo(url)),
-        _ => value.clone(),
+/// A payload field as the answer is given it, or none. A `url` is a string taken out of its `user:pass@` the way the registry's is
+/// ([`without_userinfo`]), so a gate's credentials never reach the page. A `url` that is not a string, or that still has an `@`, is none, and the
+/// field is left out of the record. Every other field is as the record has it.
+fn scrubbed(name: &str, value: &Value) -> Option<Value> {
+    match name {
+        "url" => value.as_str().and_then(without_userinfo).map(Value::String),
+        _ => Some(value.clone()),
     }
 }
 
@@ -886,10 +924,12 @@ fn scrubbed(name: &str, value: &Value) -> Value {
 ///
 /// - a record with no non-negative integer `ts` is dropped: it cannot be merged by time;
 /// - a record whose `class` is not `audit` or `gate`, or whose `door`, `command` or `status` is present and not one of the words above, is dropped;
-/// - what is kept is `ts`, `class`, `door`, `command` and `status`, and `message` for a command that is not mail's. `untrusted_data` is another's
-///   text and is never forwarded. A mail command's `message` is never forwarded either: `mail.read` writes the letter's text into it (observed,
-///   cut at about 526 characters), so a letter reaches no answer. The rule is fail-closed: a mail command is any command whose first word, before
-///   a `.`, `/` or `-`, is `mail` in any letter case; a record with no command, or a `message` that is not a string, keeps no `message`.
+/// - what is kept is `ts`, `class`, `door`, `command` and `status`, and a `message` only for aoided's start records ([`start_record`]: `daemon` and
+///   `adapter.melete` with status `started`, Doors-and-Nodes.md lines 91 and 213). `untrusted_data` is another's text and is never forwarded.
+///   Every other record's `message` is left out, because it is text the docs do not promise to be free of a secret or a letter: `mail.read` writes
+///   the letter's body into it (observed, cut at about 526 characters), and the secrets broker writes its resolve, put and admin lines to this same
+///   log, each naming a secret (Secrets-Broker.md lines 46-47 and 122). A record with no command or status, or a `message` that is not a string,
+///   keeps no `message`.
 fn audit_keep(record: &Value) -> Option<Value> {
     let object = record.as_object()?;
     let ts = object.get("ts")?.as_u64()?;
@@ -906,17 +946,21 @@ fn audit_keep(record: &Value) -> Option<Value> {
     if let Some(status) = object.get("status") {
         kept.insert("status".into(), status.as_str().filter(|status| AUDIT_STATUS.contains(status))?.into());
     }
-    let shown = object.get("message").and_then(Value::as_str).filter(|_| kept.get("command").and_then(Value::as_str).is_some_and(|command| !mail_command(command)));
+    let started = (kept.get("command").and_then(Value::as_str), kept.get("status").and_then(Value::as_str));
+    let shown = object
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|_| matches!(started, (Some(command), Some(status)) if start_record(command, status)));
     if let Some(message) = shown {
         kept.insert("message".into(), message.into());
     }
     Some(Value::Object(kept))
 }
 
-/// Whether a command is one of mail's: `mail.read`, `mail.send`, `mail.outbox` and any other `mail.*`, and the same words with `/` or `-`, in any
-/// letter case (`MAIL.read` is mail's too), so the rule does not depend on how a command is spelt.
-fn mail_command(command: &str) -> bool {
-    command.split(['.', '/', '-']).next().is_some_and(|word| word.eq_ignore_ascii_case("mail"))
+/// Whether a record is one of aoided's start records, the only ones whose `message` is kept: `daemon` (`daemon started`) and `adapter.melete`
+/// (`adapter.melete started`), with status `started`. The command is matched without regard to case, so the rule does not depend on how it is spelt.
+fn start_record(command: &str, status: &str) -> bool {
+    status == "started" && ["daemon", "adapter.melete"].iter().any(|start| command.eq_ignore_ascii_case(start))
 }
 
 /// A dotted command word as the audit log writes one: a letter, then letters, digits, `.`, `/` or `-`, at most [`COMMAND_MAX`]. No space,
@@ -966,7 +1010,11 @@ fn tail(path: &Path, after: Option<u64>, keep: Keep, last: Option<Seen>) -> std:
         None if window.len() as u64 >= EVENTS_WINDOW => window.len(),
         None => 0,
     };
-    let events = window[..whole].split(|&b| b == b'\n').filter_map(|line| serde_json::from_slice::<Value>(line).ok()).filter_map(|record| keep(&record)).collect();
+    let events = window[..whole]
+        .split(|&b| b == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .filter_map(|record| keep(&record))
+        .collect();
     Ok(Tail { events, next: start + whole as u64, reset, seen: Some(seen) })
 }
 
@@ -986,7 +1034,8 @@ fn settle(read: std::io::Result<Tail>, asked: Option<u64>, what: &str) -> (Tail,
         Ok(tail) => (tail, None),
         Err(why) => {
             tracing::warn!(error = %why, what, "perch: an events file was not read");
-            (Tail { events: Vec::new(), next: asked.unwrap_or(0), reset: false, seen: None }, Some(format!("{what} could not be read as a plain file")))
+            let empty = Tail { events: Vec::new(), next: asked.unwrap_or(0), reset: false, seen: None };
+            (empty, Some(format!("{what} could not be read as a plain file")))
         }
     }
 }
@@ -1031,7 +1080,10 @@ async fn events(ctx: &Ctx, query: &str) -> Response<BoxBody> {
     };
     let (audit_to_read, daemon_to_read) = (audit.clone(), daemon.clone());
     let read = tokio::task::spawn_blocking(move || {
-        (poll(audit_to_read.as_deref(), cursors.audit, audit_keep, last.audit), poll(daemon_to_read.as_deref(), cursors.daemon, feed_keep, last.daemon))
+        (
+            poll(audit_to_read.as_deref(), cursors.audit, audit_keep, last.audit),
+            poll(daemon_to_read.as_deref(), cursors.daemon, feed_keep, last.daemon),
+        )
     })
     .await;
     let Ok((audit_read, daemon_read)) = read else {
@@ -1147,14 +1199,35 @@ mod tests {
         assert_eq!((registry.nodes.len(), registry.skipped), (MAX_NODES, 5));
     }
 
+    /// The cut is at the authority's last `@`, and a value that still has an `@` after it is none (fail closed). Mutation: keep a value with an
+    /// `@` left in it, and the cases marked `None` go red.
     #[test]
-    fn a_url_loses_what_comes_before_the_at_sign_in_its_authority_and_nothing_else() {
-        assert_eq!(without_userinfo("http://user:pass@host:8710/x?a=b@c"), "http://host:8710/x?a=b@c");
-        assert_eq!(without_userinfo("ssh://khoa@osaka"), "ssh://osaka");
-        assert_eq!(without_userinfo("http://host/a@b"), "http://host/a@b", "an @ in the path is the path's");
-        assert_eq!(without_userinfo("http://127.0.0.1:8710"), "http://127.0.0.1:8710");
-        assert_eq!(without_userinfo("not a url"), "not a url");
-        assert_eq!(without_userinfo("http://a@b@host"), "http://host");
+    fn a_url_loses_what_comes_before_the_at_sign_in_its_authority_and_an_at_left_over_drops_it() {
+        assert_eq!(without_userinfo("ssh://khoa@osaka").as_deref(), Some("ssh://osaka"));
+        assert_eq!(without_userinfo("http://u:p@host/x").as_deref(), Some("http://host/x"));
+        assert_eq!(without_userinfo("http://a@b@host").as_deref(), Some("http://host"), "the authority's last @");
+        assert_eq!(without_userinfo("http://127.0.0.1:8710").as_deref(), Some("http://127.0.0.1:8710"));
+        assert_eq!(without_userinfo("http://host:8710/").as_deref(), Some("http://host:8710/"), "a plain url is kept");
+        assert_eq!(without_userinfo("not a url").as_deref(), Some("not a url"));
+        // An @ after the authority is still in the value, so it is dropped.
+        assert_eq!(without_userinfo("http://user:pass@host:8710/x?a=b@c"), None);
+        assert_eq!(without_userinfo("http://host/a@b"), None, "an @ in the path is dropped too");
+        // No scheme: nothing says where the authority ends, so an @ is dropped.
+        assert_eq!(without_userinfo("user:pass@box-a:8710/"), None);
+        // A password with a `/` in it ends the authority before its @, so the cut finds none and the value is dropped.
+        assert_eq!(without_userinfo("http://user:pa/ss@host/"), None);
+    }
+
+    /// A registry url that keeps an `@` is absent from the node, and nothing else of the node goes with it. A url the file does not have is
+    /// absent too.
+    #[test]
+    fn a_registry_url_with_an_at_left_in_it_is_absent_and_the_rest_of_the_node_is_not() {
+        let registry = project_registry(r#"{"nodes": [{"name": "a", "url": "user:pass@a:8710/", "verified": true}, {"name": "b"}]}"#).unwrap();
+        assert_eq!((registry.nodes[0].url.clone(), registry.nodes[0].verified), (None, true));
+        assert_eq!(registry.nodes[1].url, None, "no url in the file is no url");
+        let shown = serde_json::to_value(&registry.nodes[0]).unwrap();
+        assert!(shown.get("url").is_none() && !shown.to_string().contains("pass"), "{shown}");
+        assert!(serde_json::to_value(&registry.nodes[1]).unwrap().get("url").is_none(), "the key is not there");
     }
 
     #[test]
@@ -1189,7 +1262,11 @@ mod tests {
         let daemon_file = dir.path().join("daemon.jsonl");
         std::fs::write(
             &daemon_file,
-            "{\"v\":0,\"ts\":12,\"class\":\"gate\",\"kind\":\"d1\"}\n{\"v\":0,\"ts\":9,\"class\":\"secret\",\"kind\":\"no\"}\n{\"v\":0,\"ts\":11,\"class\":\"audit\",\"kind\":\"d2\"}\n",
+            concat!(
+                "{\"v\":0,\"ts\":12,\"class\":\"gate\",\"kind\":\"d1\"}\n",
+                "{\"v\":0,\"ts\":9,\"class\":\"secret\",\"kind\":\"no\"}\n",
+                "{\"v\":0,\"ts\":11,\"class\":\"audit\",\"kind\":\"d2\"}\n",
+            ),
         )
         .unwrap();
         let answer = answer(
@@ -1199,7 +1276,11 @@ mod tests {
             Streams { audit: None, daemon: None },
         );
         let order: Vec<(&str, &str)> =
-            answer.events.iter().map(|entry| (entry.stream, entry.event.get("command").or(entry.event.get("kind")).and_then(Value::as_str).unwrap())).collect();
+            answer
+                .events
+                .iter()
+                .map(|entry| (entry.stream, entry.event.get("command").or(entry.event.get("kind")).and_then(Value::as_str).unwrap()))
+                .collect();
         assert_eq!(order, [("audit", "a1"), ("daemon", "d2"), ("audit", "a2"), ("audit", "a3"), ("daemon", "d1")]);
         let shown = serde_json::to_string(&answer).unwrap();
         assert!(!shown.contains("LETTER-SENTINEL") && !shown.contains("FORWARDED-SENTINEL"), "{shown}");
@@ -1256,19 +1337,40 @@ mod tests {
         );
         let audit = feed_keep(&json!({"v": 0, "ts": 4, "class": "audit", "kind": "hand-edit", "source": "aoided",
             "payload": {"file": "sessions.json", "text": "PAYLOAD-SENTINEL", "name": "not an audit field"}}));
-        assert_eq!(audit, Some(json!({"v": 0, "ts": 4, "class": "audit", "kind": "hand-edit", "source": "aoided", "payload": {"file": "sessions.json"}})));
+        assert_eq!(
+            audit,
+            Some(json!({"v": 0, "ts": 4, "class": "audit", "kind": "hand-edit", "source": "aoided", "payload": {"file": "sessions.json"}}))
+        );
         // A gate's payload is not an audit's: a `name` there is not kept.
         assert_eq!(feed_keep(&json!({"ts": 5, "class": "audit", "payload": {"name": "x"}})), Some(json!({"ts": 5, "class": "audit", "payload": {}})));
         // A gate's url with a `user:pass@` is kept without it, as the registry's is: the password is in no kept field, and no byte of the answer.
         let creds = feed_keep(&json!({"ts": 6, "class": "gate", "kind": "pair-parked",
             "payload": {"url": "http://user:pass@box-a:8710/", "name": "box-a"}}));
         assert_eq!(creds, Some(json!({"ts": 6, "class": "gate", "kind": "pair-parked", "payload": {"url": "http://box-a:8710/", "name": "box-a"}})));
+        // The url cases of fail-closed scrubbing: a credential with no scheme, a `/` in the password, a cut that is kept, a plain url kept, and a url
+        // that is not text is none. A field that is none is left out of the record; the other payload fields stay.
+        for (url, shown) in [
+            (json!("user:pass@box-a:8710/"), None),
+            (json!("http://user:pa/ss@host/"), None),
+            (json!("http://u:p@host/x"), Some("http://host/x")),
+            (json!("http://host:8710/"), Some("http://host:8710/")),
+            (json!({"u": "user:pass@box-a"}), None),
+        ] {
+            let record = feed_keep(&json!({"ts": 6, "class": "gate", "payload": {"url": url.clone(), "name": "box-a"}})).unwrap();
+            assert_eq!(record["payload"].get("url").and_then(Value::as_str), shown, "{url}");
+            assert_eq!(record["payload"]["name"], "box-a", "{url}: the other field is kept");
+        }
         let none = || Tail { events: Vec::new(), next: 0, reset: false, seen: None };
         let daemon = Tail { events: creds.into_iter().collect(), next: 0, reset: false, seen: None };
         let nothing = || Streams { audit: None, daemon: None };
         let served = serde_json::to_string(&answer(none(), daemon, nothing(), nothing())).unwrap();
         assert!(served.contains("http://box-a:8710/") && !served.contains("pass"), "{served}");
-        for bad in [json!({"class": "gate", "kind": "no-ts"}), json!({"ts": "7", "class": "gate"}), json!({"ts": 7.5, "class": "gate"}), json!({"ts": -1, "class": "gate"})] {
+        for bad in [
+            json!({"class": "gate", "kind": "no-ts"}),
+            json!({"ts": "7", "class": "gate"}),
+            json!({"ts": 7.5, "class": "gate"}),
+            json!({"ts": -1, "class": "gate"}),
+        ] {
             assert_eq!(feed_keep(&bad), None, "{bad}");
         }
         for other in [json!({"ts": 1, "class": "secret"}), json!({"ts": 1, "class": "notification"}), json!({"ts": 1})] {
@@ -1288,14 +1390,20 @@ mod tests {
         assert_eq!((quiet.reset, quiet.events.len()), (false, 0), "nothing new, and no reset");
         // Replaced by another file, a new inode, longer than the cursor: the cursor is inside it, and it is still a new feed.
         let other = dir.path().join("replacement.jsonl");
-        std::fs::write(&other, "{\"ts\":3,\"class\":\"audit\",\"kind\":\"a\"}\n{\"ts\":4,\"class\":\"audit\",\"kind\":\"b\"}\n{\"ts\":5,\"class\":\"audit\",\"kind\":\"c\"}\n").unwrap();
+        let replacement = concat!(
+            "{\"ts\":3,\"class\":\"audit\",\"kind\":\"a\"}\n",
+            "{\"ts\":4,\"class\":\"audit\",\"kind\":\"b\"}\n",
+            "{\"ts\":5,\"class\":\"audit\",\"kind\":\"c\"}\n",
+        );
+        std::fs::write(&other, replacement).unwrap();
         std::fs::rename(&other, &path).unwrap();
         let replaced = tail(&path, Some(first.next), feed_keep, Some(seen)).unwrap();
         assert!(replaced.reset, "a new file is a reset");
         assert_eq!(kinds(&replaced), ["a", "b", "c"], "read from 0");
         // Cut in place to something shorter than the last poll saw: the same inode, and a reset.
         let now = replaced.seen.unwrap();
-        std::io::Write::write_all(&mut std::fs::OpenOptions::new().write(true).truncate(true).open(&path).unwrap(), b"{\"ts\":6,\"class\":\"audit\",\"kind\":\"d\"}\n").unwrap();
+        let mut cut_file = std::fs::OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut cut_file, b"{\"ts\":6,\"class\":\"audit\",\"kind\":\"d\"}\n").unwrap();
         let cut = tail(&path, Some(replaced.next), feed_keep, Some(now)).unwrap();
         assert!(cut.reset, "shorter than the last poll is a reset");
         assert_eq!(kinds(&cut), ["d"]);
@@ -1327,6 +1435,36 @@ mod tests {
         assert!(feeds_apart(None, Some(later.as_path()), Some(later.as_path())).is_err());
         assert!(feeds_apart(Some(dir.path()), None, Some(log.as_path())).is_err(), "the audit default is <home>/log");
         assert!(feeds_apart(None, Some(Path::new("log")), Some(log.as_path())).is_ok(), "a relative flag names no file");
+        // A dangling link at the audit path names the feed that aoided has not written yet: the same file once the link is followed. Two links,
+        // the second dangling, are the same; a chain of exactly LINK_HOPS links to another file is followed; one link more, and a loop, are refused.
+        let unwritten = dir.path().join("unwritten.jsonl");
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(&unwritten, &dangling).unwrap();
+        assert!(feeds_apart(None, Some(dangling.as_path()), Some(unwritten.as_path())).is_err(), "a dangling link to the feed is the feed");
+        let hop = dir.path().join("hop");
+        std::os::unix::fs::symlink(&unwritten, &hop).unwrap();
+        let two = dir.path().join("two");
+        std::os::unix::fs::symlink(&hop, &two).unwrap();
+        assert!(feeds_apart(None, Some(two.as_path()), Some(unwritten.as_path())).is_err(), "a chain of two links to the feed");
+        assert!(feeds_apart(None, Some(two.as_path()), Some(later.as_path())).is_ok(), "a chain to another path is another file");
+        let chain = |name: &str, links: usize, end: &Path| -> PathBuf {
+            let mut target = end.to_path_buf();
+            for n in (0..links).rev() {
+                let link = dir.path().join(format!("{name}{n}"));
+                std::os::unix::fs::symlink(&target, &link).unwrap();
+                target = link;
+            }
+            target
+        };
+        let forty = chain("forty", LINK_HOPS, &log);
+        assert!(feeds_apart(None, Some(forty.as_path()), Some(later.as_path())).is_ok(), "{LINK_HOPS} links are followed");
+        let too_many = chain("many", LINK_HOPS + 1, &log);
+        let why = feeds_apart(None, Some(too_many.as_path()), Some(later.as_path())).unwrap_err();
+        assert!(why.contains("more than") && why.contains("links"), "{why}");
+        let (loop_a, loop_b) = (dir.path().join("loop-a"), dir.path().join("loop-b"));
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+        assert!(feeds_apart(None, Some(loop_a.as_path()), Some(later.as_path())).is_err(), "a loop is not a file");
         assert_eq!(std::fs::read(&log).unwrap(), b"", "nothing was written");
     }
 
@@ -1466,8 +1604,10 @@ mod tests {
             "message": "LETTER-SENTINEL body of a letter", "untrusted_data": "FORWARDED-SENTINEL", "admitted": false, "argv": ["--token=x"]}));
         assert_eq!(kept, Some(json!({"ts": 1791366040, "class": "audit", "door": "cli", "command": "mail.send", "status": "ok"})));
         // The gate's self-check: no door, no command, and nothing else but its class and status.
-        assert_eq!(audit_keep(&json!({"ts": 5, "class": "gate", "status": "proposed", "admitted": false})), Some(json!({"ts": 5, "class": "gate", "status": "proposed"})));
-        // aoided's start record, as the real log writes it (door daemon, command daemon, status started): its message is kept, its command is not mail's.
+        let gate = audit_keep(&json!({"ts": 5, "class": "gate", "status": "proposed", "admitted": false}));
+        assert_eq!(gate, Some(json!({"ts": 5, "class": "gate", "status": "proposed"})));
+        // aoided's start record, as the real log writes it (door daemon, command daemon, status started): its message is kept, since it is a
+        // start record.
         let started = audit_keep(&json!({"ts": 1791365990, "door": "daemon", "class": "audit", "command": "daemon", "status": "started",
             "message": "STARTED-SENTINEL on http://127.0.0.1:8710/"}));
         assert_eq!(
@@ -1495,35 +1635,49 @@ mod tests {
             json!({"ts": 1, "class": "audit", "status": "Started"}),
             json!({"ts": 1, "class": "audit", "door": "daemon", "command": "daemon", "status": "started now"}),
             json!({"ts": 1, "class": "audit", "status": null}),
+            // `failed` is not a status the list names, so the whole record goes, message and all.
+            json!({"ts": 1, "class": "audit", "door": "daemon", "command": "daemon", "status": "failed", "message": "FAILED-TEXT"}),
             json!("a string, not a record"),
             json!(["audit"]),
         ];
         for record in drops {
             assert_eq!(audit_keep(&record), None, "{record}");
         }
+        // A secret's line keeps its command and status, and not its message, which names the secret.
+        let secret_line =
+            audit_keep(&json!({"ts": 9, "class": "audit", "door": "cli", "command": "secrets.resolve", "status": "ok", "message": "name=api-key"}));
+        assert_eq!(secret_line, Some(json!({"ts": 9, "class": "audit", "door": "cli", "command": "secrets.resolve", "status": "ok"})));
         let only_a_door = audit_keep(&json!({"ts": 1, "class": "audit", "door": "cli"}));
         assert_eq!(only_a_door, Some(json!({"ts": 1, "class": "audit", "door": "cli"})), "an absent optional field is not in the record");
     }
 
-    /// The letter rule: a mail command's `message` is never forwarded, whatever the word after `mail`; any other command keeps its `message`.
-    /// A record with no command keeps none, and a `message` that is not text is left out (the record stays).
-    /// Mutation: forward `message` for every command, or match `mail.` only, and the mail cases below go red.
+    /// The message rule: a record's `message` is forwarded only for aoided's start records (`daemon` and `adapter.melete`, status `started`), and
+    /// for no other record, mail's or anyone's (a letter, a secret's name, a failed run). The command is matched without regard to case. A record
+    /// with no command or status keeps none, and a `message` that is not text is left out (the record stays).
+    /// Mutation: forward `message` for every command, or for a start record whatever its status, and the cases below go red.
     #[test]
-    fn a_mail_letter_never_reaches_an_answer_and_another_commands_message_does() {
-        for mail in [
-            "mail.read", "mail.send", "mail.outbox", "mail.anything-new", "mail/read", "mail-read", "mail", "MAIL.read", "Mail/read", "mAiL-send",
-        ] {
-            let kept = audit_keep(&json!({"ts": 1, "class": "audit", "command": mail, "status": "ok", "message": "LETTER-SENTINEL body"}));
-            assert_eq!(kept, Some(json!({"ts": 1, "class": "audit", "command": mail, "status": "ok"})), "{mail}");
+    fn a_message_reaches_an_answer_only_for_a_start_record() {
+        for (command, status) in [("daemon", "started"), ("DAEMON", "started"), ("adapter.melete", "started"), ("Adapter.Melete", "started")] {
+            let kept = audit_keep(&json!({"ts": 1, "class": "audit", "command": command, "status": status, "message": "STARTED-TEXT"}));
+            assert_eq!(kept.as_ref().and_then(|kept| kept.get("message")), Some(&json!("STARTED-TEXT")), "{command} {status}");
         }
-        for other in ["daemon", "a2a.serve", "mailer.check", "node-mail-x", "send"] {
-            let kept = audit_keep(&json!({"ts": 1, "class": "audit", "command": other, "message": "kept text"}));
-            assert_eq!(kept, Some(json!({"ts": 1, "class": "audit", "command": other, "message": "kept text"})), "{other}");
+        for (command, status) in [
+            ("mail.read", "ok"), ("mail.send", "ok"), ("mail.outbox", "ok"), ("MAIL.read", "ok"), ("Mail/read", "ok"),
+            ("mail-read", "ok"), ("mail", "ok"), ("secrets.resolve", "ok"), ("secrets.put", "ok"), ("secrets.admin", "ok"),
+            ("node-mail-x", "ok"), ("mailer.check", "ok"), ("a2a.serve", "ok"), ("send", "pending"), ("daemon", "error"),
+            ("daemon", "ok"), ("adapter.melete", "error"),
+        ] {
+            let kept = audit_keep(&json!({"ts": 1, "class": "audit", "command": command, "status": status, "message": "LETTER-SENTINEL body"}));
+            assert_eq!(kept, Some(json!({"ts": 1, "class": "audit", "command": command, "status": status})), "{command} {status}");
         }
         assert_eq!(audit_keep(&json!({"ts": 1, "class": "audit", "message": "no command"})), Some(json!({"ts": 1, "class": "audit"})));
-        assert_eq!(audit_keep(&json!({"ts": 1, "class": "audit", "command": "send", "message": 7})), Some(json!({"ts": 1, "class": "audit", "command": "send"})));
-        assert!(!mail_command("daemon") && !mail_command("mailer.x") && mail_command("mail.read") && mail_command("mail/x"));
-        assert!(mail_command("MAIL.read") && mail_command("Mail/read") && !mail_command("MAILER.read") && !mail_command(""));
+        let no_status = audit_keep(&json!({"ts": 1, "class": "audit", "command": "daemon", "message": "no status"}));
+        assert_eq!(no_status, Some(json!({"ts": 1, "class": "audit", "command": "daemon"})));
+        let not_text = json!({"ts": 1, "class": "audit", "command": "daemon", "status": "started", "message": 7});
+        assert_eq!(audit_keep(&not_text), Some(json!({"ts": 1, "class": "audit", "command": "daemon", "status": "started"})));
+        assert!(start_record("daemon", "started") && start_record("adapter.melete", "started") && start_record("Daemon", "started"));
+        assert!(!start_record("daemon", "failed") && !start_record("daemonx", "started"));
+        assert!(!start_record("mail.read", "started") && !start_record("", "started"));
     }
 
     #[test]

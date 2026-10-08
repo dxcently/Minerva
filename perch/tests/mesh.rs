@@ -592,7 +592,10 @@ fn the_feed_keeps_two_classes_and_survives_a_truncate_in_place() {
     let lines = [
         r#"{"v":0,"ts":1,"class":"audit","kind":"hand-edit","source":"aoided","payload":{"file":"sessions.json"}}"#,
         r#"{"v":0,"ts":2,"class":"secret","kind":"released","payload":{"secret":"SECRET-NAME-SENTINEL","consumer":"CONSUMER-SENTINEL"}}"#,
-        r#"{"v":0,"ts":3,"class":"gate","kind":"pending","source":"a2a-door","note":"NOTE-SENTINEL <script>alert(1)</script>","payload":{"id":"abc12345","node":"osaka","note":"NOTE-SENTINEL <script>alert(1)</script>\u001b[31m"}}"#,
+        concat!(
+            r#"{"v":0,"ts":3,"class":"gate","kind":"pending","source":"a2a-door","note":"NOTE-SENTINEL <script>alert(1)</script>","#,
+            r#""payload":{"id":"abc12345","node":"osaka","note":"NOTE-SENTINEL <script>alert(1)</script>\u001b[31m"}}"#,
+        ),
         r#"{"v":0,"ts":4,"class":"notification","kind":"forwarded","payload":{"body":"NOTIFICATION-SENTINEL"}}"#,
         r#"{"v":0,"ts":5,"class":"rice","kind":"repaint"}"#,
         r#"{"v":0,"ts":6,"class":"content","kind":"page"}"#,
@@ -628,7 +631,8 @@ fn the_feed_keeps_two_classes_and_survives_a_truncate_in_place() {
     assert_eq!((quiet["next"]["daemon"].clone(), quiet["reset"]["daemon"].clone()), (json!(end), json!(false)));
 
     // Truncated in place, then written to again: the file is shorter than the cursor, so the feed starts over.
-    std::fs::OpenOptions::new().write(true).truncate(true).open(&rig.daemon).unwrap().write_all(b"{\"v\":0,\"ts\":9,\"class\":\"audit\",\"kind\":\"after-truncate\"}\n").unwrap();
+    let mut cut = std::fs::OpenOptions::new().write(true).truncate(true).open(&rig.daemon).unwrap();
+    cut.write_all(b"{\"v\":0,\"ts\":9,\"class\":\"audit\",\"kind\":\"after-truncate\"}\n").unwrap();
     let again = rig.tail(&format!("?daemon={end}"));
     assert_eq!(again["reset"]["daemon"], true);
     assert_eq!(streams_and_kinds(&again), pairs(&[("daemon", "after-truncate")]));
@@ -642,7 +646,10 @@ fn the_feed_keeps_two_classes_and_survives_a_truncate_in_place() {
 fn the_audit_allowlist_drops_what_it_cannot_pin_and_forwards_no_text() {
     let rig = Setup::all().start();
     for line in [
-        r#"{"ts":1,"class":"audit","door":"cli","command":"mail.send","status":"ok","message":"LETTER-SENTINEL","untrusted_data":"FORWARD-SENTINEL"}"#,
+        concat!(
+            r#"{"ts":1,"class":"audit","door":"cli","command":"mail.send","status":"ok","message":"LETTER-SENTINEL","#,
+            r#""untrusted_data":"FORWARD-SENTINEL"}"#,
+        ),
         r#"{"class":"audit","command":"no-ts-here"}"#,
         r#"{"ts":2,"class":"secret","command":"secret-class"}"#,
         r#"{"ts":3,"class":"audit","command":"node add osaka"}"#,
@@ -651,8 +658,11 @@ fn the_audit_allowlist_drops_what_it_cannot_pin_and_forwards_no_text() {
         "not json",
         r#"["audit"]"#,
         r#"{"ts":6,"class":"gate","status":"proposed","admitted":false,"argv":["--token=ARG-SENTINEL"]}"#,
-        // aoided's start record, as the real log writes it: kept, with its message (a URL, and a sentinel) dropped.
-        r#"{"ts":7,"door":"daemon","class":"audit","command":"daemon","status":"started","message":"STARTED-SENTINEL listening on http://127.0.0.1:8710/"}"#,
+        // aoided's start record, as the real log writes it: kept with its message, since it is a start record.
+        concat!(
+            r#"{"ts":7,"door":"daemon","class":"audit","command":"daemon","status":"started","#,
+            r#""message":"STARTED-SENTINEL listening on http://127.0.0.1:8710/"}"#,
+        ),
     ] {
         append(&rig.audit, line);
     }
@@ -668,7 +678,7 @@ fn the_audit_allowlist_drops_what_it_cannot_pin_and_forwards_no_text() {
         answer["events"][2]["event"],
         json!({"ts": 7, "class": "audit", "door": "daemon", "command": "daemon", "status": "started",
             "message": "STARTED-SENTINEL listening on http://127.0.0.1:8710/"}),
-        "the start record keeps its fields, and its message since its command is not mail's"
+        "the start record keeps its fields and its message"
     );
 }
 
@@ -794,21 +804,82 @@ fn a_link_or_a_fifo_at_either_path_is_not_read_and_the_other_stream_still_answer
     assert!(!answer.to_string().contains("PLANTED-FEED-SENTINEL"), "{answer}");
 }
 
-/// A letter's text does not reach the page: a `mail.read` line carries the body in its `message`, and no byte of the answer has it. A line
-/// with the same body under a command that is not mail's keeps its message, which is the rule, not an exception.
+/// A letter's text does not reach the page: a `mail.read` line carries the body in its `message`, and no byte of the answer has it. The same
+/// body under any command that is not aoided's start record is not forwarded either: `a_message_is_forwarded_for_a_start_record_and_for_no_other`.
 #[test]
 fn a_mail_letter_is_in_no_answer_byte() {
     let rig = Setup::all().start();
-    append(&rig.audit, r#"{"ts":10,"door":"cli","class":"audit","command":"mail.read","status":"ok","message":"LETTER-BODY-SENTINEL dear minerva, the body"}"#);
-    append(&rig.audit, r#"{"ts":11,"door":"cli","class":"audit","command":"mail.outbox","status":"ok","message":"LETTER-BODY-SENTINEL in the outbox"}"#);
+    append(
+        &rig.audit,
+        concat!(
+            r#"{"ts":10,"door":"cli","class":"audit","command":"mail.read","status":"ok","#,
+            r#""message":"LETTER-BODY-SENTINEL dear minerva, the body"}"#,
+        ),
+    );
+    append(
+        &rig.audit,
+        concat!(
+            r#"{"ts":11,"door":"cli","class":"audit","command":"mail.outbox","status":"ok","#,
+            r#""message":"LETTER-BODY-SENTINEL in the outbox"}"#,
+        ),
+    );
     append(&rig.audit, r#"{"ts":12,"door":"cli","class":"audit","command":"mail.send","status":"ok","message":"filed to self/minerva (msgid abc)"}"#);
     append(&rig.audit, r#"{"ts":13,"door":"cli","class":"audit","command":"MAIL.read","status":"ok","message":"LETTER-BODY-SENTINEL in capitals"}"#);
     let answer = rig.tail("?audit=0");
-    assert_eq!(streams_and_kinds(&answer), pairs(&[("audit", "mail.read"), ("audit", "mail.outbox"), ("audit", "mail.send"), ("audit", "MAIL.read")]));
+    assert_eq!(
+        streams_and_kinds(&answer),
+        pairs(&[("audit", "mail.read"), ("audit", "mail.outbox"), ("audit", "mail.send"), ("audit", "MAIL.read")])
+    );
     assert_eq!(answer["events"][0]["event"], json!({"ts": 10, "class": "audit", "door": "cli", "command": "mail.read", "status": "ok"}));
     let raw = rig.perch.get("/hub/mesh/events?audit=0");
     assert!(!raw.body.contains("LETTER-BODY-SENTINEL"), "{}", raw.body);
     assert!(!raw.body.contains("filed to self"), "{}", raw.body);
+}
+
+/// A `message` is forwarded for aoided's start records and for no other record. A secrets line's message names the secret, and a daemon line's
+/// message says why it failed: neither is in any answer byte, and the same daemon line with status `error` keeps none either. `failed` is not a
+/// status the allowlist names, so that line goes whole; the `error` line is the one that shows the rule on a daemon record. The start records
+/// (`daemon`, and `adapter.melete`, in any letter case) keep theirs.
+#[test]
+fn a_message_is_forwarded_for_a_start_record_and_for_no_other_record() {
+    let rig = Setup::all().start();
+    append(
+        &rig.audit,
+        concat!(
+            r#"{"ts":30,"door":"cli","class":"audit","command":"secrets.resolve","status":"ok","#,
+            r#""message":"SECRET-NAME-MESSAGE api-key for osaka"}"#,
+        ),
+    );
+    append(&rig.audit, r#"{"ts":31,"door":"daemon","class":"audit","command":"daemon","status":"failed","message":"FAILED-MESSAGE could not bind"}"#);
+    append(&rig.audit, r#"{"ts":32,"door":"daemon","class":"audit","command":"daemon","status":"error","message":"ERROR-MESSAGE could not bind"}"#);
+    append(
+        &rig.audit,
+        concat!(
+            r#"{"ts":33,"door":"daemon","class":"audit","command":"daemon","status":"started","#,
+            r#""message":"STARTED-MESSAGE listening on http://127.0.0.1:8710/"}"#,
+        ),
+    );
+    append(
+        &rig.audit,
+        concat!(
+            r#"{"ts":34,"door":"daemon","class":"audit","command":"ADAPTER.melete","status":"started","#,
+            r#""message":"MELETE-MESSAGE started"}"#,
+        ),
+    );
+    let answer = rig.tail("?audit=0");
+    assert_eq!(
+        streams_and_kinds(&answer),
+        pairs(&[("audit", "secrets.resolve"), ("audit", "daemon"), ("audit", "daemon"), ("audit", "ADAPTER.melete")]),
+        "the failed line is not in the allowlist, and the other four are"
+    );
+    let raw = rig.perch.get("/hub/mesh/events?audit=0");
+    for dropped in ["SECRET-NAME-MESSAGE", "FAILED-MESSAGE", "ERROR-MESSAGE", "api-key"] {
+        assert!(!raw.body.contains(dropped), "{dropped} is in the answer: {}", raw.body);
+    }
+    assert_eq!(answer["events"][0]["event"], json!({"ts": 30, "class": "audit", "door": "cli", "command": "secrets.resolve", "status": "ok"}));
+    assert_eq!(answer["events"][1]["event"], json!({"ts": 32, "class": "audit", "door": "daemon", "command": "daemon", "status": "error"}));
+    assert_eq!(answer["events"][2]["event"]["message"], "STARTED-MESSAGE listening on http://127.0.0.1:8710/", "a start record keeps its message");
+    assert_eq!(answer["events"][3]["event"]["message"], "MELETE-MESSAGE started", "so does adapter.melete's, in any case of its command");
 }
 
 /// The start refuses two paths that are one file, and says why. The audit flag and the feed flag at one path; the feed flag at the audit log's
@@ -864,7 +935,11 @@ fn a_feed_replaced_by_a_new_file_starts_again_though_the_cursor_is_inside_it() {
     let fresh = rig.daemon.with_extension("new");
     std::fs::write(
         &fresh,
-        "{\"v\":0,\"ts\":4,\"class\":\"gate\",\"kind\":\"new-one\"}\n{\"v\":0,\"ts\":5,\"class\":\"gate\",\"kind\":\"new-two\"}\n{\"v\":0,\"ts\":6,\"class\":\"gate\",\"kind\":\"new-three\"}\n",
+        concat!(
+            "{\"v\":0,\"ts\":4,\"class\":\"gate\",\"kind\":\"new-one\"}\n",
+            "{\"v\":0,\"ts\":5,\"class\":\"gate\",\"kind\":\"new-two\"}\n",
+            "{\"v\":0,\"ts\":6,\"class\":\"gate\",\"kind\":\"new-three\"}\n",
+        ),
     )
     .unwrap();
     std::fs::rename(&fresh, &rig.daemon).unwrap();

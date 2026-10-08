@@ -25,7 +25,7 @@ GET /hub/mesh/events[?audit=N][&daemon=M] the audit log's and the daemon feed's 
 available  bool                       an aoide program is configured, or there is a state folder to read; false is the page's "no Aoide here"
 aoide      {path, version}|null       the program as a `~` path and its --version (null when it did not say); null when there is no program
 daemon     {socket, ping_ms}          the socket as a `~` path (null: none known); ping_ms is how long aoided took to say ok, null for no answer
-registry   [{name, url, verified, autogate, addedAt, via, allows, grants}]     the allowlist below, in the file's order
+registry   [{name, url?, verified, autogate, addedAt, via, allows, grants}]   the allowlist below, in the file's order; `url` absent when none
 cache      [{name, age_secs, text, cut}]                   node-cache/*.json as TEXT, by name; `cut` when the file was over 64 KiB
 graph      {nodes, total, kinds, edges}|null               the stage graph, counted and listed; null when there is none
 mesh       `data` of `aoide mesh --json` | null            outbox  `data` of `aoide mail outbox --json` | null
@@ -35,12 +35,17 @@ errors     [sentence]                                      one sentence per thin
 With no aoide program and no state folder the answer is `{"available": false, ...}` with every part empty and one sentence in `errors`.
 With a state folder and no program (or the reverse) it is `available: true` with what there is, and the sentence says what is missing.
 
-`registry` is an **allowlist**: `name` (a valid node name), `url` (with any `user:pass@` taken out), `verified`, `autogate`, `addedAt`,
+`registry` is an **allowlist**: `name` (a valid node name), `url` (with any `user:pass@` taken out, or absent: see the url rule below), `verified`, `autogate`, `addedAt`,
 `via`, and the capability words as `allows` (a flat list: aoide before P-CHARTER, also read from a flat `grants` array) and `grants` (mesh
 to words: the per-mesh form after it). `pubkey`, `tokenFile`, `bearerSecret`, `hub` and every field a later Aoide adds are dropped, never
 forwarded. Both file shapes are read (`{nodes: [...]}` and `{peers: [...]}`, and a bare array). The per-mesh form is modelled from
 P-CHARTER's announcement, not observed; a shape this code does not read is left out and counted in `errors`, because `schemaVersion`
 stayed `"0"` through every change and drift would otherwise be silent.
+
+**The url rule** (the registry's, and a gate's in the feed): the cut takes the text before the last `@` of the authority (after `://`, up to the
+first `/`, `?` or `#`). Fail closed: a url that still has an `@` anywhere after the cut is **left out**, so its field is absent, not shown. That
+is a url with no `://` (`user:pass@box-a:8710/`), and one whose password has a `/` in it (`http://user:pa/ss@host/`, where the authority ends
+before the `@`). Nothing says which part before an `@` is a credential, so none is shown. A url that is not text is left out too.
 
 `cache` text is remote-authored. It is never parsed or interpreted here and travels only as a JSON string; the page must show it as text.
 
@@ -68,22 +73,23 @@ Two streams, one answer. Each stream has its own file, cursor, reset and error, 
   (`HOME` unset or empty, and no `--aoide-home`) and no flag, the stream has no file and says nothing is read.
   The stream is an **allowlist**, fail closed: a record needs an integer `ts` and a `class` of `audit` or `gate`; when present, `door` must
   be `cli`, `mcp`, `a2a` or `daemon`, `command` one word (dotted, slashed or dashed, no space, at most 64 bytes) and `status` one of `started`, `ok`,
-  `error`, `pending`, `delivered`, `proposed`. The answer keeps `ts`, `class`, `door`, `command`, `status`, and `message` **for a command
-  that is not mail's** (see below). `untrusted_data`, `admitted`, `argv` and any field a later aoide adds are never forwarded. A record that
+  `error`, `pending`, `delivered`, `proposed`. The answer keeps `ts`, `class`, `door`, `command`, `status`, and `message` **only for aoided's
+  start records** (see below). `untrusted_data`, `admitted`, `argv` and any field a later aoide adds are never forwarded. A record that
   fails a rule is dropped, not repaired.
-  - **The letter rule (`message`).** A mail command's `message` is never forwarded. A mail command is one whose first word, before a `.`,
-    `/` or `-`, is `mail` in any letter case (`mail.read`, `MAIL.read`, `mail.send`, `mail.outbox` and any other `mail.*`). The reason is an observed fact about aoide 0.0.26:
-    a `mail.read` line carries the letter's text in `message` (cut at about 526 characters), while a `mail.send` line carries no body
-    (`filed to self/minerva (msgid ...)`). The page shows a mail line's command and status only. A record with no command keeps no
-    `message`, and a `message` that is not a string is left out (the record stays). Every other command keeps its `message` (the
-    R2c-fix decision): its text is shown as it is, not stripped of any `user:pass@` in it, and it is not checked for other parties' words
-    (see the security inventory).
-  - `started` is aoided's own start record (`command` `daemon`, `door` `daemon`, `class` `audit`), which the docs describe as a `daemon
-    started` record, and the `adapter.melete started` record the docs also name. Its `message` (a listen URL, as observed) is kept.
+  - **The message rule.** A record's `message` is forwarded only for aoided's start records: `command` `daemon` or `adapter.melete` (in any
+    letter case) with `status` `started`. The docs name both: `daemon started` (`docs/Aoide-Wiki/concepts/cli/Doors-and-Nodes.md`, line 91) and
+    `adapter.melete started` (the same file, line 213). Their `message` (a listen URL, as observed) is kept. **Every other record's `message` is
+    left out**, mail's and anyone's. The rule fails closed because the docs do not make `message` free of a secret or a letter: `mail.read`
+    writes the letter's body into it (observed, cut at about 526 characters; `mail.send` writes `filed to self/minerva (msgid ...)`), and the
+    secrets broker writes its `resolve`, `put` and admin lines to this same log, each naming a secret
+    (`docs/Aoide-Wiki/concepts/orchestration/Secrets-Broker.md`, lines 46-47 and 122). Mail is no special case: `mail.read`, `MAIL.read` and
+    `Mail/read` keep no `message`, as any other command but a start record keeps none. A record with no command or status keeps no `message`,
+    and a `message` that is not a string is left out (the record stays). The page draws a `message` only where one is sent.
   - The shape of the real aoide 0.0.26 log, as the orchestrator observed it (structure only): `{"ts": <integer>, "door": "daemon" | "cli",
     "class": "audit", "command": "daemon" | "a2a.serve" | ..., "status": "started" | "ok" | ..., "message": <text>}`. The docs do not
     give `ts`'s unit; this code reads only the integer.
-  - Dropped, and why: a `status` or `door` the list does not name. The docs use other audit labels too (`unmailed`, `attribution-drift`,
+  - Dropped, and why: a `status` or `door` the list does not name (a daemon line with status `failed` is one, and goes whole, message and all).
+    The docs use other audit labels too (`unmailed`, `attribution-drift`,
     `auto-deny-on-code-mismatch`), and none of them is on the list, so a record with one is hidden until a reviewer adds it. A `command`
     with a space in it (`node add osaka`), which is a line of arguments and not a command word. A `class` of `secret`, `notification`,
     `rice` or `content`. A record with no `ts`, a `ts` that is not a non-negative integer, or a line that is not a JSON object.
@@ -100,7 +106,7 @@ Two streams, one answer. Each stream has its own file, cursor, reset and error, 
   The feed keeps only what aoide's docs name, and only for two classes: `audit` and `gate`, with an integer `ts`. Of a record it keeps the
   top-level `v`, `ts`, `class`, `kind` and `source`, and of its `payload`: for a `gate` record `id`, `name`, `originAddr`, `url` and `direction`
   (Aoide's CONTRACTS.md, at its repository root, "Pairing events feed (P-P5)": "payload carries fields BY NAME ONLY"), where a `url` is kept
-  without its `user:pass@` (as the registry's is); for an `audit` record
+  without its `user:pass@`, or left out when an `@` is still in it (the url rule above; a `url` that is not text is left out too); for an `audit` record
   `file` (`docs/architecture/AOIDED.md`, "The first producer: the hand-edit watcher"). Everything else is dropped, so a field a later aoided
   adds never reaches the page: a free-text field at either level, a gate's `sas`, a `node` or `note`, all of them. `secret`, `notification`,
   `rice` and `content` records, records with no class, records with no `ts`, and lines that are not objects are dropped as well.
@@ -122,9 +128,10 @@ Two streams, one answer. Each stream has its own file, cursor, reset and error, 
   the file is fixed the next poll reads its start). **The other stream still answers**, and the answer is a 200. `files` names each path as
   a `~` path, or `null` where a stream has none (a relative flag is none).
 - **The start refuses one file for both feeds.** `main.rs` calls [`feeds_apart`] before anything under `--home` is made. The audit log and the
-  daemon feed are each resolved as the view resolves them (the flag, else the default), and when they are the same path once symlinks and `..`
-  are resolved, or the same device and inode (a hard link), the perch refuses to start, and says so in a sentence that names the path and the
-  flags. This covers `--aoide-audit-log` and `--aoide-daemon-events` at one path, the feed flag at the audit log's default (`<home>/log`), and
+  daemon feed are each resolved as the view resolves them (the flag, else the default), and when they are the same path once every symlink on the
+  way is followed, or the same device and inode (a hard link), the perch refuses to start, and says so in a sentence that names the path and the
+  flags. A link is followed one hop at a time, so a dangling link to a feed aoided has not written yet is that path, and a chain of more than 40
+  links, or a loop, is refused with a sentence of its own (the perch cannot tell which file it names). This covers `--aoide-audit-log` and `--aoide-daemon-events` at one path, the feed flag at the audit log's default (`<home>/log`), and
   `AOIDE_DAEMON_EVENTS` at the audit log's path with no feed flag. The reason: aoide appends its audit records to the audit log, so one file for
   both would put them into the feed aoided writes.
 - Any other query (`after=`, a repeated key, a key that is neither `audit` nor `daemon`, a value that is not digits, more than 20 digits,
@@ -187,8 +194,15 @@ The events are not cached: each poll reads the files at their cursors.
 `tests/mesh.rs` runs a real perch against `fake_aoide` (the tests' stand-in, `tests/fixtures/aoide/`) with a temporary aoide home, a
 `UnixListener` standing in for aoided, and checks the fake's log for exactly `--version`, `mesh --json` and `mail outbox --json`. The
 module's own unit tests cover the projections (both registry shapes, the allowlist, the graph, the cache), the two event streams (the
-audit allowlist and the letter rule, the daemon feed's fields, the merge, the cursors, the resets and the identity a poll keeps, the 64 KiB
+audit allowlist and the message rule, the daemon feed's fields and the url rule, the merge, the cursors, the resets and the identity a poll keeps, the 64 KiB
 window, the query), the paths each stream resolves to (and that no default is ever a relative path), the start's check that the two feeds
-are two files, and the TTL cache. `tests/mesh.rs` runs the events end to end: both streams with their labels, a stream's truncate resetting only
-itself, a feed replaced by a new file, a link or a FIFO at either path (the other stream still answers), a mail letter in no answer byte,
-the runner's environment (the audit flag and never the feed), the defaults, and the start refused with both feeds at one file.
+are two files (a dangling link is followed to its path, and a chain of more than 40 links is refused), and the TTL cache. `tests/mesh.rs` runs
+the events end to end: both streams with their labels, a stream's truncate resetting only itself, a feed replaced by a new file, a link or a
+FIFO at either path (the other stream still answers), a mail letter in no answer byte, a message only on a start record, the runner's
+environment (the audit flag and never the feed), the defaults, and the start refused with both feeds at one file.
+
+**Accepted without a live test: a relative `XDG_RUNTIME_DIR`.** A relative or empty value is none, for the view's default feed and for the
+runner's `XDG_RUNTIME_DIR` (and the runner removes the perch's own from each child's environment). That case is covered by the unit tests
+`a_relative_or_empty_runtime_dir_is_none_as_an_unset_one_is` (`src/aoide/mod.rs`) and `the_default_feed_is_never_a_relative_path` (this module),
+and by `tests/aoide.rs`'s `no_path_lookup_and_no_ambient_identity` (a child's environment). It is not checked on a live perch: `tests/common` pins
+`XDG_RUNTIME_DIR` to a temp dir after a test's own environment, so a relative value cannot be set on a running perch from a test.

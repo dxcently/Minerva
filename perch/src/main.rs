@@ -136,7 +136,8 @@ async fn main() -> Result<()> {
     absolute_file("--aoide-audit-log", cli.aoide_audit_log.as_deref())?;
     absolute_file("--aoide-daemon-events", cli.aoide_daemon_events.as_deref())?;
     // The two feeds must be two files: when they are one, aoide's audit records would land in the feed aoided writes, so the start is refused.
-    perch::mesh::feeds_apart(cli.aoide_home.as_deref(), cli.aoide_audit_log.as_deref(), cli.aoide_daemon_events.as_deref()).map_err(anyhow::Error::msg)?;
+    perch::mesh::feeds_apart(cli.aoide_home.as_deref(), cli.aoide_audit_log.as_deref(), cli.aoide_daemon_events.as_deref())
+        .map_err(anyhow::Error::msg)?;
 
     let member = perch::config::member_config_path();
     let resolved = perch::config::resolve(cli.home.as_deref(), cli.sessions_dir, cli.eidolon_config, &member)?;
