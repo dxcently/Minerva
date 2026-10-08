@@ -85,8 +85,8 @@ struct Cli {
     /// Absolute only.
     #[arg(long, value_name = "PATH")]
     aoide_audit_log: Option<PathBuf>,
-    /// aoided's events feed, which the mesh view tails and nothing writes. Default: `$AOIDE_DAEMON_EVENTS` when absolute, else
-    /// `$XDG_RUNTIME_DIR/aoide/events.jsonl`. Absolute only.
+    /// aoided's events feed, which aoided writes and the mesh view only tails; the perch never writes it. Default:
+    /// `$AOIDE_DAEMON_EVENTS` when absolute, else `$XDG_RUNTIME_DIR/aoide/events.jsonl`. Absolute only.
     #[arg(long, value_name = "PATH")]
     aoide_daemon_events: Option<PathBuf>,
     /// The `minerva` binary the install routes ask, as an absolute path. Default: the one beside this perch, when there is one.

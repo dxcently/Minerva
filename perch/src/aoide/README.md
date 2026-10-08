@@ -39,12 +39,14 @@ Nothing that touches a node has a variant: no `node list`, `session`, `send`, `p
 
 - **Never a `PATH` lookup.** `Aoide::bin` is `--aoide` (else `~/.local/bin/aoide` when executable; `main.rs` decides), and `run` refuses a
   relative one. The operator has a stale 0.0.25 in `~/.cargo/bin`, ahead of the real one on `PATH`.
-- **Its environment** is the perch's with every `AOIDE_*` variable removed, then `AOIDE_ROOT` (`root`, from `--aoide-home`),
-  `AOIDE_AUDIT_LOG` (`audit_log`, from `audit_flag`, which is `--aoide-audit-log` and only when that flag was given),
+- **Its environment** is the perch's with every `AOIDE_*` variable and `XDG_RUNTIME_DIR` removed, then `AOIDE_ROOT` (`root`, from
+  `--aoide-home`), `AOIDE_AUDIT_LOG` (`audit_log`, from `audit_flag`, which is `--aoide-audit-log` and only when that flag was given),
   `AOIDE_DAEMON_SOCKET` (`daemon_socket`) and `XDG_RUNTIME_DIR` (`runtime_dir`, read by `runtime_dir()`, the one reader the mesh view's
-  default socket and feed also use) from the fields. Each one that is given must be absolute: a relative one is `Error::Refused` on every
-  call, so nothing runs with it (and `main.rs` refuses a relative `--aoide-audit-log` and `--aoide-daemon-events` at the start, and the two
-  feeds at one file, `mesh::feeds_apart`). The mesh view reads the same flag through the same `audit_flag`, so the file aoide appends to and
+  default socket and feed also use) from the fields. `runtime_dir()` gives only an absolute value: a relative or empty `XDG_RUNTIME_DIR` is
+  none, so the runner gives no call one and the view takes no default from it (`absolute_dir`, unit test
+  `a_relative_or_empty_runtime_dir_is_none_as_an_unset_one_is`). The other three that are given must be absolute: a relative one is
+  `Error::Refused` on every call, so nothing runs with it (and `main.rs` refuses a relative `--aoide-audit-log` and `--aoide-daemon-events`
+  at the start, and the two feeds at one file, `mesh::feeds_apart`). The mesh view reads the same flag through the same `audit_flag`, so the file aoide appends to and
   the file the view tails are one file. The daemon's events feed (`--aoide-daemon-events`) is not a field of the runner: no call is ever
   given its path, under any name. Why the removal: a perch started inside a conducted session would hand its
   `AOIDE_SESSION_ID` to every call, and an ambient `AOIDE_STATE_DIR` moves the mailbase away from `<root>/state/mail/base.jsonl`, the file

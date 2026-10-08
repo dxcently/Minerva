@@ -309,6 +309,8 @@ fn no_path_lookup_and_no_ambient_identity() {
         .env("AOIDE_ROOT", "/ambient/root")
         .env("AOIDE_AUDIT_LOG", "/ambient/audit.log")
         .env("AOIDE_DAEMON_SOCKET", "/ambient/aoided.sock")
+        // A relative runtime dir in the perch's own environment: it is none for the runner, so no call is given it (and none may inherit it).
+        .env("XDG_RUNTIME_DIR", "run/user")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -329,6 +331,9 @@ fn no_path_lookup_and_no_ambient_identity() {
     for call in &calls {
         // Whatever the perch itself was started under, the child has none of it: the paths are the runner's to give (and it gave none).
         assert_eq!(call["aoide_env"], serde_json::json!({}), "{call}");
+        // The relative `XDG_RUNTIME_DIR` above reaches no call: the child has no runtime dir, not the relative one (mutation: drop the
+        // `env_remove` in the runner, and every call reports `run/user`).
+        assert!(call["xdg_runtime_dir"].is_null(), "{call}");
     }
     let sessions: Vec<Option<&str>> = calls.iter().map(|call| call["session"].as_str()).collect();
     assert_eq!(sessions, [None, None, None, Some(READER), None, None], "the ambient session id reached no call, and the reader reached the read");

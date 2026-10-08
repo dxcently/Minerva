@@ -292,10 +292,11 @@ test('a gate payload draws the first four of its named fields that hold text, a 
 
 test('a mail command\'s message is never drawn, and any other command\'s message is', () => {
   const audit = (command, extra = {}) => V.eventLine({ stream: 'audit', event: { class: 'audit', command, door: 'cli', status: 'ok', ts: 1, ...extra } }).text;
-  for (const command of ['mail.read', 'mail.send', 'mail.outbox', 'mail/read', 'mail-read', 'mail']) {
+  for (const command of ['mail.read', 'mail.send', 'mail.outbox', 'mail/read', 'mail-read', 'mail', 'MAIL.read', 'Mail/read']) {
     assert.equal(audit(command, { message: 'LETTER-SENTINEL dear osaka' }), `audit ${command} (cli) ok`, command);
   }
   assert.equal(audit('mailbox.read', { message: 'kept' }), 'audit mailbox.read (cli) ok kept', 'a word that starts with mail is not mail');
+  assert.equal(audit('MAILER.read', { message: 'kept' }), 'audit MAILER.read (cli) ok kept', 'an upper-case word that starts with mail is not mail either');
   assert.equal(audit('daemon', { door: 'daemon', message: 'aoided started, listening on http://127.0.0.1:8710/' }), 'audit daemon (daemon) ok aoided started, listening on http://127.0.0.1:8710/', 'the start record keeps its message');
   assert.ok(audit('node.add', { message: 'x'.repeat(300) }).length < 150, 'a message is cut short');
 });

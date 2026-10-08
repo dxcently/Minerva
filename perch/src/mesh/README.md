@@ -67,12 +67,12 @@ Two streams, one answer. Each stream has its own file, cursor, reset and error, 
   The two readers are one function, `aoide::audit_flag`, so the runner and this view cannot disagree about the flag. With no home at all
   (`HOME` unset or empty, and no `--aoide-home`) and no flag, the stream has no file and says nothing is read.
   The stream is an **allowlist**, fail closed: a record needs an integer `ts` and a `class` of `audit` or `gate`; when present, `door` must
-  be `cli`, `mcp`, `a2a` or `daemon`, `command` one word (dotted or slashed, no space, at most 64 bytes) and `status` one of `started`, `ok`,
+  be `cli`, `mcp`, `a2a` or `daemon`, `command` one word (dotted, slashed or dashed, no space, at most 64 bytes) and `status` one of `started`, `ok`,
   `error`, `pending`, `delivered`, `proposed`. The answer keeps `ts`, `class`, `door`, `command`, `status`, and `message` **for a command
   that is not mail's** (see below). `untrusted_data`, `admitted`, `argv` and any field a later aoide adds are never forwarded. A record that
   fails a rule is dropped, not repaired.
   - **The letter rule (`message`).** A mail command's `message` is never forwarded. A mail command is one whose first word, before a `.`,
-    `/` or `-`, is `mail` (`mail.read`, `mail.send`, `mail.outbox` and any other `mail.*`). The reason is an observed fact about aoide 0.0.26:
+    `/` or `-`, is `mail` in any letter case (`mail.read`, `MAIL.read`, `mail.send`, `mail.outbox` and any other `mail.*`). The reason is an observed fact about aoide 0.0.26:
     a `mail.read` line carries the letter's text in `message` (cut at about 526 characters), while a `mail.send` line carries no body
     (`filed to self/minerva (msgid ...)`). The page shows a mail line's command and status only. A record with no command keeps no
     `message`, and a `message` that is not a string is left out (the record stays). Every other command keeps its `message` (the
@@ -94,10 +94,13 @@ Two streams, one answer. Each stream has its own file, cursor, reset and error, 
   else a sibling of the daemon socket (`docs/Aoide-Wiki/concepts/cli/Doors-and-Nodes.md`, "aoide events tail"; `docs/architecture/AOIDED.md`,
   "aoided's own feed and record shape"). The two agree while the socket is the default one. A `--aoide-daemon-socket` somewhere else moves
   aoide's path and not this one, so pass `--aoide-daemon-events` with it. The runner's `XDG_RUNTIME_DIR` is the same variable, read by the same
-  function (`aoide::runtime_dir`): a relative one is refused by the runner on every call, and names no file here.
+  function (`aoide::runtime_dir`): a relative or empty one is **none**, as an unset one is, for the runner and for this view alike. The runner
+  gives aoide no `XDG_RUNTIME_DIR` then, and does not let the perch's own (relative) one reach the child either, so no call and no default
+  path sees a value under the working directory.
   The feed keeps only what aoide's docs name, and only for two classes: `audit` and `gate`, with an integer `ts`. Of a record it keeps the
   top-level `v`, `ts`, `class`, `kind` and `source`, and of its `payload`: for a `gate` record `id`, `name`, `originAddr`, `url` and `direction`
-  (Aoide's CONTRACTS.md, at its repository root, "Pairing events feed (P-P5)": "payload carries fields BY NAME ONLY"); for an `audit` record
+  (Aoide's CONTRACTS.md, at its repository root, "Pairing events feed (P-P5)": "payload carries fields BY NAME ONLY"), where a `url` is kept
+  without its `user:pass@` (as the registry's is); for an `audit` record
   `file` (`docs/architecture/AOIDED.md`, "The first producer: the hand-edit watcher"). Everything else is dropped, so a field a later aoided
   adds never reaches the page: a free-text field at either level, a gate's `sas`, a `node` or `note`, all of them. `secret`, `notification`,
   `rice` and `content` records, records with no class, records with no `ts`, and lines that are not objects are dropped as well.
@@ -140,7 +143,8 @@ Two streams, one answer. Each stream has its own file, cursor, reset and error, 
   nothing. **What the perch writes:** the perch never opens either event file for writing. But each aoide call it makes is a command aoide
   runs, and aoide appends its own audit records for the commands it audits, to the audit log: the flag's file when `--aoide-audit-log` is
   given (the runner passes it as `AOIDE_AUDIT_LOG`), else aoide's default under `<--aoide-home or ~/.aoide>`. Which commands aoide audits is
-  aoide's rule (the mail commands and the daemon's start were observed; a usage-error exit writes none). How often: the snapshot's three
+  aoide's rule (`mail.read` and `mail.send` were observed, and the daemon's start; `mail.outbox` is expected from the docs and was not observed;
+  a usage-error exit writes none). How often: the snapshot's three
   calls are each cached for 60 s, so any number of open tabs cost at most one set of them a minute; the mesh's `nodes` for mail is that
   same cached report; mail's own calls (send, read, outbox) run once per request; the events poll runs no aoide call at all.
 - **The daemon**: one connection to the socket (`--aoide-daemon-socket`, else `$XDG_RUNTIME_DIR/aoide/aoided.sock`), one line

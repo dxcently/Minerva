@@ -16,9 +16,9 @@
 //! a command word, so `--subject status` is not safe and `--subject=status` is), and `--` stands before the text, so a letter that
 //! starts with `--` or says `--help` is a letter and not a flag.
 //!
-//! **The child's environment** is the perch's with every `AOIDE_*` variable removed, and then only what the perch means set: the four
-//! paths of [`Aoide`] and, for `mail read` alone, the reader identity [`READER`]. A perch started from inside a conducted session would
-//! otherwise hand its `AOIDE_SESSION_ID` to every call (and read mail as that session), and an ambient `AOIDE_STATE_DIR` would move the
+//! **The child's environment** is the perch's with every `AOIDE_*` variable and `XDG_RUNTIME_DIR` removed, and then only what the perch
+//! means set: the four paths of [`Aoide`] and, for `mail read` alone, the reader identity [`READER`]. A perch started from inside a conducted
+//! session would otherwise hand its `AOIDE_SESSION_ID` to every call (and read mail as that session), and an ambient `AOIDE_STATE_DIR` would move the
 //! mailbase away from `<root>/state/mail/base.jsonl`, which is the file the receive loop stats to decide whether to read at all.
 //!
 //! **Bounded.** stdin is closed, stdout is capped ([`STDOUT_CAP`]), stderr keeps only its first [`STDERR_KEEP`] bytes (the rest is read
@@ -105,11 +105,16 @@ pub fn audit_flag(opts: &Options) -> Option<PathBuf> {
     opts.aoide_audit_log.clone()
 }
 
-/// `$XDG_RUNTIME_DIR` as the perch was started with it, or none when it is not set: the one reader of that variable. The runner gives it to
-/// each call and refuses a relative one ([`Aoide::env_for`]); the mesh view takes its default daemon socket and feed from it only when it is
-/// absolute, so no path under the working directory is ever opened. Both read it here, so they agree on the value.
+/// `$XDG_RUNTIME_DIR` as the perch was started with it, or none when it is not set or is not absolute: the one reader of that variable. A
+/// relative or empty value is treated as unset, by the runner and by the mesh view alike, so no path under the working directory is ever given
+/// to aoide or opened. Both read it here, so they agree on the value.
 pub fn runtime_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+    absolute_dir(std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+/// The one rule for a runtime dir's value: absolute, else none ([`runtime_dir`] is this on the process's variable).
+fn absolute_dir(value: Option<OsString>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|dir| dir.is_absolute())
 }
 
 impl Aoide {
@@ -195,6 +200,9 @@ impl Aoide {
                 command.env_remove(key);
             }
         }
+        // The perch's own `XDG_RUNTIME_DIR` is not inherited either: the child gets the runner's value (absolute, or none), so a relative
+        // one in the perch's environment reaches no call.
+        command.env_remove("XDG_RUNTIME_DIR");
         command.envs(env);
         let mut child = command.spawn().map_err(|e| Error::Spawn(format!("{}: {e}", self.bin.display())))?;
         let group = child.id();
@@ -778,6 +786,18 @@ mod tests {
             Aoide::new("/opt/aoide").runtime_dir(Some("run".into())),
         ] {
             assert!(matches!(relative.env_for(&Shape::MeshJson), Err(Error::Refused(why)) if why.contains("absolute")));
+        }
+    }
+
+    /// The perch's runtime dir is absolute or none: a relative or empty `XDG_RUNTIME_DIR` is what an unset one is, for the runner (no
+    /// `XDG_RUNTIME_DIR` in any call) and for the mesh view (no default path under the working directory). Mutation: keep a relative value
+    /// (`absolute_dir` without the filter), and the relative cases below go red.
+    #[test]
+    fn a_relative_or_empty_runtime_dir_is_none_as_an_unset_one_is() {
+        assert_eq!(absolute_dir(Some("/run/user/1000".into())), Some(PathBuf::from("/run/user/1000")));
+        assert_eq!(absolute_dir(None), None);
+        for not in ["", "run/user", "./run", "../run"] {
+            assert_eq!(absolute_dir(Some(not.into())), None, "{not:?}");
         }
     }
 

@@ -254,8 +254,8 @@ export function clock(ts) {
 const PAYLOAD_KEYS = { gate: ['id', 'name', 'originAddr', 'url', 'direction'], audit: ['file'] };
 
 // A mail command's `message` is a letter's text, so it is never drawn (the perch does not send it either). A mail command is one whose first
-// word, before a `.`, `/` or `-`, is `mail`: the same rule the perch applies.
-const isMail = (command) => typeof command === 'string' && /^mail([./-]|$)/.test(command);
+// word, before a `.`, `/` or `-`, is `mail` in any letter case: the same rule the perch applies.
+const isMail = (command) => typeof command === 'string' && /^mail([./-]|$)/i.test(command);
 
 // A payload as `key=value` words: the first four of the class's fields whose value is text, a number or a boolean, each cut short.
 function payloadText(cls, p) {

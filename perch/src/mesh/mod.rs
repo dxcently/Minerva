@@ -842,7 +842,7 @@ struct Answer {
 /// `source` (with `ts` and `class`, which are always kept). The payload of a `gate` record: `id`, `name`, `originAddr`, `url` and `direction`
 /// (Aoide's CONTRACTS.md, at its repository root, "Pairing events feed (P-P5)": "payload carries fields BY NAME ONLY"). The payload of an `audit` record:
 /// `file` (docs/architecture/AOIDED.md, "The first producer: the hand-edit watcher"). Anything else, at either level, is dropped, so a field a
-/// later aoided adds never reaches the page.
+/// later aoided adds never reaches the page. A `url` is kept without its `user:pass@` ([`scrubbed`]).
 const FEED_TOP: [&str; 3] = ["v", "kind", "source"];
 const GATE_PAYLOAD: [&str; 5] = ["id", "name", "originAddr", "url", "direction"];
 const AUDIT_PAYLOAD: [&str; 1] = ["file"];
@@ -864,10 +864,19 @@ fn feed_keep(record: &Value) -> Option<Value> {
     if let Some(payload) = object.get("payload").and_then(Value::as_object) {
         let names: &[&str] = if class == "gate" { &GATE_PAYLOAD } else { &AUDIT_PAYLOAD };
         let shown: serde_json::Map<String, Value> =
-            names.iter().filter_map(|name| payload.get(*name).map(|value| (name.to_string(), value.clone()))).collect();
+            names.iter().filter_map(|name| payload.get(*name).map(|value| (name.to_string(), scrubbed(name, value)))).collect();
         kept.insert("payload".into(), Value::Object(shown));
     }
     Some(Value::Object(kept))
+}
+
+/// A payload field as the answer is given it. A `url` is taken out of its `user:pass@` the way the registry's is ([`without_userinfo`]), so a
+/// gate's credentials never reach the page; every other field is as the record has it.
+fn scrubbed(name: &str, value: &Value) -> Value {
+    match (name, value.as_str()) {
+        ("url", Some(url)) => Value::String(without_userinfo(url)),
+        _ => value.clone(),
+    }
 }
 
 /// The audit log, through an allowlist, and failing closed. The docs (CONTRACTS.md and the Aoide wiki's `concepts/cli/Doors-and-Nodes.md`,
@@ -880,7 +889,7 @@ fn feed_keep(record: &Value) -> Option<Value> {
 /// - what is kept is `ts`, `class`, `door`, `command` and `status`, and `message` for a command that is not mail's. `untrusted_data` is another's
 ///   text and is never forwarded. A mail command's `message` is never forwarded either: `mail.read` writes the letter's text into it (observed,
 ///   cut at about 526 characters), so a letter reaches no answer. The rule is fail-closed: a mail command is any command whose first word, before
-///   a `.`, `/` or `-`, is `mail`; a record with no command, or a `message` that is not a string, keeps no `message`.
+///   a `.`, `/` or `-`, is `mail` in any letter case; a record with no command, or a `message` that is not a string, keeps no `message`.
 fn audit_keep(record: &Value) -> Option<Value> {
     let object = record.as_object()?;
     let ts = object.get("ts")?.as_u64()?;
@@ -904,9 +913,10 @@ fn audit_keep(record: &Value) -> Option<Value> {
     Some(Value::Object(kept))
 }
 
-/// Whether a command is one of mail's: `mail.read`, `mail.send`, `mail.outbox` and any other `mail.*`, and the same words with `/` or `-`.
+/// Whether a command is one of mail's: `mail.read`, `mail.send`, `mail.outbox` and any other `mail.*`, and the same words with `/` or `-`, in any
+/// letter case (`MAIL.read` is mail's too), so the rule does not depend on how a command is spelt.
 fn mail_command(command: &str) -> bool {
-    command.split(['.', '/', '-']).next() == Some("mail")
+    command.split(['.', '/', '-']).next().is_some_and(|word| word.eq_ignore_ascii_case("mail"))
 }
 
 /// A dotted command word as the audit log writes one: a letter, then letters, digits, `.`, `/` or `-`, at most [`COMMAND_MAX`]. No space,
@@ -1249,6 +1259,15 @@ mod tests {
         assert_eq!(audit, Some(json!({"v": 0, "ts": 4, "class": "audit", "kind": "hand-edit", "source": "aoided", "payload": {"file": "sessions.json"}})));
         // A gate's payload is not an audit's: a `name` there is not kept.
         assert_eq!(feed_keep(&json!({"ts": 5, "class": "audit", "payload": {"name": "x"}})), Some(json!({"ts": 5, "class": "audit", "payload": {}})));
+        // A gate's url with a `user:pass@` is kept without it, as the registry's is: the password is in no kept field, and no byte of the answer.
+        let creds = feed_keep(&json!({"ts": 6, "class": "gate", "kind": "pair-parked",
+            "payload": {"url": "http://user:pass@box-a:8710/", "name": "box-a"}}));
+        assert_eq!(creds, Some(json!({"ts": 6, "class": "gate", "kind": "pair-parked", "payload": {"url": "http://box-a:8710/", "name": "box-a"}})));
+        let none = || Tail { events: Vec::new(), next: 0, reset: false, seen: None };
+        let daemon = Tail { events: creds.into_iter().collect(), next: 0, reset: false, seen: None };
+        let nothing = || Streams { audit: None, daemon: None };
+        let served = serde_json::to_string(&answer(none(), daemon, nothing(), nothing())).unwrap();
+        assert!(served.contains("http://box-a:8710/") && !served.contains("pass"), "{served}");
         for bad in [json!({"class": "gate", "kind": "no-ts"}), json!({"ts": "7", "class": "gate"}), json!({"ts": 7.5, "class": "gate"}), json!({"ts": -1, "class": "gate"})] {
             assert_eq!(feed_keep(&bad), None, "{bad}");
         }
@@ -1491,7 +1510,9 @@ mod tests {
     /// Mutation: forward `message` for every command, or match `mail.` only, and the mail cases below go red.
     #[test]
     fn a_mail_letter_never_reaches_an_answer_and_another_commands_message_does() {
-        for mail in ["mail.read", "mail.send", "mail.outbox", "mail.anything-new", "mail/read", "mail-read", "mail"] {
+        for mail in [
+            "mail.read", "mail.send", "mail.outbox", "mail.anything-new", "mail/read", "mail-read", "mail", "MAIL.read", "Mail/read", "mAiL-send",
+        ] {
             let kept = audit_keep(&json!({"ts": 1, "class": "audit", "command": mail, "status": "ok", "message": "LETTER-SENTINEL body"}));
             assert_eq!(kept, Some(json!({"ts": 1, "class": "audit", "command": mail, "status": "ok"})), "{mail}");
         }
@@ -1502,6 +1523,7 @@ mod tests {
         assert_eq!(audit_keep(&json!({"ts": 1, "class": "audit", "message": "no command"})), Some(json!({"ts": 1, "class": "audit"})));
         assert_eq!(audit_keep(&json!({"ts": 1, "class": "audit", "command": "send", "message": 7})), Some(json!({"ts": 1, "class": "audit", "command": "send"})));
         assert!(!mail_command("daemon") && !mail_command("mailer.x") && mail_command("mail.read") && mail_command("mail/x"));
+        assert!(mail_command("MAIL.read") && mail_command("Mail/read") && !mail_command("MAILER.read") && !mail_command(""));
     }
 
     #[test]

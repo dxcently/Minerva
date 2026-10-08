@@ -499,6 +499,22 @@ fn make_fifo(path: &Path) {
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo {}", path.display());
 }
 
+/// The perch asked to start and expected to refuse: its whole output. A perch that starts when it should not serves forever, so `output()` would
+/// never return and the suite would hang rather than fail. This polls for the exit and, at 10 s, kills the child and fails with what it printed.
+fn refusal_of(mut command: std::process::Command) -> std::process::Output {
+    let mut child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("running the perch binary");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().expect("polling the perch").is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let out = child.wait_with_output().expect("collecting the perch's output");
+            panic!("the perch started, and was killed after 10 s; it should have refused. Its stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().expect("collecting the perch's output")
+}
+
 /// Both streams in one answer: each record by `ts`, the audit log first at a tie, and each record with the stream it came from. A feed
 /// record is as the feed holds it; an audit record is the allowlist's, and its `message` is not in it.
 #[test]
@@ -786,8 +802,9 @@ fn a_mail_letter_is_in_no_answer_byte() {
     append(&rig.audit, r#"{"ts":10,"door":"cli","class":"audit","command":"mail.read","status":"ok","message":"LETTER-BODY-SENTINEL dear minerva, the body"}"#);
     append(&rig.audit, r#"{"ts":11,"door":"cli","class":"audit","command":"mail.outbox","status":"ok","message":"LETTER-BODY-SENTINEL in the outbox"}"#);
     append(&rig.audit, r#"{"ts":12,"door":"cli","class":"audit","command":"mail.send","status":"ok","message":"filed to self/minerva (msgid abc)"}"#);
+    append(&rig.audit, r#"{"ts":13,"door":"cli","class":"audit","command":"MAIL.read","status":"ok","message":"LETTER-BODY-SENTINEL in capitals"}"#);
     let answer = rig.tail("?audit=0");
-    assert_eq!(streams_and_kinds(&answer), pairs(&[("audit", "mail.read"), ("audit", "mail.outbox"), ("audit", "mail.send")]));
+    assert_eq!(streams_and_kinds(&answer), pairs(&[("audit", "mail.read"), ("audit", "mail.outbox"), ("audit", "mail.send"), ("audit", "MAIL.read")]));
     assert_eq!(answer["events"][0]["event"], json!({"ts": 10, "class": "audit", "door": "cli", "command": "mail.read", "status": "ok"}));
     let raw = rig.perch.get("/hub/mesh/events?audit=0");
     assert!(!raw.body.contains("LETTER-BODY-SENTINEL"), "{}", raw.body);
@@ -818,7 +835,7 @@ fn a_start_with_both_feeds_at_one_file_is_refused_with_a_sentence() {
         for (key, value) in env {
             command.env(key, value);
         }
-        let out = command.output().expect("running the perch binary");
+        let out = refusal_of(command);
         assert!(!out.status.success(), "{args:?} {env:?} must not start");
         assert!(!same.exists() || std::fs::metadata(&same).unwrap().len() == 0, "nothing is written to the feed");
         String::from_utf8_lossy(&out.stderr).into_owned()
