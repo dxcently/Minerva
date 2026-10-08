@@ -32,7 +32,10 @@ aoide 0.0.26 (a temp root, self-mail, `env -i`). The fixtures keep those structu
 node names); no raw output is copied. Not observed, because no node is paired: a remote send, `--hold`, a non-empty outbox entry, a
 remote letter's delivery object, and a remote receipt. Those are modelled from the vendored `aoide-core` (0.0.23) source and the field
 names in the plan, and the entries that depend on them say so. A self send and a remote one answer the same `--subject` shape (the
-`self` and `osaka` entries of `send.json`), and the perch reads `data.recipients[0]` for both.
+`self` and `osaka` entries of `send.json`), and the perch reads `data.recipients[0]` for both. The `refused`, `silent` and `partial` entries of
+`send.json` are made-up cases for the perch's three other send branches (aoide will not take the letter: a 409 and no row; the recipient has
+no msgid: a 502 and an unknown row; the send is not complete: a 202 with a warning). None of them was printed by a real aoide. The
+`_` text of `schema.json` says which of its fields the perch reads (`aoide`, and `commands` against `aoide::USED`).
 
 **The no-subject shape is not in this directory.** A send without `--subject` answers `data.envelope` (with its msgid), `receivedAt`, `ring`,
 `seq`, `type` and `via`, with no `recipients`, and no `disposition` anywhere (both observed). The perch always sends `--subject`, and no

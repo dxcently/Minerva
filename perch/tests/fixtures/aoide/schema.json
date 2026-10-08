@@ -1,5 +1,5 @@
 {
-  "_": "What `aoide schema` prints, cut to the commands and flags the perch sends. The top-level fields and the flag names are the 0.0.26 ones; the summaries and descriptions are made up. The version is the only field the perch reads at the top.",
+  "_": "What `aoide schema` prints, cut to the commands and flags the perch sends. `schemaVersion`, `aoide` (the version) and `commands` are the 0.0.26 fields, and the flag names are the 0.0.26 ones (checked against the observed schema). The perch reads `aoide`, and checks each command's `path` and each flag `name` against its own list (`aoide::USED`). The summaries and args are made up, and `stageNotesVersion` is left out.",
   "schemaVersion": "0",
   "aoide": "0.0.26",
   "commands": [

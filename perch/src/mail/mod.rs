@@ -244,16 +244,21 @@ pub(crate) fn refused(state: &State) -> Option<String> {
 /// usable aoide, else the sentence for the person that says why mail is off. Runs `aoide schema` when the answer is old.
 pub(crate) async fn usable(ctx: &Ctx) -> Result<Aoide, String> {
     let aoide = Aoide::from_options(&ctx.opts).map_err(|e| e.to_string())?;
-    let mut checked = ctx.mail.schema.lock().await;
-    if let Some((_, outcome)) = checked.as_ref().filter(|(at, _)| at.elapsed() < SCHEMA_TTL) {
-        return outcome.clone().map(|()| aoide);
+    // The lock is held for the cache only. `aoide schema` can take up to its timeout, and a page's `GET` waits on this same lock
+    // (`schema_refusal`), so it is never held across the call: two checks at once are two calls, and the later answer is the one kept.
+    let cached = {
+        let checked = ctx.mail.schema.lock().await;
+        checked.as_ref().filter(|(at, _)| at.elapsed() < SCHEMA_TTL).map(|(_, outcome)| outcome.clone())
+    };
+    if let Some(outcome) = cached {
+        return outcome.map(|()| aoide);
     }
     let outcome = match aoide.schema_check().await {
         Ok(_) => Ok(()),
         Err(Error::Refused(why)) => Err(why),
         Err(other) => Err(format!("aoide's schema could not be read: {other}")),
     };
-    *checked = Some((Instant::now(), outcome.clone()));
+    *ctx.mail.schema.lock().await = Some((Instant::now(), outcome.clone()));
     outcome.map(|()| aoide)
 }
 

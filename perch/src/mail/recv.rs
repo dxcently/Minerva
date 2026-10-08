@@ -1504,6 +1504,30 @@ mod tests {
     }
 
     #[test]
+    fn a_letter_on_file_is_not_written_again_when_the_cards_are_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("mail");
+        mail::ensure_dir(&folder).unwrap();
+        let paths = Paths {
+            dir: folder.clone(),
+            received: folder.join("received.jsonl"),
+            cards: folder.join("cards.json"),
+            sent: folder.join("sent.jsonl"),
+            tombs: folder.join("dismissed.jsonl"),
+        };
+        let ids = [ID.to_string(), "2".repeat(64), "3".repeat(64)];
+        let read = |msgid: &str| letter(parse_entry(&entry("letter", "osaka", "minerva", msgid, "a letter"), 1));
+        // A first read keeps two letters.
+        assert_eq!(apply(&State::default(), &paths, &[read(&ids[0]), read(&ids[1])], vec![]), Ok(2));
+        // The cards are gone (no cards.json, and a fresh state), and a reread prints the whole history again. The two on file are not
+        // written a second time; only the new letter is appended.
+        std::fs::remove_file(&paths.cards).unwrap();
+        assert_eq!(apply(&State::default(), &paths, &[read(&ids[0]), read(&ids[1]), read(&ids[2])], vec![]), Ok(3));
+        let on_file: Vec<String> = mail::rows_of::<Value>(&std::fs::read(&paths.received).unwrap()).iter().map(|row| row["msgid"].as_str().unwrap().to_string()).collect();
+        assert_eq!(on_file, ids, "each letter is on file once, in the order it came");
+    }
+
+    #[test]
     fn a_card_path_is_a_message_id_and_one_of_three_verbs() {
         assert_eq!(target_of(""), Target::List);
         assert_eq!(target_of(&format!("{ID}/place")), Target::Card(ID, Verb::Place));

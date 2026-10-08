@@ -10,7 +10,9 @@
 //! refusal and that a refusal runs nothing, the row it leaves); the stat gate of the receive task (no page looking, no mailbox, an
 //! unchanged mailbox: no call); the cards (decoded, clamped, deduped, text only ever a JSON string); receipts and the outbox; place,
 //! dismiss and save; and the files (modes, a planted link, a FIFO, a corrupt `cards.json`, the store cap and its resume); then the fix
-//! round: a relative `--aoide-home` refused before aoide runs, the notice cap, a send ended by a signal, and a linked mail folder.
+//! round: a relative `--aoide-home` refused before aoide runs, the notice cap, a send ended by a signal, and a linked mail folder; then
+//! the second fix round: the plain and reread caps, a reread of a history, the send's own timeout, a slow schema check that does not hold
+//! the page, a second perch on one home, and the three send branches that answer without a row or with a warning.
 //!
 //! Run with `cargo test --features test-bins`: the fakes are `test-bins` targets, so without the feature this file is empty.
 //!
@@ -47,6 +49,19 @@
 //!   the notice cap raised to 100 000              a_notice_is_one_printable_line_of_at_most_300_characters
 //!   HTTP_PROXY added to ENV_KEEP                  the_proxy_and_the_provider_key_of_the_perch_do_not_reach_aoide
 //!   a send ended by a signal made a refusal       a_send_ended_by_a_signal_after_aoide_started_is_an_unknown_row
+//!   -- the second fix round (M2-fix), each by itself, the file restored after each (cmp):
+//!   the file-level dedupe removed (a unit test)   mail::recv::tests::a_letter_on_file_is_not_written_again_when_the_cards_are_gone
+//!   the plain cap at 1 MiB                        a_plain_read_of_two_mebibytes_is_kept_whole
+//!   the reread cap at 4 MiB                       a_reread_of_four_and_a_half_mebibytes_is_kept_whole
+//!   a reread too big to print armed again         a_reread_too_big_to_print_is_a_loss_said_on_the_page_and_never_armed_again
+//!   the entries cut at 2000 by position           two_thousand_and_one_letters_are_all_kept_and_the_page_counts_the_rest
+//!   the outbox cut marked complete (a unit test)  mail::recv::tests::a_cut_outbox_cannot_say_that_a_row_left_it
+//!   the send timeout at 10 s                      a_send_that_stalls_for_twelve_seconds_is_still_accepted
+//!   a second perch's lock refusal not set         a_second_perch_on_one_home_is_refused_mail_and_reads_none
+//!   the schema mutex held across aoide's check    a_slow_schema_check_does_not_hold_up_the_page
+//!   a recipient aoide will not take not refused   a_recipient_aoide_will_not_take_is_a_409_and_no_row
+//!   a send not complete not warned                a_send_aoide_did_not_complete_is_kept_with_a_warning
+//!   an answer with no msgid taken as a letter     an_answer_with_no_msgid_is_an_unknown_row_and_no_resend
 //! ```
 #![cfg(feature = "test-bins")]
 
@@ -74,8 +89,9 @@ fn id(digit: char) -> String {
 
 /// The registry the perch reads: every shape a node can have, and in it every field that must never be shown. `osaka` and `yomi` are in
 /// meshes (`mesh.json` has rows for them); `multi` is trusted in two meshes but `mesh --json` has no row for it; `bridge` is not paired;
-/// `stray` is paired and unknown to `send.json`, so `fake_aoide` answers it with `unknown-node`; `self` and `Bad Name` are not nodes a
-/// letter can go to.
+/// `stray` is paired and unknown to `send.json`, so `fake_aoide` answers it with `unknown-node`; `refused`, `silent` and `partial` are the send
+/// branches `send.json` answers in its own shapes (aoide will not take the letter, no msgid, the send not complete); `self` and `Bad Name` are
+/// not nodes a letter can go to.
 const REGISTRY: &str = r#"{
   "schemaVersion": "0",
   "nodes": [
@@ -85,6 +101,9 @@ const REGISTRY: &str = r#"{
     {"name": "bridge", "url": "http://bridge:8710"},
     {"name": "multi", "url": "http://multi:8710", "verified": true},
     {"name": "stray", "url": "http://stray:8710", "verified": true},
+    {"name": "refused", "url": "http://refused:8710", "verified": true},
+    {"name": "silent", "url": "http://silent:8710", "verified": true},
+    {"name": "partial", "url": "http://partial:8710", "verified": true},
     {"name": "self", "url": "http://self:8710", "verified": true},
     {"name": "Bad Name", "url": "http://bad:8710", "verified": true}
   ]
@@ -106,6 +125,8 @@ struct Setup {
     aoide_home: Option<PathBuf>,
     /// Every `mail send` is ended by SIGKILL before the stand-in runs: a child that dies after its spawn.
     kill_sends: bool,
+    /// Calls of one verb (`schema`, `send`) that take this many milliseconds more: the stand-in sleeps for those and no others.
+    slow: Vec<(String, u64)>,
 }
 
 impl Setup {
@@ -121,7 +142,14 @@ impl Setup {
             env: Vec::new(),
             aoide_home: None,
             kill_sends: false,
+            slow: Vec::new(),
         }
+    }
+
+    /// Calls of `verb` (`schema` or `send`) sleep for `ms` before they answer, and the other calls do not.
+    fn slow(mut self, verb: &str, ms: u64) -> Self {
+        self.slow.push((verb.to_string(), ms));
+        self
     }
 
     fn aoide_home(mut self, path: &str) -> Self {
@@ -206,7 +234,7 @@ impl Setup {
             builder = builder.arg("--home").arg(&home);
         }
         if self.aoide {
-            builder = builder.arg("--aoide").arg(steered(root.join("aoide-bin"), &fixtures, &log, &self.env, self.kill_sends));
+            builder = builder.arg("--aoide").arg(steered(root.join("aoide-bin"), &fixtures, &log, &self.env, self.kill_sends, &self.slow));
         }
         builder = builder
             .arg("--aoide-home")
@@ -224,6 +252,11 @@ impl Setup {
             }
         }
         let perch = builder.hold(base).start();
+        if self.home {
+            // The perch says it is listening before it takes the mail folder's lock (lib.rs prints first, and the receive side starts
+            // after), so a test that reaches into the folder waits for the lock here, and does not race the start.
+            until(Duration::from_secs(10), "the mail lock", || home.join("mail").join(".lock").exists().then_some(()));
+        }
         Rig { perch, root, home, aoide, fixtures, log, agent }
     }
 }
@@ -231,7 +264,7 @@ impl Setup {
 /// The stand-in, run through a script that sets its steering: the fixtures, the log, and every `FAKE_AOIDE_*` the test gave the perch. A
 /// perch hands its children only its allowlist (`aoide::ENV_KEEP`, and the AOIDE_* it sets itself), so the steering cannot ride on the
 /// perch's environment, and the script is what carries it. With `kill_sends`, a `mail send` ends by SIGKILL before the stand-in runs.
-fn steered(path: PathBuf, fixtures: &Path, log: &Path, env: &[(String, String)], kill_sends: bool) -> PathBuf {
+fn steered(path: PathBuf, fixtures: &Path, log: &Path, env: &[(String, String)], kill_sends: bool, slow: &[(String, u64)]) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
     let mut settings = format!("FAKE_AOIDE_DIR={} FAKE_AOIDE_LOG={}", quote(&fixtures.display().to_string()), quote(&log.display().to_string()));
@@ -239,8 +272,18 @@ fn steered(path: PathBuf, fixtures: &Path, log: &Path, env: &[(String, String)],
         settings.push_str(&format!(" {key}={}", quote(value)));
     }
     let ends = if kill_sends { "if [ \"$1\" = mail ] && [ \"$2\" = send ]; then kill -KILL $$; fi\n" } else { "" };
+    // A verb that is slowed sets the stand-in's sleep for its own call only (`schema`, or `mail send`).
+    let mut slows = String::new();
+    for (verb, ms) in slow {
+        let which = match verb.as_str() {
+            "schema" => "[ \"$1\" = schema ]",
+            "send" => "[ \"$1\" = mail ] && [ \"$2\" = send ]",
+            other => panic!("no verb {other} to slow"),
+        };
+        slows.push_str(&format!("if {which}; then export FAKE_AOIDE_SLEEP_MS={ms}; fi\n"));
+    }
     let bin = fake_aoide().expect("the stand-in aoide").replace('\'', "'\\''");
-    std::fs::write(&path, format!("#!/bin/sh\n{ends}{settings} exec '{bin}' \"$@\"\n")).unwrap();
+    std::fs::write(&path, format!("#!/bin/sh\n{ends}{slows}{settings} exec '{bin}' \"$@\"\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
@@ -260,14 +303,67 @@ fn lay_fixtures(dest: &Path, entries: Option<&[Value]>) {
 
 fn set_entries(dir: &Path, entries: &[Value]) {
     for name in ["mail-read.json", "mail-read-reread.json"] {
-        let path = dir.join(name);
-        let mut whole: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        whole["data"]["entries"] = json!(entries);
-        // Renamed into place: a fake that is mid-read never sees half a file.
-        let next = dir.join(format!("{name}.next"));
-        std::fs::write(&next, serde_json::to_string_pretty(&whole).unwrap()).unwrap();
-        std::fs::rename(&next, &path).unwrap();
+        write_read(&dir.join(name), entries);
     }
+}
+
+/// One `mail read` file with these entries: `data.entries`, and the envelope's `message` that aoide prints the same letters in (so the output
+/// is about twice the letters, as aoide's is). Renamed into place: a fake that is mid-read never sees half a file.
+fn write_read(path: &Path, entries: &[Value]) {
+    let mut whole: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    whole["data"]["entries"] = json!(entries);
+    whole["message"] = json!(message_of(entries));
+    let next = path.with_extension("json.next");
+    std::fs::write(&next, serde_json::to_string_pretty(&whole).unwrap()).unwrap();
+    std::fs::rename(&next, path).unwrap();
+}
+
+/// The envelope's `message` for these entries: the count, then each letter's id, header and text.
+fn message_of(entries: &[Value]) -> String {
+    let mut text = format!("{} entries\n", entries.len());
+    for entry in entries {
+        let envelope = &entry["envelope"];
+        text.push_str(&format!(
+            "msgid {}\nfrom {}/minerva  mintedAt {}  mesh -  via {}\n```\n{}\n```\n",
+            envelope["msgid"].as_str().unwrap_or_default(),
+            envelope["header"]["from"]["node"].as_str().unwrap_or_default(),
+            entry["receivedAt"].as_str().unwrap_or_default(),
+            entry["via"].as_str().unwrap_or_default(),
+            envelope["text"].as_str().unwrap_or_default(),
+        ));
+    }
+    text
+}
+
+/// `count` letters from osaka, each of `size` bytes of text, with message ids that are distinct hex64 numbers.
+fn big_letters(count: usize, size: usize) -> Vec<Value> {
+    (1..=count).map(|i| entry("letter", "osaka", "minerva", &format!("{i:064x}"), &"x".repeat(size))).collect()
+}
+
+/// A second perch on the first one's home (its `--home`, so its mail folder and its lock), with an aoide log of its own. The first perch holds
+/// the lock, so this one refuses mail with a sentence and runs no receive task.
+fn second_perch(rig: &Rig) -> (Perch, PathBuf) {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().canonicalize().unwrap();
+    let (user, log) = (root.join("user"), root.join("fake.log"));
+    std::fs::create_dir(&user).unwrap();
+    let perch = Perch::builder()
+        .env("HOME", user.to_str().unwrap())
+        .arg("--root")
+        .arg(&root)
+        .arg("--home")
+        .arg(&rig.home)
+        .arg("--aoide")
+        .arg(steered(root.join("aoide-bin"), &rig.fixtures, &log, &[], false, &[]))
+        .arg("--aoide-home")
+        .arg(&rig.aoide)
+        .arg("--aoide-daemon-socket")
+        .arg(root.join("aoided.sock"))
+        .arg("--aoide-events")
+        .arg(root.join("events.jsonl"))
+        .hold(base)
+        .start();
+    (perch, log)
 }
 
 /// One entry of `mail read`, from `osaka` unless said.
@@ -593,7 +689,10 @@ fn the_node_menu_puts_this_machine_first_and_shows_a_node_that_is_not_paired_as_
             ("yomi", true, vec!["alpha"]),
             ("bridge", false, vec![]),
             ("multi", true, vec![]),
-            ("stray", true, vec![])
+            ("stray", true, vec![]),
+            ("refused", true, vec![]),
+            ("silent", true, vec![]),
+            ("partial", true, vec![])
         ],
         "the registry in its order, and `self` and a name outside the grammar left out"
     );
@@ -618,7 +717,7 @@ fn without_aoide_the_menu_is_this_machine_and_the_list_says_why_nothing_comes() 
     // The registry is a file, so its nodes are listed; what needs aoide (their meshes) is not there.
     let menu = json_of(&rig.perch.get("/hub/mail/nodes"), 200, "GET /hub/mail/nodes");
     let names: Vec<&str> = menu.as_array().unwrap().iter().map(|row| row["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["self", "osaka", "yomi", "bridge", "multi", "stray"]);
+    assert_eq!(names, ["self", "osaka", "yomi", "bridge", "multi", "stray", "refused", "silent", "partial"]);
     assert!(menu.as_array().unwrap().iter().all(|row| row["meshes"] == json!([])), "{menu}");
     let mail = rig.mail();
     assert_eq!((mail["available"].clone(), mail["received"].clone(), mail["sent"].clone()), (json!(false), json!([]), json!([])));
@@ -1565,4 +1664,145 @@ fn a_linked_mail_folder_is_read_by_nothing() {
     std::thread::sleep(Duration::from_millis(500));
     assert!(rig.reads().is_empty(), "nothing is read through a link: {:?}", rig.argvs());
     assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "and nothing is written behind it");
+}
+
+// ---------------------------------------------------------------------------
+// The M2 second fix round: the caps pinned, a reread of a history, the lock and the send branches
+// ---------------------------------------------------------------------------
+
+/// A plain read of about two mebibytes is kept whole: the plain cap is 4 MiB, not the runner's 1 MiB default. Eleven letters of 96 KiB are about
+/// 2 MiB of stdout (each letter is in the envelope's `message` and in `data.entries`). The first look is a reread, then the plain read that
+/// keeps them, and then nothing: the reads stop at two.
+#[test]
+fn a_plain_read_of_two_mebibytes_is_kept_whole() {
+    let rig = Setup::new().entries(big_letters(11, 96 * 1024)).env("FAKE_AOIDE_SPARES_SCHEMA", "1").start();
+    let mail = until(Duration::from_secs(20), "the eleven letters", || {
+        let mail = rig.mail();
+        (mail["received"].as_array().unwrap().len() + mail["more"].as_u64().unwrap() as usize == 11).then_some(mail)
+    });
+    assert_eq!(mail["error"], Value::Null, "{mail}");
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(rig.reads().len(), 2, "a reread, then the plain read that kept the letters, and no third read: {:?}", rig.argvs());
+    assert_eq!(rig.reads()[1], ["mail", "read", "--for=minerva", "--json"], "the second read is the plain one");
+}
+
+/// A reread of about 4.5 MiB is kept whole: the reread's cap is 16 MiB, above the plain read's 4 MiB, so a history that fits is never lost. The
+/// plain read is empty here; the reread is twenty-four letters of 96 KiB (each is in the message and in the entries). The letters stay inside
+/// the page's 2 MiB window of `received.jsonl` (each is kept at 64 KiB), which is what this test is not about.
+#[test]
+fn a_reread_of_four_and_a_half_mebibytes_is_kept_whole() {
+    let rig = Setup::new().env("FAKE_AOIDE_SPARES_SCHEMA", "1").start();
+    write_read(&rig.fixtures.join("mail-read-reread.json"), &big_letters(24, 96 * 1024));
+    write_read(&rig.fixtures.join("mail-read.json"), &[]);
+    let mail = until(Duration::from_secs(30), "the twenty-four letters of the reread", || {
+        let mail = rig.mail();
+        (mail["received"].as_array().unwrap().len() + mail["more"].as_u64().unwrap() as usize == 24).then_some(mail)
+    });
+    assert_eq!(mail["error"], Value::Null, "nothing is lost on a history that fits: {mail}");
+    assert!(rig.reads()[0].last().map(String::as_str) == Some("--reread"), "the first look is the reread: {:?}", rig.argvs());
+}
+
+/// A reread prints the whole history again, and a letter it prints that is on file is neither delivered nor written twice. Here the plain read
+/// is too big to read (a flood that is not JSON, which the reread is spared from), so each plain read arms a reread that prints the same three
+/// letters again: three rereads, and the file holds each letter once.
+#[test]
+fn a_reread_of_a_history_re_delivers_nothing_twice() {
+    let history: Vec<Value> = (1..=3).map(|i| entry("letter", "osaka", "minerva", &format!("{i:064x}"), &format!("letter {i}"))).collect();
+    let rig = Setup::new().entries(history).env("FAKE_AOIDE_FLOOD", "64").env("FAKE_AOIDE_FLOOD_SPARES_REREAD", "1").env("FAKE_AOIDE_SPARES_SCHEMA", "1").start();
+    // Each look is a page's `GET`: the receive task works only while a page is looking.
+    until(Duration::from_secs(15), "a third reread of the same history", || {
+        rig.mail();
+        (rereads(&rig) >= 3).then_some(())
+    });
+    assert_eq!(rig.mail()["received"].as_array().unwrap().len(), 3, "three cards, and no more");
+    let on_file: Vec<String> = rig.lines("received.jsonl").iter().map(|row| row["msgid"].as_str().unwrap().to_string()).collect();
+    let mut unique = on_file.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!((on_file.len(), unique.len()), (3, 3), "each letter is on file once: {on_file:?}");
+}
+
+/// The send's own timeout is 45 s, longer than aoide's (its POST can take up to about 15 s after the spool), so a letter aoide took is never
+/// answered as "did not answer". A send that takes twelve seconds is accepted; only the send is slowed (`slow("send", ..)`).
+#[test]
+fn a_send_that_stalls_for_twelve_seconds_is_still_accepted() {
+    let rig = Setup::new().slow("send", 12_000).start();
+    let name = rig.note("Stalled", "text");
+    let body = json_of(&rig.send(&name, json!({ "node": "self" })), 202, "a send that stalls for twelve seconds");
+    assert_eq!(body["msgid"], json!(id('5')), "{body}");
+    assert_eq!(rig.lines("sent.jsonl").len(), 1, "one row, and the send was run once: {:?}", rig.argvs());
+}
+
+/// The schema check can take up to its timeout, and a page's `GET /hub/mail` reads the cache under the same lock: the lock is not held across
+/// the call, so the page is not held behind it. The first look starts the check; the check is slowed to five seconds; a second page's `GET`
+/// returns well inside that.
+#[test]
+fn a_slow_schema_check_does_not_hold_up_the_page() {
+    let rig = Setup::new().slow("schema", 5000).start();
+    rig.perch.get("/hub/mail");
+    until(Duration::from_secs(10), "the schema check to start", || rig.with(&["schema"]).first().cloned());
+    let began = Instant::now();
+    let mail = rig.mail();
+    let waited = began.elapsed();
+    assert!(waited < Duration::from_secs(2), "GET /hub/mail waited {waited:?} behind aoide's schema check: {mail}");
+    until(Duration::from_secs(15), "the schema check to finish and mail to be available", || (rig.mail()["available"] == json!(true)).then_some(()));
+}
+
+/// A second perch on a home whose lock the first perch holds: its mail routes answer with the sentence, it sends nothing and runs no aoide,
+/// and the first perch keeps its mail.
+#[test]
+fn a_second_perch_on_one_home_is_refused_mail_and_reads_none() {
+    let rig = Setup::new().start();
+    let (second, log) = second_perch(&rig);
+    let mail = json_of(&second.get("/hub/mail"), 200, "GET /hub/mail of the second perch");
+    assert_eq!(mail["available"], json!(false), "{mail}");
+    assert!(mail["error"].as_str().unwrap_or_default().contains("another perch keeps this home's mail"), "{mail}");
+    let note = json_of(&second.post_json("/hub/notes", json!({ "title": "Second", "text": "text" })), 201, "a note on the second perch");
+    let name = note["name"].as_str().unwrap().to_string();
+    let body = serde_json::to_vec(&json!({ "node": "self" })).unwrap();
+    let answer = second.apireq("POST", &format!("/hub/notes/{name}/send")).body(body).send(&second.addr);
+    assert_eq!(answer.status, 503, "{}{}", answer.head, answer.body);
+    assert!(answer.body.contains("another perch keeps this home's mail"), "{}", answer.body);
+    std::thread::sleep(Duration::from_millis(800));
+    let ran = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!ran.contains("\"argv\""), "the second perch ran aoide: {ran}");
+    until(Duration::from_secs(10), "the first perch to keep its mail", || (rig.mail()["available"] == json!(true)).then_some(()));
+}
+
+/// A recipient aoide will not take (`accepted` false) is a 409 with aoide's reason, and nothing was spooled: no row.
+#[test]
+fn a_recipient_aoide_will_not_take_is_a_409_and_no_row() {
+    let rig = Setup::new().start();
+    let name = rig.note("Refused", "text");
+    let answer = rig.send(&name, json!({ "node": "refused" }));
+    assert_eq!(answer.status, 409, "{}{}", answer.head, answer.body);
+    assert!(answer.body.contains("made-up reason"), "aoide's reason: {}", answer.body);
+    assert_eq!(rig.sends().len(), 1, "one send was run: {:?}", rig.argvs());
+    assert!(rig.lines("sent.jsonl").is_empty(), "a refusal writes no row");
+}
+
+/// An answer with no message id for the recipient: the letter may have been spooled, so it is a 502 with an unknown row that has no msgid, and
+/// the page says to check the outbox. Nothing is sent again.
+#[test]
+fn an_answer_with_no_msgid_is_an_unknown_row_and_no_resend() {
+    let rig = Setup::new().start();
+    let name = rig.note("Silent", "text");
+    let answer = rig.send(&name, json!({ "node": "silent" }));
+    let error = error_of(&answer, 502, "an answer with no msgid");
+    assert!(error.contains("may or may not have been sent"), "{error}");
+    let rows = rig.lines("sent.jsonl");
+    assert_eq!((rows.len(), rows[0]["msgid"].clone(), rows[0]["status"].clone()), (1, Value::Null, json!("unknown")), "{rows:?}");
+    assert_eq!(rig.sends().len(), 1, "one send, and no resend: {:?}", rig.argvs());
+}
+
+/// A send aoide did not complete is still a letter: the row is kept with its msgid, and the 202 carries a warning to check the outbox.
+#[test]
+fn a_send_aoide_did_not_complete_is_kept_with_a_warning() {
+    let rig = Setup::new().start();
+    let name = rig.note("Partial", "text");
+    let body = json_of(&rig.send(&name, json!({ "node": "partial" })), 202, "a send that is not complete");
+    assert!(body["warning"].as_str().unwrap_or_default().contains("did not complete"), "{body}");
+    assert_eq!(body["msgid"], json!("c".repeat(64)), "{body}");
+    let rows = rig.lines("sent.jsonl");
+    assert_eq!((rows.len(), rows[0]["msgid"].clone()), (1, json!("c".repeat(64))), "{rows:?}");
 }

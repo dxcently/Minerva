@@ -221,6 +221,8 @@ impl Aoide {
         }
         command.envs(env);
         // The child dies with the perch: PR_SET_PDEATHSIG is set before the exec, and a perch that is already gone by then is an error.
+        // The closure runs between fork and exec, where nothing may allocate (another thread may hold the allocator's lock at the fork), so
+        // its errors are raw OS codes, which build no message, and not `io::Error::other`.
         let perch = std::process::id() as libc::pid_t;
         unsafe {
             command.pre_exec(move || {
@@ -228,7 +230,7 @@ impl Aoide {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::getppid() != perch {
-                    return Err(std::io::Error::other("the perch that started aoide is gone"));
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
                 }
                 Ok(())
             });
@@ -922,7 +924,23 @@ mod tests {
         for kept in ["PATH", "HOME", "LANG", "TZ", "LC_ALL", "LC_CTYPE"] {
             assert!(kept_env(OsStr::new(kept)), "{kept}");
         }
-        for dropped in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "ALL_PROXY", "OPENAI_API_KEY", "AOIDE_SESSION_ID", "LC", "XDG_RUNTIME_DIR", "path"] {
+        // The XDG directories and the CA bundle variables are dropped too (see aoide/README.md, "The child"): the perch decides them, not the operator's shell.
+        for dropped in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "OPENAI_API_KEY",
+            "AOIDE_SESSION_ID",
+            "LC",
+            "XDG_RUNTIME_DIR",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "SSL_CERT_FILE",
+            "CURL_CA_BUNDLE",
+            "path",
+        ] {
             assert!(!kept_env(OsStr::new(dropped)), "{dropped}");
         }
     }

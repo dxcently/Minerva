@@ -1,5 +1,5 @@
 {
-  "_": "The reply a `mail send` gets, by the node in --to. `code` is the exit code; `stdout` is printed as given (an object is pretty-printed JSON, a string is raw); `with_hold` and `with_mesh` replace the reply when --hold or --mesh is in the argv. A node that is not here is `unknown-node`.",
+  "_": "The reply a `mail send` gets, by the node in --to. `code` is the exit code; `stdout` is printed as given (an object is pretty-printed JSON, a string is raw); `with_hold` and `with_mesh` replace the reply when --hold or --mesh is in the argv. A node that is not here is `unknown-node`. The send branches the tests drive: `refused` (aoide did not accept the recipient: a 409 and no row), `silent` (no msgid on the recipient: a 502 and an unknown row), and `partial` (the send is not complete: a 202 with a warning and the row kept).",
   "self": {
     "code": 0,
     "stdout": {
@@ -181,6 +181,114 @@
           "subject": "a made-up subject",
           "threadId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
         }
+      }
+    }
+  },
+  "refused": {
+    "code": 0,
+    "stdout": {
+      "status": "ok",
+      "command": "mail.send",
+      "message": "0/1 recipient copies filed or spooled; aoide did not accept the letter for this node",
+      "gated": false,
+      "changed": [],
+      "data": {
+        "accepted": 0,
+        "complete": false,
+        "recipients": [
+          {
+            "address": {
+              "name": "minerva",
+              "node": "refused"
+            },
+            "ring": "no-daemon",
+            "role": "to",
+            "accepted": false,
+            "delivery": null,
+            "error": {
+              "reason": "made-up reason: this node takes no letters from here"
+            },
+            "status": "refused"
+          }
+        ],
+        "replyTo": null,
+        "subject": "a made-up subject",
+        "threadId": null
+      }
+    }
+  },
+  "silent": {
+    "code": 0,
+    "stdout": {
+      "status": "ok",
+      "command": "mail.send",
+      "message": "1/1 recipient copies filed or spooled; inspect recipient delivery status before retrying",
+      "gated": false,
+      "changed": [],
+      "data": {
+        "accepted": 1,
+        "complete": true,
+        "recipients": [
+          {
+            "address": {
+              "name": "minerva",
+              "node": "silent"
+            },
+            "ring": "no-daemon",
+            "role": "to",
+            "accepted": true,
+            "delivery": {
+              "status": "queued",
+              "reason": null,
+              "reasonScope": null,
+              "nextAttemptAt": null,
+              "ackPending": false
+            },
+            "error": null,
+            "status": "spooled"
+          }
+        ],
+        "replyTo": null,
+        "subject": "a made-up subject",
+        "threadId": null
+      }
+    }
+  },
+  "partial": {
+    "code": 0,
+    "stdout": {
+      "status": "ok",
+      "command": "mail.send",
+      "message": "1/1 recipient copies filed or spooled; the send is not complete",
+      "gated": false,
+      "changed": [],
+      "data": {
+        "accepted": 1,
+        "complete": false,
+        "recipients": [
+          {
+            "address": {
+              "name": "minerva",
+              "node": "partial"
+            },
+            "ring": "no-daemon",
+            "role": "to",
+            "accepted": true,
+            "msgid": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "delivery": {
+              "status": "queued",
+              "reason": "made-up: a retry is due",
+              "reasonScope": "node",
+              "nextAttemptAt": null,
+              "ackPending": true
+            },
+            "error": null,
+            "status": "spooled"
+          }
+        ],
+        "replyTo": null,
+        "subject": "a made-up subject",
+        "threadId": null
       }
     }
   }

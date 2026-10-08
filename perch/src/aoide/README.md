@@ -49,7 +49,13 @@ Nothing that touches a node has a variant: no `node list`, `session`, `send`, `p
 - **Its environment** is cleared, then given the allowlist `ENV_KEEP` (`PATH`, `HOME`, `LANG`, `TZ`, and every `LC_*`), then the call's
   own: `AOIDE_ROOT` (`root`, from `--aoide-home`), `AOIDE_AUDIT_LOG` (`audit_log`, `--aoide-events`), `AOIDE_DAEMON_SOCKET`
   (`daemon_socket`) and `XDG_RUNTIME_DIR` (`runtime_dir`), each only when given and each absolute, and `AOIDE_SESSION_ID` for a read.
-  The list is one constant, so a variable a call needs is one line there. Why the allowlist: a perch's proxy variables and provider keys
+  The list is one constant, so a variable a call needs is one line there. **Dropped, and so not seen by aoide:** every other name, and in
+  particular the XDG directories (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`; `XDG_RUNTIME_DIR` only as the
+  perch sets it), the CA bundle variables (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`),
+  and the proxies (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, lower case included). The consequences, stated plainly: an XDG path the perch
+  did not set falls back to aoide's own default under `HOME`, and a node behind a private CA bundle cannot be reached until its variable is
+  one line in `ENV_KEEP`. Those are the costs of the allowlist; `kept_env` and `the_children_environment_is_the_kept_names_and_the_locale`
+  pin the names. Whether real aoide needs any of them is not checked: the fake reads none of them. Why the allowlist: a perch's proxy variables and provider keys
   do not reach aoide (a letter deposit must not go through an operator's proxy), a perch started inside a conducted session would hand its
   `AOIDE_SESSION_ID` to every call, and an ambient `AOIDE_STATE_DIR` moves the mailbase away from `<root>/state/mail/base.jsonl`, the file
   M2's receive loop stats. A test sets `HTTP_PROXY` and `OPENAI_API_KEY` on the perch and checks the fake sees neither. Test doubles'
@@ -61,7 +67,9 @@ Nothing that touches a node has a variant: no `node list`, `session`, `send`, `p
   10 s (`Error::Timeout`; a mail read takes a blocking `flock` on `.stage.lock`, so a held lock ends there). stderr keeps its first 8 KiB
   and the rest is read and dropped, so a chatty child never stalls on a full pipe. On a timeout or a cap the child's whole process group is
   killed and reaped. A process the child left holding a pipe is waited for 250 ms and then killed with the group. The child also gets
-  `PR_SET_PDEATHSIG` (SIGKILL) before its exec, so a perch that dies takes a running aoide with it. The signal goes when the *thread* that
+  `PR_SET_PDEATHSIG` (SIGKILL) before its exec, so a perch that dies takes a running aoide with it. The closure that does it runs between
+  fork and exec, so it allocates nothing: its one failure (the perch already gone, `getppid` no longer the perch) is a raw `ESRCH`, not a
+  message. The signal goes when the *thread* that
   started the child exits; the perch's runtime keeps its worker threads for its whole life, so that is the perch's death. Checked by
   `the_child_dies_with_the_perch_that_started_it` in `tests/aoide.rs`.
 - **Logged**: one line per call, the verb and the exit code (`perch: aoide ran`). Never an argument, the text, or what aoide printed.
