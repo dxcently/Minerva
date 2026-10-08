@@ -158,6 +158,8 @@ back but the end of a UTF-8 character (at most 3 bytes; `Terminal::text` reports
 | bytes that are not UTF-8 | one U+FFFD each, as the page shows them |
 | `CSI b` (REP) | the count clamped to the screen's width; a REP of a zero-width character is dropped |
 | zero-width characters | 16 in a row at most with no character that takes a cell between them, and at most 16 on one cell however the cursor is moved between them (checked against the cell they would land on) |
+| `CSI Pt;Pb r` (DECSTBM) | passed on unchanged when the page takes it, and the region it leaves is kept for the snapshot. A region the page ignores (its top on or past the last line, or a bottom not below its top) is cancelled with a CAN, so the copy ignores it too |
+| a bare `CSI r`, `CSI ! p` (DECSTR), `ESC c` (RIS) | pass on; each clears the kept region, as the page's xterm does |
 | OSC 8 (hyperlinks) | dropped (the grid would hold an allocation for every cell written under one) |
 
 None of this changes the ring; the page reads what the shell wrote. The tests feed the page's probe (`ESC ] 9999 ;` + 1100 filler +
@@ -288,6 +290,79 @@ What the table does not show:
   nothing on the runtime waits for a lock. A terminal whose shell has ended but which is still listed (kept 30 minutes) answers
   resize and hold as a live one does, because `Terms` does; only input answers 409.
 
+## The stream (T1c, `stream.rs` and `snap.rs`)
+
+`GET /hub/term/events?since=t1:4096,t3:0` is the one SSE for every terminal, behind the same gate as the other routes. A non-GET is a
+405 with `Allow: GET`. A `since` that is not a comma list of `<id>:<seq>` (a valid id, a decimal seq), or that is given twice, is a 400
+before the stream starts. Every entry is checked, including one past the `MAX_TERMS` (16) that are kept, so a malformed entry anywhere is
+a 400. `since` is the page's seq per terminal (the first seq for a terminal named twice); a terminal it does not name joins with a reset.
+
+```text
+  GET /hub/term/events?since=..
+  |
+  +- term-list                          the roster, always first
+  +- per listed terminal, in roster order
+  |    resume  named seq the ring still holds, not ahead of the terminal   --> term-out from that seq
+  |    reset   everything else                                             --> term-reset {snap}
+  |                                       (then term-out chunks when it is over 32 KiB)
+  +- live, from the subscription taken before the list
+  |    term-out                 on a tick: a flush at most every 16 ms, at most 32 KiB raw a frame
+  |    term-open / term-size / term-title / term-hold / term-exit / term-closed / term-input   (each flushes the output before it, at once)
+  +- ": keep-alive" after 15 s of silence (knob term_keepalive=N, in ms, clamped to 10..=60000)
+  +- hub-stream-end {reason: "stopping"}  once, when the perch stops
+```
+
+Each frame is one `data: {json}` line. Every frame has a string `type`; the terminal frames have a string `id`; output is base64.
+
+| type | fields | when |
+|---|---|---|
+| `term-list` | `terms` (the `Info` rows) | first, and again on a relist after the subscription lagged |
+| `term-reset` | `id`, `seq`, `data`, `snap` | a join that is not a resume. `snap` false: the ring still starts at byte 0, so `data` is all the output and `seq` is its length. `snap` true: the screen is rebuilt (`snap::encode`), and `seq` is the ring's end less the UTF-8 character the guard still holds (`Guard::lag`), which follows as live output. An escape the parser is in the middle of is not counted (see the residuals) |
+| `term-out` | `id`, `seq`, `data` | output. `seq` is where the page is after the frame; a reset's chunks carry the reset's `seq` |
+| `term-open` | `id`, `term` | a terminal the stream does not track yet |
+| `term-size` | `id`, `cols`, `rows` | a resize |
+| `term-title` | `id`, `title`, `fg` | a title change |
+| `term-hold` | `id`, `hold` | a hold change |
+| `term-exit` | `id`, `code`, `signal` | the shell ended |
+| `term-closed` | `id` | a close, or a relist that no longer lists the terminal |
+| `term-input` | `id`, `by` (`"agent"`), `chat`, `text` | an agent's input. `text` is the picture with CR and LF shown as the return sign, tab as the tab sign, other pictures as `^X`, cut at 200 characters |
+| `hub-stream-end` | `reason` (`"stopping"`) | the perch stops; exactly once |
+
+**Snapshots.** `snap::picture` copies the visible cells, the cursor, the modes and the scroll region under the screen lock; `snap::encode`
+writes the bytes after the lock is dropped (inside `spawn_blocking`). The bytes are RIS, the alternate screen when it is on, the DECSET
+and ANSI modes a TUI uses (application cursor, autowrap, the mouse modes, focus, alternate scroll, bracketed paste, cursor visibility,
+LNM and IRM), the scroll region when there is one, then each row by CUP with SGR runs (an underline's style as `4:n` and its colour as
+`58`, both as alacritty 0.26 keeps them on the cell), then origin mode when it is on, and the cursor last. Origin mode comes last
+because, with it on, a row is addressed from the region's top; setting it also homes the cursor. alacritty keeps the mouse modes
+mutually exclusive, so the one that is set is the one written.
+
+**Bounds.** A flush reads the ring from each watch's cursor in pieces of at most 32 KiB raw (`FRAME_RAW`). The per-connection queue is
+32 frames (`IN_FLIGHT`); a page that stops reading holds its own cursor back, not the ring, and a cursor the ring has passed gets a
+`term-reset` at the next flush. A reset over 32 KiB goes out as its `term-reset` and then `term-out` chunks at the reset's `seq`. The output tick is coalesced to 16 ms
+(`COALESCE`, through `flush_due`): a burst of reads is one flush. A change event is not held back: it flushes the output before it at once,
+so the 16 ms bound is for output ticks only.
+
+**Residuals** (what a join does not rebuild):
+
+* The scroll region is the guard's, not alacritty's (alacritty 0.26 keeps it private). The guard keeps the region each `CSI Pt;Pb r`
+  leaves by the page's rule (xterm.js `setScrollRegion`: a bottom past the screen, or 0, is the last line; a region applies only when
+  its bottom is below its top, so one that starts on or past the last line is ignored; a region as big as the screen is none), and a
+  resize clears it, as alacritty's and the page's xterm do. Two places still differ from the page. alacritty has no DECSTR (vte 0.15
+  does not dispatch `CSI ! p`), so the copy keeps its own region and every mode a DECSTR resets on the page (DECCKM, the keypad,
+  bracketed paste, focus, origin, insert, cursor visibility), where the page clears them all; the snapshot follows the page for the
+  region and the copy for the modes. `reset` sends RIS first, which clears both alike, so only a bare `CSI ! p` meets this. And the page keeps a region for each screen, while alacritty keeps one
+  for both, so a snapshot of the alternate screen can carry a region the program set on the primary.
+* An escape split across reads: the guard and the parser keep that escape's state, not its bytes. A snapshot taken then is the screen
+  without the escape's remaining bytes, and the page resumes after them, so those bytes show as text until the next repaint.
+  `Guard::lag` counts only the UTF-8 tail.
+* A relist (the change channel lagged): a terminal that has left the table loses the output it wrote after the last flush, because its
+  `term-closed` goes out without one. A close that is not lagged is flushed first.
+* The primary screen behind the alternate one: a snapshot taken on the alternate screen is the alternate screen alone.
+* History: a snapshot is the visible screen. An exact replay (`snap` false) carries the history, since it is the whole ring.
+* `note_input` (the hook for T2) only stamps and announces an agent's input that the perch does not write itself, pictured the way
+  `agent_input` pictures it and cut at 80 characters. `agent_input` announces its own input, so a route calls one of the two for a
+  given input, never both.
+
 ## For the slices that build on this
 
 ```text
@@ -327,6 +402,22 @@ environment, the shell's descriptors, backpressure, the hold's flush, titles, th
 shutdown inside 2.5 s with a shell that ignores `SIGHUP` and with a screen that is held, an open racing the shutdown, an open dropped
 mid-fork, a dropped table, and the last output of a shell being there when it is reported ended. Each e2e rig kills anything still
 working in its temporary home when it is dropped, so no test leaves a shell behind.
+
+`cargo test --features test-bins --test term_stream` (`perch/tests/term_stream.rs`, T1c) runs the stream through the perch binary over a
+real `/bin/sh`: the roster first, a join that resumes from a seq and one that rebuilds a screen whose ring has moved on (DECCKM kept, and the
+scroll region the shell set),
+a since the ring has passed is a snapshot and one it holds resumes from that seq, a live client the ring passes is reset with a
+snapshot at the shell's end (a 16 MiB flood the page does not read), a lagged change channel is listed again and a terminal that left
+is closed (16 MiB unread, then 300 changes), a burst of 2000 one-byte writes is flushed in a few frames, a pager (`less`, skipped when it
+is not installed) is rebuilt as the screen it drew, a live flush and a replay cut at 32 KiB (the replay's chunks at its seq, the same
+bytes as a resume from byte 0), opens, closes, size, title, hold and exit announced, the keep-alive knob, a shape check on every frame,
+the stop that ends the stream within 3 s with `hub-stream-end`, and the refusals (401, 405 with `Allow`, 400 for a bad `since`). The
+unit tests `term::stream` and `term::snap` cover the `since` grammar (a bad entry past the 16th included), the base64, the pictures,
+the coalescing's due time, the snapshot's modes and colours, the scroll region (a round trip, RIS, DECSTR and a bare `CSI r` clearing
+it, origin mode inside one, a region the page ignores), the underline's style and colour, and the `term-input` frame that `note_input`
+announces (an agent's input only; the operator's typing is not an event). `term::screen` covers how the guard keeps the region as the
+page takes each sequence, and that a resize starts it over. The frame is pinned here; T2's `term_agent.rs` pins the route that calls
+`note_input`.
 
 Limits worth knowing: an exited terminal's session is swept when it is closed or expires, not the moment its shell exits (the zombie
 shell holds the session id until then); `fg` is the foreground group's `comm` and is empty for an ended terminal.

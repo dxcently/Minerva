@@ -403,8 +403,8 @@ fn ids_that_are_not_terminals_are_the_empty_404() {
                 assert_eq!(answer.body, "", "{method} {path}: the 404 has no body");
             }
         }
-        // `a` and `events` are never ids: a bare `a` is nobody's, and `events` is the stream's own path.
-        for path in ["/hub/term/a", "/hub/term/a/", "/hub/term/events", "/hub/term/t1", "/hub/term/t1/nothing"] {
+        // `a` is never an id: a bare `a` is nobody's.
+        for path in ["/hub/term/a", "/hub/term/a/", "/hub/term/t1", "/hub/term/t1/nothing"] {
             let answer = perch.get(path);
             assert_eq!(answer.status, 404, "GET {path}: {}", answer.head);
             assert_eq!(answer.body, "", "GET {path}: the 404 has no body");

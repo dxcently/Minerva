@@ -1549,7 +1549,6 @@ mod tests {
             ("GET", "/hub/runs/r1/log"),
             ("GET", "/hub/meta/health"),
             ("POST", "/hub/install/jev"),
-            ("GET", "/hub/term/events"),
             ("POST", "/hub/term/t1/input"),
             ("GET", "/hub/notes"),
             ("POST", "/hub/notes/x"),
@@ -1564,6 +1563,7 @@ mod tests {
             assert_eq!((code, body.as_str()), (404, ""), "{method} {path} with the token");
             assert_eq!(call(&perch, method, path, "", "{}").await.0, 401, "{method} {path} without it");
         }
+        assert_eq!(call(&perch, "GET", "/hub/term/events", "", "").await.0, 401, "the stream without it");
         // The two that were already pinned stay where they were, and so does a path that only looks like a namespace.
         for path in ["/hub/events", "/hub/terminal", "/hub/termx", "/hub/notesx", "/hub/meta"] {
             assert_eq!(call(&perch, "GET", path, &bearer(), "").await.0, 404, "{path}");

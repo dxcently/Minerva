@@ -440,6 +440,9 @@ enum Mode {
 ///   is changed is cancelled with a CAN and, if it has a count, written again.
 /// - **Zero-width characters are bounded.** At most [`MAX_ZEROWIDTH`] of them in a row, with nothing that takes a cell between them
 ///   (the [`Emu`] holds each one to the cell it lands on as well).
+/// - **The scroll region is read.** `CSI Pt;Pb r` is passed on as it was when the page takes it, and cancelled with a CAN when the page
+///   ignores it, so the copy ignores it too. The region it makes is kept for the snapshot ([`Guard::scroll_region`]); a bare `CSI r`,
+///   `CSI ! p` (DECSTR) and `ESC c` (RIS) clear it.
 /// - **OSC 8 (hyperlinks) is dropped.** The grid would hold a separate allocation for every cell written under one.
 ///
 /// None of it changes the ring: the page reads what the shell wrote.
@@ -453,11 +456,18 @@ pub struct Guard {
     marks_run: usize,
     /// The last character printed took no width.
     last_zero: bool,
-    /// The CSI sequence in progress has no private marker and no intermediate byte (so a `b` is a REP).
-    plain: bool,
-    /// Its first parameter (saturating at 65535), and whether the first parameter has ended.
-    first: u32,
-    first_done: bool,
+    /// The CSI sequence in progress: whether it has a private marker (`CSI ?`), its intermediate byte (`!` in `CSI ! p`, `0xff` for
+    /// more than one), and its first two parameters, each the first of its subparameters (saturating at 65535; one not given is 0).
+    /// `param` is the one being read, 2 once past both; `sub` is set by a `:` and cleared by the next `;`.
+    private: bool,
+    inter: u8,
+    params: [u32; 2],
+    param: usize,
+    sub: bool,
+    /// The scroll region the copy has, from line 0 with the line after its bottom, or `None` for the whole screen. alacritty keeps its
+    /// region private, so the guard keeps the one `CSI Pt;Pb r` sets (see [`Guard::scroll_region`]), and what clears it: `ESC c`,
+    /// `CSI ! p` and a resize ([`Screen::resize`]). The snapshot writes it ([`super::snap`]).
+    region: Option<(usize, usize)>,
     /// The OSC's number while it is read (`None` once it is past), whether it is OSC 8, and how many bytes of it have been passed.
     osc_number: Option<u32>,
     osc_link: bool,
@@ -469,6 +479,7 @@ struct Out<'a> {
     bytes: &'a mut Vec<u8>,
     marks: &'a mut Vec<Mark>,
     cols: usize,
+    rows: usize,
 }
 
 enum Decoded {
@@ -518,9 +529,9 @@ impl Guard {
     }
 
     /// `input` through the guard: what the parser is to be given goes on the end of `bytes`, and where its zero-width characters are
-    /// on the end of `marks`. `cols` is the screen's width.
-    pub fn filter(&mut self, input: &[u8], cols: usize, bytes: &mut Vec<u8>, marks: &mut Vec<Mark>) {
-        let mut o = Out { bytes, marks, cols };
+    /// on the end of `marks`. `cols` and `rows` are the screen's size.
+    pub fn filter(&mut self, input: &[u8], cols: usize, rows: usize, bytes: &mut Vec<u8>, marks: &mut Vec<Mark>) {
+        let mut o = Out { bytes, marks, cols, rows };
         let mut i = if self.tail_len > 0 { self.finish_tail(input, &mut o) } else { 0 };
         while i < input.len() {
             let b = input[i];
@@ -667,9 +678,11 @@ impl Guard {
     fn esc(&mut self, b: u8, o: &mut Out<'_>) {
         let next = match b {
             b'[' => {
-                self.first = 0;
-                self.first_done = false;
-                self.plain = true;
+                self.params = [0; 2];
+                self.param = 0;
+                self.sub = false;
+                self.private = false;
+                self.inter = 0;
                 Mode::CsiEntry
             }
             b']' => {
@@ -681,6 +694,11 @@ impl Guard {
             b'P' => Mode::DcsEntry,
             b'X' | b'^' | b'_' => Mode::Sos,
             0x20..=0x2f => Mode::EscInt,
+            // RIS: the page's xterm starts its margins over too.
+            b'c' => {
+                self.region = None;
+                Mode::Ground
+            }
             0x30..DEL => Mode::Ground,
             DEL => return,
             // A control character runs and leaves the escape where it was.
@@ -706,7 +724,7 @@ impl Guard {
             DEL => {}
             0x00..0x20 => o.bytes.push(b),
             0x20..=0x2f => {
-                self.plain = false;
+                self.inter = if self.inter == 0 { b } else { u8::MAX };
                 self.mode = Mode::CsiInt;
                 o.bytes.push(b);
             }
@@ -715,17 +733,13 @@ impl Guard {
                     self.mode = Mode::CsiIgnore;
                 } else {
                     self.mode = Mode::CsiParam;
-                    if b >= b':' {
-                        self.first_done = true;
-                    } else if !self.first_done {
-                        self.first = (self.first * 10 + u32::from(b - b'0')).min(65535);
-                    }
+                    self.parameter(b);
                 }
                 o.bytes.push(b);
             }
             0x3c..=0x3f => {
                 if self.mode == Mode::CsiEntry {
-                    self.plain = false;
+                    self.private = true;
                     self.mode = Mode::CsiParam;
                 } else {
                     self.mode = Mode::CsiIgnore;
@@ -739,14 +753,45 @@ impl Guard {
         }
     }
 
-    /// The end of a CSI sequence. Everything before it has been passed already; a REP that is not to run as it is is cancelled (CAN
-    /// leaves the parser's sequence without running it) and, if it can be written smaller, written again.
+    /// A digit, `:` or `;` of a CSI sequence, read as the parser reads the first two parameters: `;` starts the next one, `:` starts a
+    /// subparameter, and the digits of a subparameter are not the parameter's value.
+    fn parameter(&mut self, b: u8) {
+        match b {
+            b';' => {
+                self.param = (self.param + 1).min(2);
+                self.sub = false;
+            }
+            b':' => self.sub = true,
+            _ => {
+                if !self.sub && self.param < 2 {
+                    self.params[self.param] = (self.params[self.param] * 10 + u32::from(b - b'0')).min(65535);
+                }
+            }
+        }
+    }
+
+    /// The end of a CSI sequence. Everything before it has been passed already, so the parameters are read here: `CSI Pt;Pb r` sets the
+    /// scroll region ([`Guard::scroll_region`]), `CSI ! p` (DECSTR) clears it. A region the page ignores is cancelled the same way, as is
+    /// a REP that is not to run as it is (CAN leaves the parser's sequence without running it); a REP that can be written smaller is
+    /// written again.
     fn csi_final(&mut self, b: u8, o: &mut Out<'_>) {
-        if b != b'b' || !self.plain {
+        if !self.private {
+            if b == b'r' && self.inter == 0 {
+                if !self.scroll_region(o.rows) {
+                    // The page ignores the region, and the copy must too: alacritty would apply a one-line or an empty one. The bytes
+                    // of the sequence are already in the copy's input, so the final byte becomes a CAN, which cancels it.
+                    o.bytes.push(CAN);
+                    return;
+                }
+            } else if b == b'p' && self.inter == b'!' {
+                self.region = None;
+            }
+        }
+        if b != b'b' || self.private || self.inter != 0 {
             o.bytes.push(b);
             return;
         }
-        let count = if self.first == 0 { 1 } else { self.first as usize };
+        let count = if self.params[0] == 0 { 1 } else { self.params[0] as usize };
         if self.last_zero {
             o.bytes.push(CAN);
         } else if count > o.cols {
@@ -755,6 +800,22 @@ impl Guard {
         } else {
             o.bytes.push(b);
         }
+    }
+
+    /// `CSI Pt;Pb r` the way the page's xterm takes it (`setScrollRegion` in webui/term/vendor/xterm.js): a top of 0 or none is line 1,
+    /// a bottom of 0 or none, or one past the screen, is the last line, and the region applies only when its bottom is below its top,
+    /// so one that starts on or past the last line is ignored. The whole screen is no region at all, so a bare `CSI r` clears it.
+    /// alacritty takes a top on the last line, or past it, as a one-line or an empty region, so the sequence is cancelled rather
+    /// than passed on when this returns `false` (see [`Guard::csi_final`]).
+    fn scroll_region(&mut self, rows: usize) -> bool {
+        let top = self.params[0].max(1) as usize;
+        let bottom = if self.params[1] == 0 || self.params[1] as usize > rows { rows } else { self.params[1] as usize };
+        if top >= bottom {
+            return false;
+        }
+        let region = (top - 1, bottom);
+        self.region = if region == (0, rows) { None } else { Some(region) };
+        true
     }
 
     fn csi_ignore(&mut self, b: u8, o: &mut Out<'_>) {
@@ -846,10 +907,10 @@ impl Emu {
     /// looking at the cell a mark lands on. This copy therefore shows a frame as far as it has been read, where the page shows it
     /// whole; and no update can freeze it, because none is ever held.
     pub fn feed(&mut self, bytes: &[u8]) -> Effects {
-        let cols = self.term.columns();
+        let (cols, rows) = (self.term.columns(), self.term.screen_lines());
         self.passed.clear();
         self.marks.clear();
-        self.guard.filter(bytes, cols, &mut self.passed, &mut self.marks);
+        self.guard.filter(bytes, cols, rows, &mut self.passed, &mut self.marks);
         let passed = std::mem::take(&mut self.passed);
         let marks = std::mem::take(&mut self.marks);
         let mut at = 0;
@@ -907,6 +968,11 @@ impl Emu {
 
     pub fn alt_screen(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// The scroll region, from line 0 with the line after its bottom, or `None` for the whole screen (see [`Guard`]'s `region`).
+    pub fn region(&self) -> Option<(usize, usize)> {
+        self.guard.region
     }
 }
 
@@ -974,6 +1040,8 @@ impl Screen {
         let mut emu = self.lock();
         let pty = also();
         emu.term.resize(Size { cols: cols as usize, rows: rows as usize });
+        // alacritty starts the region over on a resize, and so does the page's xterm (its buffer's resize sets the bottom margin again).
+        emu.guard.region = None;
         self.size.store(pack(cols, rows), Ordering::Relaxed);
         pty
     }
@@ -1148,8 +1216,16 @@ mod tests {
     /// `input` through a fresh guard at `cols` wide: what the parser would be given.
     fn guarded(input: &[u8], cols: usize) -> Vec<u8> {
         let (mut bytes, mut marks) = (Vec::new(), Vec::new());
-        Guard::default().filter(input, cols, &mut bytes, &mut marks);
+        Guard::default().filter(input, cols, DEFAULT_ROWS as usize, &mut bytes, &mut marks);
         bytes
+    }
+
+    /// The scroll region the copy has after `input` on a fresh screen of `rows` lines.
+    fn region_after(rows: u16, input: &[u8]) -> Option<(usize, usize)> {
+        let (screen, _) = fresh(40, rows);
+        feed(&screen, input);
+        let emu = screen.lock();
+        emu.region()
     }
 
     fn replies(recorder: &Recorder) -> Vec<String> {
@@ -1415,9 +1491,9 @@ mod tests {
         let flood_of = |intro: &str, flood: &[u8], times: usize| {
             let (mut out, mut marks) = (Vec::new(), Vec::new());
             let mut guard = Guard::default();
-            guard.filter(intro.as_bytes(), 80, &mut out, &mut marks);
+            guard.filter(intro.as_bytes(), 80, DEFAULT_ROWS as usize, &mut out, &mut marks);
             for _ in 0..times {
-                guard.filter(flood, 80, &mut out, &mut marks);
+                guard.filter(flood, 80, DEFAULT_ROWS as usize, &mut out, &mut marks);
             }
             out
         };
@@ -1790,5 +1866,67 @@ mod tests {
         assert_eq!(tail_bytes("ab€cd".into(), 5), "€cd");
         let saved = text_of_saved("one\ntwo\nthree", 2, 100);
         assert_eq!((saved.text.as_str(), saved.cursor, saved.seq), ("two\nthree", None, 0));
+    }
+
+    #[test]
+    fn a_scroll_region_is_passed_on_as_it_was_and_the_copy_takes_it() {
+        assert_eq!(guarded(b"\x1b[2;4r", 40), b"\x1b[2;4r", "the guard passes the region through unchanged");
+        let (home, _) = fresh(40, 10);
+        feed(&home, b"\x1b[5;5H\x1b[2;4r");
+        assert_eq!(home.lock().term.grid().cursor.point, Point::new(Line(0), Column(0)), "the copy homes the cursor on a region");
+        // A line feed at the region's bottom scrolls the region and nothing above it: `top` stays on line 1.
+        let (screen, _) = fresh(40, 10);
+        feed(&screen, b"\x1b[2;4r\x1b[1;1Htop\x1b[4;1Hx\r\ny\r\nz");
+        assert_eq!(screen.lock().region(), Some((1, 4)));
+        assert_eq!(shown_text(&screen).lines().collect::<Vec<_>>(), ["top", "x", "y", "z"]);
+    }
+
+    #[test]
+    fn the_region_is_kept_as_the_parser_takes_each_sequence() {
+        type Case = (&'static [u8], Option<(usize, usize)>);
+        let whole = None;
+        let cases: [Case; 17] = [
+            (b"\x1b[2;4r", Some((1, 4))),
+            (b"\x1b[;4r", Some((0, 4))),
+            (b"\x1b[2r", Some((1, 10))),
+            (b"\x1b[2;0r", Some((1, 10))),
+            (b"\x1b[2:9;4r", Some((1, 4))),
+            (b"\x1b[2;100r", Some((1, 10))),
+            (b"\x1b[11;12r", whole),
+            (b"\x1b[10;12r", whole),
+            (b"\x1b[2;4r\x1b[5;3r", Some((1, 4))),
+            (b"\x1b[2;4r\x1b[2;2r", Some((1, 4))),
+            (b"\x1b[2;4r\x1b[11;12r", Some((1, 4))),
+            (b"\x1b[2;4r\x1b[?2;3r", Some((1, 4))),
+            (b"\x1b[2;4r\x1b[2;4$r", Some((1, 4))),
+            (b"\x1b[2;4r\x1b[r", whole),
+            (b"\x1b[2;4r\x1b[1;10r", whole),
+            (b"\x1b[2;4r\x1b[!p", whole),
+            (b"\x1b[2;4r\x1bc", whole),
+        ];
+        for (input, want) in cases {
+            assert_eq!(region_after(10, input), want, "after {:?}", String::from_utf8_lossy(input));
+        }
+    }
+
+    #[test]
+    fn an_ignored_region_is_cancelled_so_the_copy_does_not_take_it() {
+        // On ten lines `CSI 11;12r` starts past the last line, so the page ignores it. alacritty would take it as a one-line region on
+        // the last line and home the cursor, so the guard writes a CAN for the final byte, and `A` lands after `xyz`, as on the page.
+        let (mut bytes, mut marks) = (Vec::new(), Vec::new());
+        Guard::default().filter(b"\x1b[11;12r", 40, 10, &mut bytes, &mut marks);
+        assert_eq!(bytes, b"\x1b[11;12\x18", "the final byte is cancelled");
+        let (screen, _) = fresh(40, 10);
+        feed(&screen, b"xyz\x1b[11;12rA");
+        assert_eq!(screen.lock().region(), None, "the region is not kept");
+        assert_eq!(shown_text(&screen).lines().next(), Some("xyzA"), "the copy shows the page's line");
+    }
+
+    #[test]
+    fn a_resize_starts_the_region_over() {
+        let (screen, _) = fresh(40, 10);
+        feed(&screen, b"\x1b[2;4r");
+        screen.resize(40, 12, || Ok(())).unwrap();
+        assert_eq!(screen.lock().region(), None, "alacritty starts the region over on a resize, and so does the copy");
     }
 }
