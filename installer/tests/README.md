@@ -35,5 +35,6 @@ test kills afterwards (and only while that pid is still the stub).
 The unit tests of the same slice are next to the code: `src/status/tests.rs` (the JSON, the cache, the plugin record, the jev states,
 each held to the sentence the command itself would print) and `src/keys.rs` (`every_refusal_carries_its_kind_through_added_context`,
 and the fingerprint, record and crash tests: `a_revoked_key_has_no_way_back_under_a_fresh_id`, `trusted_never_lists_a_key_whose_fingerprint_is_revoked`,
-`add_manual_refuses_a_key_already_in_the_list_and_never_rewrites_its_record`, `a_crash_while_the_keys_dir_is_made_leaves_nothing_that_reads_as_a_keys_dir`).
+`add_manual_refuses_a_key_already_in_the_list_and_never_rewrites_its_record`, `a_crash_while_the_keys_dir_is_made_leaves_nothing_that_reads_as_a_keys_dir`,
+`a_fault_after_the_record_and_before_the_rename_leaves_no_keys_dir`).
 The `compiled` kind is only reachable there: a test build compiles in the placeholder key, so the CLI has no compiled-in key to refuse.

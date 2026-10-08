@@ -223,8 +223,9 @@ be removed by hand; only a signed rotation revokes it. `hoot keys ...` passes th
 was revoked (`revoked`); a key whose id a DIFFERENT key uses (`collision`); a key already in the list, under its id or under another id
 with the same bytes (`collision`: a key's record is never rewritten, so a rotation key keeps its source, its expiry and who added it);
 the compiled-in key, under its id or its bytes (`compiled`). A revocation keeps the key's fingerprint, and the fingerprint is the sha-256
-of the 32 key bytes, so the same bytes under a fresh id are refused too. A revocation written before fingerprints were kept has no `fp`
-and refuses by id only; the key's file is gone by then, so its bytes are not known.
+of the 32 key bytes, so the same bytes under a fresh id are refused too. A revocation has no `fp` and refuses by id only when it was written
+before fingerprints were kept, or when the key's bytes were not on this machine at the revocation (a revoked key's file is removed, so
+its bytes are not known afterwards). Such a revocation does not refuse the same bytes under a fresh id.
 
 **For the perch.** A perch route that adds a key runs `minerva keys inspect - --json` with the public key on stdin (answer
 `{"id","fingerprint","comment"}`), shows the fingerprint to the person, and when they have typed the FINGERPRINT back runs
@@ -427,18 +428,18 @@ keys): good signature installs, tampered bundle refused, wrong key refused, miss
 refused, rollback and forward, Nix refused, notice once a day / silent on failure / bad signature gives no notice,
 install/rerun/upgrade/prune/uninstall layout, WSL list parsing, PATH list edits, key rotation (good, unknown signer, revoked
 signer, revoked compiled-in key, manual add/remove and the refusals of `add`, a revoked key under a fresh id by hand and in a rotation, a fingerprint
-that is not 16 hex digits, expiry, replay, open keys dir, a crash while the keys dir is made), and the plugin lifecycle (install, trust, foreign
+that is not 16 hex digits, expiry, replay, open keys dir, a crash while the keys dir is made, a fault between its record and its rename leaving no keys dir), and the plugin lifecycle (install, trust, foreign
 plugin kept, update keeps trust, uninstall removes only ours) when `MINERVA_TEST_EIDOLON` names an eidolon binary (otherwise that
 one test says it was skipped). The Windows pieces (registry,
 shortcut, WSL calls) are exercised by running the exe with the test options above, never against the real settings.
 
 `tests/` (see `tests/README.md`) holds the perch contract's tests: `status --json` over fixture prefixes (cache present, stale, corrupt,
 absent; no `plugins.json`; every jev state), `keys add|remove --json` (every error kind, and the keys dir byte for byte unchanged on a
-refusal), and the two scripts against a stub HTTP server on 127.0.0.1:48110 (the arm sends exactly the given token, only through a 0600
-header file, never in argv, through no proxy and no `~/.curlrc`, and nothing is aimed at 47820; a ^C leaves no header file), plus the perch
-start with `--help` outputs captured from an old and a current perch (also with colour forced in the environment, and a second perch
-on another port). `bash -n` runs on both scripts. `nix_allow_web.rs` runs `nix/minerva.sh keys allow-web` (under a temp HOME, with the curl shim): it
-prints the Nix sentence, exits 1, sends no request and makes no runtime file. Nothing in `cargo test` parses `hoot.ps1`: that is done by hand, from the
+refusal), `bin/perch-open.sh`'s arm against the stub HTTP server on 127.0.0.1:48110 (the arm sends exactly the given token, only through a
+0600 header file, never in argv, through no proxy and no `~/.curlrc`, and nothing is aimed at 47820; a ^C leaves no header file), both
+scripts' start-up flags (the perch start with `--help` outputs captured from an old and a current perch, also with colour forced in the
+environment, and a second perch on another port), and `bash -n` on both scripts. `nix_allow_web.rs` checks that `nix/minerva.sh keys
+allow-web` refuses and arms nothing: it prints the Nix sentence, exits 1, sends no request and makes no runtime file. Nothing in `cargo test` parses `hoot.ps1`: that is done by hand, from the
 Windows side (Windows PowerShell 5.1 is the parser that matters), from the repository root, and must print `0`, the number of parse
 errors:
 

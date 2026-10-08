@@ -269,6 +269,12 @@ const RECOVER: &str = "To recover: restore state.json from a backup; or, accepti
 /// make every later (real) rotation look "already applied".
 pub const MAX_SERIAL_JUMP: u64 = 16;
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault point: with it set, `ensure_dir` fails after the record is written and before the temp dir is renamed into place.
+    static FAIL_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The trust anchor and where the extra keys live.
 #[derive(Debug, Clone)]
 pub struct Trust {
@@ -369,10 +375,6 @@ impl Trust {
         Ok(st)
     }
 
-    pub fn is_revoked(&self, id: &str) -> Result<bool> {
-        Ok(self.state()?.revoked.iter().any(|r| r.id.eq_ignore_ascii_case(id)))
-    }
-
     fn meta_of(&self, id: &str) -> Option<Meta> {
         fs::read_to_string(self.dir.join(format!("{id}.json"))).ok().and_then(|t| serde_json::from_str::<Meta>(&t).ok())
     }
@@ -462,6 +464,10 @@ impl Trust {
             fs::DirBuilder::new().mode(0o700).create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
             // A directory always has its record, so a missing one later means something deleted it.
             write_private_in(&tmp, "state.json", serde_json::to_string_pretty(&State::default())?.as_bytes())?;
+            #[cfg(test)]
+            if FAIL_BEFORE_RENAME.with(|f| f.get()) {
+                bail!("injected fault: the keys dir was not renamed into place");
+            }
             fs::rename(&tmp, &self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
             sync_dir(parent)?;
         }
@@ -1056,6 +1062,31 @@ pub mod tests {
         assert!(e.contains("is missing although") && e.contains("To recover"), "{e}");
         let json = rotation(1, "2030-01-01", &[], &[]);
         assert!(apply_rotation(&tr, json.as_bytes(), &sign(&sk, json.as_bytes()), "2026-10-06").is_err());
+    }
+
+    #[test]
+    fn a_fault_after_the_record_and_before_the_rename_leaves_no_keys_dir() {
+        // the keys dir is built beside its place and renamed in. The fault sits after the record is written and before the rename: a
+        // build made in place (no rename) leaves a dir here, and this test fails.
+        let (pk, _) = keypair();
+        let (extra, _) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        let leftover = tr.dir.parent().unwrap().join(".keys.new");
+        FAIL_BEFORE_RENAME.with(|f| f.set(true));
+        let r = tr.add_manual(&extra);
+        FAIL_BEFORE_RENAME.with(|f| f.set(false));
+        let e = r.unwrap_err();
+        assert!(format!("{e:#}").contains("injected fault"), "{e:#}");
+        assert!(!tr.dir.exists(), "no keys dir was made");
+        assert!(leftover.join("state.json").is_file(), "the record was written before the fault");
+        let st = tr.state().unwrap();
+        assert_eq!((st.serial, st.revoked.len()), (0, 0), "the fresh default, not a record that revokes or trusts anything");
+        assert_eq!(tr.trusted("2026-10-06").unwrap().len(), 1, "trusts only the compiled-in key");
+        // disarmed: the next run removes the leftover, makes the dir, and the key is added
+        tr.add_manual(&extra).unwrap();
+        assert!(!leftover.exists(), "the leftover is removed");
+        assert!(tr.dir.join("state.json").is_file());
+        assert_eq!(tr.trusted("2026-10-06").unwrap().len(), 2);
     }
 
     #[test]
