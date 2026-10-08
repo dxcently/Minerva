@@ -1,0 +1,12 @@
+// A plugin only the tests use (tests/shape.sh installs it in a temp config): one workflow that calls each term_* tool through
+// the gate, the way a chat's agent does, and reports what every call answered.
+pub fn manifest() {
+    #{
+        name: "probe",
+        version: "0.0.0",
+        description: "test workflow for the term_* tools; never shipped",
+        claims: #{
+            workflows: ["shape"],
+        },
+    }
+}

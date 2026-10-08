@@ -1,0 +1,61 @@
+// Calls the term_* tools through the gate and reports, for every call, whether it ran and what it answered:
+// a JSON list of {label, ok, text}. `set` picks the calls: "basic" (one of each, with extra fields the tools must not
+// forward), "errors" (an id that makes the stub answer 423 / 403, and the missing-argument refusals), "note" (a read whose text
+// tries to give an order).
+pub fn workflow() {
+    #{
+        name: "shape",
+        description: "Call each term_* tool and report what it answered. Test only.",
+        approval: "read_only",
+        params: #{
+            "type": "object",
+            "properties": #{
+                "set": #{ "type": "string", "description": "basic, errors or note." },
+            },
+        },
+    }
+}
+
+async fn step(out, label, tool, input) {
+    match eidolon::tool_call(tool, input).await {
+        Ok(text) => out.push(#{ "label": label, "ok": true, "text": text }),
+        Err(e) => out.push(#{ "label": label, "ok": false, "text": `${e}` }),
+    }
+}
+
+pub async fn run(args) {
+    let out = [];
+    let set = match args.get("set") {
+        Some(s) => s,
+        None => "basic",
+    };
+    if set == "basic" {
+        step(out, "list", "term_list", #{}).await;
+        step(out, "open", "term_open", #{ "title": "probe", "cols": 100, "rows": 30, "chat": "evil", "cwd": "/" }).await;
+        step(out, "read-min", "term_read", #{ "id": "t7" }).await;
+        step(out, "read-full", "term_read", #{
+            "id": "t7", "lines": 50, "max_chars": 900,
+            "wait": #{ "for": "$ ", "idle_ms": 200, "timeout_s": 5, "extra": 1 },
+            "chat": "evil",
+        }).await;
+        step(out, "send-text-keys", "term_send", #{ "id": "t7", "text": "echo hi", "keys": ["enter"], "chat": "evil" }).await;
+        step(out, "send-keys", "term_send", #{ "id": "t7", "keys": ["ctrl-c"] }).await;
+        step(out, "close", "term_close", #{ "id": "t7", "chat": "evil" }).await;
+    } else if set == "errors" {
+        step(out, "read-held", "term_read", #{ "id": "t-held" }).await;
+        step(out, "send-held", "term_send", #{ "id": "t-held", "text": "ls" }).await;
+        step(out, "send-guard", "term_send", #{ "id": "t-guard", "text": "aoide mail send x" }).await;
+        step(out, "close-notmine", "term_close", #{ "id": "t-notmine" }).await;
+        step(out, "send-nothing", "term_send", #{ "id": "t7" }).await;
+        step(out, "read-no-id", "term_read", #{}).await;
+        step(out, "close-no-id", "term_close", #{}).await;
+    } else if set == "note" {
+        step(out, "read-note", "term_read", #{ "id": "t-note" }).await;
+    } else if set == "list" {
+        step(out, "list", "term_list", #{}).await;
+    }
+    match json::to_string(out) {
+        Ok(s) => s,
+        Err(_) => "[]",
+    }
+}

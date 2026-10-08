@@ -1,0 +1,14 @@
+// The plugin manifest for `term`: the agent's hands on the web terminals Minerva's perch hosts. The directory's name is the
+// namespace every verb it ships is registered under (`term_list`, ...). No `service:` block on purpose: the service is the
+// perch itself, which `minerva web` starts; a plugin cannot own it. The README says how the tools find it.
+pub fn manifest() {
+    #{
+        name: "term",
+        version: "0.1.0",
+        description: "web terminals for a chat's agent: list, open, read, send and close, on the terminals Minerva's perch hosts and the operator watches live",
+        claims: #{
+            tools: ["list", "open", "read", "send", "close"],
+            grants: ["file:~/.config/eidolon/minerva-term.token"],
+        },
+    }
+}

@@ -1,5 +1,6 @@
-//! The plugins that come with Minerva (browser, subagent, jev): installed, trusted and kept current by the SAME stock
-//! eidolon commands a person would type (`eidolon plugins install|trust|grant|service approve`).
+//! The plugins that come with Minerva (browser, subagent, jev from eidolon-plugins/, and term, mail from plugins/): installed,
+//! trusted and kept current by the SAME stock eidolon commands a person would type
+//! (`eidolon plugins install|trust|grant|service approve`).
 //!
 //! Where: eidolon reads plugins from `<config dir>/eidolon/plugins` only (the `plugins_dir` key is the one other way, and
 //! the perch's generated config keeps the member's keys but never sets it), so that is where they go. Hence the rules:
@@ -29,6 +30,15 @@ use crate::install::Layout;
 const BROWSER_VERBS: [&str; 6] = ["open", "snapshot", "click", "type", "read", "back"];
 const BROWSER_TOKEN: &str = "file:~/.config/eidolon/browser.token";
 
+/// The five verbs of plugins/term, and the token file the perch writes for them (perch/src/agent/README.md).
+const TERM_VERBS: [&str; 5] = ["list", "open", "read", "send", "close"];
+const TERM_TOKEN: &str = "file:~/.config/eidolon/minerva-term.token";
+/// D6: the verbs the installer vouches, so that they run unasked in auto. term_send is NEVER among them: typing into a terminal is
+/// bash by another door, and a vouch would let it run in auto without an ask. Nothing below may name it in a `trust` call.
+const TERM_VOUCHED: [&str; 4] = ["list", "read", "open", "close"];
+/// plugins/mail's one verb and its token file. It is granted and not vouched: it asks in manual and in auto.
+const MAIL_TOKEN: &str = "file:~/.config/eidolon/minerva-mail.token";
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Ours {
     pub version: String,
@@ -36,8 +46,8 @@ pub struct Ours {
     pub hash: String,
     /// "stock" (eidolon plugins install) or "copy" (no git).
     pub how: String,
-    /// sha-256 over the INSTALLED copy right after we installed and trusted it. Trust is only ever (re)applied to a copy
-    /// that still hashes to this; anything else was edited by the member and is left alone, untrusted.
+    /// sha-256 over the INSTALLED copy right after we installed it, before any trust is applied. Trust is only ever (re)applied
+    /// to a copy that still hashes to this; anything else was edited by the member and is left alone, untrusted.
     #[serde(default)]
     pub installed: String,
 }
@@ -199,15 +209,56 @@ impl PluginEnv {
         if ok { Some(td) } else { None }
     }
 
-    fn trust_one(&self, name: &str, out: &mut Vec<String>) -> Result<()> {
-        self.eid_ok(&["plugins", "trust", name])?;
-        if name == "browser" {
-            for v in BROWSER_VERBS {
-                self.eid_ok(&["plugins", "grant", &format!("browser_{v}"), BROWSER_TOKEN])?;
-            }
-            self.eid_ok(&["plugins", "service", "approve", "browser"])?;
+    /// `plugins untrust <name>`: every vouch the plugin has. Eidolon answers "no vouch on record" when there is none (a first
+    /// install), which is what we want anyway; any other failure stops the sync.
+    fn untrust_all(&self, name: &str) -> Result<()> {
+        let (ok, text) = self.eidolon(&["plugins", "untrust", name])?;
+        if ok || text.contains("no vouch on record") {
+            return Ok(());
         }
-        out.push(format!("{name}: trusted"));
+        bail!("eidolon plugins untrust {name} failed: {}", text.trim())
+    }
+
+    /// Trust one bundled plugin by the rule for its name. A name with no arm vouches and grants nothing: it is installed, and
+    /// what it does asks as it always did. A failure part-way stops the sync with an error: the vouches already made stand and
+    /// the rest ask, which is the safe side. The next pass runs the whole arm again, because the plugin is on record (see the
+    /// install loop in `sync`) and so reaches this arm as ours and unchanged. This arm runs on each pass that is not settled;
+    /// a settled `--if-needed` pass returns before it (installer/README.md, "when it runs").
+    fn trust_one(&self, name: &str, out: &mut Vec<String>) -> Result<()> {
+        match name {
+            // Minerva's own plugins that call the perch. They are trusted verb by verb, never as a whole plugin (a bare
+            // `plugins trust term` would vouch term_send), and what they are granted is the token file the perch writes. Both
+            // go to eidolon's default permits store, the one the perch keeps shared for auto, yolo and runs. Each run of this arm
+            // first takes back every vouch term has, so a verb that is no longer in TERM_VOUCHED stops running unasked.
+            "term" => {
+                self.untrust_all("term")?;
+                for v in TERM_VOUCHED {
+                    self.eid_ok(&["plugins", "trust", "term", v])?;
+                }
+                for v in TERM_VERBS {
+                    self.eid_ok(&["plugins", "grant", &format!("term_{v}"), TERM_TOKEN])?;
+                }
+                out.push("term: trusted list, read, open and close; term_send is not vouched and asks".into());
+            }
+            "mail" => {
+                self.untrust_all("mail")?;
+                self.eid_ok(&["plugins", "grant", "mail_send", MAIL_TOKEN])?;
+                out.push("mail: mail_send is granted its token file and not vouched, so it asks".into());
+            }
+            "browser" => {
+                self.eid_ok(&["plugins", "trust", "browser"])?;
+                for v in BROWSER_VERBS {
+                    self.eid_ok(&["plugins", "grant", &format!("browser_{v}"), BROWSER_TOKEN])?;
+                }
+                self.eid_ok(&["plugins", "service", "approve", "browser"])?;
+                out.push("browser: trusted".into());
+            }
+            "jev" | "subagent" => {
+                self.eid_ok(&["plugins", "trust", name])?;
+                out.push(format!("{name}: trusted"));
+            }
+            _ => out.push(format!("{name}: installed, not vouched (no rule in trust_one)")),
+        }
         Ok(())
     }
 }
@@ -269,7 +320,7 @@ pub fn sync(env: &PluginEnv, mut o: SyncOpts) -> Result<Vec<String>> {
                 // The installed copy is not what we installed: the member edited it (or it was swapped). We neither trust nor
                 // replace it; a vouch is only ever put on bytes we put there ourselves.
                 out.push(format!(
-                    "{n}: your copy was changed since Minerva installed it; left as it is and NOT trusted (to get Minerva's again: delete that folder, then minerva plugins sync)"
+                    "{n}: your copy was changed since Minerva installed it; left as it is, not re-trusted; earlier vouches of unchanged verbs and the token grants still stand (to get Minerva's again: delete that folder, then minerva plugins sync)"
                 ));
             }
             (true, Some(ours)) if ours.hash == hash => {
@@ -322,6 +373,10 @@ pub fn sync(env: &PluginEnv, mut o: SyncOpts) -> Result<Vec<String>> {
             }
         }
         drop(repo);
+        // Every new copy is landed and recorded before any trust is applied. A trust that fails below then leaves each plugin on
+        // record, so the next pass finds it as ours and unchanged and runs its whole arm again; unrecorded, its folder would be
+        // the member's own and be left alone for good.
+        let mut landed = Vec::new();
         for n in &to_install {
             let dest = pdir.join(n);
             let how = if stock_ok && dest.is_dir() {
@@ -337,10 +392,15 @@ pub fn sync(env: &PluginEnv, mut o: SyncOpts) -> Result<Vec<String>> {
                 fs::rename(&stage, &dest).with_context(|| format!("landing {n}"))?;
                 "copy"
             };
-            env.trust_one(n, &mut out)?;
             let installed = hash_tree(&dest)?;
             st.plugins.insert(n.clone(), Ours { version: version_of(&dest), hash: hashes[n].clone(), how: how.into(), installed });
-            out.push(format!("{n}: installed {} ({how})", version_of(&dest)));
+            landed.push(n.clone());
+        }
+        save_state(&env.layout, &st)?;
+        for n in &landed {
+            env.trust_one(n, &mut out)?;
+            let ours = &st.plugins[n];
+            out.push(format!("{n}: installed {} ({})", ours.version, ours.how));
         }
     }
     st.stamp = o.version.to_string();
@@ -349,16 +409,37 @@ pub fn sync(env: &PluginEnv, mut o: SyncOpts) -> Result<Vec<String>> {
 }
 
 /// Remove only what we installed: untrust, revoke our grants, uninstall. Best effort; never touches the member's own.
+///
+/// Two things this cannot take back, and the output says so. `plugins untrust` works through the plugin's folder, so once the
+/// member has deleted that folder its vouches stay in eidolon's permits store. And `plugins revoke` takes every grant of a tool
+/// whatever its source, so it drops a grant of term_* or mail_send that the member made by hand. Whatever is still on record
+/// for a plugin after its removal is listed under its name, with the store it is in.
 pub fn remove_ours(env: &PluginEnv) -> Result<Vec<String>> {
+    remove_ours_from(env, permits_store().as_deref())
+}
+
+/// `remove_ours`, with the permits store to look in given (None: nothing is looked for).
+fn remove_ours_from(env: &PluginEnv, store: Option<&Path>) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let st = load_state(&env.layout);
-    for (n, _) in st.plugins.iter() {
+    for n in st.plugins.keys() {
         let _ = env.eidolon(&["plugins", "service", "stop", n]);
-        let _ = env.eidolon(&["plugins", "untrust", n]);
+        let (untrusted, text) = env.eidolon(&["plugins", "untrust", n]).unwrap_or((true, String::new()));
+        if !untrusted && !text.contains("no vouch on record") {
+            out.push(format!("{n}: could not take its vouches back ({})", text.trim().lines().next().unwrap_or("")));
+        }
         if n == "browser" {
             for v in BROWSER_VERBS {
                 let _ = env.eidolon(&["plugins", "revoke", &format!("browser_{v}"), BROWSER_TOKEN]);
             }
+        }
+        if n == "term" {
+            for v in TERM_VERBS {
+                let _ = env.eidolon(&["plugins", "revoke", &format!("term_{v}"), TERM_TOKEN]);
+            }
+        }
+        if n == "mail" {
+            let _ = env.eidolon(&["plugins", "revoke", "mail_send", MAIL_TOKEN]);
         }
         if n == "jev" {
             for v in ["choose", "entail"] {
@@ -367,9 +448,57 @@ pub fn remove_ours(env: &PluginEnv) -> Result<Vec<String>> {
         }
         let (ok, text) = env.eidolon(&["plugins", "uninstall", n, "--force"])?;
         out.push(if ok { format!("{n}: removed") } else { format!("{n}: not removed ({})", text.trim().lines().next().unwrap_or("")) });
+        if let Some(store) = store {
+            for row in rows_left(store, n, &granted_verbs(n)) {
+                out.push(format!("{n}: still on record in {}: {row}", store.display()));
+            }
+        }
     }
     let _ = fs::remove_file(state_path(&env.layout));
     Ok(out)
+}
+
+/// eidolon's default permits store: `policy.permits.rn` beside its default policy. A member who moved the policy (`[policy] path`)
+/// keeps the store beside that file instead, and is told nothing here about it.
+fn permits_store() -> Option<PathBuf> {
+    config_dir().ok().map(|d| d.join("policy.permits.rn"))
+}
+
+/// The tool names a bundled plugin's grants are on record under: the ones `remove_ours` revokes.
+fn granted_verbs(n: &str) -> Vec<String> {
+    match n {
+        "browser" => BROWSER_VERBS.iter().map(|v| format!("browser_{v}")).collect(),
+        "term" => TERM_VERBS.iter().map(|v| format!("term_{v}")).collect(),
+        "mail" => vec!["mail_send".to_string()],
+        "jev" => vec!["jev_choose".to_string(), "jev_entail".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// The rows of eidolon's permits store that still belong to `plugin`: its vouches (the rows of the VOUCHE list whose `plugin` is
+/// it) and the grants of `verbs` (the rows of the GRANT list). Eidolon writes each list on one line, a row per `#{ ... }`, with
+/// its fields as `name: "value"`.
+fn rows_left(store: &Path, plugin: &str, verbs: &[String]) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(store) else { return Vec::new() };
+    let field = |row: &str, key: &str| -> Option<String> {
+        let rest = row.split(format!("{key}: \"").as_str()).nth(1)?;
+        Some(rest.split('"').next()?.to_string())
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        for row in line.split("#{").skip(1) {
+            if line.starts_with("const VOUCHE") && field(row, "plugin").as_deref() == Some(plugin) {
+                out.extend(field(row, "verb").map(|verb| format!("vouch of {verb}")));
+            } else if line.starts_with("const GRANT") {
+                out.extend(
+                    field(row, "tool")
+                        .filter(|tool| verbs.contains(tool))
+                        .map(|tool| format!("grant of {tool} on {}", field(row, "source").unwrap_or_default())),
+                );
+            }
+        }
+    }
+    out
 }
 
 pub const JEV_TOKEN: &str = "file:~/.config/eidolon/jev.token";

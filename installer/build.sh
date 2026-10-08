@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # build.sh: build the Minerva Linux bundle (static musl binaries + the web UI + the Windows hoot files).
 # Runs on Linux or in WSL. Needs: rust (cargo) with the x86_64-unknown-linux-musl target, a C compiler (gcc, or musl-gcc
-# when installed), tar, gzip. It does not publish anything.
+# when installed), tar, gzip, and git with a checkout it can read (plugins/ ships git's tracked files only). It does not
+# publish anything.
 #
-# usage: installer/build.sh --out DIR [--version-base X.Y.Z] [--sha SHA] [--pubkey FILE] [--allow-placeholder-key] [--dev] [--test-overrides]
+# usage: installer/build.sh --out DIR [--version-base X.Y.Z] [--sha SHA] [--pubkey FILE] [--allow-placeholder-key] [--dev] [--test-overrides] [--dry-run]
 #   --out DIR       where minerva-<version>-linux-x86_64.tar.gz and install.sh are written
 #   --version-base  default: the repo-root VERSION file
 #   --sha           default: git rev-parse --short HEAD (+ .dirty when the tracked files changed)
@@ -13,11 +14,13 @@
 #                   switches glibc's FORTIFY_SOURCE off, so such a build is for testing only. A release build (no --dev)
 #                   requires musl-gcc (apt install musl-tools) and keeps the stack protector and fortify.
 #   --test-overrides  compile the test-only back doors (MINERVA_KEYS_DIR, update --self-path) into `minerva`; never for a release
+#   --dry-run       stage only the plugins and the licence notices (no cargo, no chromium, no tarball), print the files of
+#                   plugins/, LICENSES/ and THIRD-PARTY.md that the bundle would hold, and remove the staging again
 # environment: CARGO_TARGET_DIR (default $HOME/installer-target; never the repo, never ~/perch-target)
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$here/.." && pwd)
-out= base= sha= pubkey= allow=0 dev=0 testov=0
+out= base= sha= pubkey= allow=0 dev=0 testov=0 dry=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) out=$2; shift 2 ;;
@@ -27,7 +30,8 @@ while [ $# -gt 0 ]; do
     --allow-placeholder-key) allow=1; shift ;;
     --dev) dev=1; shift ;;
     --test-overrides) testov=1; shift ;;
-    -h|--help) sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --dry-run) dry=1; shift ;;
+    -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "build.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -37,12 +41,63 @@ mkdir -p "$out"; out=$(cd "$out" && pwd)
 [ -n "$base" ] || base=$(tr -d ' \r\n' <"$repo/VERSION")
 if [ -z "$sha" ]; then
   sha=$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo nogit)
-  # tracked changes AND untracked files in every path that ships (nix and the flake included)
-  if [ -n "$(git -C "$repo" status --porcelain --untracked-files=all -- perch setup eidolon harnox webui/term bin installer jev eidolon-plugins nix flake.nix flake.lock VERSION 2>/dev/null)" ]; then
+  # tracked changes AND untracked files in every path that ships (nix and the flake included). installer/build.ps1 has this
+  # same pathspec for its own dirty gate: when a path is added here, add it there too, and the other way round.
+  if [ -n "$(git -C "$repo" status --porcelain --untracked-files=all -- perch setup eidolon harnox webui/term bin installer jev eidolon-plugins plugins nix flake.nix flake.lock VERSION 2>/dev/null)" ]; then
     sha=$sha.dirty
   fi
 fi
 full=$base-g$sha
+
+# The plugins (installed into the member's eidolon config by `minerva plugins sync`) and the licence notices a redistribution keeps.
+# Two sources: eidolon-plugins/ (browser, jev, subagent, named here, without the browser's Rust source) and Minerva's own plugins/
+# (every folder with a plugin.rn: term, and mail once it lands; their tests stay out). perch/THIRD-PARTY.md links LICENSES/, so
+# the two sit side by side at the top of the bundle. Of plugins/<p> only what git tracks is staged: a gitignored file (.env, a
+# key, a cache) in the working tree never ships. A symlink is refused, and so is a folder named like one the bundle already has
+# (nix/plugins.nix refuses the same). installer/build.ps1's dirty gate and nix/plugins.nix name the same folders: keep them in step.
+stage_plugins() { # top
+  local top=$1 d p
+  mkdir -p "$top/plugins" "$top/LICENSES"
+  for p in browser jev subagent; do cp -r "$repo/eidolon-plugins/$p" "$top/plugins/$p"; done
+  rm -rf "$top/plugins/browser/service" "$top/plugins/browser/package.nix"
+  if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "build.sh: plugins/ is staged from git's list of tracked files, so the build needs git and a checkout it can read (in WSL, a checkout made in WSL, not a git worktree made on Windows)" >&2
+    exit 1
+  fi
+  for d in "$repo"/plugins/*/; do
+    [ -f "$d/plugin.rn" ] || continue
+    p=$(basename "$d")
+    if [ -e "$top/plugins/$p" ]; then
+      echo "build.sh: plugins/$p has the name of a plugin the bundle already carries (eidolon-plugins/$p); rename the folder in plugins/" >&2
+      exit 1
+    fi
+    # the pipeline's status counts (pipefail): a git that fails, or a copy that fails, stops the build here
+    git -C "$repo" ls-files -z "plugins/$p" | while IFS= read -r -d '' f; do
+      case $f in "plugins/$p/tests/"*) continue ;; esac
+      if [ -L "$repo/$f" ]; then
+        echo "build.sh: $f is a symlink; a plugin ships its own files only, so replace the link with the file it points at" >&2
+        exit 1
+      fi
+      mkdir -p "$top/$(dirname "$f")"
+      cp "$repo/$f" "$top/$f"
+    done
+    [ -f "$top/plugins/$p/plugin.rn" ] || { echo "build.sh: plugins/$p/plugin.rn is not tracked by git; commit the plugin before building it" >&2; exit 1; }
+  done
+  install -m 0644 "$repo/perch/THIRD-PARTY.md" "$top/THIRD-PARTY.md"
+  install -m 0644 "$repo"/perch/LICENSES/* "$top/LICENSES/"
+}
+
+if [ "$dry" = 1 ]; then
+  echo "== dry run: the plugins and notices of Minerva $full (nothing is built)"
+  top=$out/stage/minerva-$full
+  rm -rf "$out/stage"
+  mkdir -p "$top"
+  stage_plugins "$top"
+  (cd "$top" && find plugins LICENSES THIRD-PARTY.md ! -type d | LC_ALL=C sort)
+  rm -rf "$out/stage"
+  exit 0
+fi
+
 echo "== building Minerva $full"
 export MINERVA_VERSION_BASE=$base MINERVA_BUILD_SHA=$sha
 if [ -n "$pubkey" ]; then export MINERVA_UPDATE_PUBKEY=$pubkey; fi
@@ -99,10 +154,7 @@ done
 install -m 0755 "$repo/bin/perch-open.sh" "$repo/bin/minerva-setup.sh" "$top/bin/"
 cp -r "$repo/webui/term" "$top/webui/term"
 
-# plugins (installed into the member's eidolon config by `minerva plugins sync`), without the browser's Rust source
-mkdir -p "$top/plugins"
-for p in browser jev subagent; do cp -r "$repo/eidolon-plugins/$p" "$top/plugins/$p"; done
-rm -rf "$top/plugins/browser/service" "$top/plugins/browser/package.nix"
+stage_plugins "$top"
 # the headless Chromium + the libraries it needs (pinned and checksummed: installer/chromium/)
 echo "== chromium (pinned, checksummed)"
 bash "$here/chromium/fetch.sh" "$top/lib/chromium"

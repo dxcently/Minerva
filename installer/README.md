@@ -31,7 +31,13 @@ Only the numbers decide "newer", so a rebuild of the same version is never offer
    ~/.local/state/minerva/update-check                      the once-a-day notice cache
    ~/.local/state/minerva/plugins.json                      which plugins WE installed (and their hashes)
    ~/.local/opt/minerva/jev-venv/                           only if you said yes to the jev step
-   ~/.config/eidolon/plugins/{browser,jev,subagent}         the plugins (eidolon's own plugins dir; see "Plugins")
+   ~/.config/eidolon/plugins/{browser,jev,subagent,term}    the plugins (eidolon's own plugins dir; see "Plugins")
+   ~/.config/eidolon/policy.permits.rn                      eidolon's own permits store: the vouches and grants the plugins get
+                                                            land here through stock `eidolon plugins trust|grant` (beside the
+                                                            policy in force: with the default policy, this one; a member who moved
+                                                            `[policy] path` has it beside that file instead)
+   ~/.config/eidolon/minerva-{term,mail}.token              0600; the PERCH writes them at each start (default-port perch only) and
+   ~/.config/eidolon/minerva-perch.url                      removes them at a clean exit; the installer never creates or deletes them
    ~/.config/minerva/update-keys/*.pub                      only keys you or a signed rotation added (see "Key rotation")
  Windows  (%LOCALAPPDATA%\Minerva, or --win-root DIR)
    bin\hoot.ps1  bin\hoot.cmd  bin\install.json             hoot + {distro, wsl_prefix}
@@ -41,19 +47,24 @@ Only the numbers decide "newer", so a rebuild of the same version is never offer
    Start menu\Programs\Minerva.lnk
 ```
 
-Nothing else is created, changed or removed (the plugins, the browser token, the jev token and the keys dir above are the
-only things outside `opt/minerva`, `bin/minerva`, `state/minerva`). Never `~/.local/opt/eidolon*` or any other directory
+Nothing else is created, changed or removed (the plugins, their vouches and grants in eidolon's permits file, the browser token,
+the jev token, the perch's term and mail token files and url file, and the keys dir above are the only things outside
+`opt/minerva`, `bin/minerva`, `state/minerva`). Never `~/.local/opt/eidolon*` or any other directory
 beside `minerva`, and **never `~/Minerva`** (chats, settings): install, update and uninstall all say where it is kept. No admin rights
 (everything is per user); `wsl --install` is the one step that needs them, and it is only ever offered.
 
 The bundle (about 139 MB) holds `bin/{minerva, perch, eidolon, eidolon-browser, chromium, minerva-setup, perch-open.sh,
 minerva-setup.sh}`, `lib/chromium/` (the pinned headless Chromium plus the libraries it needs, 285 MB unpacked), `plugins/{browser,
-jev,subagent}`, `jev/` (the optional Python service's files), `webui/term/`, `windows/{hoot.ps1, hoot.cmd}`, `VERSION`, `LICENSE`.
+jev,subagent,term}`, `jev/` (the optional Python service's files), `webui/term/`, `windows/{hoot.ps1, hoot.cmd}`, `VERSION`,
+`LICENSE`, and the third-party notices of the perch (`THIRD-PARTY.md`, `LICENSES/`, which it links).
 
 ## Plugins
 
-`browser`, `subagent` and `jev` (from `eidolon-plugins/`) are preinstalled and pre-trusted, so `eidolon tools` shows them
-(browser 7, subagent 7, jev 15 tools) on a fresh install with no network and no paid turn.
+`browser`, `subagent` and `jev` (from `eidolon-plugins/`) and `term` (Minerva's own, from `plugins/`) are preinstalled and
+pre-trusted, so `eidolon tools` shows them (browser 7, subagent 7, jev 15, term 5 tools) on a fresh install with no network and no
+paid turn. `build.sh` and `nix/plugins.nix` copy every folder of `plugins/` that has a `plugin.rn` (without its `tests/`), so `mail`
+joins the same way when it lands. `build.sh` copies only what git tracks (a `.env`, a key or a cache in the working tree stays out),
+and it refuses a symlink in a plugin and a folder named like one the bundle already has (`eidolon-plugins/browser` and so on).
 
 ```text
  where eidolon looks:  <config dir>/eidolon/plugins   (~/.config/eidolon/plugins). The only override is the config key
@@ -61,18 +72,41 @@ jev,subagent}`, `jev/` (the optional Python service's files), `webui/term/`, `wi
  how:                  stock `eidolon plugins install file://<git repo> <name>` from a temp git repo made from the bundle's
                        plugins/ (a plain copy when git is missing), then `eidolon plugins trust <name>`; for browser also the
                        six grants on file:~/.config/eidolon/browser.token and `plugins service approve browser`.
+ term and mail:        trusted verb by verb, never as a whole plugin (D6). term: `plugins untrust term` first (every vouch term has),
+                       then `plugins trust term list|read|open|close`, and NEVER send, so term_send asks in auto and in manual and runs
+                       only in yolo; plus a grant of each of the five verbs on file:~/.config/eidolon/minerva-term.token, so a call
+                       asks once and not twice. mail (when bundled): `plugins untrust mail` first, then no vouch at all (mail_send
+                       always asks) and one grant of mail_send on minerva-mail.token. Both go to eidolon's default permits store,
+                       the one the perch keeps shared for auto, yolo and runs. The first `untrust` may answer "no vouch on record"
+                       (a first install): that is nothing to take back, not a failure. Any other failure stops the pass: the vouches
+                       already made stand and the rest ask, which is the safe side. A plugin is on record before its trust is
+                       applied, so the next pass finds it as ours and does the whole arm again.
+ any other name:       `trust_one` has a rule for each name it knows (browser, jev, subagent, term, mail). A plugin folder with no
+                       rule is installed, vouches and grants nothing, and the line says so: "<name>: installed, not vouched".
  who owns what:        ~/.local/state/minerva/plugins.json records each plugin WE installed with its hash.
                        - a plugin of that name that is not ours: left exactly as it is (it is the member's); on a terminal we ask
                          whether to replace it, in a script the answer is no.
-                       - ours and unchanged: only re-trusted if the vouch went missing, and only when the INSTALLED copy still hashes
-                         to what we recorded. If it was edited (the hash differs) it is left untrusted, and we say so; we never
-                         vouch for bytes we did not install. The temp repo used to install lives in a `tempfile` directory.
+                       - ours and unchanged: its trust is applied again on each pass that reaches it (a full sync, an install or an
+                         update), and only when the INSTALLED copy still hashes to what we recorded. If it was edited (the hash differs) it is left as it is, not re-trusted, and we say
+                         so; earlier vouches of unchanged verbs and the token grants still stand. We never vouch for bytes we did
+                         not install. The temp repo used to install lives in a `tempfile` directory.
                        - ours and outdated (after `minerva update` / install): replaced, then trusted again (a vouch is bound to
                          the script hash, so this is how trust "carries over").
  uninstall:            removes only plugins in that record (stops their service, untrusts, revokes the grants, uninstalls),
-                       then the record. The member's own plugins, eidolon's config and tokens stay.
+                       then the record. The member's own plugins, eidolon's config and tokens stay. Its limits (the first two
+                       are printed):
+                       `plugins untrust` works through the plugin's folder, so a member who deleted that folder first keeps its
+                       vouches, and the uninstall lists them ("still on record in <store>"); `plugins revoke` takes every grant of
+                       a tool whatever its source, so uninstall also drops a grant of term_* or mail_send made by hand.
+                       A rollback to a version from before term and mail existed cannot untrust or revoke what they added: that
+                       version's uninstall does not know them. Only the current minerva's `uninstall` (or deleting their rows by
+                       hand from the permits store) takes those rows back. A member who moved `[policy] path` after the
+                       install has two permits stores: uninstall works on the one beside the policy in force now, and the
+                       old one keeps its rows (not printed).
  when it runs:         `minerva install`, `minerva update`/rollback, and every `hoot`/`minerva web` start (quiet, only when
-                       something differs: `minerva plugins sync --if-needed --quiet`, then `minerva services start`).
+                       something differs: `minerva plugins sync --if-needed --quiet`, then `minerva services start`). That pass
+                       returns before any trust call when every plugin is settled, so a vouch changed by hand stays as it is until
+                       the next install, update or full sync.
  by hand:              minerva plugins sync [--if-needed] [--quiet] | status         minerva services start|stop|status
 ```
 
@@ -358,10 +392,13 @@ unmodified). Static musl, so any distro works (no glibc floor); `build.sh` fails
 `musl-gcc` (`apt install musl-tools`) so the stack protector and fortify stay on. Without it, `build.sh --dev` (never for a release)
 lets gcc compile the C parts against glibc headers with fortify off; that links and runs, but is not shippable. `--test-overrides`
 (dev only) compiles in the test-only environment overrides (`MINERVA_KEYS_DIR` and friends); a release build never has them.
+`--dry-run` builds nothing: it stages the plugins (eidolon-plugins/ and every `plugins/*/` with a `plugin.rn`, tests left out, and of
+`plugins/` only the git-tracked files) and the perch's licence notices, prints the files, and removes the staging
+(`plugins/term/tests/bundle.sh` checks that list against `git ls-files`; run it where git reads the checkout). It needs git.
 The Windows exe is built with a statically linked C runtime (`installer/.cargo/config.toml`) so it does not need the VC++
 redistributable and imports no `VCRUNTIME140`; it calls `wsl.exe`, `cmd.exe` and `powershell.exe` by absolute path under
 `%SystemRoot%\System32` and restricts DLL search to System32. The dirty check counts untracked files in every shipped path
-(installer, nix, flake.nix, ...).
+(installer, nix, plugins, flake.nix, ...); `build.sh` and `build.ps1` name the same paths and must be changed together.
 
 ### Checking a download by hand
 
@@ -416,8 +453,12 @@ keys): good signature installs, tampered bundle refused, wrong key refused, miss
 refused, rollback and forward, Nix refused, notice once a day / silent on failure / bad signature gives no notice,
 install/rerun/upgrade/prune/uninstall layout, WSL list parsing, PATH list edits, key rotation (good, unknown signer, revoked
 signer, revoked compiled-in key, manual add/remove, expiry, replay, open keys dir), and the plugin lifecycle (install, trust, foreign
-plugin kept, update keeps trust, uninstall removes only ours) when `MINERVA_TEST_EIDOLON` names an eidolon binary (otherwise that
-one test says it was skipped). The Windows pieces (registry,
+plugin kept, update keeps trust, uninstall removes only ours, a sixth plugin no rule names is installed and vouched for nothing, and on
+the real permits store: term's list, read, open and close vouched, term_send not, all five granted) when `MINERVA_TEST_EIDOLON` names
+an eidolon binary (otherwise that one test says it was skipped). The trust argv is also checked through a fake eidolon that only
+writes down what it is asked (term and mail: the untrust first, then the vouches and grants; the others as before; an untrust that
+says "no vouch on record" is not a failure, any other one stops the pass; every bundled folder has an explicit arm; uninstall's revokes
+and the rows it could not take back), with no eidolon needed. The Windows pieces (registry,
 shortcut, WSL calls) are exercised by running the exe with the test options above, never against the real settings.
 
 `tests/` (see `tests/README.md`) holds the perch contract's tests: `status --json` over fixture prefixes (cache present, stale, corrupt,

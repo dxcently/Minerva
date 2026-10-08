@@ -13,14 +13,14 @@ there is no second copy).
 | attr | what | file |
 |---|---|---|
 | `.#eidolon` | the agent core (runs its test suite) | `eidolon/nix/eidolon.nix` |
-| `.#perch` | the Minerva server in front of the eidolon doors | `perch.nix` |
+| `.#perch` | the Minerva server in front of the eidolon doors; its third-party notices at `share/doc/perch` | `perch.nix` |
 | `.#minerva-setup` | the first-run wizard | `minerva-setup.nix` |
 | `.#webui-term` | the static web UI, at `share/minerva/webui-term` | `webui-term.nix` |
 | `.#minerva` (= `.#default`) | the desktop set: the `minerva` command + `eidolon` on PATH | `minerva.nix`, `minerva.sh` |
 | `.#minerva-eidolon` | server wrapper: `bin/minerva-eidolon` execs eidolon, no config baked in, nothing named `eidolon` | `minerva-eidolon.nix` |
 | `.#eidolon-browser` | the browser plugin service (chromium from nixpkgs) | `eidolon-plugins/browser/package.nix` |
 | `.#minerva-core` | the installer crate's `minerva` as `bin/minerva-core` (plugin sync) | `minerva-core.nix` |
-| `.#minerva-plugins` | the bundled plugins at `share/minerva/plugins` | `plugins.nix` |
+| `.#minerva-plugins` | the bundled plugins at `share/minerva/plugins`: browser, jev, subagent (eidolon-plugins/) and term (plugins/, mail when it lands) | `plugins.nix` |
 
 `checks.<system>.perch-tests` runs perch's tests (`--features test-bins`). Not built: `jev-service`
 (torch; needs its own slice).
@@ -34,9 +34,12 @@ never updates itself: it prints `installed with Nix; update with: nix profile up
 ## Plugins preinstalled
 
 `minerva-core.nix` builds the installer crate's `minerva` binary as `bin/minerva-core`, and `plugins.nix` lays the bundled
-plugins (browser, jev, subagent; without the browser's Rust source) at `share/minerva/plugins`. `minerva web` first runs
+plugins (browser, jev, subagent from `eidolon-plugins/`; term from `plugins/`, and mail once it lands; without the browser's Rust
+source and the plugins' `tests/`) at `share/minerva/plugins`. `minerva web` first runs
 `minerva-core plugins sync --if-needed --quiet` and `services start --quiet`: the plugins go into the member's own
-`~/.config/eidolon/plugins` through eidolon's stock `plugins install` and are trusted (the browser also gets its token grants);
+`~/.config/eidolon/plugins` through eidolon's stock `plugins install` and are trusted (the browser also gets its token grants;
+term's list, read, open and close are vouched and its send is not, mail is granted its token and not vouched; the rule for each
+name is in `installer/src/plugins.rs`, `trust_one`);
 a plugin of the same name that is not ours is never overwritten; a newer Minerva replaces ours and keeps them trusted. What is
 ours is recorded in `~/.local/state/minerva-nix/state/minerva/plugins.json`, never in the store. The browser service is
 `.#eidolon-browser` (Chromium from nixpkgs). `MINERVA_NO_PLUGIN_SYNC=1` skips all this. The compiled-in release key of

@@ -40,7 +40,8 @@ function Wsl-Path([string]$p) {
 # ---- version: VERSION + short sha (not stored anywhere) ----
 $base = if ($Version) { $Version } else { (Get-Content -Raw (Join-Path $Repo 'VERSION')).Trim() }
 $sha = (& git -C $Repo rev-parse --short HEAD).Trim()
-$dirty = @(& git -C $Repo status --porcelain --untracked-files=all -- perch setup eidolon harnox webui/term bin installer jev eidolon-plugins nix flake.nix flake.lock VERSION)
+# the same pathspec as installer/build.sh's dirty check (which also names plugins/): keep the two lists in step
+$dirty = @(& git -C $Repo status --porcelain --untracked-files=all -- perch setup eidolon harnox webui/term bin installer jev eidolon-plugins plugins nix flake.nix flake.lock VERSION)
 if ($dirty.Count -gt 0) {
     if (-not $AllowDirty) { throw "tracked sources differ from HEAD ($($dirty.Count) paths); commit first, or -AllowDirty for a test build" }
     $sha = "$sha.dirty"

@@ -26,6 +26,12 @@ rustPlatform.buildRustPackage {
   checkFeatures = [ "test-bins" ];
   # The perch needs an existing $HOME (default root); the sandbox points it at a missing dir.
   preCheck = "export HOME=$TMPDIR/home; mkdir -p $HOME";
+  # The perch's third-party notices, beside the binary: THIRD-PARTY.md links LICENSES/, the same two installer/build.sh bundles.
+  postInstall = ''
+    mkdir -p $out/share/doc/perch
+    install -m 0644 ${../perch/THIRD-PARTY.md} $out/share/doc/perch/THIRD-PARTY.md
+    cp -r ${../perch/LICENSES} $out/share/doc/perch/LICENSES
+  '';
   meta = {
     description = "The Minerva perch: one loopback HTTP server in front of several eidolon web doors";
     license = lib.licenses.mit;
