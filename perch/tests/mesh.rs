@@ -633,17 +633,24 @@ fn the_audit_allowlist_drops_what_it_cannot_pin_and_forwards_no_text() {
         "not json",
         r#"["audit"]"#,
         r#"{"ts":6,"class":"gate","status":"proposed","admitted":false,"argv":["--token=ARG-SENTINEL"]}"#,
+        // aoided's start record, as the real log writes it: kept, with its message (a URL, and a sentinel) dropped.
+        r#"{"ts":7,"door":"daemon","class":"audit","command":"daemon","status":"started","message":"STARTED-SENTINEL listening on http://127.0.0.1:8710/"}"#,
     ] {
         append(&rig.audit, line);
     }
     let answer = rig.tail("?audit=0");
     let ts: Vec<u64> = answer["events"].as_array().unwrap().iter().map(|entry| entry["event"]["ts"].as_u64().unwrap()).collect();
-    assert_eq!(ts, [1, 6]);
+    assert_eq!(ts, [1, 6, 7]);
     let shown = answer.to_string();
-    for sentinel in ["LETTER-SENTINEL", "FORWARD-SENTINEL", "ARG-SENTINEL", "secret-class", "no-ts-here", "node add", "elsewhere", "parked"] {
+    for sentinel in ["LETTER-SENTINEL", "FORWARD-SENTINEL", "ARG-SENTINEL", "secret-class", "no-ts-here", "node add", "elsewhere", "parked", "STARTED-SENTINEL"] {
         assert!(!shown.contains(sentinel), "{sentinel} reached the answer: {shown}");
     }
     assert_eq!(answer["events"][1]["event"], json!({"ts": 6, "class": "gate", "status": "proposed"}));
+    assert_eq!(
+        answer["events"][2]["event"],
+        json!({"ts": 7, "class": "audit", "door": "daemon", "command": "daemon", "status": "started"}),
+        "the start record keeps its five fields"
+    );
 }
 
 /// Both streams' defaults, with no flag for either: the audit log is `<aoide-home>/log`, and the feed is `$XDG_RUNTIME_DIR/aoide/events.jsonl`
@@ -744,6 +751,35 @@ fn a_link_or_a_fifo_at_either_path_is_not_read() {
     let answer = rig.perch.get("/hub/mesh/events");
     assert_eq!(answer.status, 502, "{}", answer.head);
     assert!(answer.body.contains("the daemon feed"), "{}", answer.body);
+
+    // The other two pairings: a FIFO where the audit log is, and a link where the feed is.
+    let rig = Setup::all().start();
+    make_fifo(&rig.audit);
+    let answer = rig.perch.get("/hub/mesh/events");
+    assert_eq!(answer.status, 502, "{}", answer.head);
+    assert!(answer.body.contains("the audit log"), "{}", answer.body);
+
+    let rig = Setup::all().start();
+    let planted = rig.home.join("planted-feed.jsonl");
+    std::fs::write(&planted, "{\"v\":0,\"ts\":1,\"class\":\"gate\",\"kind\":\"PLANTED-FEED-SENTINEL\"}\n").unwrap();
+    std::os::unix::fs::symlink(&planted, &rig.daemon).unwrap();
+    let answer = rig.perch.get("/hub/mesh/events");
+    assert_eq!(answer.status, 502, "{}", answer.head);
+    assert!(answer.body.contains("the daemon feed"), "{}", answer.body);
+    assert!(!answer.body.contains("PLANTED-FEED-SENTINEL"), "{}", answer.body);
+}
+
+/// A relative `--aoide-audit-log` or `--aoide-daemon-events` is refused at the start, before anything is made, and the refusal names its flag.
+/// (The unit test `main.rs::a_feed_file_the_perch_is_told_of...` covers the rule; this is the binary doing it.) Refused with no state of the
+/// operator's: `refused_start` gives the perch a temp `HOME`, runtime dir and config.
+#[test]
+fn a_relative_feed_path_is_refused_at_the_start_and_the_refusal_names_its_flag() {
+    for flag in ["--aoide-audit-log", "--aoide-daemon-events"] {
+        let out = Perch::refused_start(&[flag.into(), "audit.log".into()]);
+        assert!(!out.status.success(), "{flag} relative must not start");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(flag) && err.contains("not an absolute path"), "{flag}: {err}");
+    }
 }
 
 fn kinds_of(answer: &Value) -> Vec<String> {

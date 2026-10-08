@@ -1,3 +1,4 @@
+{"ts":1791365990,"door":"daemon","class":"audit","command":"daemon","status":"started","message":"aoided started, listening on http://127.0.0.1:8710/ STARTED-SENTINEL"}
 {"ts":1791366040,"door":"cli","class":"audit","command":"mail.send","status":"ok","message":"spooled to osaka/minerva","untrusted_data":"FORWARDED-SENTINEL"}
 {"ts":1791366045,"door":"mcp","class":"gate","command":"node.add","status":"proposed","admitted":false}
 {"door":"cli","class":"audit","command":"mail.read","status":"ok"}

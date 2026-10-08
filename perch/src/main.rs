@@ -133,6 +133,8 @@ async fn main() -> Result<()> {
     let knobs = perch::Knobs::parse(&cli.knob)?;
     absolute_binary("--aoide", cli.aoide.as_deref())?;
     absolute_binary("--minerva", cli.minerva.as_deref())?;
+    absolute_file("--aoide-audit-log", cli.aoide_audit_log.as_deref())?;
+    absolute_file("--aoide-daemon-events", cli.aoide_daemon_events.as_deref())?;
 
     let member = perch::config::member_config_path();
     let resolved = perch::config::resolve(cli.home.as_deref(), cli.sessions_dir, cli.eidolon_config, &member)?;
@@ -195,6 +197,19 @@ fn absolute_binary(flag: &str, asked: Option<&std::path::Path>) -> Result<()> {
         anyhow::ensure!(
             path.is_absolute(),
             "{flag} {} is not an absolute path (a bare name would be looked up on PATH, and the perch never runs a binary it found there)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// `--aoide-audit-log` and `--aoide-daemon-events` name a file the perch reads, and are an absolute path or not given: a relative one would be
+/// read from wherever the perch was started, and the runner refuses every call that carries it. Refused at the start, like the binaries.
+fn absolute_file(flag: &str, asked: Option<&std::path::Path>) -> Result<()> {
+    if let Some(path) = asked {
+        anyhow::ensure!(
+            path.is_absolute(),
+            "{flag} {} is not an absolute path (a relative file would be read from wherever the perch was started)",
             path.display()
         );
     }
@@ -326,5 +341,23 @@ mod tests {
         assert!(absolute_binary("--minerva", cli.minerva.as_deref()).is_ok());
         // …and the default one is not found through a `$HOME` that is not absolute either.
         assert_eq!(aoide_or_default(None, Some("relative/home".into())), None);
+    }
+
+    /// The two feed files: an absolute path or not given, refused at the start otherwise, and said with their flag. The rule is the same for
+    /// both, and `--aoide-events` (the flag that named both) is no longer parsed. Mutation: accept a relative path and the cases below go red.
+    #[test]
+    fn a_feed_file_the_perch_is_told_of_is_an_absolute_path_or_it_is_refused() {
+        for flag in ["--aoide-audit-log", "--aoide-daemon-events"] {
+            assert!(absolute_file(flag, None).is_ok(), "not given is fine");
+            assert!(absolute_file(flag, Some(std::path::Path::new("/var/log/aoide/log"))).is_ok(), "{flag}");
+            for bad in ["audit.log", "./log", "relative/events.jsonl", "", "~/.aoide/log"] {
+                let why = absolute_file(flag, Some(std::path::Path::new(bad))).unwrap_err().to_string();
+                assert!(why.contains(flag) && why.contains("absolute"), "{flag} {bad:?}: {why}");
+            }
+        }
+        let cli = Cli::try_parse_from(["perch", "--aoide-audit-log", "audit.log"]).unwrap();
+        assert!(absolute_file("--aoide-audit-log", cli.aoide_audit_log.as_deref()).is_err());
+        let cli = Cli::try_parse_from(["perch", "--aoide-daemon-events", "events.jsonl"]).unwrap();
+        assert!(absolute_file("--aoide-daemon-events", cli.aoide_daemon_events.as_deref()).is_err());
     }
 }

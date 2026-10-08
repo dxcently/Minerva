@@ -83,9 +83,10 @@ const EVENTS_WINDOW: u64 = 64 * 1024;
 /// are not the mesh's. Both streams keep to these.
 const CLASSES: [&str; 2] = ["audit", "gate"];
 /// The audit log's `door`, `status` and `command` values, through [`audit_keep`]. The docs name `cli`, `mcp`, `a2a` and `daemon` for a door;
-/// `ok`, `error`, `pending`, `delivered` and `proposed` for a status; and a dotted command word (`mail.send`), at most [`COMMAND_MAX`].
+/// `started` (aoided's start record, and `adapter.melete started`, observed in the real aoide 0.0.26 log), `ok`, `error`, `pending`,
+/// `delivered` and `proposed` for a status; and a dotted command word (`mail.send`), at most [`COMMAND_MAX`].
 const AUDIT_DOORS: [&str; 4] = ["cli", "mcp", "a2a", "daemon"];
-const AUDIT_STATUS: [&str; 5] = ["ok", "error", "pending", "delivered", "proposed"];
+const AUDIT_STATUS: [&str; 6] = ["started", "ok", "error", "pending", "delivered", "proposed"];
 const COMMAND_MAX: usize = 64;
 /// A capability word (`message`, `read`, `spawn`, and whatever a later Aoide adds) is this long at most, and a node has this many.
 const WORD_MAX: usize = 32;
@@ -189,18 +190,22 @@ fn default_socket() -> Option<PathBuf> {
     Some(PathBuf::from(TEST_DEFAULT).join("aoided.sock"))
 }
 
-/// The audit log: `--aoide-audit-log`, else `<aoide-home>/log`. That is aoide's own default (`$AOIDE_AUDIT_LOG`, else `$AOIDE_ROOT/log` when
-/// that is absolute, else `<home>/.aoide/log`), and the runner gives aoide `AOIDE_ROOT` = `--aoide-home` and removes every ambient `AOIDE_*`,
-/// so the file aoide appends to under the runner is this one. Absolute only: a relative flag names no file.
+/// The audit log: `--aoide-audit-log`, else `<aoide-home>/log`. Aoide's own rule for the file it appends to is `$AOIDE_AUDIT_LOG`, else
+/// `$AOIDE_ROOT/log` (when `$AOIDE_ROOT` is absolute), else `<home>/.aoide/log` (`docs/Aoide-Wiki/concepts/cli/Doors-and-Nodes.md`, and
+/// `CLI-Reference.md`). The runner removes every ambient `AOIDE_*` from its calls and gives `AOIDE_ROOT` = `--aoide-home`, so under the perch
+/// the `$AOIDE_AUDIT_LOG` step is the flag alone, and the file aoide appends to is the one this names. Absolute only: a relative flag names no
+/// file, and `main.rs` refuses one at the start. The flag is read through [`crate::aoide::audit_flag`], the one reader the runner shares.
 pub fn audit_path(opts: &Options) -> Option<PathBuf> {
-    match &opts.aoide_audit_log {
-        Some(path) => path.is_absolute().then(|| path.clone()),
+    match crate::aoide::audit_flag(opts) {
+        Some(path) => path.is_absolute().then_some(path),
         None => home(opts).map(|home| home.join("log")),
     }
 }
 
-/// aoided's events feed: `--aoide-daemon-events`, else `$AOIDE_DAEMON_EVENTS` when absolute, else `$XDG_RUNTIME_DIR/aoide/events.jsonl`
-/// (aoided's own default, beside its socket). Absolute only. Nothing the runner runs is ever given this path.
+/// aoided's events feed: `--aoide-daemon-events`, else `$AOIDE_DAEMON_EVENTS` when absolute, else `$XDG_RUNTIME_DIR/aoide/events.jsonl`.
+/// Absolute only. The XDG path is the perch's own choice (it mirrors [`default_socket`]); aoide's rule is `$AOIDE_DAEMON_EVENTS`, else a
+/// sibling of the daemon socket, which is the same file only while the socket is the default one, so a `--aoide-daemon-socket` elsewhere
+/// does not move this path. Nothing the runner runs is ever given this path.
 pub fn daemon_path(opts: &Options) -> Option<PathBuf> {
     match &opts.aoide_daemon_events {
         Some(path) => path.is_absolute().then(|| path.clone()),
@@ -765,9 +770,10 @@ fn feed_keep(record: &Value) -> Option<Value> {
 
 /// The audit log, through an allowlist, and failing closed. The docs (CONTRACTS.md and the Aoide wiki's `concepts/cli/Doors-and-Nodes.md`,
 /// `entities/aoided.md`, `concepts/cli/CLI-Reference.md`) name an audit record's `class`, `door`, `command`, `status`, `message` and
-/// `untrusted_data`, and none of them names a timestamp. So:
+/// `untrusted_data`. They do not name the type or unit of `ts`; the real aoide 0.0.26 log writes it as an integer (observed), and that is
+/// all this reads. So:
 ///
-/// - a record with no numeric `ts` is dropped: it cannot be merged by time, and its unit is not given;
+/// - a record with no non-negative integer `ts` is dropped: it cannot be merged by time;
 /// - a record whose `class` is not `audit` or `gate`, or whose `door`, `command` or `status` is present and not one of the words above, is dropped;
 /// - what is kept is `ts`, `class`, `door`, `command` and `status`, and nothing else. `message` is what a command printed (for `mail show` and
 ///   `mail read` the rendered letter, cut to 512 bytes), `untrusted_data` is another's text, and neither is forwarded.
@@ -1206,6 +1212,12 @@ mod tests {
         assert_eq!(kept, Some(json!({"ts": 1791366040, "class": "audit", "door": "cli", "command": "mail.send", "status": "ok"})));
         // The gate's self-check: no door, no command, and nothing else but its class and status.
         assert_eq!(audit_keep(&json!({"ts": 5, "class": "gate", "status": "proposed", "admitted": false})), Some(json!({"ts": 5, "class": "gate", "status": "proposed"})));
+        // aoided's start record, as the real log writes it (door daemon, command daemon, status started), with its free-text message dropped.
+        let started = audit_keep(&json!({"ts": 1791365990, "door": "daemon", "class": "audit", "command": "daemon", "status": "started",
+            "message": "STARTED-SENTINEL on http://127.0.0.1:8710/"}));
+        assert_eq!(started, Some(json!({"ts": 1791365990, "class": "audit", "door": "daemon", "command": "daemon", "status": "started"})));
+        let melete = json!({"ts": 2, "class": "audit", "command": "adapter.melete", "status": "started"});
+        assert_eq!(audit_keep(&melete), Some(melete.clone()));
         // Each drop has its reason, and none of them is a secret or a letter that got through.
         let drops = [
             json!({"class": "audit", "command": "mail.send"}),
@@ -1221,6 +1233,8 @@ mod tests {
             json!({"ts": 1, "class": "audit", "command": "-leading"}),
             json!({"ts": 1, "class": "audit", "command": 7}),
             json!({"ts": 1, "class": "audit", "status": "parked (superseding osaka)"}),
+            json!({"ts": 1, "class": "audit", "status": "Started"}),
+            json!({"ts": 1, "class": "audit", "door": "daemon", "command": "daemon", "status": "started now"}),
             json!({"ts": 1, "class": "audit", "status": null}),
             json!("a string, not a record"),
             json!(["audit"]),
@@ -1463,5 +1477,25 @@ mod tests {
         // The default is `$AOIDE_DAEMON_EVENTS` when absolute and `$XDG_RUNTIME_DIR/aoide/events.jsonl` otherwise. The unit tests see the
         // stand-in, whatever this process's environment is; the integration tests set the perch's own environment and check it there.
         assert_eq!(daemon_path(&opts), Some(PathBuf::from("/nonexistent-minerva-test/aoide/events.jsonl")));
+    }
+
+    /// The audit flag has one reader: the runner's `AOIDE_AUDIT_LOG` and the view's audit path are both taken from it, so they name the same
+    /// file. A relative flag reaches the runner as it is (its calls are refused, not run with aoide's own default) and the view names no file.
+    /// Mutation: have either side read the raw field, or fall back to the default for a relative flag, and one of these goes red.
+    #[test]
+    fn the_runner_and_the_view_read_the_audit_flag_from_one_place() {
+        let mut opts = unflagged();
+        opts.aoide = Some(PathBuf::from("/opt/aoide"));
+        opts.aoide_audit_log = Some(PathBuf::from("/given/audit.log"));
+        assert_eq!(crate::aoide::audit_flag(&opts), Some(PathBuf::from("/given/audit.log")));
+        assert_eq!(audit_path(&opts), Some(PathBuf::from("/given/audit.log")));
+        assert_eq!(Aoide::from_options(&opts).unwrap().audit_log, Some(PathBuf::from("/given/audit.log")));
+        opts.aoide_audit_log = Some(PathBuf::from("relative/audit.log"));
+        let relative = Some(PathBuf::from("relative/audit.log"));
+        assert_eq!(Aoide::from_options(&opts).unwrap().audit_log, relative, "refused by the runner, not defaulted");
+        assert_eq!(audit_path(&opts), None, "and the view names no file for it");
+        opts.aoide_audit_log = None;
+        assert_eq!(Aoide::from_options(&opts).unwrap().audit_log, None, "no flag, no AOIDE_AUDIT_LOG: aoide's own default");
+        assert_eq!(audit_path(&opts), Some(PathBuf::from("/nonexistent-minerva-test/aoide/log")));
     }
 }

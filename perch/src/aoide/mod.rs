@@ -83,9 +83,10 @@ pub struct Aoide {
     pub bin: PathBuf,
     /// `--aoide-home`, given to the child as `AOIDE_ROOT`. `None` leaves aoide its default (`~/.aoide`).
     pub root: Option<PathBuf>,
-    /// `--aoide-audit-log`, given as `AOIDE_AUDIT_LOG` and only when the flag was given. Never the daemon's feed: aoide appending its own
-    /// audit records into aoided's feed would be the one file both writers share. With no flag aoide writes its own default (`<root>/log`),
-    /// which is the file the mesh view tails when it has no flag either.
+    /// `--aoide-audit-log` (through [`audit_flag`], the same reader the mesh view's audit path uses), given as `AOIDE_AUDIT_LOG` and only when
+    /// the flag was given. Never the daemon's feed: aoide appending its own audit records into aoided's feed would be the one file both
+    /// writers share. With no flag aoide writes its own default (`<root>/log`), which is the file the mesh view tails when it has no flag
+    /// either. A relative one is refused when a call runs ([`Aoide::env_for`]).
     pub audit_log: Option<PathBuf>,
     /// `--aoide-daemon-socket`, given as `AOIDE_DAEMON_SOCKET`.
     pub daemon_socket: Option<PathBuf>,
@@ -94,6 +95,14 @@ pub struct Aoide {
     pub limits: Limits,
     /// Variables beyond those above, for the test doubles (`FAKE_*`). A name starting `AOIDE_` is the runner's and is refused.
     extra: Vec<(OsString, OsString)>,
+}
+
+/// `--aoide-audit-log`, as the perch was given it, or none. The one reader of that flag: the runner's `AOIDE_AUDIT_LOG` ([`Aoide::from_options`])
+/// and the mesh view's audit path (`mesh::audit_path`) both take it from here, so they name the same file. Absolute is checked where each uses
+/// it (the runner refuses a relative one on every call, the view names no file for it), and `main.rs` refuses one at the start, so a running
+/// perch never has one.
+pub fn audit_flag(opts: &Options) -> Option<PathBuf> {
+    opts.aoide_audit_log.clone()
 }
 
 impl Aoide {
@@ -107,7 +116,7 @@ impl Aoide {
         let bin = opts.aoide.clone().ok_or(Error::NoBinary)?;
         Ok(Self::new(bin)
             .root(opts.aoide_home.clone())
-            .audit_log(opts.aoide_audit_log.clone())
+            .audit_log(audit_flag(opts))
             .daemon_socket(opts.aoide_daemon_socket.clone())
             .runtime_dir(std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)))
     }

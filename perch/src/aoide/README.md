@@ -40,9 +40,12 @@ Nothing that touches a node has a variant: no `node list`, `session`, `send`, `p
 - **Never a `PATH` lookup.** `Aoide::bin` is `--aoide` (else `~/.local/bin/aoide` when executable; `main.rs` decides), and `run` refuses a
   relative one. The operator has a stale 0.0.25 in `~/.cargo/bin`, ahead of the real one on `PATH`.
 - **Its environment** is the perch's with every `AOIDE_*` variable removed, then `AOIDE_ROOT` (`root`, from `--aoide-home`),
-  `AOIDE_AUDIT_LOG` (`audit_log`, `--aoide-audit-log`, given only when that flag was), `AOIDE_DAEMON_SOCKET` (`daemon_socket`) and
-  `XDG_RUNTIME_DIR` (`runtime_dir`) from the fields, each only when given and each absolute. The daemon's events feed
-  (`--aoide-daemon-events`) is not a field of the runner: no call is ever given its path, under any name. Why the removal: a perch started inside a conducted session would hand its
+  `AOIDE_AUDIT_LOG` (`audit_log`, from `audit_flag`, which is `--aoide-audit-log` and only when that flag was given),
+  `AOIDE_DAEMON_SOCKET` (`daemon_socket`) and `XDG_RUNTIME_DIR` (`runtime_dir`) from the fields. Each one that is given must be absolute:
+  a relative one is `Error::Refused` on every call, so nothing runs with it (and `main.rs` refuses a relative `--aoide-audit-log` and
+  `--aoide-daemon-events` at the start). The mesh view reads the same flag through the same `audit_flag`, so the file aoide appends to and
+  the file the view tails are one file. The daemon's events feed (`--aoide-daemon-events`) is not a field of the runner: no call is ever
+  given its path, under any name. Why the removal: a perch started inside a conducted session would hand its
   `AOIDE_SESSION_ID` to every call, and an ambient `AOIDE_STATE_DIR` moves the mailbase away from `<root>/state/mail/base.jsonl`, the file
   M2's receive loop stats. Everything else (`HOME`, `PATH`, `LANG`, the tests' `FAKE_*`) passes through.
 - **Bounded.** stdin is `/dev/null`. stdout is capped at 1 MiB (one byte more is `Error::TooBig` and the child is killed). stderr keeps

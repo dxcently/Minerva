@@ -167,20 +167,21 @@ test('the perch\'s own sentences about what it left out come through, at most 8,
 test('an event line says its stream and reads both record shapes: the daemon feed (kind, source, payload) and the audit log (command, door)', () => {
   const lines = events.events.map(V.eventLine);
   assert.deepEqual(lines.map((l) => [l.cls, l.text]), [
+    ['audit', 'audit daemon (daemon) started'],
     ['daemon', 'audit hand-edit (aoided) file=sessions.json'],
     ['daemon', 'gate pair-parked (a2a-door) direction=inbound id=abc12345 name=box-a originAddr=10.0.0.5'],
     ['audit', 'audit mail.send (cli) ok'],
     ['audit', 'gate node.add (mcp) proposed'],
     ['daemon', 'gate pending node=osaka note=<script>alert(1)</script> [31m'],
   ]);
-  assert.deepEqual(lines.map((l) => l.at), [1791366000, 1791366020, 1791366040, 1791366045, 1791366050].map(hhmmss), 'the time is the event\'s own, local');
+  assert.deepEqual(lines.map((l) => l.at), [1791365990, 1791366000, 1791366020, 1791366040, 1791366045, 1791366050].map(hhmmss), 'the time is the event\'s own, local');
   assert.equal(V.clock(undefined), '--:--:--');
   assert.equal(V.clock(1791366000000), hhmmss(1791366000), 'milliseconds are taken as such');
 });
 
 test('the events fixture is the perch\'s answer over the two files: the classes the page must never see are not in it, and each stream has its cursor at its file\'s end', () => {
   const shown = JSON.stringify(events);
-  for (const sentinel of ['SECRET-NAME-SENTINEL', 'CONSUMER-SENTINEL', 'NOTIFICATION-SENTINEL', 'FORWARDED-SENTINEL', 'spooled to osaka', 'secret.get', 'node add osaka']) {
+  for (const sentinel of ['SECRET-NAME-SENTINEL', 'CONSUMER-SENTINEL', 'NOTIFICATION-SENTINEL', 'FORWARDED-SENTINEL', 'STARTED-SENTINEL', 'spooled to osaka', 'secret.get', 'node add osaka']) {
     assert.ok(!shown.includes(sentinel), `${sentinel} is in the answer`);
   }
   assert.deepEqual(events.next, { audit: Buffer.byteLength(read('./fixtures/aoide/audit.log')), daemon: Buffer.byteLength(read('./fixtures/aoide/daemon-events.jsonl')) });
@@ -189,14 +190,14 @@ test('the events fixture is the perch\'s answer over the two files: the classes 
 
 test('the tail takes each answer in: the events join the held ones, each stream moves its own cursor, a reset clears only its own stream, a failed poll keeps all', () => {
   let f = V.foldFeed(V.emptyFeed(), { status: 200, data: events }, 1000);
-  assert.deepEqual([f.lines.length, f.next, f.files.audit, f.why, f.at], [5, events.next, '~/.aoide/log', '', 1000]);
+  assert.deepEqual([f.lines.length, f.next, f.files.audit, f.why, f.at], [6, events.next, '~/.aoide/log', '', 1000]);
   const late = { events: [{ stream: 'daemon', event: { v: 0, ts: 1791366100, class: 'audit', kind: 'late' } }], next: { audit: events.next.audit, daemon: 900 }, reset: { audit: false, daemon: false }, files: events.files };
   f = V.foldFeed(f, { status: 200, data: late }, 2000);
-  assert.deepEqual([f.lines.length, f.next.daemon, f.lines[5].text], [6, 900, 'audit late']);
+  assert.deepEqual([f.lines.length, f.next.daemon, f.lines[6].text], [7, 900, 'audit late']);
   const kept = V.foldFeed(f, { status: 0, data: { error: 'network error' } }, 3000);
   assert.deepEqual([kept.lines, kept.next, kept.why], [f.lines, f.next, 'the perch did not answer'], 'a hiccup keeps what was held');
   const cleared = V.foldFeed(kept, { status: 200, data: { events: [{ stream: 'audit', event: { class: 'gate', command: 'again', status: 'ok', ts: 1791366200 } }], next: { audit: 40, daemon: 40 }, reset: { audit: false, daemon: true }, files: events.files } }, 4000);
-  assert.deepEqual(cleared.lines.map((l) => [l.cls, l.text]), [['audit', 'audit mail.send (cli) ok'], ['audit', 'gate node.add (mcp) proposed'], ['audit', 'gate again ok']], 'a reset of the daemon clears the daemon lines and nothing else');
+  assert.deepEqual(cleared.lines.map((l) => [l.cls, l.text]), [['audit', 'audit daemon (daemon) started'], ['audit', 'audit mail.send (cli) ok'], ['audit', 'gate node.add (mcp) proposed'], ['audit', 'gate again ok']], 'a reset of the daemon clears the daemon lines and nothing else');
   assert.deepEqual(cleared.next, { audit: 40, daemon: 40 });
   assert.match(V.foldFeed(f, { status: 200, data: { oops: 1 } }).why, /not in a shape/);
 });

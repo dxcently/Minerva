@@ -159,10 +159,10 @@ pub struct Options {
     pub aoide_home: Option<PathBuf>,
     /// `--aoide-daemon-socket`: the daemon's socket, which is only ever asked to `ping`.
     pub aoide_daemon_socket: Option<PathBuf>,
-    /// `--aoide-audit-log`: Aoide's audit log, which the mesh view tails. The runner gives it to aoide as `AOIDE_AUDIT_LOG` only when this
-    /// flag is given; aoide's own default is the same file otherwise.
+    /// `--aoide-audit-log`: Aoide's audit log, which the mesh view tails. Absolute only (`main.rs` refuses a relative one). The runner gives it
+    /// to aoide as `AOIDE_AUDIT_LOG` only when this flag is given; aoide's own default is `<aoide-home>/log` otherwise.
     pub aoide_audit_log: Option<PathBuf>,
-    /// `--aoide-daemon-events`: aoided's own events feed, which the mesh view tails. Nothing the perch runs is given this path.
+    /// `--aoide-daemon-events`: aoided's own events feed, which the mesh view tails. Absolute only. Nothing the perch runs is given this path.
     pub aoide_daemon_events: Option<PathBuf>,
     /// `--minerva`: the `minerva` binary the install routes ask, when it is not beside the perch's own.
     pub minerva: Option<PathBuf>,

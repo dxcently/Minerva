@@ -56,19 +56,35 @@ stayed `"0"` through every change and drift would otherwise be silent.
 
 Two streams, one answer. Each stream has its own file, cursor and reset, and each record says which stream it came from.
 
-- **`audit`** is `--aoide-audit-log`, else `<--aoide-home or ~/.aoide>/log`, which is aoide's own default. The runner gives aoide the
-  explicit flag's path as `AOIDE_AUDIT_LOG` **only when the flag was given**, and strips every ambient `AOIDE_*` from its call, so the file
-  aoide appends to under the runner is the one tailed here. The stream is an **allowlist**, fail closed: a record needs a numeric `ts`
-  and a `class` of `audit` or `gate`; when present, `door` must be `cli`, `mcp`, `a2a` or `daemon`, `command` one word (dotted or slashed,
-  no space, at most 64 bytes) and `status` one of `ok`, `error`, `pending`, `delivered`, `proposed`. The answer keeps `ts`, `class`,
-  `door`, `command` and `status` and nothing else: a `message`, `untrusted_data` or any field a later aoide adds is never forwarded. A
-  record that fails a rule is dropped, not repaired.
-- **`daemon`** is `--aoide-daemon-events`, else `$AOIDE_DAEMON_EVENTS` when absolute, else `$XDG_RUNTIME_DIR/aoide/events.jsonl` (aoided's
-  own default, beside its socket). Its records pass as they are when `class` is `audit` or `gate`; `secret`, `notification`, `rice`,
+- **`audit`** is `--aoide-audit-log` (absolute only), else `<--aoide-home or ~/.aoide>/log`. Aoide's own rule for the file it appends to
+  is `$AOIDE_AUDIT_LOG`, else `$AOIDE_ROOT/log` (absolute `$AOIDE_ROOT`), else `<home>/.aoide/log` (`docs/Aoide-Wiki/concepts/cli/
+  Doors-and-Nodes.md`, `CLI-Reference.md`). Under the perch the first step is the flag alone: the runner gives aoide the flag's path as
+  `AOIDE_AUDIT_LOG` **only when the flag was given**, sets `AOIDE_ROOT` to `--aoide-home`, and strips every ambient `AOIDE_*` from its
+  call, so a `$AOIDE_AUDIT_LOG` in the perch's own environment does not reach aoide. The two readers are one function,
+  `aoide::audit_flag`, so the runner and this view cannot disagree about the flag. The stream is an **allowlist**, fail closed: a record
+  needs an integer `ts` and a `class` of `audit` or `gate`; when present, `door` must be `cli`, `mcp`, `a2a` or `daemon`, `command` one
+  word (dotted or slashed, no space, at most 64 bytes) and `status` one of `started`, `ok`, `error`, `pending`, `delivered`, `proposed`.
+  The answer keeps `ts`, `class`, `door`, `command` and `status` and nothing else: a `message`, `untrusted_data`, `admitted`, `argv` or any
+  field a later aoide adds is never forwarded. A record that fails a rule is dropped, not repaired.
+  - `started` is aoided's own start record (`command` `daemon`, `door` `daemon`, `class` `audit`), which the docs describe as a `daemon
+    started` record, and the `adapter.melete started` record the docs also name. Its `message` is free text (it can hold a URL), so it is
+    dropped with the rest.
+  - The shape of the real aoide 0.0.26 log, as the orchestrator observed it (structure only): `{"ts": <integer>, "door": "daemon" | "cli",
+    "class": "audit", "command": "daemon" | "a2a.serve" | ..., "status": "started" | "ok" | ..., "message": <free text>}`. The docs do not
+    give `ts`'s unit; this code reads only the integer.
+  - Dropped, and why: a `status` or `door` the list does not name. The docs use other audit labels too (`unmailed`, `attribution-drift`,
+    `auto-deny-on-code-mismatch`), and none of them is on the list, so a record with one is hidden until a reviewer adds it. A `command`
+    with a space in it (`node add osaka`), which is a line of arguments and not a command word. A `class` of `secret`, `notification`,
+    `rice` or `content`. A record with no `ts`, a `ts` that is not a non-negative integer, or a line that is not a JSON object.
+- **`daemon`** is `--aoide-daemon-events` (absolute only), else `$AOIDE_DAEMON_EVENTS` when absolute, else `$XDG_RUNTIME_DIR/aoide/events.jsonl`.
+  **The XDG path is the perch's own default**, chosen so it mirrors `default_socket()`. Aoide's rule for the same file is
+  `$AOIDE_DAEMON_EVENTS`, else a sibling of the daemon socket (`docs/Aoide-Wiki/concepts/cli/Doors-and-Nodes.md`, `docs/architecture/AOIDED.md`).
+  The two agree while the socket is the default one; a `--aoide-daemon-socket` somewhere else moves aoide's path and not this one, so pass
+  `--aoide-daemon-events` with it. Its records pass as they are when `class` is `audit` or `gate`; `secret`, `notification`, `rice`,
   `content` and anything else are never shown. No aoide call is ever given this path.
 - The two are merged by `ts`, at a tie the audit log first, then each file's order. A record with no numeric `ts` in the audit log sorts
-  as 0 and, under the allowlist, is dropped before that. Aoide's audit timestamp is not documented anywhere the perch reads, so until it is
-  the audit stream is the one most likely to read empty against a real aoide.
+  as 0 and, under the allowlist, is dropped before that. Against a real aoide the audit stream reads by the same integer `ts` the log
+  writes (observed), so it is not empty for want of a timestamp; a record without one is not shown.
 - `next.<stream>` is that stream's next cursor: the end of its last **whole** line read, so a line still being written is read again once
   it has its newline. Pass them back as `?audit=N&daemon=M` (either, or both, each once).
 - `reset.<stream>` is true when that stream's cursor was past the end of its file (truncated in place at 1 MiB, replaced, or gone): that
