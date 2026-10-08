@@ -55,8 +55,9 @@ pub const MAILBOX: &str = "minerva";
 pub const READER: &str = "minerva-perch";
 /// How long a call may take before the child is killed. Mail reads block on `.stage.lock`, so a held lock ends here.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a `mail send` may take. aoide itself spools the letter and then POSTs for up to about 15 s, so the perch waits longer than
-/// aoide does: a perch that gave up first would answer "did not answer" for a letter that was spooled, and the page would invite a resend.
+/// How long a `mail send` may take. aoide itself spools the letter and then POSTs under its own timeout, which is 30 s, so the perch
+/// waits longer than aoide does: a perch that gave up first would answer "did not answer" for a letter that was spooled, and the page
+/// would invite a resend.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(45);
 /// How much stdout is taken. One byte more is [`Error::TooBig`], and the child is killed.
 pub const STDOUT_CAP: usize = 1024 * 1024;
@@ -608,6 +609,9 @@ pub enum Error {
     TooBig(usize),
     /// It exited 0 for a `--json` call and printed something that is not a JSON object.
     NotJson,
+    /// It started, and its run could not be followed to the end: its `wait` failed, or it had no output pipes. It may have spooled the
+    /// letter, so a caller treats it as a run that gave no answer (a row, for a send), and not as one that never started ([`Error::Spawn`]).
+    Started(String),
     /// It ran and said no. The reply is whole, so `data.reason` and `data.meshes` are there for a caller to read.
     Failed(Reply),
 }
@@ -621,6 +625,7 @@ impl std::fmt::Display for Error {
             Self::Timeout(within) => write!(f, "aoide did not answer in {} s", within.as_secs_f32().ceil() as u64),
             Self::TooBig(cap) => write!(f, "aoide printed more than {cap} bytes"),
             Self::NotJson => write!(f, "aoide did not answer with JSON"),
+            Self::Started(why) => write!(f, "aoide started, but its run could not be followed: {why}"),
             Self::Failed(reply) => write!(f, "{}", reply.sentence()),
         }
     }
@@ -650,7 +655,7 @@ struct Done {
 /// is noticed the moment it is, and a pipe that outlives the child (a process it started) costs [`EXIT_GRACE`] and no more.
 async fn drive(child: &mut Child, cap: usize) -> Result<Done, Error> {
     let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        return Err(Error::Spawn("aoide's output was not a pipe".to_string()));
+        return Err(Error::Started("aoide's output was not a pipe".to_string()));
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let (mut obuf, mut ebuf) = (vec![0u8; 16 * 1024], vec![0u8; 4 * 1024]);
@@ -681,7 +686,7 @@ async fn drive(child: &mut Child, cap: usize) -> Result<Done, Error> {
                 _ => err_open = false,
             },
             status = child.wait(), if exit.is_none() => {
-                exit = Some(status.map_err(|e| Error::Spawn(format!("waiting for aoide: {e}")))?);
+                exit = Some(status.map_err(|e| Error::Started(format!("waiting for aoide: {e}")))?);
                 deadline = Some(tokio::time::Instant::now() + EXIT_GRACE);
             },
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
@@ -1030,5 +1035,23 @@ mod tests {
         let outcome = Aoide::new("/nonexistent/aoide").run(&Shape::Schema).await;
         assert!(matches!(&outcome, Err(Error::Spawn(why)) if why.contains("/nonexistent/aoide")), "{outcome:?}");
         assert!(outcome.unwrap_err().to_string().starts_with("aoide could not be started"));
+    }
+
+    /// A child that started and then cannot be followed is [`Error::Started`], a run that may have spooled, and not [`Error::Spawn`]. Here it
+    /// is reaped behind the runner's back, so its own `wait` finds no child to wait for; a child with no output pipes is the same.
+    #[tokio::test]
+    async fn a_child_that_started_and_cannot_be_followed_is_started_and_not_spawn() {
+        let mut child =
+            Command::new("/bin/sh").args(["-c", "exit 0"]).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        let pid = child.id().unwrap() as libc::pid_t;
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid, "the test reaps its own child");
+        match drive(&mut child, STDOUT_CAP).await {
+            Err(Error::Started(why)) => assert!(why.contains("waiting for aoide"), "{why}"),
+            Err(other) => panic!("a reaped child is a started one, not {other}"),
+            Ok(_) => panic!("a reaped child gave an answer"),
+        }
+        let mut unpiped = Command::new("/bin/sh").args(["-c", "exit 0"]).kill_on_drop(true).spawn().unwrap();
+        assert!(matches!(drive(&mut unpiped, STDOUT_CAP).await, Err(Error::Started(_))), "a child with no pipes is started too");
     }
 }

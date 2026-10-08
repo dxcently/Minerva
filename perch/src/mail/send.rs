@@ -30,9 +30,9 @@
 //!   409  aoide refused for a reason it names (unknown-node, unpaired-node, ambiguous-mesh): nothing was spooled, so no row. A
 //!        refusal with `data.meshes` is `{error, why, meshes}`, so the page can ask which and send again with `mesh`
 //!   502  any other answer that may come after the letter was spooled: a refusal without a reason, an envelope-less failure, a
-//!        signal, a timeout, too much output, output that is not JSON, or a reply with no recipient the perch can read. Each writes a
-//!        row with status `unknown` (msgid absent when none was read), and says "may or may not have been sent: check `aoide mail
-//!        outbox` for <node>/minerva before sending it again". Never a 504 that invites a resend
+//!        signal, a timeout, too much output, output that is not JSON, a wait that failed after the spawn, or a reply with no
+//!        recipient the perch can read. Each writes a row with status `unknown` (msgid absent when none was read), and says "may or
+//!        may not have been sent: check `aoide mail outbox` for <node>/minerva before sending it again". Never a 504 that invites a resend
 //!   502  aoide could not be started (nothing ran, no row)
 //! ```
 //!
@@ -397,7 +397,7 @@ async fn deliver(ctx: &Ctx, aoide: &Aoide, dir: &std::path::Path, letter: Letter
         Err(e @ Error::NoBinary) => Err(Refusal::new(StatusCode::SERVICE_UNAVAILABLE, e.to_string())),
         // Not started: nothing was spooled, so there is no row and nothing to check.
         Err(e @ Error::Spawn(_)) => Err(Refusal::new(StatusCode::BAD_GATEWAY, e.to_string())),
-        Err(e @ (Error::Timeout(_) | Error::TooBig(_) | Error::NotJson)) => {
+        Err(e @ (Error::Timeout(_) | Error::TooBig(_) | Error::NotJson | Error::Started(_))) => {
             let _ = record(ctx, dir, row_of(&letter, &sha, &address, None, "unknown", "unknown")).await;
             Err(unknown(e.to_string()))
         }

@@ -12,7 +12,9 @@
 //! dismiss and save; and the files (modes, a planted link, a FIFO, a corrupt `cards.json`, the store cap and its resume); then the fix
 //! round: a relative `--aoide-home` refused before aoide runs, the notice cap, a send ended by a signal, and a linked mail folder; then
 //! the second fix round: the plain and reread caps, a reread of a history, the send's own timeout, a slow schema check that does not hold
-//! the page, a second perch on one home, and the three send branches that answer without a row or with a warning.
+//! the page, a second perch on one home, and the three send branches that answer without a row or with a warning; then the third fix
+//! round: a failed store write re-arms a reread, a reread that fails is tried again after its gap, and the page's error holds every
+//! sentence that applies.
 //!
 //! Run with `cargo test --features test-bins`: the fakes are `test-bins` targets, so without the feature this file is empty.
 //!
@@ -62,6 +64,15 @@
 //!   a recipient aoide will not take not refused   a_recipient_aoide_will_not_take_is_a_409_and_no_row
 //!   a send not complete not warned                a_send_aoide_did_not_complete_is_kept_with_a_warning
 //!   an answer with no msgid taken as a letter     an_answer_with_no_msgid_is_an_unknown_row_and_no_resend
+//!   -- the third fix round (M2-fix3), each by itself, the file restored after each (cmp):
+//!   recv.rs `task.reread = true` after a failed plain read (line 1196)
+//!                                                 a_plain_read_whose_store_write_fails_re_arms_the_reread_and_keeps_each_letter_once
+//!   recv.rs `task.reread_after = ...` after a failed reread (line 1181)
+//!                                                 a_reread_that_fails_for_another_reason_is_tried_again_after_the_gap
+//!   recv.rs `lost.or(notice)` in list (the GET error shows one sentence)
+//!                                                 a_full_store_is_shown_beside_the_loss_of_a_reread_too_big_to_print
+//!   aoide/mod.rs drive(): a wait error back to Spawn (a unit test, src/aoide/mod.rs)
+//!                                                 aoide::tests::a_child_that_started_and_cannot_be_followed_is_started_and_not_spawn
 //! ```
 #![cfg(feature = "test-bins")]
 
@@ -1498,6 +1509,79 @@ fn a_reread_too_big_to_print_is_a_loss_said_on_the_page_and_never_armed_again() 
     std::thread::sleep(Duration::from_millis(1500));
     assert_eq!(rereads(&rig), 1, "a reread too big to print is not tried again: {:?}", rig.reads());
     assert!(rig.mail()["error"].as_str().unwrap_or_default().contains("could not be read here"), "the loss stays until a restart");
+}
+
+/// A plain read whose store write fails is a failed read, and the cursor has moved past its letters: a reread is due (the line in `recv.rs`
+/// that re-arms it after a failed plain read is the one this test needs). The store is unwritable for two ticks, the plain read and then
+/// the reread that follows it; the letter is kept once, when the store is writable again. aoide consumes what a plain read prints, so the
+/// plain fixture is empty after the failure and only a reread can bring the letter back.
+#[test]
+fn a_plain_read_whose_store_write_fails_re_arms_the_reread_and_keeps_each_letter_once() {
+    let rig = Setup::new().entries(Vec::new()).knob("mail_reread_ms", "200").env("FAKE_AOIDE_SPARES_SCHEMA", "1").start();
+    let letter = entry("letter", "osaka", "minerva", &id('a'), "a letter the store cannot keep yet");
+    // The first look is a reread and a plain read, both empty, so the store is written by nothing before the letter comes.
+    rig.mail();
+    rig.wait_reads(2);
+    let rereads_before = rereads(&rig);
+    let received = rig.mail_dir().join("received.jsonl");
+    std::fs::write(&received, "").unwrap();
+    std::fs::set_permissions(&received, std::fs::Permissions::from_mode(0o400)).unwrap();
+    rig.set_entries(std::slice::from_ref(&letter));
+    rig.touch_mailbox();
+    until(Duration::from_secs(10), "the plain read to fail on the store", || {
+        rig.mail()["error"].as_str().is_some_and(|error| error.contains("received.jsonl")).then_some(())
+    });
+    write_read(&rig.fixtures.join("mail-read.json"), &[]);
+    until(Duration::from_secs(10), "two rereads to fail on the same store", || (rereads(&rig) >= rereads_before + 2).then_some(()));
+    std::fs::set_permissions(&received, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mail = rig.wait_cards(1);
+    assert_eq!(ids_of(&mail), [id('a')], "{mail}");
+    let on_file = rig.lines("received.jsonl").iter().filter(|row| row["msgid"] == json!(id('a'))).count();
+    assert_eq!(on_file, 1, "the letter is kept once: {:?}", rig.argvs());
+}
+
+/// A reread that fails for another reason (here an answer that is not JSON) is tried again after the gap, `mail_reread_ms`, and not before:
+/// the line in `recv.rs` that sets `reread_after` after a failed reread is the one this test needs. Without it the reread is tried on every
+/// tick, and the count below is not 1 during the gap.
+#[test]
+fn a_reread_that_fails_for_another_reason_is_tried_again_after_the_gap() {
+    let rig = Setup::new().knob("mail_reread_ms", "1000").env("FAKE_AOIDE_SPARES_SCHEMA", "1").start();
+    rig.set_entries(&[entry("letter", "osaka", "minerva", &id('b'), "letter b")]);
+    let reread_file = rig.fixtures.join("mail-read-reread.json");
+    let good = std::fs::read_to_string(&reread_file).unwrap();
+    // The first look is the reread, and its answer is not JSON.
+    std::fs::write(&reread_file, "not json").unwrap();
+    rig.mail();
+    until(Duration::from_secs(10), "the reread's failure", || {
+        rig.mail()["error"].as_str().is_some_and(|error| error.contains("did not answer with JSON")).then_some(())
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(rereads(&rig), 1, "the failed reread is not tried again inside its gap: {:?}", rig.argvs());
+    std::fs::write(&reread_file, good).unwrap();
+    until(Duration::from_secs(10), "the reread, tried again after the gap", || (rereads(&rig) >= 2).then_some(()));
+    let mail = rig.wait_cards(1);
+    assert_eq!(ids_of(&mail), [id('b')], "{mail}");
+    let on_file = rig.lines("received.jsonl").iter().filter(|row| row["msgid"] == json!(id('b'))).count();
+    assert_eq!(on_file, 1, "and the letter is kept once");
+}
+
+/// The page's error shows every sentence that applies, not the first one set: a too-big reread leaves the loss for good, and a store that fills
+/// afterwards is a second sentence beside it. Each sentence is one line, and the whole is at most 600 characters.
+#[test]
+fn a_full_store_is_shown_beside_the_loss_of_a_reread_too_big_to_print() {
+    let rig = Setup::new().env("FAKE_AOIDE_FLOOD", &(20 * 1024 * 1024).to_string()).env("FAKE_AOIDE_SPARES_SCHEMA", "1").start();
+    until(Duration::from_secs(10), "the loss", || {
+        rig.mail()["error"].as_str().unwrap_or_default().contains("could not be read here").then_some(())
+    });
+    // The store fills by its bytes: 32 MiB of letters stops the reading, and that notice comes after the loss.
+    let file = std::fs::File::create(rig.mail_dir().join("received.jsonl")).unwrap();
+    file.set_len(32 * 1024 * 1024).unwrap();
+    drop(file);
+    let error = until(Duration::from_secs(10), "both sentences in the error", || {
+        let error = rig.mail()["error"].as_str().unwrap_or_default().to_string();
+        (error.contains("could not be read here") && error.contains("card store is full")).then_some(error)
+    });
+    assert!(error.chars().count() <= 600 && !error.chars().any(char::is_control), "{error}");
 }
 
 /// Every letter of one read is kept, not the first 2000 by position: 2001 letters make 25 cards shown and 1976 more, with none dropped.

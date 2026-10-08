@@ -56,8 +56,12 @@ send   400  the body is not {node, mesh?, hold?} (an unknown field is refused: t
             Every other 502 comes after the spawn, and writes a row with status `unknown`: a timeout (`SEND_TIMEOUT`, 45 s: longer than
             aoide's own 30 s, and `mail_send_ms` in a test), a signal, more output than the cap, an answer that is not JSON, a failure that
             names no certain reason (only `unknown-node`, `unpaired-node`, `ambiguous-mesh` or a `meshes` list are certain, and they are
-            409), or an answer with no msgid for the recipient. It answers 502 with "may or may not have been sent: check `aoide mail outbox`
+            409), a run that started and could not be followed to its end (its `wait` failed, or it had no pipes: `Error::Started`), or an
+            answer with no msgid for the recipient. It answers 502 with "may or may not have been sent: check `aoide mail outbox`
             for <node>/minerva before sending it again". There is no 504: a 504 invites a resend.
+            Those 502 rows carry no msgid, so no receipt and no outbox answer can settle them (both are matched by msgid): they stay
+            `unknown`, and the page says to check the outbox. A 202 whose recipient gave neither a `delivery.status` nor one of `filed`,
+            `held`, `spooled` is `unknown` as well, but it keeps its msgid, so the outbox can still settle that one.
             An answer that says the send is not complete is a 202 with a `warning`, and the row is kept.
 place  400  the body is not {chat}; 404 no such card, or a chat this perch does not know (an id outside the grammar included); 409 dismissed
 dismiss, save   400 a body that is not empty or {}; 404 no such card; save: 404 when the text of the card is not on file
@@ -126,6 +130,12 @@ JSON-escaped. So a read's stdout is about
 and a control byte costs `\u00XX` (six bytes) in each copy, so up to 12 × for a letter of control bytes. A plain read is capped at
 `PLAIN_CAP` = 4 MiB and a `--reread` at `REREAD_CAP` = 16 MiB (and 30 s, `REREAD_TIMEOUT`); the runner's default is 1 MiB and 10 s. For 1 KiB
 letters that is about 3 KiB of stdout per letter: about 1,400 letters fit a plain read and about 5,400 a reread.
+
+Where those numbers come from. The 2 × is observed: aoide 0.0.26 prints each letter twice, and both copies are JSON-escaped. The 12 ×
+for control bytes follows from the escaping (`\u00XX` is six bytes, in each of the two copies), and the ~1 KiB per entry is the envelope
+around each letter, an estimate. Neither is measured on a control-byte letter: the fixtures hold printable text only, so the 12 × is
+derived and not checked against aoide. Past a cap a read is refused whole and never cut: a plain read that is too big arms a reread, and a
+reread too big to print is a loss the page names.
 
 A plain read over its cap has **already consumed** its letters (aoide marks a batch read as it prints it), so the reread due after it is
 what brings them back, for as long as the whole history fits 16 MiB. Past that the loss is said on the page (see above).

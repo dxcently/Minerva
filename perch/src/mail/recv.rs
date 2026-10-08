@@ -108,6 +108,8 @@ const REREAD_TIMEOUT: Duration = Duration::from_secs(30);
 const MIB: usize = 1024 * 1024;
 /// A notice is at most this many characters, one line.
 const NOTICE_MAX: usize = 300;
+/// The page's error holds every sentence that applies (see [`sentences`]), joined: at most this many characters in all.
+const NOTICES_MAX: usize = 2 * NOTICE_MAX;
 
 // ---------------------------------------------------------------------------
 // What is kept
@@ -213,7 +215,7 @@ impl std::fmt::Debug for Row {
 }
 
 /// A line of `sent.jsonl` (`send.rs` writes it).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SentRow {
     ts: u64,
     origin: String,
@@ -232,6 +234,25 @@ struct SentRow {
     /// key, which the `--subject` shape does not have. `current` and `waiting` read `filed` as delivered on this machine.
     disposition: String,
     status: String,
+}
+
+/// The sizes of a row and not its words: the subject and the note's name are the operator's, and a `{:?}` in a log line is not a place for
+/// them (the same rule as [`Row`]).
+impl std::fmt::Debug for SentRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SentRow")
+            .field("ts", &self.ts)
+            .field("origin", &self.origin)
+            .field("from", &self.from)
+            .field("to", &self.to)
+            .field("mesh", &self.mesh)
+            .field("msgid", &self.msgid)
+            .field("disposition", &self.disposition)
+            .field("status", &self.status)
+            .field("subject_chars", &self.subject.chars().count())
+            .field("note_chars", &self.note.as_ref().map(|note| note.chars().count()))
+            .finish()
+    }
 }
 
 /// What `mail outbox --json` said, and when.
@@ -774,7 +795,7 @@ async fn list(ctx: &Ctx, paths: Paths) -> Response<BoxBody> {
         let lost = ctx.mail.recv.lost.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let held = ctx.clone();
         match blocking(move || snapshot(&held.mail.recv, &paths, outbox.as_deref())).await {
-            Ok(Ok(snap)) => (snap, lost.or(notice)),
+            Ok(Ok(snap)) => (snap, sentences(&[lost, notice])),
             Ok(Err(why)) | Err((_, why)) => (Snapshot::default(), Some(why)),
         }
     };
@@ -1092,6 +1113,13 @@ fn set_lost(ctx: &Ctx, why: String) {
     *ctx.mail.recv.lost.lock().unwrap_or_else(|e| e.into_inner()) = Some(mail::line_safe(&why, NOTICE_MAX));
 }
 
+/// Every sentence that applies, each one line of at most [`NOTICE_MAX`] characters, joined with `; ` and cut at [`NOTICES_MAX`]. The page
+/// shows all of them: the lost letters (which stay until a restart) and the task's own notice (a full store, a failed read), not one of them.
+fn sentences(parts: &[Option<String>]) -> Option<String> {
+    let lines: Vec<String> = parts.iter().flatten().map(|text| mail::line_safe(text, NOTICE_MAX)).filter(|line| !line.is_empty()).collect();
+    (!lines.is_empty()).then(|| mail::line_safe(&lines.join("; "), NOTICES_MAX))
+}
+
 /// One look: the outbox if a row waits on it, then the gate, then the room, then the reread if one is due, then a plain read when the
 /// mailbox changed (or a reread was just made, so that the look ends on a plain read as well).
 async fn tick_once(ctx: &Ctx, paths: &Paths, task: &mut Task) {
@@ -1340,6 +1368,13 @@ mod tests {
         assert!(!shown.contains("SECRET-TEXT"), "{shown}");
         assert!(shown.contains("text_bytes: 11") && shown.contains("subject_chars: 11"), "{shown}");
         assert!(shown.contains(ID) && shown.contains("node: Some(\"osaka\")"), "{shown}");
+        // A sent row is the same rule: its subject and its note's name are the operator's words, and only their sizes print.
+        let mut sent_row = sent(Some(ID), "spooled", "queued", 1);
+        sent_row.subject = "SUBJECT-WORDS".to_string();
+        sent_row.note = Some("NOTE-WORDS".to_string());
+        let shown = format!("{sent_row:?}");
+        assert!(!shown.contains("SUBJECT-WORDS") && !shown.contains("NOTE-WORDS") && !shown.contains("aaaa"), "{shown}");
+        assert!(shown.contains("subject_chars: 13") && shown.contains("note_chars: Some(10)"), "{shown}");
     }
 
     #[test]

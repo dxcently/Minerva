@@ -78,9 +78,11 @@ Nothing that touches a node has a variant: no `node list`, `session`, `send`, `p
 ## What comes back
 
 `run` returns `Ok(Reply)` for an exit 0 whose `--json` envelope does not say otherwise, and an `Error` for everything else:
-`NoBinary`, `Refused`, `Spawn`, `Timeout`, `TooBig`, `NotJson` (exit 0 but stdout is not one JSON object) and `Failed(Reply)`, an aoide that
-ran and said no, with its whole reply so a caller can read `data.reason` (`unknown-node`, `unpaired-node`) or `data.meshes` (the refusal
-for a node that is trusted in more than one mesh). `Error`'s `Display` is aoide's own `message` when it sent one, else the first line of its
+`NoBinary`, `Refused`, `Spawn` (the child never started), `Timeout`, `TooBig`, `NotJson` (exit 0 but stdout is not one JSON object), `Started`
+(the child started, and its run could not be followed to the end: its `wait` failed, or it had no pipes; a caller treats it as a run that
+may have spooled, and `mail/send.rs` writes an unknown row for it) and `Failed(Reply)`, an aoide that ran and said no, with its whole reply
+so a caller can read `data.reason` (`unknown-node`, `unpaired-node`) or `data.meshes` (the refusal for a node that is trusted in more than
+one mesh). `Error`'s `Display` is aoide's own `message` when it sent one, else the first line of its
 stderr, else the exit code.
 
 The envelope is `{status, command, message, gated, changed?, data?}` and **its shape is parsed defensively**: `aoide schema` does not

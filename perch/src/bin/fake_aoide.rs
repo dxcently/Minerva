@@ -25,7 +25,9 @@
 //! A missing file is exit 99 with the file's name, so a test that forgot its fixture fails loudly and not as an empty answer.
 //!
 //! **What it records** is `FAKE_AOIDE_LOG`, one JSON line per call, written before anything else (so a refused call is in it too):
-//! `{"argv": [...], "session": <AOIDE_SESSION_ID or null>, "aoide_env": {every other AOIDE_* variable}, "xdg_runtime_dir": ..., "pid": N}`.
+//! `{"argv": [...], "session": <AOIDE_SESSION_ID or null>, "aoide_env": {every other AOIDE_* variable}, "xdg_runtime_dir": ...,`
+//! `"env_names": [...], "pid": N}`, where `env_names` is the name, and never the value, of every variable the call was run with (how a
+//! test sees what the runner let through).
 //! A call that sleeps adds `{"event": "woke", "pid": N}` when it wakes, so a test can tell a child that was killed from one that was not.
 //! A line with an `event` is not a call; a line with an `argv` is.
 //!
