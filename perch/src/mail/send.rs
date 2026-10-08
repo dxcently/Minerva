@@ -596,8 +596,10 @@ mod tests {
         let held = json!({"accepted": true, "delivery": null, "error": {"reason": "held\u{1b}[0m\nfor a while"}, "msgid": "7".repeat(64), "status": "held"});
         let took = parse_took(&reply(0, subject_reply(held)));
         assert_eq!((took.status.as_str(), took.error.as_deref()), ("held", Some("held[0mfor a while")));
-        // The envelope with no subject is not a shape the perch reads: no msgid comes from it.
-        let no_subject = reply(0, json!({"status": "ok", "data": {"envelope": {"msgid": "5".repeat(64)}, "disposition": "filed", "ring": "no-daemon"}}));
+        // The envelope with no subject is not a shape the perch reads: no msgid comes from it. This is the shape the probe observed (no
+        // `disposition` anywhere in it), and the perch reads nothing of it.
+        let no_subject = reply(0, json!({"status": "ok", "command": "mail.send", "data": {"envelope": {"msgid": "5".repeat(64)},
+            "receivedAt": "2026-10-07T10:00:00Z", "ring": "no-daemon", "seq": 9, "type": "letter", "via": "self"}}));
         let took = parse_took(&no_subject);
         assert_eq!((took.msgid, took.disposition.as_str(), took.status.as_str()), (None, "unknown", "unknown"));
         // Two recipients is not the one the perch sent to.
@@ -676,6 +678,15 @@ mod tests {
         let argv = refused(letter("osaka", Some("alpha"), true, "a note", "text")).unwrap();
         assert_eq!(argv.first().map(String::as_str), Some("mail"));
         assert!(argv.contains(&"--from=minerva".to_string()) && argv.contains(&"--mesh=alpha".to_string()), "{argv:?}");
+    }
+
+    #[test]
+    fn a_letter_prints_its_sizes_and_never_its_words() {
+        let secret = letter("osaka", Some("alpha"), true, "SUBJECT-WORDS", "TEXT-WORDS");
+        let shown = format!("{secret:?}");
+        assert!(!shown.contains("SUBJECT-WORDS") && !shown.contains("TEXT-WORDS"), "{shown}");
+        assert!(shown.contains("subject_chars: 13") && shown.contains("text_bytes: 10"), "{shown}");
+        assert!(shown.contains("node: \"osaka\"") && shown.contains("hold: true"), "{shown}");
     }
 
     #[test]

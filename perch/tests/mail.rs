@@ -9,7 +9,8 @@
 //! What is tested, by the order a letter travels: the gate and the no-home 404; the node menu; the send (its argv, its answers, every
 //! refusal and that a refusal runs nothing, the row it leaves); the stat gate of the receive task (no page looking, no mailbox, an
 //! unchanged mailbox: no call); the cards (decoded, clamped, deduped, text only ever a JSON string); receipts and the outbox; place,
-//! dismiss and save; and the files (modes, a planted link, a FIFO, a corrupt `cards.json`, the store cap).
+//! dismiss and save; and the files (modes, a planted link, a FIFO, a corrupt `cards.json`, the store cap and its resume); then the fix
+//! round: a relative `--aoide-home` refused before aoide runs, the notice cap, a send ended by a signal, and a linked mail folder.
 //!
 //! Run with `cargo test --features test-bins`: the fakes are `test-bins` targets, so without the feature this file is empty.
 //!
@@ -39,6 +40,13 @@
 //!   dismiss taking any body                        the same test
 //!   the store cap dropped                          a_full_store_stops_the_reading_and_says_so
 //!   a marker prefix is a letter (a lib unit test)  mail::recv::tests::a_structured_letter_is_decoded_and_a_broken_one_is_kept_raw
+//!   -- the fix round, each run with only the named test selected (the rest of the file was not re-run for each):
+//!   PR_SET_PDEATHSIG off in the runner             the_child_dies_with_the_perch_that_started_it (tests/aoide.rs)
+//!   the receive task's folder check off           a_linked_mail_folder_is_read_by_nothing
+//!   a failed plain read does not re-arm           a_plain_read_too_big_re_arms_the_reread_and_the_reread_keeps_the_letters
+//!   the notice cap raised to 100 000              a_notice_is_one_printable_line_of_at_most_300_characters
+//!   HTTP_PROXY added to ENV_KEEP                  the_proxy_and_the_provider_key_of_the_perch_do_not_reach_aoide
+//!   a send ended by a signal made a refusal       a_send_ended_by_a_signal_after_aoide_started_is_an_unknown_row
 //! ```
 #![cfg(feature = "test-bins")]
 
@@ -94,6 +102,10 @@ struct Setup {
     entries: Option<Vec<Value>>,
     knobs: Vec<(String, String)>,
     env: Vec<(String, String)>,
+    /// `--aoide-home` as given, when a test wants another than the temp one (a relative path, say).
+    aoide_home: Option<PathBuf>,
+    /// Every `mail send` is ended by SIGKILL before the stand-in runs: a child that dies after its spawn.
+    kill_sends: bool,
 }
 
 impl Setup {
@@ -107,7 +119,19 @@ impl Setup {
             entries: None,
             knobs: vec![("mail_tick_ms".to_string(), "50".to_string()), ("mail_pause_ms".to_string(), "300".to_string())],
             env: Vec::new(),
+            aoide_home: None,
+            kill_sends: false,
         }
+    }
+
+    fn aoide_home(mut self, path: &str) -> Self {
+        self.aoide_home = Some(PathBuf::from(path));
+        self
+    }
+
+    fn kill_sends(mut self) -> Self {
+        self.kill_sends = true;
+        self
     }
 
     fn no_aoide(mut self) -> Self {
@@ -182,11 +206,11 @@ impl Setup {
             builder = builder.arg("--home").arg(&home);
         }
         if self.aoide {
-            builder = builder.arg("--aoide").arg(steered(root.join("aoide-bin"), &fixtures, &log, &self.env));
+            builder = builder.arg("--aoide").arg(steered(root.join("aoide-bin"), &fixtures, &log, &self.env, self.kill_sends));
         }
         builder = builder
             .arg("--aoide-home")
-            .arg(&aoide)
+            .arg(self.aoide_home.clone().unwrap_or_else(|| aoide.clone()))
             .arg("--aoide-daemon-socket")
             .arg(root.join("aoided.sock"))
             .arg("--aoide-events")
@@ -204,23 +228,24 @@ impl Setup {
     }
 }
 
-/// A copy of the stock fixtures, with the entries of both `mail read` files replaced when a test brings its own.
 /// The stand-in, run through a script that sets its steering: the fixtures, the log, and every `FAKE_AOIDE_*` the test gave the perch. A
 /// perch hands its children only its allowlist (`aoide::ENV_KEEP`, and the AOIDE_* it sets itself), so the steering cannot ride on the
-/// perch's environment, and the script is what carries it.
-fn steered(path: PathBuf, fixtures: &Path, log: &Path, env: &[(String, String)]) -> PathBuf {
+/// perch's environment, and the script is what carries it. With `kill_sends`, a `mail send` ends by SIGKILL before the stand-in runs.
+fn steered(path: PathBuf, fixtures: &Path, log: &Path, env: &[(String, String)], kill_sends: bool) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
     let mut settings = format!("FAKE_AOIDE_DIR={} FAKE_AOIDE_LOG={}", quote(&fixtures.display().to_string()), quote(&log.display().to_string()));
     for (key, value) in env.iter().filter(|(key, _)| key.starts_with("FAKE_AOIDE_")) {
         settings.push_str(&format!(" {key}={}", quote(value)));
     }
+    let ends = if kill_sends { "if [ \"$1\" = mail ] && [ \"$2\" = send ]; then kill -KILL $$; fi\n" } else { "" };
     let bin = fake_aoide().expect("the stand-in aoide").replace('\'', "'\\''");
-    std::fs::write(&path, format!("#!/bin/sh\n{settings} exec '{bin}' \"$@\"\n")).unwrap();
+    std::fs::write(&path, format!("#!/bin/sh\n{ends}{settings} exec '{bin}' \"$@\"\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 
+/// A copy of the stock fixtures, with the entries of both `mail read` files replaced when a test brings its own.
 fn lay_fixtures(dest: &Path, entries: Option<&[Value]>) {
     std::fs::create_dir(dest).unwrap();
     for file in std::fs::read_dir(stock()).unwrap().flatten() {
@@ -1302,6 +1327,31 @@ fn a_full_store_stops_the_reading_and_says_so() {
     assert!(mail["error"].as_str().unwrap().contains("card store is full"), "{mail}");
     std::thread::sleep(Duration::from_millis(300));
     assert!(rig.asked_calls().is_empty(), "a full store reads nothing: {:?}", rig.argvs());
+    // Dismissing one card makes room for one more live card, and the next tick reads again, with no restart.
+    let first = format!("{:064x}", 0);
+    json_of(&rig.verb(&first, "dismiss", json!({})), 200, "dismissing a card of the full store");
+    until(Duration::from_secs(10), "a read once a card is dismissed", || (!rig.asked_calls().is_empty()).then_some(()));
+}
+
+/// The store is held to its bytes too: a `received.jsonl` of 32 MiB stops the reading, and moving that file aside lets it go on in the same
+/// run, without a restart.
+#[test]
+fn a_store_full_of_letters_goes_on_once_the_file_is_moved_aside() {
+    let rig = Setup::new().start();
+    std::fs::create_dir_all(rig.mail_dir()).unwrap();
+    let received = rig.mail_dir().join("received.jsonl");
+    let file = std::fs::File::create(&received).unwrap();
+    file.set_len(32 * 1024 * 1024).unwrap();
+    drop(file);
+    let error = until(Duration::from_secs(10), "the full-store notice for the bytes", || {
+        let mail = rig.mail();
+        mail["error"].as_str().filter(|error| error.contains("card store is full")).map(str::to_string)
+    });
+    assert!(error.contains("32 MiB"), "{error}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(rig.asked_calls().is_empty(), "a full store reads nothing: {:?}", rig.argvs());
+    std::fs::rename(&received, rig.mail_dir().join("received.jsonl.aside")).unwrap();
+    until(Duration::from_secs(10), "a read once the file is moved aside", || (!rig.asked_calls().is_empty()).then_some(()));
 }
 
 // ---------------------------------------------------------------------------
@@ -1448,4 +1498,71 @@ fn the_proxy_and_the_provider_key_of_the_perch_do_not_reach_aoide() {
             assert!(!names.contains(&banned), "{banned} reached aoide: {names:?}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The M2 fix round: the home, the notice, the signal and the link
+// ---------------------------------------------------------------------------
+
+/// `--aoide-home` must be absolute, or it is resolved against the perch's cwd. The runner refuses it before a process exists, so a send is a
+/// 503 with the sentence, and nothing runs or is written.
+#[test]
+fn a_relative_aoide_home_is_refused_before_aoide_runs() {
+    let rig = Setup::new().aoide_home("relative-aoide-home").start();
+    let name = rig.note("Relative", "text");
+    let answer = rig.send(&name, json!({ "node": "self" }));
+    assert_eq!(answer.status, 503, "{}{}", answer.head, answer.body);
+    assert!(answer.body.contains("AOIDE_ROOT must be an absolute path"), "{}", answer.body);
+    assert!(rig.argvs().is_empty(), "nothing was run: {:?}", rig.argvs());
+    assert!(!rig.mail_dir().join("sent.jsonl").exists(), "and nothing was written");
+}
+
+/// The page's `error` is one printable line of at most 300 characters, whatever aoide's message is: a plain read that aoide says no to, with a
+/// long message full of escapes and a line break, leaves a notice that is cut and clean.
+#[test]
+fn a_notice_is_one_printable_line_of_at_most_300_characters() {
+    let rig = Setup::new().env("FAKE_AOIDE_SPARES_SCHEMA", "1").start();
+    let mut whole: Value = serde_json::from_str(&std::fs::read_to_string(rig.fixtures.join("mail-read.json")).unwrap()).unwrap();
+    whole["status"] = json!("error");
+    whole["message"] = json!(format!("{}\u{1b}[31m{}\n{}", "x".repeat(400), "y".repeat(400), "tail"));
+    std::fs::write(rig.fixtures.join("mail-read.json"), whole.to_string()).unwrap();
+    let error = until(Duration::from_secs(10), "the notice of the failed plain read", || {
+        let mail = rig.mail();
+        mail["error"].as_str().filter(|error| error.starts_with("mail could not be read")).map(str::to_string)
+    });
+    assert!(error.chars().count() <= 300, "{} characters: {error}", error.chars().count());
+    assert!(error.chars().all(|c| !c.is_control()), "{error:?}");
+    assert!(error.starts_with("mail could not be read: xxx"), "{error}");
+}
+
+/// A send that aoide ends by a signal after it started is not a refusal: the letter may have been spooled. The row is `unknown`, and the answer
+/// is the 502 that says so, never a 409 that says nothing was filed.
+#[test]
+fn a_send_ended_by_a_signal_after_aoide_started_is_an_unknown_row() {
+    let rig = Setup::new().kill_sends().start();
+    let name = rig.note("Signalled", "text");
+    let answer = rig.send(&name, json!({ "node": "self" }));
+    let error = error_of(&answer, 502, "a send that a signal ended");
+    assert!(error.contains("may or may not have been sent"), "{error}");
+    let rows = rig.lines("sent.jsonl");
+    assert_eq!(rows.len(), 1, "the attempt is on record");
+    assert_eq!((rows[0]["msgid"].clone(), rows[0]["status"].clone()), (Value::Null, json!("unknown")), "{rows:?}");
+    assert!(rig.sends().is_empty(), "the stand-in never ran the send: {:?}", rig.argvs());
+}
+
+/// A mail folder that is a link is read by nothing: not by a page's `GET` (the sentence says so), and not by the receive task, which would
+/// otherwise take letters from aoide and have no plain file to keep them in.
+#[test]
+fn a_linked_mail_folder_is_read_by_nothing() {
+    let rig = Setup::new().start();
+    let dir = rig.mail_dir();
+    std::fs::rename(&dir, rig.root.join("folder-aside")).unwrap();
+    let elsewhere = rig.root.join("elsewhere-folder");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+    let mail = rig.mail();
+    assert!(mail["error"].as_str().unwrap_or_default().contains("not a plain directory"), "{mail}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(rig.reads().is_empty(), "nothing is read through a link: {:?}", rig.argvs());
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "and nothing is written behind it");
 }

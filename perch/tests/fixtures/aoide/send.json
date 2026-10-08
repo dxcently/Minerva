@@ -183,44 +183,5 @@
         }
       }
     }
-  },
-  "nosubject": {
-    "code": 0,
-    "stdout": {
-      "status": "ok",
-      "command": "mail.send",
-      "message": "filed to nosubject/minerva (msgid 5555555555555555555555555555555555555555555555555555555555555555)",
-      "gated": false,
-      "changed": [
-        "state/mail/base.jsonl: +1 letter to minerva"
-      ],
-      "data": {
-        "seq": 9,
-        "receivedAt": "2026-10-07T10:00:00Z",
-        "type": "letter",
-        "via": "self",
-        "envelope": {
-          "header": {
-            "version": "1",
-            "from": {
-              "node": "workbench",
-              "name": "minerva"
-            },
-            "to": {
-              "node": "workbench",
-              "name": "minerva"
-            },
-            "type": "letter",
-            "mintedAt": "2026-10-07T10:00:00Z",
-            "originMesh": ""
-          },
-          "text": "(scripted)",
-          "sig": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
-          "msgid": "5555555555555555555555555555555555555555555555555555555555555555"
-        },
-        "disposition": "filed",
-        "ring": "no-daemon"
-      }
-    }
   }
 }

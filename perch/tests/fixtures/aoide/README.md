@@ -12,7 +12,7 @@ reads this directory through `FAKE_AOIDE_DIR`; `src/bin/fake_aoide.rs` says whic
 | `outbox.json` | `mail outbox --json` | two entries (one retrying toward `osaka`, one refused toward `bridge`) and the per-node summary |
 | `mail-read.json` | `mail read --for=minerva --json` | eight entries, below. Each letter is in the envelope's `message` and in `data.entries[i].envelope.text`, both JSON-escaped, as aoide prints it |
 | `mail-read-reread.json` | the same with `--reread` | the same eight and one older letter that only a reread prints |
-| `send.json` | `mail send ...` | a table by the node in `--to`, answering in the `--subject` shape (`data.recipients[0]` holds the msgid, status, delivery and error): `self` (filed), `osaka` (spooled, queued; `with_hold` held), `bridge` (unpaired), `multi` (the multi-mesh refusal; `with_mesh` spooled), `nosubject` (the envelope a send without `--subject` answers, see below). Any other node is `unknown-node` |
+| `send.json` | `mail send ...` | a table by the node in `--to`, answering in the `--subject` shape (`data.recipients[0]` holds the msgid, status, delivery and error): `self` (filed), `osaka` (spooled, queued; `with_hold` held), `bridge` (unpaired), `multi` (the multi-mesh refusal; `with_mesh` spooled). Any other node is `unknown-node`. Per recipient: `accepted` (a bool), `address`, `delivery`, `error`, `msgid`, `ring`, `role`, `status`; for the whole send `data.accepted` is a count and `data.complete` a bool |
 
 The eight entries of `mail-read.json`, which are the cases M2 and the mesh view lean on:
 
@@ -34,9 +34,10 @@ remote letter's delivery object, and a remote receipt. Those are modelled from t
 names in the plan, and the entries that depend on them say so. A self send and a remote one answer the same `--subject` shape (the
 `self` and `osaka` entries of `send.json`), and the perch reads `data.recipients[0]` for both.
 
-**`nosubject`** is the envelope a send without `--subject` answers (`data.envelope` with its msgid, `data.disposition`, `data.ring`, and no
-`recipients`), so the perch reads no msgid from it and writes no row that names one. The perch always sends `--subject`, and no registered node is named `nosubject`, so no integration test asks for it. The
-proof that the perch reads no msgid from that shape is the unit test `a_letter_aoide_took_is_read_from_the_recipient_of_its_subject_shape`
-in `src/mail/send.rs`.
+**The no-subject shape is not in this directory.** A send without `--subject` answers `data.envelope` (with its msgid), `receivedAt`, `ring`,
+`seq`, `type` and `via`, with no `recipients`, and no `disposition` anywhere (both observed). The perch always sends `--subject`, and no
+registered node could reach an entry for this shape, so it was removed from `send.json` rather than kept unreachable. The unit test
+`a_letter_aoide_took_is_read_from_the_recipient_of_its_subject_shape` in `src/mail/send.rs` holds that shape and proves the perch reads no
+msgid from it.
 
 The files are generated once and edited by hand after that; ids are runs of one hex digit so a test can say which letter it means.

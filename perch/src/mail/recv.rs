@@ -228,6 +228,8 @@ struct SentRow {
     mesh: Option<String>,
     #[serde(default)]
     msgid: Option<String>,
+    /// The recipient's `status` word as `send` stored it (`filed`, `spooled`, `held`): the perch's own copy. It is not aoide's `disposition`
+    /// key, which the `--subject` shape does not have. `current` and `waiting` read `filed` as delivered on this machine.
     disposition: String,
     status: String,
 }
@@ -1095,6 +1097,11 @@ fn set_lost(ctx: &Ctx, why: String) {
 async fn tick_once(ctx: &Ctx, paths: &Paths, task: &mut Task) {
     let Ok(aoide) = mail::usable(ctx).await else { return };
     let Some(home) = mesh::home(&ctx.opts) else { return };
+    // A folder that is a link, or not this user's, is read by nothing here: a letter aoide handed over would have no plain file to be kept in.
+    if let Err(e) = mail::readable_dir(&paths.dir) {
+        set_notice(ctx, Some(format!("{e}")));
+        return;
+    }
     refresh_outbox(ctx, &aoide, paths, task).await;
     let pause = mail::knob_ms(ctx, "mail_pause_ms", PAUSE);
     if task.quiet_until.is_some_and(|until| Instant::now() < until) {
@@ -1324,6 +1331,15 @@ mod tests {
         assert!(row.text.chars().all(|c| c == '世'));
         let row = letter(parse_entry(&entry("letter", "osaka", "minerva", ID, "a\0b"), 1));
         assert_eq!((row.text.as_str(), row.clipped), ("a\u{fffd}b", false));
+    }
+
+    #[test]
+    fn a_letter_row_prints_its_sizes_and_never_its_words() {
+        let row = letter(parse_entry(&entry("letter", "osaka", "minerva", ID, "SECRET-TEXT"), 1));
+        let shown = format!("{row:?}");
+        assert!(!shown.contains("SECRET-TEXT"), "{shown}");
+        assert!(shown.contains("text_bytes: 11") && shown.contains("subject_chars: 11"), "{shown}");
+        assert!(shown.contains(ID) && shown.contains("node: Some(\"osaka\")"), "{shown}");
     }
 
     #[test]

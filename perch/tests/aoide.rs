@@ -368,6 +368,85 @@ async fn the_timeout_kills_a_fake_that_sleeps() {
     assert!(fake.lines().iter().all(|line| line.get("event").is_none()), "a killed fake never woke: {:?}", fake.lines());
 }
 
+/// Whether a process is running. A zombie, or one that is gone, is not: `kill(pid, 0)` would call a zombie alive, and a child whose parent
+/// died is reaped by whoever inherits it, which is not this test.
+fn running(pid: i64) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
+    let state = stat.rsplit(')').next().and_then(|rest| rest.trim_start().chars().next());
+    !matches!(state, None | Some('Z' | 'X'))
+}
+
+/// Kills the process it holds when it is dropped, so a failed assertion does not leave a perch behind.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Run by `the_child_dies_with_the_perch_that_started_it` in a copy of this binary: a perch that starts a child that sleeps a minute, and that
+/// the test then kills. By hand it only sleeps.
+#[tokio::test]
+#[ignore = "started by the_child_dies_with_the_perch_that_started_it, which kills it"]
+async fn inner_perch_that_starts_a_sleeper() {
+    let log = PathBuf::from(std::env::var_os("PROBE_LOG").expect("PROBE_LOG: this test is started by the_child_dies_with_the_perch_that_started_it"));
+    let aoide = Aoide::new(common::fake_aoide().unwrap())
+        .env("FAKE_AOIDE_LOG", log.into_os_string())
+        .env("FAKE_AOIDE_DIR", fixtures())
+        .env("FAKE_AOIDE_SLEEP_MS", "60000")
+        .limits(Limits { timeout: Duration::from_secs(120), ..Limits::default() });
+    let _ = aoide.run(&Shape::MeshJson).await;
+}
+
+/// `PR_SET_PDEATHSIG` on the child: a perch that is killed takes its aoide with it, at once, where without it the sleeping child would go on
+/// for a minute. The perch is a copy of this test binary, so the kill is a real one: SIGKILL, with no cleanup of the perch's own.
+#[test]
+fn the_child_dies_with_the_perch_that_started_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("sleeper.log");
+    let mut perch = Reaped(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "inner_perch_that_starts_a_sleeper", "--nocapture", "--test-threads=1"])
+            .env("PROBE_LOG", &log)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    // The child is known from its call's line, which the fake writes before it sleeps.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let child = loop {
+        let started = std::fs::read_to_string(&log).unwrap_or_default().lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).find_map(|line| {
+            line.get("argv").and_then(|_| line["pid"].as_i64())
+        });
+        if let Some(pid) = started {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the perch never started its child");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(running(child), "the child is running before its parent is killed");
+    unsafe { libc::kill(perch.0.id() as libc::pid_t, libc::SIGKILL) };
+    let _ = perch.0.wait();
+    let give_up = Instant::now() + Duration::from_secs(5);
+    let died = loop {
+        if !running(child) {
+            break true;
+        }
+        if Instant::now() > give_up {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if !died {
+        unsafe { libc::kill(child as libc::pid_t, libc::SIGKILL) };
+    }
+    assert!(died, "the child of a killed perch is still running 5 s later: its PR_SET_PDEATHSIG is not set");
+}
+
 #[tokio::test]
 async fn the_schema_cap_holds_to_the_byte() {
     let fake = Fake::new();
@@ -447,6 +526,22 @@ async fn a_schema_that_lacks_a_flag_the_perch_sends_refuses_mail_with_a_sentence
     match aoide.schema_check().await {
         Err(Error::Refused(why)) => assert!(why.contains("--reread") && why.contains("mail is off"), "{why}"),
         other => panic!("a schema without --reread was not refused: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_schema_without_the_mesh_command_refuses_mail_too() {
+    // A send's node check reads `mesh --json`, so a schema that lacks the command turns mail off as well. (The mesh view's own gate is not
+    // this list: it reads the version only, and is the mesh owner's to route through here.)
+    let fake = Fake::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut schema = fixture("schema.json");
+    schema["commands"].as_array_mut().unwrap().retain(|command| command["path"] != serde_json::json!(["mesh"]));
+    std::fs::write(dir.path().join("schema.json"), schema.to_string()).unwrap();
+    let aoide = fake.aoide().env("FAKE_AOIDE_DIR", dir.path().to_path_buf());
+    match aoide.schema_check().await {
+        Err(Error::Refused(why)) => assert!(why.contains("aoide mesh") && why.contains("mail is off"), "{why}"),
+        other => panic!("a schema without `mesh` was not refused: {other:?}"),
     }
 }
 

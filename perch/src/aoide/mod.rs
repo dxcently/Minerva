@@ -168,7 +168,8 @@ impl Aoide {
     }
 
     /// `aoide schema`, and whether it lists every command and flag the perch sends ([`USED`]). `Ok` is the version. `Err` is
-    /// [`Error::Refused`] with a sentence that names the command or flag, which turns mail off.
+    /// [`Error::Refused`] with a sentence that names the command or flag, which turns mail off. Mail's gate includes the `mesh --json` entry,
+    /// because a send's node check reads that call; [`Aoide::version`], which the mesh view reads, does not ask this list.
     pub async fn schema_check(&self) -> Result<Option<String>, Error> {
         let reply = self.schema_reply().await?;
         match missing(reply.json.as_ref().unwrap_or(&Value::Null)) {
@@ -908,6 +909,10 @@ mod tests {
         assert!(no_subject.contains("--subject") && no_subject.contains("mail send"), "{no_subject}");
         let no_outbox = missing(&schema(None, Some(("mail outbox", "")))).expect("a missing command");
         assert!(no_outbox.contains("aoide mail outbox"), "{no_outbox}");
+        let no_mesh = missing(&schema(None, Some(("mesh", "")))).expect("a missing command");
+        assert!(no_mesh.contains("aoide mesh") && no_mesh.contains("mail is off"), "{no_mesh}");
+        let no_mesh_json = missing(&schema(None, Some(("mesh", "json")))).expect("a missing flag");
+        assert!(no_mesh_json.contains("--json") && no_mesh_json.contains("`mesh`"), "{no_mesh_json}");
         assert!(missing(&json!({ "aoide": "0.0.26" })).is_some(), "no commands at all");
         assert!(missing(&json!("not an object")).is_some());
     }

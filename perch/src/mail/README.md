@@ -21,7 +21,7 @@ gate, and a message id is 64 hex digits, so `nodes` and `a` are never ids. Two e
 ```text
 GET  /hub/mail/nodes                  [{name, verified, self, meshes}]   this machine (`self`, first), then the registry's nodes
 POST /hub/notes/<n>/send {node, mesh?, hold?}
-                                      202 {msgid, disposition, delivery, status, to, mesh?, warning?}
+                                      202 {msgid, disposition, delivery, status, to, mesh?, error?, warning?}
                                       409 {error, why, meshes}           a node in several meshes: ask which, send again with `mesh`
 GET  /hub/mail                        {available, received:[card], more, sent:[row], error}      also: "a page is looking"
 POST /hub/mail/<msgid>/place {chat}   200 {msgid, state:"placed", chat}  404 no such card or chat, 409 dismissed
@@ -44,16 +44,20 @@ send   400  the body is not {node, mesh?, hold?} (an unknown field is refused: t
        404  no --home; no such note (the name grammar, a link or FIFO under the name)                             -> nothing is run
        413  the note is over 64 KiB (it sits in argv while aoide runs); the body is over 4 KiB                     -> nothing is run
        503  no aoide (no --aoide and no ~/.local/bin/aoide); aoide's schema does not list a command or flag the perch sends (the sentence
-            names it, and mail is off until aoide is one that does); another perch holds this home's mail (its lock), or the mail folder
-            cannot be used. The schema is asked at most once a minute, good or bad (`aoide schema`, never `--version`: aoide has no such flag)
+            names it, and mail is off until aoide is one that does); a relative --aoide-home (`AOIDE_ROOT must be an absolute path`; the
+            perch starts anyway, and every mail call is refused before aoide runs); another perch holds this home's mail (its lock), or the
+            mail folder cannot be used. The schema is asked at most once a minute, good or bad (`aoide schema`, never `--version`: aoide has
+            no such flag). The `mesh --json` entry of the schema is in that list, because a send's node check reads it
        429  two sends are running already (`SENDS_AT_ONCE` = 2): the third is refused at once, and nothing is run or written
        409  the node is not in the registry, or not paired; the mesh is not one the node is in (when `mesh --json` puts it in any);
             aoide refused the send before it filed anything (`accepted` false). The same sentences when aoide itself says unknown-node /
             unpaired-node; a node in several meshes is {error, why, meshes}. Certain refusals write no row.
-       502  aoide could not start, printed too much, printed what is not JSON, or failed with no envelope: no row, nothing was spooled.
-            After the spawn, a timeout (`SEND_TIMEOUT`, 45 s: longer than aoide's own 30 s, and `mail_send_ms` in a test), a signal, an answer
-            that is not JSON, or an answer with no recipient copy writes a row with status `unknown` and answers 502 with "may or may not
-            have been sent: check `aoide mail outbox` for <node>/minerva before sending it again". There is no 504: a 504 invites a resend.
+       502  aoide could not be started: no row, nothing was spooled (the one failure before the spawn).
+            After the spawn, a timeout (`SEND_TIMEOUT`, 45 s: longer than aoide's own 30 s, and `mail_send_ms` in a test), a signal, more
+            output than the cap, an answer that is not JSON, a failure that names no certain reason (only `unknown-node`, `unpaired-node`,
+            `ambiguous-mesh` or a `meshes` list are certain, and they are 409), or an answer with no recipient copy writes a row with
+            status `unknown` and answers 502 with "may or may not have been sent: check `aoide mail outbox` for
+            <node>/minerva before sending it again". There is no 504: a 504 invites a resend.
 place  400  the body is not {chat}; 404 no such card, or a chat this perch does not know (an id outside the grammar included); 409 dismissed
 dismiss, save   400 a body that is not empty or {}; 404 no such card; save: 404 when the text of the card is not on file
 every route     401 no credential (a scoped agent token included); 404 for a method or a path that is not a route; 400 for a query string
@@ -67,6 +71,7 @@ All under `<home>/mail/` (a directory made `0700`, never a link), each opened `O
 sent.jsonl      one line per send, appended under a lock: {ts, origin, from, note, subject, sha256, to, mesh?, msgid, disposition, status}.
                 origin is `operator`, or `agent:<chat>` (M3). The text is not kept, only its sha256. A row that cannot be written does not
                 undo the send: the answer is the 202 with a `warning` sentence. The msgid is the recipient's copy (`--subject` shape).
+                `disposition` is the recipient's `status` word (`filed`, `spooled`, `held`) as the perch kept it; aoide has no such key.
 received.jsonl  one line per letter read from the mailbox, appended, text at most 64 KiB (cut at a character). A message id already on file
                 is not written again, whatever cards.json holds. A torn last line (no newline) is never read as a record.
 cards.json      message id -> {state, chat?, at}, and sent message id -> when its receipt was read. Rewritten whole, atomically. One that
@@ -97,9 +102,11 @@ a page that stopped looking, and a `GET` itself cost no aoide call.
   receipt than the registry does, rows stay `accepted` and never reach `delivered`; the check is one `if` in `recv::apply`.
 - Any other status comes from `mail outbox --json`, asked at most once a minute (`mail_ttl_ms`) and only while a row waits on it: a row in
   the outbox shows aoide's status and reason; a row that is not in an outbox fetched after it was sent has left it (`accepted`).
-- The store is bounded: the task stops reading at 5000 live cards (dismissed ones do not count) or 32 MiB of letters, says so in `error`,
-  and receipts wait with it. Dismissing cards, or moving `received.jsonl` aside, lets it go on in the same run. Moving `cards.json` aside
-  needs a restart, because the cards are read into memory once. Aoide keeps the letters the perch does not read, so nothing is lost.
+- The store is bounded: the task reads nothing while there are 5000 live cards (dismissed ones do not count) or `received.jsonl` is 32 MiB
+  or more. It says so in `error`, and receipts wait with it. There are two ways on, both in the same run and without a restart: dismiss
+  cards until fewer than 5000 are live, or move `received.jsonl` aside (the next tick finds it short). Moving `cards.json` aside does not
+  free the store, because the cards are read into memory once, so that needs a restart. Aoide keeps the letters the perch has not read, so
+  nothing is lost while the store is full.
   `GET` shows the 25 newest cards that are not dismissed (`more` counts the rest) and the 50 newest sent rows, and reads only the end of
   each file (2 MiB of letters, 256 KiB of rows).
 - A card's sender is what the letter claims: the card shows `mailbox on node` beside it (`from_label`) and says so (`sender_claimed`).
@@ -124,11 +131,13 @@ what brings them back, for as long as the whole history fits 16 MiB. Past that t
 
 - **The letter's text is in argv while aoide runs**, so it can be read from `/proc/<pid>/cmdline` for that moment by any local account that can
   read that file (on a default Linux mount, every account; `hidepid` narrows it). aoide reads no body on stdin, and the schema lists `text`
-  as the one argument, so there is no other shape to send it in. The cap (64 KiB) keeps it one argument.
-- **The perch's environment is not handed on.** The runner clears it and passes only the allowlist (`aoide::ENV_KEEP`: PATH, HOME, LANG, TZ)
-  and the AOIDE_* variables it sets itself. A proxy and a provider key of the perch's do not reach aoide, and a test checks that.
+  as the one argument, so there is no other shape to send it in. The cap (64 KiB) keeps it one argument; it does not hide the text.
+- **The perch's environment is not handed on.** The runner clears it and passes only the allowlist (`aoide::ENV_KEEP`: PATH, HOME, LANG, TZ,
+  and every `LC_*`) and the AOIDE_* variables it sets itself. A proxy and a provider key of the perch's do not reach aoide, and a test
+  checks that.
 - **A child dies with the perch.** The runner sets `PR_SET_PDEATHSIG` (SIGKILL) on aoide in `pre_exec`, so a perch that dies takes a running
-  aoide with it. A timeout kills its process group as well.
+  aoide with it. The signal is tied to the thread that started the child, and the perch's runtime keeps its worker threads for its whole
+  life. `the_child_dies_with_the_perch_that_started_it` (`tests/aoide.rs`) checks it. A timeout kills its process group as well.
 - **A send to `self` rings aoided** (it is a filed letter in this machine's own mailbox). If aoided's petname fallback resolves the
   `minerva` mailbox to a running session named `minerva`, that session is nudged. Nothing here names a session.
 - **Every mail read takes aoide's mailbox lock**; the runner's 10 s timeout bounds the wait. The task never runs two at once.

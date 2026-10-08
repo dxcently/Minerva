@@ -38,7 +38,9 @@ Nothing that touches a node has a variant: no `node list`, `session`, `send`, `p
 - **Version and schema.** `aoide --version` does not exist in 0.0.26: it exits 2 with usage. So the version is the top-level `"aoide"`
   string of `aoide schema`, and [`Aoide::schema_check`] also reads the commands and flags the perch sends (`USED`: `mail send` json, to,
   from, subject, mesh, hold; `mail read` json, for, reread; `mail outbox` json; `mesh` json) and refuses with a sentence that names the
-  first one the schema does not list. A refusal turns mail (or mesh) off; the gate is asked at most once a minute, good or bad.
+  first one the schema does not list. A refusal turns mail off; the gate is asked at most once a minute, good or bad. The `mesh --json`
+  entry is in the list because a send's node check reads that call. The mesh view reads only [`Aoide::version`] (the same schema call, with
+  no list check), so a schema without `mesh --json` does not turn the mesh view off yet.
 
 ## The child
 
@@ -59,7 +61,9 @@ Nothing that touches a node has a variant: no `node list`, `session`, `send`, `p
   10 s (`Error::Timeout`; a mail read takes a blocking `flock` on `.stage.lock`, so a held lock ends there). stderr keeps its first 8 KiB
   and the rest is read and dropped, so a chatty child never stalls on a full pipe. On a timeout or a cap the child's whole process group is
   killed and reaped. A process the child left holding a pipe is waited for 250 ms and then killed with the group. The child also gets
-  `PR_SET_PDEATHSIG` (SIGKILL) before its exec, so a perch that dies takes a running aoide with it.
+  `PR_SET_PDEATHSIG` (SIGKILL) before its exec, so a perch that dies takes a running aoide with it. The signal goes when the *thread* that
+  started the child exits; the perch's runtime keeps its worker threads for its whole life, so that is the perch's death. Checked by
+  `the_child_dies_with_the_perch_that_started_it` in `tests/aoide.rs`.
 - **Logged**: one line per call, the verb and the exit code (`perch: aoide ran`). Never an argument, the text, or what aoide printed.
   `Shape` and `Reply` print themselves the same way (sizes, not words), so a `{:?}` cannot put a letter in a log.
 
