@@ -62,7 +62,7 @@ no other test file.
 | `install.rs` | R4 | done: the notice, keys list and inspect, the arm (bearer only, never a page), add and remove spending it once, listed/mismatch/unknown/updated/Nix answers, writes that outlive the client, the child's env list |
 | `eidolon_config.rs` | SA2 | done: a door and every other eidolon call started with `--config` see `EIDOLON_CONFIG` naming that file (a shell shim in front of the stand-in records it); a door with no config has the name removed even when the perch inherited one |
 | `agent.rs` | AG | done: scoped tokens, attribution to a door (its children refused), files on exit by identity, refused starts leave nothing |
-| `term.rs` | T1b | `/hub/term[/...]` is a 404 behind the gate |
+| `term.rs` | T1b | done: create (size, title, a chat's remembered folder, a listed chat with none starts in `$HOME`, an unknown chat 404), input (octet-stream only, 415/413 before the body, 503 once a shell that reads nothing has its queue full), resize (clamp, 400 shapes), hold, close (a background `sleep` is gone), cwd 422, text (digits given once; a count over 400 reads 400 lines; 7000 characters at most, the end kept), the 17th a 409, an ended terminal read back from `terms.json` (409 for input, resize and hold), ids as the empty 404 and a wrong method as 405 with `Allow`, no environment or token in an answer, the gate (401; a bearer cross-site 403; a cookie cross-site 401; a cookie same-origin 200) |
 | `term_stream.rs` | T1c | `/hub/term/events` is a 404 behind the gate |
 | `term_agent.rs` | T2 | `/hub/term/a/<verb>` is a 404 for the master bearer |
 | `notes.rs` | N1 | `/hub/notes[...]` is a 404 behind the gate |

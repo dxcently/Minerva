@@ -21,6 +21,8 @@ the agent gate (`agent::verb`), and a test holds the two together.
 
 **T1a built the host** (this README's rest). It has no route: `cargo test` is its only check.
 
+**T1b built the operator's routes** (the section below). `tests/term.rs` runs them over a real `/bin/sh`.
+
 ## What a terminal is
 
 ```text
@@ -246,6 +248,46 @@ creates the folder). No `--home`, no file.
   paragraph separator (the newline and the tab stay in the text). A chat id with any of them is dropped, not repaired.
 * An ended terminal read from the file can be listed, read (`text`) and closed; `input`, `resize` and `hold` answer `Ended`.
 
+## The operator's routes and refusals (T1b, `routes.rs`)
+
+The operator is the master bearer or a same-origin login cookie; gate 1 has passed by the time a request is here. The route bodies
+arrive unread, and each route reads its own under its own cap (`serve::body_of`). Nothing an answer carries is the environment, a
+token or the perch's argv.
+
+| route | answers | refused with |
+|---|---|---|
+| `GET /hub/term` | 200, a list of `Info` (oldest first, ended ones included; `started_ms` is in it as well) | none |
+| `POST /hub/term {chat?, cwd?, cols?, rows?, title?}` (no body is the default) | 201 `{id}` | 400 not that shape; 404 no such chat; 422 `cwd` not under a `--root`, or not a folder (with the reason); 409 the table holds 16; 503 the perch is stopping; 500 the shell did not start |
+| `POST /hub/term/<t>/input` (`application/octet-stream`, the bytes as sent) | 204 | 415 any other `Content-Type`, before the body is read; 413 over 64 KiB, by the declared length before a byte is read, or by the first frame past it; 409 the shell has ended; 503 the queue is full; 404 no such terminal |
+| `POST /hub/term/<t>/resize {cols, rows}` | 200 `{cols, rows}`, the size now (T1a's clamp: 20-400 columns, 5-200 rows) | 400 not an object of unsigned integers (unknown keys too); 404; 409 an ended terminal read back from `terms.json` |
+| `POST /hub/term/<t>/hold {hold}` | 200 `{hold}`, the state now | 400 not `{hold: bool}`; 404; 409 as resize |
+| `POST /hub/term/<t>/close` | 202, no body; the hang-up runs in the background and the request does not wait for it | 404 |
+| `GET /hub/term/<t>/text?lines=N` | 200 `{text, cursor, alt_screen}`, `cursor` `null` for an ended terminal; `lines` is digits given once, 100 when absent, and a number over 400 reads 400 (`screen::MAX_TEXT_LINES`); at most 7000 characters (`screen::MAX_TEXT_CHARS`), the end kept | 400 `lines` not digits or given twice; 404 |
+
+What the table does not show:
+
+* **Ids and paths.** `valid_id` (`^t[0-9]{1,6}$`) is checked first. A bad id, a path that is no route and a terminal that is not there
+  are the empty 404. A route with the wrong method is a 405 that names the method it takes (`Allow`). `DELETE` is a 405 at the gate,
+  before any route. `a` and `events` are never ids. `/hub/term/a/<verb>` belongs to the agent gate, which answers a master credential
+  (the bearer, or a same-origin login cookie) with the empty 404, and no credential or a wrong token with 401, before a route is asked.
+* **Existence before the body.** A terminal is looked up before its `Content-Type` or its body is judged, so a request to a terminal
+  that is not there is a 404 whatever body or `Content-Type` it sends. The method is checked before the terminal is looked up, so a
+  wrong method on a real route is a 405 first.
+* **Where a shell starts.** An explicit `cwd` goes through `Registry::cwd_under_a_root` (canonical, under a `--root`, not the Minerva
+  home's own). Without one, a `chat` gives that chat's remembered folder (`known_cwd`), and a chat with none starts in `$HOME`; an
+  unknown chat is a 404. A chat's remembered folder and `$HOME` are **not** root-checked: the check bounds only where a shell is
+  started, and the operator's own shell can `cd` anywhere.
+* **What a chat is.** A chat is known when the perch remembers a folder for it, or when the session list has a row for it. The list
+  is read only for a chat with no remembered folder, since reading it reads the logs.
+* **Whose terminal.** Every terminal a route makes is the operator's (`by: operator`); `chat` is recorded when one was named. An agent's
+  terminal is T2's.
+* **The lane.** The route calls `Terms::input`, never `agent_input`, so the operator's hold never refuses it.
+* **Content-Type.** Exactly one header, whose media type is `application/octet-stream`: parameters after `;` are allowed, the case of
+  the media type is not judged. A repeated header is refused.
+* **Blocking.** `text` and `resize` take a live screen's lock, so they run on a blocking thread on an `Arc<Terminal>` from `Terms::get`;
+  nothing on the runtime waits for a lock. A terminal whose shell has ended but which is still listed (kept 30 minutes) answers
+  resize and hold as a live one does, because `Terms` does; only input answers 409.
+
 ## For the slices that build on this
 
 ```text
@@ -271,6 +313,9 @@ screen::{text_of, saved_text, text_of_saved, clean_title, shown, clamp_size, tai
 `Terms::new(host)` without a `Ctx`. A test of a route that wants a shell uses `/bin/sh` through `Host.env` (`SHELL`).
 
 ## Tests
+
+`cargo test --features test-bins --test term` (`perch/tests/term.rs`, T1b) runs the operator's routes through the perch binary, over
+a real `/bin/sh`, and stops the perch at the end of each test so no shell outlives it.
 
 `cargo test --lib term::`: unit tests for the ring, the queue and its lanes and hold, the pace, `/proc` parsing, the signal guards (a
 process of another session is left alone; a foreground group no member is in is left alone), the thread-start failure, the title pace

@@ -1519,8 +1519,8 @@ mod tests {
         // The controls: the same credentials do open the namespaces around the agent's, so the answers below are the agent gate's.
         assert_eq!(call(&perch, "GET", "/hub/sessions", &bearer(), "").await.0, 200);
         assert_eq!(call(&perch, "GET", "/hub/sessions", &cookie, "").await.0, 200);
-        assert_eq!(call(&perch, "GET", "/hub/term", &bearer(), "").await.0, 404);
-        assert_eq!(call(&perch, "GET", "/hub/term", &cookie, "").await.0, 404);
+        assert_eq!(call(&perch, "GET", "/hub/term", &bearer(), "").await.0, 200);
+        assert_eq!(call(&perch, "GET", "/hub/term", &cookie, "").await.0, 200);
         assert_eq!(call(&perch, "GET", "/hub/term", "", "").await.0, 401);
         for path in ["/hub/term/a/list", "/hub/term/a/whoami", "/hub/mail/a/send", "/hub/mail/a/whoami"] {
             for method in ["GET", "POST"] {
@@ -1549,7 +1549,6 @@ mod tests {
             ("GET", "/hub/runs/r1/log"),
             ("GET", "/hub/meta/health"),
             ("POST", "/hub/install/jev"),
-            ("GET", "/hub/term"),
             ("GET", "/hub/term/events"),
             ("POST", "/hub/term/t1/input"),
             ("GET", "/hub/notes"),
