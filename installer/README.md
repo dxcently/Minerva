@@ -200,19 +200,20 @@ the manifest and the bundle:
 { "schema": 1, "serial": 3, "expires": "2027-01-01",
   "add":       [ { "key": "RWQ...the second line of the new .pub...", "expires": "2028-01-01", "comment": "release key 2" } ],
   "revoke":    [ "0F7A3A5C447EC7EF" ],
-  "revoke_fp": [ { "id": "0F7A3A5C447EC7EF", "fp": "0f7a3a5c447ec7ef" } ] }
+  "revoke_fp": [ { "id": "0F7A3A5C447EC7EF", "fp": "5a1c9e0b3f7d2d48" } ] }
 ```
 
-`revoke_fp` names the fingerprint of each revoked key (the 16 hex digits `minerva keys inspect` prints; spaces and case do not matter). It is
-what refuses the key's bytes under a fresh id on a machine that never held the key. The fingerprint must be the one this machine holds
-under that id, if it holds one; a different one refuses the whole file. An installer built before `revoke_fp` ignores the field and
-revokes by id only, as it always did, so a release can carry it without breaking an older install.
+`revoke_fp` names the fingerprint of each revoked key, never its id: the `fp` is the 16 hex digits `minerva keys inspect` prints (spaces and
+case do not matter), and in the sample above it differs from the `id`, as it does for every real key. It is what refuses the key's bytes
+under a fresh id on a machine that never held the key. The fingerprint must be the one this machine holds under that id, if it holds one;
+a different one refuses the whole file. An installer built before `revoke_fp` ignores the field and revokes by id only, as it always did,
+so a release can carry it without breaking an older install.
 
 **Every id in `revoke` needs its fingerprint.** A client that holds the key takes the fingerprint from its own copy and records it. A
 client that does not hold it needs `revoke_fp` for it. Without that, `minerva update` refuses the whole file and nothing is written (the
 serial does not move): `keys.json revokes <id> without its fingerprint; the maintainer lists every revoked key in revoke_fp`. A key a
-revoked key added is not named in the file; it is recorded by id alone, and it is not trusted on that machine either, since its bytes
-are gone from it.
+revoked key added is not named in the file. A machine that still holds its bytes records their fingerprint; one that does not records the
+id alone, and does not trust it either, since its bytes are gone from it.
 
 Rules: `serial` must be higher than the last applied but at most 16 higher (a leaked key cannot burn the counter with a huge
 serial); a serial that is not higher is "already applied" and is answered BEFORE the signature or expiry is looked at, so

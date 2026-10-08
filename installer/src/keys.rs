@@ -776,7 +776,7 @@ pub fn plan_rotation(trust: &Trust, json: &[u8], sig: Option<&str>, today: &str)
                 bail!("keys.json revokes key {id} with fingerprint {g}, but this machine holds key {id} with fingerprint {h}; refusing the whole file, nothing changed")
             }
             // Named, with no fingerprint from the file and no key here: its bytes cannot be checked, so the same bytes under a fresh id
-            // would pass. Refused whole. (Keys this file revokes only because a revoked key added them are not named, and stay id-only.)
+            // would pass. Refused whole. (Keys a revoked key added are not named here: their fingerprint if this machine holds their bytes, else the id alone.)
             (None, None) => bail!("keys.json revokes {id} without its fingerprint; the maintainer lists every revoked key in revoke_fp"),
             (g, h) => g.or(h),
         };
@@ -1359,6 +1359,26 @@ pub mod tests {
         assert!(tr.verify(b"x", &sign(&ok_sk, b"x"), "2026-10-06").is_err());
         let e = format!("{:#}", tr.verify(b"x", &sign(&n1_sk, b"x"), "2026-10-06").unwrap_err());
         assert!(e.contains("revoked"), "{e}");
+    }
+
+    #[test]
+    fn a_key_a_revoked_key_added_keeps_its_fingerprint_only_while_its_bytes_are_held() {
+        // A adds HELD and GONE; GONE's .pub is removed by hand before A is revoked: HELD is recorded with its fingerprint, GONE by id alone
+        let (a_pk, a_sk) = keypair();
+        let (held, _) = keypair();
+        let (gone, _) = keypair();
+        let (_t, tr) = trust_with(&a_pk);
+        let r1 = rotation(1, "2030-01-01", &[&held, &gone], &[]);
+        apply_rotation(&tr, r1.as_bytes(), &sign(&a_sk, r1.as_bytes()), "2026-10-06").unwrap();
+        fs::remove_file(tr.dir.join(format!("{}.pub", id_of(&gone)))).unwrap();
+        let r2 = rotation(2, "2030-01-01", &[], &[&id_of(&a_pk)]);
+        apply_rotation(&tr, r2.as_bytes(), &sign(&a_sk, r2.as_bytes()), "2026-10-06").unwrap();
+        let st = tr.state().unwrap();
+        let recorded = |id: String| st.revoked.iter().find(|r| r.id == id).and_then(|r| r.fp.clone());
+        assert_eq!(recorded(id_of(&held)), Some(fp_hex(&parse_pub(&held, Source::Manual).unwrap().fingerprint)));
+        assert_eq!(recorded(id_of(&gone)), None, "its bytes are gone from this machine: the id alone");
+        assert!(st.revoked.iter().any(|r| r.id == id_of(&gone)), "the id is still revoked");
+        assert!(tr.trusted("2026-10-06").unwrap().is_empty(), "A is revoked, and nothing it added is trusted");
     }
 
     #[test]
