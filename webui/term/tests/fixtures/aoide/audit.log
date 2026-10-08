@@ -1,0 +1,5 @@
+{"ts":1791366040,"door":"cli","class":"audit","command":"mail.send","status":"ok","message":"spooled to osaka/minerva","untrusted_data":"FORWARDED-SENTINEL"}
+{"ts":1791366045,"door":"mcp","class":"gate","command":"node.add","status":"proposed","admitted":false}
+{"door":"cli","class":"audit","command":"mail.read","status":"ok"}
+{"ts":1791366060,"door":"cli","class":"audit","command":"node add osaka","status":"ok"}
+{"ts":1791366070,"class":"secret","command":"secret.get","status":"ok"}

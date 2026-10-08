@@ -1,14 +1,16 @@
-//! `/hub/mesh`: the mesh view (slice R2b). Network-free: it reads Aoide's own files, asks the `aoide` CLI for `mesh --json` and
+//! `/hub/mesh`: the mesh view (slices R2b and R2c). Network-free: it reads Aoide's own files, asks the `aoide` CLI for `mesh --json` and
 //! `mail outbox --json`, pings the daemon once, and never runs anything that touches a node.
 //!
 //! ```text
-//!   GET /hub/mesh                  the snapshot: available, aoide, daemon, registry, cache, graph, mesh, outbox, errors
-//!   GET /hub/mesh/events[?after=N] the audit and gate events since byte N of --aoide-events, at most 64 KiB of the file per call
+//!   GET /hub/mesh                                  the snapshot: available, aoide, daemon, registry, cache, graph, mesh, outbox, errors
+//!   GET /hub/mesh/events[?audit=N][&daemon=M]      the two streams since byte N of the audit log and byte M of the daemon feed
 //! ```
 //!
-//! `--aoide-events` is any JSON-lines file whose lines are objects with a `class` (aoide's audit log is one, and so is the feed aoided
-//! keeps beside its socket). Only lines of class `audit` or `gate` are shown. The runner hands the same path to every call it makes as
-//! `AOIDE_AUDIT_LOG` (R2a), so what the perch runs is audited there by aoide itself and the perch keeps no log of its own.
+//! **The two streams** are two named files, each read from its own cursor (see [`events`]): the audit log (`--aoide-audit-log`, else
+//! `<aoide-home>/log`, aoide's own default) and aoided's events feed (`--aoide-daemon-events`, else `$AOIDE_DAEMON_EVENTS` when absolute, else
+//! `$XDG_RUNTIME_DIR/aoide/events.jsonl`). Their records are merged by `ts`, and each carries the stream it came from. The runner gives aoide
+//! `AOIDE_AUDIT_LOG` only for the explicit flag and never gives it the daemon's feed, so aoide's audit records do not land in the feed aoided
+//! writes. The perch never writes either file.
 //!
 //! **What is never done.** The only calls to Aoide are [`Shape::Version`], [`Shape::MeshJson`] and [`Shape::MailOutboxJson`], through
 //! [`crate::aoide::Aoide`] (so never a `PATH` lookup, and nothing else is spellable: `node list`, `session`, `send`, `pair`, `spawn`,
@@ -78,8 +80,13 @@ const GRAPH_NODES: usize = 500;
 /// The events file is read this many bytes at a time.
 const EVENTS_WINDOW: u64 = 64 * 1024;
 /// The only classes the page is shown: `secret` names secrets and consumers, `notification` carries forwarded text, `rice` and `content`
-/// are not the mesh's.
+/// are not the mesh's. Both streams keep to these.
 const CLASSES: [&str; 2] = ["audit", "gate"];
+/// The audit log's `door`, `status` and `command` values, through [`audit_keep`]. The docs name `cli`, `mcp`, `a2a` and `daemon` for a door;
+/// `ok`, `error`, `pending`, `delivered` and `proposed` for a status; and a dotted command word (`mail.send`), at most [`COMMAND_MAX`].
+const AUDIT_DOORS: [&str; 4] = ["cli", "mcp", "a2a", "daemon"];
+const AUDIT_STATUS: [&str; 5] = ["ok", "error", "pending", "delivered", "proposed"];
+const COMMAND_MAX: usize = 64;
 /// A capability word (`message`, `read`, `spawn`, and whatever a later Aoide adds) is this long at most, and a node has this many.
 const WORD_MAX: usize = 32;
 const WORDS_MAX: usize = 16;
@@ -182,10 +189,34 @@ fn default_socket() -> Option<PathBuf> {
     Some(PathBuf::from(TEST_DEFAULT).join("aoided.sock"))
 }
 
-/// `--aoide-events` and nothing else. Aoide has two JSON-lines files of records with a `class` (the audit log, and the feed aoided keeps
-/// beside its socket) and the flag does not say which, so no default is guessed: without it the tail is empty.
-fn events_path(opts: &Options) -> Option<PathBuf> {
-    opts.aoide_events.clone().filter(|path| path.is_absolute())
+/// The audit log: `--aoide-audit-log`, else `<aoide-home>/log`. That is aoide's own default (`$AOIDE_AUDIT_LOG`, else `$AOIDE_ROOT/log` when
+/// that is absolute, else `<home>/.aoide/log`), and the runner gives aoide `AOIDE_ROOT` = `--aoide-home` and removes every ambient `AOIDE_*`,
+/// so the file aoide appends to under the runner is this one. Absolute only: a relative flag names no file.
+pub fn audit_path(opts: &Options) -> Option<PathBuf> {
+    match &opts.aoide_audit_log {
+        Some(path) => path.is_absolute().then(|| path.clone()),
+        None => home(opts).map(|home| home.join("log")),
+    }
+}
+
+/// aoided's events feed: `--aoide-daemon-events`, else `$AOIDE_DAEMON_EVENTS` when absolute, else `$XDG_RUNTIME_DIR/aoide/events.jsonl`
+/// (aoided's own default, beside its socket). Absolute only. Nothing the runner runs is ever given this path.
+pub fn daemon_path(opts: &Options) -> Option<PathBuf> {
+    match &opts.aoide_daemon_events {
+        Some(path) => path.is_absolute().then(|| path.clone()),
+        None => default_daemon_path(),
+    }
+}
+
+#[cfg(not(test))]
+fn default_daemon_path() -> Option<PathBuf> {
+    let set = std::env::var_os("AOIDE_DAEMON_EVENTS").map(PathBuf::from).filter(|path| path.is_absolute());
+    set.or_else(|| std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()).map(|dir| PathBuf::from(dir).join("aoide").join("events.jsonl")))
+}
+
+#[cfg(test)]
+fn default_daemon_path() -> Option<PathBuf> {
+    Some(PathBuf::from(TEST_DEFAULT).join("events.jsonl"))
 }
 
 /// A path as the page shows it: `~` for the home directory.
@@ -661,32 +692,117 @@ fn meshes_by_node(data: &Value) -> BTreeMap<String, Vec<String>> {
 // GET /hub/mesh/events
 // ---------------------------------------------------------------------------
 
-/// `after=<digits>` and nothing else, or no query at all (`Some(None)`: the newest events). `None` is the 400.
-fn after_asked(query: &str) -> Option<Option<u64>> {
-    if query.is_empty() {
-        return Some(None);
-    }
-    let digits = query.strip_prefix("after=");
-    let digits = digits.filter(|digits| !digits.is_empty() && digits.len() <= 20 && digits.bytes().all(|b| b.is_ascii_digit()))?;
-    digits.parse().ok().map(Some)
+/// Each stream's cursor, `None` for the first poll of that stream (which reads the newest window of it).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Cursors {
+    audit: Option<u64>,
+    daemon: Option<u64>,
 }
 
-/// What one poll of the feed found.
-#[derive(Debug, PartialEq, Serialize)]
+/// `audit=<digits>` and `daemon=<digits>`, each at most once, in either order, and nothing else. No query at all is the first poll of both.
+/// `None` is the 400: an unknown key (`after=` included), a repeat, a value that is not digits, or an empty pair.
+fn cursors_asked(query: &str) -> Option<Cursors> {
+    let mut cursors = Cursors::default();
+    if query.is_empty() {
+        return Some(cursors);
+    }
+    for pair in query.split('&') {
+        let (key, text) = pair.split_once('=')?;
+        let digits = !text.is_empty() && text.len() <= 20 && text.bytes().all(|b| b.is_ascii_digit());
+        let offset: u64 = digits.then(|| text.parse().ok()).flatten()?;
+        match key {
+            "audit" if cursors.audit.is_none() => cursors.audit = Some(offset),
+            "daemon" if cursors.daemon.is_none() => cursors.daemon = Some(offset),
+            _ => return None,
+        }
+    }
+    Some(cursors)
+}
+
+/// One record of a feed, or not. The daemon's feed keeps the classes it always has ([`feed_keep`]); the audit log is an allowlist ([`audit_keep`]).
+type Keep = fn(&Value) -> Option<Value>;
+
+/// What one poll of a feed found.
+#[derive(Debug, PartialEq)]
 struct Tail {
-    /// The feed's lines of class `audit` or `gate`, as the objects they are, oldest first. A line that is not an object is left out.
+    /// The records that pass the stream's [`Keep`], oldest first. A line that is not an object is left out.
     events: Vec<Value>,
-    /// Where the next poll starts (`?after=`): the end of the last whole line read.
+    /// Where the next poll of this stream starts: the end of the last whole line read.
     next: u64,
     /// The cursor was past the end of the file (it was truncated in place, or replaced), so this read started again at 0.
     reset: bool,
 }
 
-/// One poll of the feed at `path`. `after` is the byte offset of the last poll's `next`; `None` is the first poll, which starts at the
-/// last 64 KiB (from the first whole line in it). At most [`EVENTS_WINDOW`] bytes of the file are read, and only whole lines are used: a
-/// last line without its newline is read again next time, once it has one. A window with no newline at all is one line too long to be an
-/// event, and is passed over.
-fn tail(path: &Path, after: Option<u64>) -> std::io::Result<Tail> {
+/// The answer's three parts for each stream: a cursor, a flag, or a path.
+#[derive(Debug, PartialEq, Serialize)]
+struct Streams<T> {
+    audit: T,
+    daemon: T,
+}
+
+/// One record of the answer and the stream it came from. `event` is the record as the stream keeps it, and is never altered.
+#[derive(Debug, PartialEq, Serialize)]
+struct Entry {
+    stream: &'static str,
+    event: Value,
+}
+
+/// `GET /hub/mesh/events`: the merged records, the two next cursors, the two resets, and the two files as the page shows them.
+#[derive(Debug, PartialEq, Serialize)]
+struct Answer {
+    events: Vec<Entry>,
+    next: Streams<u64>,
+    reset: Streams<bool>,
+    files: Streams<Option<String>>,
+}
+
+/// The daemon's feed: a record of class `audit` or `gate` as it is, and nothing else. `secret` names secrets and consumers, and
+/// `notification` carries forwarded text: neither is ever forwarded.
+fn feed_keep(record: &Value) -> Option<Value> {
+    let class = record.get("class").and_then(Value::as_str);
+    (record.is_object() && class.is_some_and(|class| CLASSES.contains(&class))).then(|| record.clone())
+}
+
+/// The audit log, through an allowlist, and failing closed. The docs (CONTRACTS.md and the Aoide wiki's `concepts/cli/Doors-and-Nodes.md`,
+/// `entities/aoided.md`, `concepts/cli/CLI-Reference.md`) name an audit record's `class`, `door`, `command`, `status`, `message` and
+/// `untrusted_data`, and none of them names a timestamp. So:
+///
+/// - a record with no numeric `ts` is dropped: it cannot be merged by time, and its unit is not given;
+/// - a record whose `class` is not `audit` or `gate`, or whose `door`, `command` or `status` is present and not one of the words above, is dropped;
+/// - what is kept is `ts`, `class`, `door`, `command` and `status`, and nothing else. `message` is what a command printed (for `mail show` and
+///   `mail read` the rendered letter, cut to 512 bytes), `untrusted_data` is another's text, and neither is forwarded.
+fn audit_keep(record: &Value) -> Option<Value> {
+    let object = record.as_object()?;
+    let ts = object.get("ts")?.as_u64()?;
+    let class = object.get("class")?.as_str().filter(|class| CLASSES.contains(class))?;
+    let mut kept = serde_json::Map::new();
+    kept.insert("ts".into(), ts.into());
+    kept.insert("class".into(), class.into());
+    if let Some(command) = object.get("command") {
+        kept.insert("command".into(), command.as_str().filter(|command| command_ok(command))?.into());
+    }
+    if let Some(door) = object.get("door") {
+        kept.insert("door".into(), door.as_str().filter(|door| AUDIT_DOORS.contains(door))?.into());
+    }
+    if let Some(status) = object.get("status") {
+        kept.insert("status".into(), status.as_str().filter(|status| AUDIT_STATUS.contains(status))?.into());
+    }
+    Some(Value::Object(kept))
+}
+
+/// A dotted command word as the audit log writes one: a letter, then letters, digits, `.`, `/` or `-`, at most [`COMMAND_MAX`]. No space,
+/// so a word with an argument in it is not one.
+fn command_ok(command: &str) -> bool {
+    command.len() <= COMMAND_MAX
+        && command.starts_with(|c: char| c.is_ascii_alphabetic())
+        && command.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '-'))
+}
+
+/// One poll of the feed at `path`, through `keep`. `after` is the byte offset of the last poll's `next`; `None` is the first poll, which
+/// starts at the last 64 KiB (from the first whole line in it). At most [`EVENTS_WINDOW`] bytes of the file are read, and only whole lines are
+/// used: a last line without its newline is read again next time, once it has one. A window with no newline at all is one line too long to
+/// be an event, and is passed over.
+fn tail(path: &Path, after: Option<u64>, keep: Keep) -> std::io::Result<Tail> {
     let (mut file, len) = match crate::rawfile::open_regular(path) {
         Ok(opened) => opened,
         // No feed yet is a feed with nothing in it, and a cursor from a feed that was there is past its end.
@@ -714,24 +830,67 @@ fn tail(path: &Path, after: Option<u64>) -> std::io::Result<Tail> {
         None if window.len() as u64 >= EVENTS_WINDOW => window.len(),
         None => 0,
     };
-    let events = window[..whole]
-        .split(|&b| b == b'\n')
-        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
-        .filter(|event| event.is_object() && event.get("class").and_then(Value::as_str).is_some_and(|class| CLASSES.contains(&class)))
-        .collect();
+    let events = window[..whole].split(|&b| b == b'\n').filter_map(|line| serde_json::from_slice::<Value>(line).ok()).filter_map(|record| keep(&record)).collect();
     Ok(Tail { events, next: start + whole as u64, reset })
 }
 
-/// `GET /hub/mesh/events[?after=N]`: `{"events", "next", "reset"}` (see [`Tail`]). A feed that is not there yet is an empty one, and so is
-/// a perch that could name no feed. A feed that is not a plain file is a 502.
+/// One stream's poll: at `path` when it has one, else an empty stream (no path is no file, and so nothing to read).
+fn poll(path: Option<&Path>, after: Option<u64>, keep: Keep) -> std::io::Result<Tail> {
+    match path {
+        Some(path) => tail(path, after, keep),
+        None => Ok(Tail { events: Vec::new(), next: 0, reset: false }),
+    }
+}
+
+/// The records' time, for the merge. A record with no numeric `ts` sorts as 0.
+fn ts_of(event: &Value) -> u64 {
+    event.get("ts").and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// The two polls as one answer. The records of both, by `ts`; at a tie the audit log's first, then each stream's own file order (a
+/// stable sort, so nothing is reordered within a stream that has the same `ts`).
+fn answer(audit: Tail, daemon: Tail, files: Streams<Option<String>>) -> Answer {
+    let mut events: Vec<Entry> = audit
+        .events
+        .into_iter()
+        .map(|event| Entry { stream: "audit", event })
+        .chain(daemon.events.into_iter().map(|event| Entry { stream: "daemon", event }))
+        .collect();
+    events.sort_by_key(|entry| (ts_of(&entry.event), entry.stream != "audit"));
+    Answer {
+        events,
+        next: Streams { audit: audit.next, daemon: daemon.next },
+        reset: Streams { audit: audit.reset, daemon: daemon.reset },
+        files,
+    }
+}
+
+/// `GET /hub/mesh/events[?audit=N][&daemon=M]`: [`Answer`]. A stream whose file is not there yet is an empty one, and so is a stream with
+/// no usable path (a relative flag, or no home to name a default under). A file that is not a plain file (a link, a FIFO, a directory) is
+/// not read, and the whole answer is a 502 that names which one it was.
 async fn events(ctx: &Ctx, query: &str) -> Response<BoxBody> {
-    let Some(after) = after_asked(query) else { return problem(StatusCode::BAD_REQUEST, "expected no query, or after=<offset>") };
-    let Some(path) = events_path(&ctx.opts) else { return json(StatusCode::OK, &Tail { events: Vec::new(), next: 0, reset: false }) };
-    match tokio::task::spawn_blocking(move || tail(&path, after)).await {
-        Ok(Ok(tail)) => json(StatusCode::OK, &tail),
-        outcome => {
-            tracing::warn!(error = ?outcome.map(|read| read.err()), "perch: the events file was not read");
-            problem(StatusCode::BAD_GATEWAY, "the events file could not be read as a plain file")
+    let Some(cursors) = cursors_asked(query) else {
+        return problem(StatusCode::BAD_REQUEST, "expected no query, or audit=<offset> and/or daemon=<offset>, each once");
+    };
+    let (audit, daemon) = (audit_path(&ctx.opts), daemon_path(&ctx.opts));
+    let files = Streams { audit: audit.as_deref().map(tilde), daemon: daemon.as_deref().map(tilde) };
+    let read = tokio::task::spawn_blocking(move || {
+        (poll(audit.as_deref(), cursors.audit, audit_keep), poll(daemon.as_deref(), cursors.daemon, feed_keep))
+    })
+    .await;
+    match read {
+        Ok((Ok(audit), Ok(daemon))) => json(StatusCode::OK, &answer(audit, daemon, files)),
+        Ok((Err(why), _)) => {
+            tracing::warn!(error = %why, "perch: the audit log was not read");
+            problem(StatusCode::BAD_GATEWAY, "the audit log could not be read as a plain file")
+        }
+        Ok((_, Err(why))) => {
+            tracing::warn!(error = %why, "perch: the daemon feed was not read");
+            problem(StatusCode::BAD_GATEWAY, "the daemon feed could not be read as a plain file")
+        }
+        Err(why) => {
+            tracing::warn!(error = %why, "perch: the events read did not finish");
+            problem(StatusCode::BAD_GATEWAY, "the events could not be read")
         }
     }
 }
@@ -740,6 +899,18 @@ async fn events(ctx: &Ctx, query: &str) -> Response<BoxBody> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+
+    /// [`tail`] with the daemon feed's filter: what the feed tests below mean by a feed.
+    fn feed_tail(path: &Path, after: Option<u64>) -> std::io::Result<Tail> {
+        tail(path, after, feed_keep)
+    }
+
+    /// [`tail`] with the audit log's allowlist.
+    fn audit_tail(path: &Path, after: Option<u64>) -> std::io::Result<Tail> {
+        tail(path, after, audit_keep)
+    }
 
     fn names(nodes: &[NodeView]) -> Vec<&str> {
         nodes.iter().map(|node| node.name.as_str()).collect()
@@ -848,6 +1019,44 @@ mod tests {
         (dir, path)
     }
 
+    /// Both streams as one answer: by `ts`, the audit log first at a tie, each stream in its own file order. What the audit log holds that
+    /// is not on its allowlist (a `message`, a record with no `ts`) is not in the answer, and each stream keeps its own cursor.
+    #[test]
+    fn the_two_streams_merge_by_ts_then_audit_first_then_file_order() {
+        let (dir, audit_file) = feed(&[
+            r#"{"ts":10,"class":"audit","command":"a1","message":"LETTER-SENTINEL"}"#,
+            r#"{"class":"audit","command":"no-ts"}"#,
+            r#"{"ts":12,"class":"audit","command":"a2"}"#,
+            r#"{"ts":12,"class":"audit","command":"a3","untrusted_data":"FORWARDED-SENTINEL"}"#,
+        ]);
+        let daemon_file = dir.path().join("daemon.jsonl");
+        std::fs::write(
+            &daemon_file,
+            "{\"v\":0,\"ts\":12,\"class\":\"gate\",\"kind\":\"d1\"}\n{\"v\":0,\"ts\":9,\"class\":\"secret\",\"kind\":\"no\"}\n{\"v\":0,\"ts\":11,\"class\":\"audit\",\"kind\":\"d2\"}\n",
+        )
+        .unwrap();
+        let answer = answer(
+            audit_tail(&audit_file, Some(0)).unwrap(),
+            feed_tail(&daemon_file, Some(0)).unwrap(),
+            Streams { audit: Some("a".into()), daemon: None },
+        );
+        let order: Vec<(&str, &str)> =
+            answer.events.iter().map(|entry| (entry.stream, entry.event.get("command").or(entry.event.get("kind")).and_then(Value::as_str).unwrap())).collect();
+        assert_eq!(order, [("audit", "a1"), ("daemon", "d2"), ("audit", "a2"), ("audit", "a3"), ("daemon", "d1")]);
+        let shown = serde_json::to_string(&answer).unwrap();
+        assert!(!shown.contains("LETTER-SENTINEL") && !shown.contains("FORWARDED-SENTINEL"), "{shown}");
+        let shown: Value = serde_json::from_str(&shown).unwrap();
+        // The keys are as serde_json sorts them (not the struct's order): the four parts, and nothing else.
+        let mut keys: Vec<&str> = shown.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["events", "files", "next", "reset"]);
+        assert_eq!(shown["next"]["audit"], std::fs::metadata(&audit_file).unwrap().len());
+        assert_eq!(shown["next"]["daemon"], std::fs::metadata(&daemon_file).unwrap().len());
+        assert_eq!(shown["files"], json!({"audit": "a", "daemon": null}));
+        assert_eq!(shown["events"][0]["stream"], "audit");
+        assert_eq!(shown["events"][1]["event"]["kind"], "d2", "the feed's record is as it is");
+    }
+
     fn kinds(tail: &Tail) -> Vec<&str> {
         tail.events.iter().map(|event| event["kind"].as_str().unwrap()).collect()
     }
@@ -866,11 +1075,11 @@ mod tests {
             r#"["audit"]"#,
             r#"{"v":0,"ts":8,"class":"audit","kind":"a2"}"#,
         ]);
-        let got = tail(&path, Some(0)).unwrap();
+        let got = feed_tail(&path, Some(0)).unwrap();
         assert_eq!(kinds(&got), ["a1", "g1", "a2"]);
         assert_eq!(got.next, std::fs::metadata(&path).unwrap().len());
         assert!(!got.reset);
-        assert!(!serde_json::to_string(&got).unwrap().contains("SECRET-NAME"));
+        assert!(!format!("{:?}", got.events).contains("SECRET-NAME"));
     }
 
     #[test]
@@ -879,31 +1088,31 @@ mod tests {
         let whole = std::fs::metadata(&path).unwrap().len();
         let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         std::io::Write::write_all(&mut file, br#"{"class":"gate","kind":"sec"#).unwrap();
-        let got = tail(&path, Some(0)).unwrap();
+        let got = feed_tail(&path, Some(0)).unwrap();
         assert_eq!((kinds(&got), got.next), (vec!["first"], whole), "the half line is not read, and the cursor stays before it");
         std::io::Write::write_all(&mut file, b"ond\"}\n").unwrap();
-        let got = tail(&path, Some(whole)).unwrap();
+        let got = feed_tail(&path, Some(whole)).unwrap();
         assert_eq!(kinds(&got), ["second"]);
         assert_eq!(got.next, std::fs::metadata(&path).unwrap().len());
-        let again = tail(&path, Some(got.next)).unwrap();
+        let again = feed_tail(&path, Some(got.next)).unwrap();
         assert_eq!((again.events.len(), again.next, again.reset), (0, got.next, false));
     }
 
     #[test]
     fn a_file_that_shrank_is_read_again_from_the_start() {
         let (_dir, path) = feed(&[r#"{"class":"audit","kind":"old-1"}"#, r#"{"class":"audit","kind":"old-2"}"#]);
-        let before = tail(&path, Some(0)).unwrap();
+        let before = feed_tail(&path, Some(0)).unwrap();
         // aoided truncates in place at its cap and goes on writing: the file is shorter than the cursor.
         std::fs::write(&path, "{\"class\":\"gate\",\"kind\":\"new\"}\n").unwrap();
-        let got = tail(&path, Some(before.next)).unwrap();
+        let got = feed_tail(&path, Some(before.next)).unwrap();
         assert!(got.reset);
         assert_eq!(kinds(&got), ["new"]);
         assert_eq!(got.next, std::fs::metadata(&path).unwrap().len());
         // A file that is gone after a cursor is the same fact; with no cursor there is nothing to reset.
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(tail(&path, Some(5)).unwrap(), Tail { events: vec![], next: 0, reset: true });
-        assert_eq!(tail(&path, Some(0)).unwrap(), Tail { events: vec![], next: 0, reset: false });
-        assert_eq!(tail(&path, None).unwrap(), Tail { events: vec![], next: 0, reset: false });
+        assert_eq!(feed_tail(&path, Some(5)).unwrap(), Tail { events: vec![], next: 0, reset: true });
+        assert_eq!(feed_tail(&path, Some(0)).unwrap(), Tail { events: vec![], next: 0, reset: false });
+        assert_eq!(feed_tail(&path, None).unwrap(), Tail { events: vec![], next: 0, reset: false });
     }
 
     #[test]
@@ -915,7 +1124,7 @@ mod tests {
         assert!(size > 3 * EVENTS_WINDOW);
         let (mut after, mut seen, mut calls) = (0, Vec::new(), 0);
         while after < size {
-            let got = tail(&path, Some(after)).unwrap();
+            let got = feed_tail(&path, Some(after)).unwrap();
             assert!(got.next - after <= EVENTS_WINDOW, "a call read {} bytes", got.next - after);
             assert!(got.next > after, "every call moves on");
             seen.extend(got.events.iter().map(|event| event["kind"].as_str().unwrap().to_string()));
@@ -931,7 +1140,7 @@ mod tests {
         let all: Vec<String> = (0..1000).map(line).collect();
         let (_dir, path) = feed(&all.iter().map(String::as_str).collect::<Vec<_>>());
         let size = std::fs::metadata(&path).unwrap().len();
-        let got = tail(&path, None).unwrap();
+        let got = feed_tail(&path, None).unwrap();
         assert_eq!(got.next, size);
         assert_eq!(got.events.last().unwrap()["kind"], "k00999");
         let first = got.events[0]["kind"].as_str().unwrap().to_string();
@@ -942,7 +1151,7 @@ mod tests {
         assert_eq!(count, 1000 - n, "a run of lines with none missing in the middle");
         // A small file is read whole.
         let (_dir, path) = feed(&[r#"{"class":"audit","kind":"only"}"#]);
-        assert_eq!(kinds(&tail(&path, None).unwrap()), ["only"]);
+        assert_eq!(kinds(&feed_tail(&path, None).unwrap()), ["only"]);
     }
 
     #[test]
@@ -953,10 +1162,10 @@ mod tests {
         text.push('\n');
         text.push_str("{\"class\":\"audit\",\"kind\":\"after\"}\n");
         std::fs::write(&path, &text).unwrap();
-        let first = tail(&path, Some(0)).unwrap();
+        let first = feed_tail(&path, Some(0)).unwrap();
         assert!(first.events.is_empty());
         assert_eq!(first.next, EVENTS_WINDOW, "the cursor moves on so the poll is not stuck behind it");
-        let second = tail(&path, Some(first.next)).unwrap();
+        let second = feed_tail(&path, Some(first.next)).unwrap();
         assert_eq!(kinds(&second), ["after"], "the rest of the long line is a fragment and is not an event");
     }
 
@@ -965,17 +1174,71 @@ mod tests {
         let (dir, path) = feed(&[r#"{"class":"audit","kind":"real"}"#]);
         let link = dir.path().join("link.jsonl");
         std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert!(tail(&link, Some(0)).is_err(), "O_NOFOLLOW: a link is not followed");
-        assert!(tail(dir.path(), Some(0)).is_err(), "a directory is not a feed");
+        assert!(feed_tail(&link, Some(0)).is_err(), "O_NOFOLLOW: a link is not followed");
+        assert!(feed_tail(dir.path(), Some(0)).is_err(), "a directory is not a feed");
+    }
+
+    fn cursors(audit: Option<u64>, daemon: Option<u64>) -> Option<Cursors> {
+        Some(Cursors { audit, daemon })
     }
 
     #[test]
-    fn the_events_query_is_nothing_or_one_offset() {
-        assert_eq!(after_asked(""), Some(None));
-        assert_eq!(after_asked("after=0"), Some(Some(0)));
-        assert_eq!(after_asked("after=1234567"), Some(Some(1_234_567)));
-        for bad in ["after=", "after=-1", "after=1.5", "after=1e3", "after=%31", "after= 1", "after=1&after=2", "after=1&x=1", "x=1", "after", "AFTER=1", "after=99999999999999999999999"] {
-            assert_eq!(after_asked(bad), None, "{bad:?}");
+    fn the_events_query_is_each_stream_s_offset_once_and_nothing_else() {
+        assert_eq!(cursors_asked(""), cursors(None, None), "no query is the first poll of both");
+        assert_eq!(cursors_asked("audit=0"), cursors(Some(0), None));
+        assert_eq!(cursors_asked("daemon=1234567"), cursors(None, Some(1_234_567)));
+        assert_eq!(cursors_asked("audit=5&daemon=7"), cursors(Some(5), Some(7)));
+        assert_eq!(cursors_asked("daemon=7&audit=5"), cursors(Some(5), Some(7)), "either order");
+        for bad in [
+            "after=0", "after=", "audit=", "audit=-1", "audit=1.5", "audit=1e3", "audit=%31", "audit=+1", "audit= 1", "audit=x", "audit",
+            "AUDIT=1", "audit=1&audit=2", "daemon=1&daemon=1", "audit=1&after=1", "audit=1&x=1", "x=1", "audit=1&", "&audit=1", "audit=1&&daemon=2",
+            "audit=99999999999999999999999", "audit=1=2",
+        ] {
+            assert_eq!(cursors_asked(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The audit log's allowlist: what is forwarded is `ts`, `class`, `door`, `command` and `status`, and a record outside it is dropped.
+    #[test]
+    fn the_audit_log_forwards_its_allowlist_and_drops_what_it_cannot_pin() {
+        let kept = audit_keep(&json!({"ts": 1791366040, "door": "cli", "class": "audit", "command": "mail.send", "status": "ok",
+            "message": "LETTER-SENTINEL body of a letter", "untrusted_data": "FORWARDED-SENTINEL", "admitted": false, "argv": ["--token=x"]}));
+        assert_eq!(kept, Some(json!({"ts": 1791366040, "class": "audit", "door": "cli", "command": "mail.send", "status": "ok"})));
+        // The gate's self-check: no door, no command, and nothing else but its class and status.
+        assert_eq!(audit_keep(&json!({"ts": 5, "class": "gate", "status": "proposed", "admitted": false})), Some(json!({"ts": 5, "class": "gate", "status": "proposed"})));
+        // Each drop has its reason, and none of them is a secret or a letter that got through.
+        let drops = [
+            json!({"class": "audit", "command": "mail.send"}),
+            json!({"ts": "1791366040", "class": "audit"}),
+            json!({"ts": 1.5, "class": "audit"}),
+            json!({"ts": -1, "class": "audit"}),
+            json!({"ts": 1, "class": "secret", "command": "x"}),
+            json!({"ts": 1, "class": "notification"}),
+            json!({"ts": 1}),
+            json!({"ts": 1, "class": "audit", "door": "non-cli"}),
+            json!({"ts": 1, "class": "audit", "command": "node add osaka"}),
+            json!({"ts": 1, "class": "audit", "command": "mail send"}),
+            json!({"ts": 1, "class": "audit", "command": "-leading"}),
+            json!({"ts": 1, "class": "audit", "command": 7}),
+            json!({"ts": 1, "class": "audit", "status": "parked (superseding osaka)"}),
+            json!({"ts": 1, "class": "audit", "status": null}),
+            json!("a string, not a record"),
+            json!(["audit"]),
+        ];
+        for record in drops {
+            assert_eq!(audit_keep(&record), None, "{record}");
+        }
+        let only_a_door = audit_keep(&json!({"ts": 1, "class": "audit", "door": "cli"}));
+        assert_eq!(only_a_door, Some(json!({"ts": 1, "class": "audit", "door": "cli"})), "an absent optional field is not in the record");
+    }
+
+    #[test]
+    fn a_command_word_is_dotted_or_slashed_and_never_has_an_argument_in_it() {
+        for ok in ["mail.send", "a2a.pairRequest", "session.pending.approve", "aoide/pairRequest", "send", "x-1"] {
+            assert!(command_ok(ok), "{ok}");
+        }
+        for bad in ["", "1send", ".send", "mail send", "node add osaka", "mail.send\n", "a:b", "é", &"c".repeat(COMMAND_MAX + 1)] {
+            assert!(!command_ok(bad), "{bad:?}");
         }
     }
 
@@ -1139,7 +1402,8 @@ mod tests {
             aoide: None,
             aoide_home: None,
             aoide_daemon_socket: None,
-            aoide_events: None,
+            aoide_audit_log: None,
+            aoide_daemon_events: None,
             minerva: None,
             term_token_file: None,
             mail_token_file: None,
@@ -1164,14 +1428,40 @@ mod tests {
                 assert!(!path.starts_with(&real), "{path:?} is under ${name}");
             }
         }
-        assert_eq!(events_path(&opts), None, "the events feed has no default at all");
+        // The two feeds default under the same stand-in folder, never under the real home or the real runtime dir.
+        assert_eq!(audit_path(&opts).unwrap(), Path::new("/nonexistent-minerva-test/aoide/log"));
+        assert_eq!(daemon_path(&opts).unwrap(), Path::new("/nonexistent-minerva-test/aoide/events.jsonl"));
         // A flag still wins, in this build too.
         let flagged = Options {
             aoide_home: Some(PathBuf::from("/given/aoide")),
             aoide_daemon_socket: Some(PathBuf::from("/given/aoided.sock")),
+            aoide_audit_log: Some(PathBuf::from("/given/audit.log")),
+            aoide_daemon_events: Some(PathBuf::from("/given/events.jsonl")),
             ..opts
         };
         assert_eq!(super::home(&flagged).unwrap(), Path::new("/given/aoide"));
         assert_eq!(daemon_socket(&flagged).unwrap(), Path::new("/given/aoided.sock"));
+        assert_eq!(audit_path(&flagged).unwrap(), Path::new("/given/audit.log"));
+        assert_eq!(daemon_path(&flagged).unwrap(), Path::new("/given/events.jsonl"));
+    }
+
+    /// The defaults of the two files, and the one rule that holds for both: a relative path names no file, and an explicit flag is never
+    /// replaced by the default (a relative flag is none, not the default under the home).
+    #[test]
+    fn the_two_feeds_resolve_from_their_flags_and_their_defaults_and_only_absolute_paths_count() {
+        let mut opts = unflagged();
+        opts.aoide_home = Some(PathBuf::from("/given/aoide"));
+        assert_eq!(audit_path(&opts), Some(PathBuf::from("/given/aoide/log")), "aoide's own default under --aoide-home");
+        opts.aoide_audit_log = Some(PathBuf::from("relative/audit.log"));
+        assert_eq!(audit_path(&opts), None, "a relative flag names no file, and does not fall back to the default");
+        opts.aoide_audit_log = None;
+        opts.aoide_home = Some(PathBuf::from("relative-home"));
+        assert_eq!(audit_path(&opts), None, "a relative home has no log under it");
+        opts.aoide_daemon_events = Some(PathBuf::from("relative/events.jsonl"));
+        assert_eq!(daemon_path(&opts), None, "a relative daemon flag is none");
+        opts.aoide_daemon_events = None;
+        // The default is `$AOIDE_DAEMON_EVENTS` when absolute and `$XDG_RUNTIME_DIR/aoide/events.jsonl` otherwise. The unit tests see the
+        // stand-in, whatever this process's environment is; the integration tests set the perch's own environment and check it there.
+        assert_eq!(daemon_path(&opts), Some(PathBuf::from("/nonexistent-minerva-test/aoide/events.jsonl")));
     }
 }

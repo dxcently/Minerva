@@ -1,48 +1,12 @@
 {
   "events": [
-    {
-      "class": "audit",
-      "kind": "hand-edit",
-      "payload": {
-        "file": "sessions.json"
-      },
-      "source": "aoided",
-      "ts": 1791366000,
-      "v": 0
-    },
-    {
-      "class": "gate",
-      "kind": "pair-parked",
-      "payload": {
-        "direction": "inbound",
-        "id": "abc12345",
-        "name": "box-a",
-        "originAddr": "10.0.0.5",
-        "url": "http://box-a/"
-      },
-      "source": "a2a-door",
-      "ts": 1791366020,
-      "v": 0
-    },
-    {
-      "class": "audit",
-      "command": "mail.send",
-      "door": "cli",
-      "message": "spooled to osaka/minerva",
-      "status": "ok",
-      "ts": 1791366040
-    },
-    {
-      "class": "gate",
-      "kind": "pending",
-      "payload": {
-        "node": "osaka",
-        "note": "<script>alert(1)</script>\u001b[31m"
-      },
-      "ts": 1791366050,
-      "v": 0
-    }
+    {"stream": "daemon", "event": {"class": "audit", "kind": "hand-edit", "payload": {"file": "sessions.json"}, "source": "aoided", "ts": 1791366000, "v": 0}},
+    {"stream": "daemon", "event": {"class": "gate", "kind": "pair-parked", "payload": {"direction": "inbound", "id": "abc12345", "name": "box-a", "originAddr": "10.0.0.5", "url": "http://box-a/"}, "source": "a2a-door", "ts": 1791366020, "v": 0}},
+    {"stream": "audit", "event": {"class": "audit", "command": "mail.send", "door": "cli", "status": "ok", "ts": 1791366040}},
+    {"stream": "audit", "event": {"class": "gate", "command": "node.add", "door": "mcp", "status": "proposed", "ts": 1791366045}},
+    {"stream": "daemon", "event": {"class": "gate", "kind": "pending", "payload": {"node": "osaka", "note": "<script>alert(1)</script>\u001b[31m"}, "ts": 1791366050, "v": 0}}
   ],
-  "next": 794,
-  "reset": false
+  "next": {"audit": 489, "daemon": 674},
+  "reset": {"audit": false, "daemon": false},
+  "files": {"audit": "~/.aoide/log", "daemon": "/run/user/1000/aoide/events.jsonl"}
 }

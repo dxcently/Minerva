@@ -81,9 +81,14 @@ struct Cli {
     /// Aoide's daemon socket, which is only ever asked to `ping`.
     #[arg(long, value_name = "PATH")]
     aoide_daemon_socket: Option<PathBuf>,
-    /// Aoide's audit log, which the mesh view tails.
-    #[arg(long, value_name = "FILE")]
-    aoide_events: Option<PathBuf>,
+    /// Aoide's audit log, which the mesh view tails and the runner gives aoide as `AOIDE_AUDIT_LOG`. Default: `<aoide-home>/log`.
+    /// Absolute only.
+    #[arg(long, value_name = "PATH")]
+    aoide_audit_log: Option<PathBuf>,
+    /// aoided's events feed, which the mesh view tails and nothing writes. Default: `$AOIDE_DAEMON_EVENTS` when absolute, else
+    /// `$XDG_RUNTIME_DIR/aoide/events.jsonl`. Absolute only.
+    #[arg(long, value_name = "PATH")]
+    aoide_daemon_events: Option<PathBuf>,
     /// The `minerva` binary the install routes ask, as an absolute path. Default: the one beside this perch, when there is one.
     #[arg(long, value_name = "PATH")]
     minerva: Option<PathBuf>,
@@ -158,7 +163,8 @@ async fn main() -> Result<()> {
         aoide: aoide_or_default(cli.aoide, std::env::var_os("HOME")),
         aoide_home: cli.aoide_home,
         aoide_daemon_socket: cli.aoide_daemon_socket,
-        aoide_events: cli.aoide_events,
+        aoide_audit_log: cli.aoide_audit_log,
+        aoide_daemon_events: cli.aoide_daemon_events,
         minerva: cli.minerva,
         term_token_file: cli.term_token_file,
         mail_token_file: cli.mail_token_file,
@@ -250,17 +256,21 @@ mod tests {
         let bare = Cli::try_parse_from(["perch"]).unwrap();
         assert_eq!(bare.run_graphs, ["wiki-hop"], "the default graph");
         assert!(bare.plugins_dir.is_none() && bare.jev_health.is_none() && bare.browser_health.is_none());
-        assert!(bare.aoide.is_none() && bare.aoide_home.is_none() && bare.aoide_daemon_socket.is_none() && bare.aoide_events.is_none());
+        assert!(bare.aoide.is_none() && bare.aoide_home.is_none() && bare.aoide_daemon_socket.is_none());
+        assert!(bare.aoide_audit_log.is_none() && bare.aoide_daemon_events.is_none());
         assert!(bare.minerva.is_none() && bare.term_token_file.is_none() && bare.mail_token_file.is_none() && bare.agent_url_file.is_none());
         assert!(bare.knob.is_empty());
 
         let all = Cli::try_parse_from([
             "perch", "--plugins-dir", "/p", "--run-graphs", "a,b", "--jev-health", "http://127.0.0.1:8091/health", "--browser-health",
             "http://127.0.0.1:8090/health", "--aoide", "/bin/aoide", "--aoide-home", "/h/.aoide", "--aoide-daemon-socket", "/s.sock",
-            "--aoide-events", "/e.log", "--minerva", "/bin/minerva", "--term-token-file", "/t", "--mail-token-file", "/m",
-            "--agent-url-file", "/u", "--knob", "doors=off", "--knob", "term_ring=4096",
+            "--aoide-audit-log", "/e.log", "--aoide-daemon-events", "/d.jsonl", "--minerva", "/bin/minerva", "--term-token-file", "/t",
+            "--mail-token-file", "/m", "--agent-url-file", "/u", "--knob", "doors=off", "--knob", "term_ring=4096",
         ])
         .unwrap();
+        assert_eq!(all.aoide_audit_log.as_deref(), Some(std::path::Path::new("/e.log")), "the audit log flag");
+        assert_eq!(all.aoide_daemon_events.as_deref(), Some(std::path::Path::new("/d.jsonl")), "the daemon feed flag");
+        assert!(Cli::try_parse_from(["perch", "--aoide-events", "/e.log"]).is_err(), "the one flag that named both files is gone");
         assert_eq!(all.run_graphs, ["a", "b"], "given graphs replace the default");
         assert_eq!(all.plugins_dir.as_deref(), Some(std::path::Path::new("/p")));
         assert_eq!(all.aoide.as_deref(), Some(std::path::Path::new("/bin/aoide")));

@@ -16,7 +16,7 @@ asked. The other paths under it (`/hub/mesh/nodes`, `/hub/mesh/events/x`) are 40
 
 ```text
 GET /hub/mesh                  the snapshot, always 200 (what is missing is said in `errors`); a query string is a 400
-GET /hub/mesh/events[?after=N] audit and gate events from byte N of --aoide-events; `after` is digits and nothing else (else 400)
+GET /hub/mesh/events[?audit=N][&daemon=M] the audit log's and the daemon feed's events, from byte N and byte M; each key once, digits and nothing else (else 400)
 ```
 
 ### The snapshot
@@ -50,26 +50,42 @@ stayed `"0"` through every change and drift would otherwise be silent.
 ### The events
 
 ```text
-{"events": [object, ...], "next": N, "reset": bool}
+{"events": [{"stream": "audit"|"daemon", "event": object}, ...],
+ "next": {"audit": N, "daemon": M}, "reset": {"audit": bool, "daemon": bool}, "files": {"audit": path|null, "daemon": path|null}}
 ```
 
-- `events` are the feed's lines that are JSON objects with `class` of `audit` or `gate`, oldest first. `secret`, `notification`, `rice`,
-  `content` and anything else are never shown.
-- `next` is where the next poll starts: pass it back as `?after=`. It is the end of the last **whole** line read, so a line still being
-  written is read again once it has its newline.
-- `reset` is true when the cursor was past the end of the file (truncated in place, replaced, or gone): the read starts again at 0.
-- No `after` is the first poll: the last 64 KiB of the file, from its first whole line.
-- A poll reads at most 64 KiB of the file, so a long backlog takes several polls and loses nothing; `next` advances through it.
-- `--aoide-events` is any JSON-lines file of objects with a `class`. Aoide has two (its audit log and the feed aoided keeps beside its
-  socket) and the flag does not say which, so there is **no default**: without the flag the tail is empty (`events: []`, `next: 0`). The
-  runner hands the same path to every aoide call it makes as `AOIDE_AUDIT_LOG`.
-- A feed that is not there yet is an empty one; a feed that is a link, a directory or a FIFO is a 502.
+Two streams, one answer. Each stream has its own file, cursor and reset, and each record says which stream it came from.
+
+- **`audit`** is `--aoide-audit-log`, else `<--aoide-home or ~/.aoide>/log`, which is aoide's own default. The runner gives aoide the
+  explicit flag's path as `AOIDE_AUDIT_LOG` **only when the flag was given**, and strips every ambient `AOIDE_*` from its call, so the file
+  aoide appends to under the runner is the one tailed here. The stream is an **allowlist**, fail closed: a record needs a numeric `ts`
+  and a `class` of `audit` or `gate`; when present, `door` must be `cli`, `mcp`, `a2a` or `daemon`, `command` one word (dotted or slashed,
+  no space, at most 64 bytes) and `status` one of `ok`, `error`, `pending`, `delivered`, `proposed`. The answer keeps `ts`, `class`,
+  `door`, `command` and `status` and nothing else: a `message`, `untrusted_data` or any field a later aoide adds is never forwarded. A
+  record that fails a rule is dropped, not repaired.
+- **`daemon`** is `--aoide-daemon-events`, else `$AOIDE_DAEMON_EVENTS` when absolute, else `$XDG_RUNTIME_DIR/aoide/events.jsonl` (aoided's
+  own default, beside its socket). Its records pass as they are when `class` is `audit` or `gate`; `secret`, `notification`, `rice`,
+  `content` and anything else are never shown. No aoide call is ever given this path.
+- The two are merged by `ts`, at a tie the audit log first, then each file's order. A record with no numeric `ts` in the audit log sorts
+  as 0 and, under the allowlist, is dropped before that. Aoide's audit timestamp is not documented anywhere the perch reads, so until it is
+  the audit stream is the one most likely to read empty against a real aoide.
+- `next.<stream>` is that stream's next cursor: the end of its last **whole** line read, so a line still being written is read again once
+  it has its newline. Pass them back as `?audit=N&daemon=M` (either, or both, each once).
+- `reset.<stream>` is true when that stream's cursor was past the end of its file (truncated in place at 1 MiB, replaced, or gone): that
+  stream reads again from 0, and the other is untouched.
+- No query is the first poll: each stream's last 64 KiB, from its first whole line. A poll reads at most 64 KiB of each file, so a long
+  backlog takes several polls and loses nothing.
+- A file that is not there yet is an empty stream with cursor 0. A file that is a link, a directory or a FIFO is a 502 that names the
+  stream, and nothing is read from it. `files` names each path as a `~` path, or `null` where a stream has none (a relative flag is none).
+- Any other query (`after=`, a repeated key, a key that is neither `audit` nor `daemon`, a value that is not digits, more than 20 digits,
+  an empty pair) is a 400.
 
 ## What it reads, and how
 
 - **Files**, under `<--aoide-home or ~/.aoide>/state/`: `nodes.json` (1 MiB), `node-cache/*.json` (64 files, 64 KiB each, and 1000
-  directory entries looked at at most), `stage/graph.json` (2 MiB), and the events file. Each is opened `O_NOFOLLOW | O_NONBLOCK` through
-  `crate::rawfile::open_regular` and must be a regular file, so a link or FIFO planted under a name is not read.
+  directory entries looked at at most), `stage/graph.json` (2 MiB). Each is opened `O_NOFOLLOW | O_NONBLOCK` through
+  `crate::rawfile::open_regular` and must be a regular file, so a link or FIFO planted under a name is not read. The two event feeds are
+  not under the state folder: they are the paths of `--aoide-audit-log` and `--aoide-daemon-events` (see The events).
 - **Aoide, through `crate::aoide::Aoide` and nothing else**: `--version`, `mesh --json`, `mail outbox --json`. Never `node list`,
   `session`, `send`, `pair`, `spawn`, `allow`, `node status`, `node pull`, `dispatch` or anything on the A2A door: the runner has no
   variant for them. The perch never spawns aoide itself, and a perch with no `--aoide` and no executable `~/.local/bin/aoide` runs
@@ -110,5 +126,7 @@ at most, the runner's timeout) and not their sum. The files are read fresh on ev
 
 `tests/mesh.rs` runs a real perch against `fake_aoide` (the tests' stand-in, `tests/fixtures/aoide/`) with a temporary aoide home, a
 `UnixListener` standing in for aoided, and checks the fake's log for exactly `--version`, `mesh --json` and `mail outbox --json`. The
-module's own unit tests cover the projections (both registry shapes, the allowlist, the graph, the cache), the event tail's boundaries
-and the TTL cache.
+module's own unit tests cover the projections (both registry shapes, the allowlist, the graph, the cache), the two event streams (the
+audit allowlist, the merge, the cursors and resets, the 64 KiB window, the query), the paths each stream resolves to, and the TTL cache.
+`tests/mesh.rs` runs the events end to end: both streams with their labels, a stream's truncate resetting only itself, a link or a FIFO at
+either path, the runner's environment (the audit flag and never the feed), and the defaults.

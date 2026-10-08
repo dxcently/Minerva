@@ -2,5 +2,4 @@
 {"v":0,"ts":1791366010,"class":"secret","kind":"released","payload":{"secret":"SECRET-NAME-SENTINEL","consumer":"CONSUMER-SENTINEL"}}
 {"v":0,"ts":1791366020,"class":"gate","kind":"pair-parked","source":"a2a-door","payload":{"id":"abc12345","name":"box-a","originAddr":"10.0.0.5","url":"http://box-a/","direction":"inbound"}}
 {"v":0,"ts":1791366030,"class":"notification","kind":"forwarded","payload":{"body":"NOTIFICATION-SENTINEL"}}
-{"ts":1791366040,"door":"cli","class":"audit","command":"mail.send","status":"ok","message":"spooled to osaka/minerva"}
 {"v":0,"ts":1791366050,"class":"gate","kind":"pending","payload":{"node":"osaka","note":"<script>alert(1)</script>\u001b[31m"}}

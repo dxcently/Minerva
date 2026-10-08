@@ -57,7 +57,7 @@ no other test file.
 | `runs.rs` | R1a | built: start, park, answer, cancel, abandon, adopt, the health gate, against the fake's `workflow` (`FAKE_WORKFLOW_*`) |
 | `runs_log.rs` | R1b | built: `log?after` while a run steps, one child per unchanged journal, the query refusals, the graphs list and file, names outside `--run-graphs` |
 | `aoide.rs` | R2a | `fake_aoide` refuses every argv with exit 99 |
-| `mesh.rs` | R2b | `/hub/mesh` and `/hub/mesh/events` are a 404 behind the gate (pinned in `http.rs` until this file took them over) |
+| `mesh.rs` | R2b, R2c | `/hub/mesh` and `/hub/mesh/events` are a 404 behind the gate (pinned in `http.rs` until this file took them over). R2c: the events of both streams (the audit log and the daemon feed), merged and labelled, each cursor and reset on its own, the audit allowlist, the 400 and 502 cases, and the defaults and the runner's environment (`AOIDE_AUDIT_LOG` only with its flag, the feed never) |
 | `meta.rs` | R3 | `/hub/meta/...` is a 404 behind the gate; the fake's `tools`, `plugins` and `policy-rows` refuse |
 | `install.rs` | R4 | done: the notice, keys list and inspect, the arm (bearer only, never a page), add and remove spending it once, listed/mismatch/unknown/updated/Nix answers, writes that outlive the client, the child's env list |
 | `agent.rs` | AG | done: scoped tokens, attribution to a door (its children refused), files on exit by identity, refused starts leave nothing |

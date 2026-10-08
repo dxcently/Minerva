@@ -83,7 +83,9 @@ pub struct Aoide {
     pub bin: PathBuf,
     /// `--aoide-home`, given to the child as `AOIDE_ROOT`. `None` leaves aoide its default (`~/.aoide`).
     pub root: Option<PathBuf>,
-    /// `--aoide-events`, given as `AOIDE_AUDIT_LOG`: the log the mesh view tails.
+    /// `--aoide-audit-log`, given as `AOIDE_AUDIT_LOG` and only when the flag was given. Never the daemon's feed: aoide appending its own
+    /// audit records into aoided's feed would be the one file both writers share. With no flag aoide writes its own default (`<root>/log`),
+    /// which is the file the mesh view tails when it has no flag either.
     pub audit_log: Option<PathBuf>,
     /// `--aoide-daemon-socket`, given as `AOIDE_DAEMON_SOCKET`.
     pub daemon_socket: Option<PathBuf>,
@@ -105,7 +107,7 @@ impl Aoide {
         let bin = opts.aoide.clone().ok_or(Error::NoBinary)?;
         Ok(Self::new(bin)
             .root(opts.aoide_home.clone())
-            .audit_log(opts.aoide_events.clone())
+            .audit_log(opts.aoide_audit_log.clone())
             .daemon_socket(opts.aoide_daemon_socket.clone())
             .runtime_dir(std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)))
     }

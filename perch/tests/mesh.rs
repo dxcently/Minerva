@@ -55,21 +55,25 @@ const GRAPH: &str = r#"{
   "edges": [{"from": "project:p", "to": "session:s1", "kind": "anchors"}]
 }"#;
 
-/// Which flags a perch is started with.
+/// Which flags a perch is started with, and what else it is given in its environment.
 #[derive(Clone)]
 struct Setup {
     aoide: bool,
     home: bool,
-    events: bool,
+    /// `--aoide-audit-log`, at `audit.log` in the rig.
+    audit: bool,
+    /// `--aoide-daemon-events`, at `daemon-events.jsonl` in the rig.
+    daemon: bool,
     socket: bool,
     state: bool,
     ttl_ms: Option<u64>,
     fake_dir: PathBuf,
+    env: Vec<(String, String)>,
 }
 
 impl Setup {
     fn all() -> Self {
-        Self { aoide: true, home: true, events: true, socket: true, state: true, ttl_ms: None, fake_dir: fixtures() }
+        Self { aoide: true, home: true, audit: true, daemon: true, socket: true, state: true, ttl_ms: None, fake_dir: fixtures(), env: Vec::new() }
     }
 
     fn start(self) -> Rig {
@@ -78,7 +82,8 @@ impl Setup {
         // `HOME` of the perch: empty, so nothing of the real one is the default of anything.
         let user = root.join("user");
         std::fs::create_dir(&user).unwrap();
-        let (home, events, socket, log) = (root.join("aoide"), root.join("events.jsonl"), root.join("aoided.sock"), root.join("fake.log"));
+        let (home, audit, daemon, socket, log) =
+            (root.join("aoide"), root.join("audit.log"), root.join("daemon-events.jsonl"), root.join("aoided.sock"), root.join("fake.log"));
         let state = home.join("state");
         if self.state {
             std::fs::create_dir_all(state.join("node-cache")).unwrap();
@@ -92,15 +97,22 @@ impl Setup {
             .env("FAKE_AOIDE_LOG", log.to_str().unwrap())
             // What a perch started from inside a conducted session has in its environment: none of it may reach a call.
             .env("AOIDE_SESSION_ID", "a-conducted-session")
-            .env("AOIDE_STATE_DIR", "/nonexistent/ambient-state");
+            .env("AOIDE_STATE_DIR", "/nonexistent/ambient-state")
+            // The daemon's feed is not the operator's to read here: a value that is not absolute is ignored, so the default is the
+            // runtime dir's file. A test that wants another path sets it through `env`, after this.
+            .env("AOIDE_DAEMON_EVENTS", "")
+            .envs(self.env);
         if self.aoide {
             builder = builder.arg("--aoide").arg(fake_aoide().expect("the stand-in aoide"));
         }
         if self.home {
             builder = builder.arg("--aoide-home").arg(&home);
         }
-        if self.events {
-            builder = builder.arg("--aoide-events").arg(&events);
+        if self.audit {
+            builder = builder.arg("--aoide-audit-log").arg(&audit);
+        }
+        if self.daemon {
+            builder = builder.arg("--aoide-daemon-events").arg(&daemon);
         }
         if self.socket {
             builder = builder.arg("--aoide-daemon-socket").arg(&socket);
@@ -109,7 +121,7 @@ impl Setup {
             builder = builder.arg("--knob").arg(format!("mesh_ttl_ms={ms}"));
         }
         let perch = builder.hold(dir).start();
-        Rig { perch, home, state, events, socket, log }
+        Rig { perch, home, state, audit, daemon, socket, log }
     }
 }
 
@@ -118,7 +130,10 @@ struct Rig {
     /// `--aoide-home`, and `state/` in it.
     home: PathBuf,
     state: PathBuf,
-    events: PathBuf,
+    /// `--aoide-audit-log`, when given.
+    audit: PathBuf,
+    /// `--aoide-daemon-events`, when given.
+    daemon: PathBuf,
     socket: PathBuf,
     log: PathBuf,
 }
@@ -198,7 +213,7 @@ fn a_snapshot_runs_version_mesh_and_outbox_and_nothing_else() {
             call["aoide_env"],
             json!({
                 "AOIDE_ROOT": rig.home.to_str().unwrap(),
-                "AOIDE_AUDIT_LOG": rig.events.to_str().unwrap(),
+                "AOIDE_AUDIT_LOG": rig.audit.to_str().unwrap(),
                 "AOIDE_DAEMON_SOCKET": rig.socket.to_str().unwrap(),
             }),
             "the four flags are the four variables, and the ambient AOIDE_STATE_DIR is gone"
@@ -269,8 +284,8 @@ fn a_failed_run_is_a_sentence_and_is_not_cached() {
 fn no_pubkey_tokenfile_or_bearersecret_is_in_any_response() {
     let rig = Setup::all().start();
     // The feed has lines of the classes that are shown, so that route's body is not empty either.
-    std::fs::write(&rig.events, "{\"class\":\"audit\",\"kind\":\"hand-edit\",\"payload\":{\"file\":\"sessions.json\"}}\n").unwrap();
-    for path in ["/hub/mesh", "/hub/mesh/events", "/hub/mesh/events?after=0"] {
+    std::fs::write(&rig.daemon, "{\"class\":\"audit\",\"kind\":\"hand-edit\",\"payload\":{\"file\":\"sessions.json\"}}\n").unwrap();
+    for path in ["/hub/mesh", "/hub/mesh/events", "/hub/mesh/events?audit=0&daemon=0"] {
         let answer = rig.perch.get(path);
         assert_eq!(answer.status, 200, "{path}");
         for sentinel in SENTINELS {
@@ -393,7 +408,7 @@ fn bare_perch(state: Option<&str>) -> (Perch, PathBuf) {
         std::fs::write(user.join(".aoide/state/nodes.json"), registry).unwrap();
     }
     // No --aoide, and a HOME with no ~/.local/bin/aoide: the perch has no program.
-    (Perch::builder().env("HOME", user.to_str().unwrap()).hold(dir).start(), user)
+    (Perch::builder().env("HOME", user.to_str().unwrap()).env("AOIDE_DAEMON_EVENTS", "").hold(dir).start(), user)
 }
 
 #[test]
@@ -412,9 +427,10 @@ fn no_aoide_and_no_state_is_unavailable_with_a_sentence() {
         assert_eq!(snapshot[none], Value::Null, "{none}");
     }
     assert_eq!(snapshot["daemon"], json!({"socket": null, "ping_ms": null}));
-    // The feed is an empty one, not an error.
+    // The feeds are empty ones, not an error: both streams have a path (aoide's default, and the runtime dir's), and nothing in them.
     let events = json_of(&perch.get("/hub/mesh/events"), "/hub/mesh/events");
-    assert_eq!(events, json!({"events": [], "next": 0, "reset": false}));
+    assert_eq!(events["events"], json!([]));
+    assert_eq!((events["next"].clone(), events["reset"].clone()), (json!({"audit": 0, "daemon": 0}), json!({"audit": false, "daemon": false})));
 }
 
 /// State and no program is available, and the home is `~/.aoide` of the perch's own `HOME` when no flag names one. Nothing is run.
@@ -445,14 +461,117 @@ fn a_program_without_state_is_available_and_lists_nothing() {
 // The events
 // ---------------------------------------------------------------------------
 
-fn kinds(tail: &Value) -> Vec<String> {
-    tail["events"].as_array().unwrap().iter().map(|event| event["kind"].as_str().unwrap().to_string()).collect()
+fn append(path: &Path, line: &str) {
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+    writeln!(file, "{line}").unwrap();
 }
 
-/// Only the `audit` and `gate` classes come back; a secret's name, a forwarded notification, a line that is not an event and a half line
-/// do not; and a file truncated in place (aoided does it at 1 MiB) is read again from 0.
+fn len(path: &Path) -> u64 {
+    std::fs::metadata(path).unwrap().len()
+}
+
+fn path_str(path: &Path) -> String {
+    path.to_str().unwrap().to_string()
+}
+
+/// `(stream, what the record says)` for each event of an answer, in order: a feed record's `kind`, an audit record's `command`.
+fn streams_and_kinds(answer: &Value) -> Vec<(String, String)> {
+    answer["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            let event = &entry["event"];
+            let word = event.get("kind").or_else(|| event.get("command")).and_then(Value::as_str).unwrap_or("?");
+            (entry["stream"].as_str().unwrap().to_string(), word.to_string())
+        })
+        .collect()
+}
+
+fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+    list.iter().map(|(stream, word)| (stream.to_string(), word.to_string())).collect()
+}
+
+/// A FIFO at `path`: a read that is not careful would wait on it for a writer that never comes.
+fn make_fifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo {}", path.display());
+}
+
+/// Both streams in one answer: each record by `ts`, the audit log first at a tie, and each record with the stream it came from. A feed
+/// record is as the feed holds it; an audit record is the allowlist's, and its `message` is not in it.
 #[test]
-fn the_events_tail_keeps_two_classes_and_survives_a_truncate_in_place() {
+fn both_streams_merge_by_ts_and_each_record_says_which_stream_it_came_from() {
+    let rig = Setup::all().start();
+    append(&rig.audit, r#"{"ts":1791366000,"door":"cli","class":"audit","command":"mail.send","status":"ok","message":"LETTER-SENTINEL spooled"}"#);
+    append(&rig.audit, r#"{"ts":1791366020,"door":"mcp","class":"gate","command":"send","status":"pending"}"#);
+    append(&rig.daemon, r#"{"v":0,"ts":1791366000,"class":"audit","kind":"hand-edit","source":"aoided","payload":{"file":"sessions.json"}}"#);
+    append(&rig.daemon, r#"{"v":0,"ts":1791366010,"class":"secret","kind":"released","payload":{"secret":"SECRET-NAME-SENTINEL"}}"#);
+    append(&rig.daemon, r#"{"v":0,"ts":1791366020,"class":"gate","kind":"pair-parked","source":"a2a-door","payload":{"name":"box-a"}}"#);
+    append(&rig.daemon, r#"{"v":0,"ts":1791366030,"class":"notification","kind":"forwarded","payload":{"body":"NOTIFICATION-SENTINEL"}}"#);
+    let answer = rig.tail("");
+    assert_eq!(
+        streams_and_kinds(&answer),
+        pairs(&[("audit", "mail.send"), ("daemon", "hand-edit"), ("audit", "send"), ("daemon", "pair-parked")]),
+        "by ts, and the audit log first at a tie"
+    );
+    let shown = answer.to_string();
+    for sentinel in ["LETTER-SENTINEL", "SECRET-NAME-SENTINEL", "NOTIFICATION-SENTINEL"] {
+        assert!(!shown.contains(sentinel), "{sentinel} is in the answer: {shown}");
+    }
+    assert_eq!(answer["events"][0]["event"], json!({"ts": 1791366000, "class": "audit", "door": "cli", "command": "mail.send", "status": "ok"}));
+    assert_eq!(answer["events"][1]["event"]["payload"], json!({"file": "sessions.json"}), "a feed record is as it is");
+    assert_eq!(answer["files"], json!({"audit": path_str(&rig.audit), "daemon": path_str(&rig.daemon)}));
+    assert_eq!(answer["next"], json!({"audit": len(&rig.audit), "daemon": len(&rig.daemon)}));
+    assert_eq!(answer["reset"], json!({"audit": false, "daemon": false}));
+}
+
+/// Each stream has its own cursor. A poll of both moves both; a stream that grew is read from its own cursor alone; and a file truncated
+/// in place (aoided does it at 1 MiB) resets only its own stream.
+#[test]
+fn the_cursors_advance_per_stream_and_a_truncate_resets_only_that_stream() {
+    let rig = Setup::all().start();
+    append(&rig.audit, r#"{"ts":1,"class":"audit","command":"a-one"}"#);
+    append(&rig.daemon, r#"{"v":0,"ts":1,"class":"audit","kind":"d-one","payload":{"pad":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}}"#);
+    let first = rig.tail("");
+    assert_eq!(streams_and_kinds(&first), pairs(&[("audit", "a-one"), ("daemon", "d-one")]));
+    let (audit, daemon) = (first["next"]["audit"].as_u64().unwrap(), first["next"]["daemon"].as_u64().unwrap());
+    assert_eq!((audit, daemon), (len(&rig.audit), len(&rig.daemon)));
+
+    append(&rig.audit, r#"{"ts":2,"class":"audit","command":"a-two"}"#);
+    let second = rig.tail(&format!("?audit={audit}&daemon={daemon}"));
+    assert_eq!(streams_and_kinds(&second), pairs(&[("audit", "a-two")]), "only the audit log grew, and the feed is not read again");
+    assert_eq!(second["reset"], json!({"audit": false, "daemon": false}));
+    let (audit, daemon) = (second["next"]["audit"].as_u64().unwrap(), second["next"]["daemon"].as_u64().unwrap());
+
+    // The feed is cut in place and written again, shorter than its cursor: the feed starts over, and the audit log does not.
+    std::fs::write(&rig.daemon, "{\"v\":0,\"ts\":3,\"class\":\"gate\",\"kind\":\"d-after\"}\n").unwrap();
+    let third = rig.tail(&format!("?audit={audit}&daemon={daemon}"));
+    assert_eq!(third["reset"], json!({"audit": false, "daemon": true}));
+    assert_eq!(streams_and_kinds(&third), pairs(&[("daemon", "d-after")]));
+    assert_eq!(third["next"], json!({"audit": audit, "daemon": len(&rig.daemon)}));
+}
+
+/// A file that is not there is an empty stream with a cursor of 0: the other stream reads as normal, and the answer still names the path.
+#[test]
+fn a_missing_file_is_an_empty_stream_and_the_other_still_reads() {
+    let rig = Setup::all().start();
+    append(&rig.daemon, r#"{"v":0,"ts":5,"class":"gate","kind":"only-the-feed"}"#);
+    let answer = rig.tail("");
+    assert_eq!(streams_and_kinds(&answer), pairs(&[("daemon", "only-the-feed")]));
+    assert_eq!(answer["next"]["audit"], 0);
+    assert_eq!(answer["files"]["audit"], json!(path_str(&rig.audit)), "named, though it is not there");
+    // A cursor from an audit log that has gone starts over, and gives nothing for that stream.
+    let gone = rig.tail("?audit=40");
+    assert_eq!((gone["reset"]["audit"].clone(), gone["next"]["audit"].clone()), (json!(true), json!(0)));
+    assert!(streams_and_kinds(&gone).iter().all(|(stream, _)| stream == "daemon"));
+}
+
+/// The daemon's feed, end to end: only its `audit` and `gate` records come back. A secret's name, a forwarded notification, a rice record,
+/// a line that is not an event and a half line do not, and a feed truncated in place is read again from 0.
+#[test]
+fn the_feed_keeps_two_classes_and_survives_a_truncate_in_place() {
     let rig = Setup::all().start();
     let lines = [
         r#"{"v":0,"ts":1,"class":"audit","kind":"hand-edit","source":"aoided","payload":{"file":"sessions.json"}}"#,
@@ -466,103 +585,202 @@ fn the_events_tail_keeps_two_classes_and_survives_a_truncate_in_place() {
     ];
     let mut text: String = lines.iter().map(|line| format!("{line}\n")).collect();
     text.push_str("{\"class\":\"gate\",\"kind\":\"half");
-    std::fs::write(&rig.events, text).unwrap();
+    std::fs::write(&rig.daemon, text).unwrap();
     let whole = lines.iter().map(|line| line.len() as u64 + 1).sum::<u64>();
 
-    let first = rig.tail("?after=0");
-    assert_eq!(kinds(&first), ["hand-edit", "pending", "last"]);
-    assert_eq!((first["next"].clone(), first["reset"].clone()), (json!(whole), json!(false)), "the cursor stops before the half line");
-    let answer = rig.perch.get("/hub/mesh/events?after=0");
+    let first = rig.tail("?daemon=0");
+    assert_eq!(streams_and_kinds(&first), pairs(&[("daemon", "hand-edit"), ("daemon", "pending"), ("daemon", "last")]));
+    assert_eq!(first["next"]["daemon"], whole, "the cursor stops before the half line");
+    assert_eq!(first["reset"]["daemon"], false);
+    let answer = rig.perch.get("/hub/mesh/events?daemon=0");
     for sentinel in ["SECRET-NAME-SENTINEL", "CONSUMER-SENTINEL", "NOTIFICATION-SENTINEL"] {
         assert!(!answer.body.contains(sentinel), "{sentinel} is in the feed's answer: {}", answer.body);
     }
-    assert_eq!(first["events"][1]["payload"]["note"], "<script>alert(1)</script>\u{1b}[31m", "remote text is a string, whole");
+    assert_eq!(first["events"][1]["event"]["payload"]["note"], "<script>alert(1)</script>\u{1b}[31m", "remote text is a string, whole");
 
     // The line is finished, and the next poll has exactly it.
-    let mut file = std::fs::OpenOptions::new().append(true).open(&rig.events).unwrap();
+    let mut file = std::fs::OpenOptions::new().append(true).open(&rig.daemon).unwrap();
     file.write_all(b"-over\"}\n").unwrap();
-    let next = rig.tail(&format!("?after={whole}"));
-    assert_eq!(kinds(&next), ["half-over"]);
-    let end = std::fs::metadata(&rig.events).unwrap().len();
-    assert_eq!(next["next"], end);
-    let quiet = rig.tail(&format!("?after={end}"));
-    assert_eq!((kinds(&quiet), quiet["next"].clone(), quiet["reset"].clone()), (Vec::<String>::new(), json!(end), json!(false)));
+    let next = rig.tail(&format!("?daemon={whole}"));
+    assert_eq!(streams_and_kinds(&next), pairs(&[("daemon", "half-over")]));
+    let end = len(&rig.daemon);
+    assert_eq!(next["next"]["daemon"], end);
+    let quiet = rig.tail(&format!("?daemon={end}"));
+    assert!(streams_and_kinds(&quiet).is_empty());
+    assert_eq!((quiet["next"]["daemon"].clone(), quiet["reset"]["daemon"].clone()), (json!(end), json!(false)));
 
-    // Truncated in place, then written to again: the file is shorter than the cursor, so it starts over.
-    std::fs::OpenOptions::new().write(true).truncate(true).open(&rig.events).unwrap().write_all(b"{\"class\":\"audit\",\"kind\":\"after-truncate\"}\n").unwrap();
-    let again = rig.tail(&format!("?after={end}"));
-    assert_eq!(again["reset"], true);
-    assert_eq!(kinds(&again), ["after-truncate"]);
-    assert_eq!(again["next"], std::fs::metadata(&rig.events).unwrap().len());
+    // Truncated in place, then written to again: the file is shorter than the cursor, so the feed starts over.
+    std::fs::OpenOptions::new().write(true).truncate(true).open(&rig.daemon).unwrap().write_all(b"{\"class\":\"audit\",\"kind\":\"after-truncate\"}\n").unwrap();
+    let again = rig.tail(&format!("?daemon={end}"));
+    assert_eq!(again["reset"]["daemon"], true);
+    assert_eq!(streams_and_kinds(&again), pairs(&[("daemon", "after-truncate")]));
+    assert_eq!(again["next"]["daemon"], len(&rig.daemon));
 }
 
-/// A call reads 64 KiB of the file at most, the calls together lose and repeat nothing, and the first poll (no cursor) is the newest
-/// window and starts on a whole line.
+/// The audit log's allowlist, end to end: a record with no `ts`, a `class` that is not the mesh's, a door, command or status that is not a
+/// word the docs give, a command with an argument in it, and a line that is not an object are dropped. What is kept is `ts`, `class`, `door`,
+/// `command` and `status`, and no text of theirs is in the answer.
 #[test]
-fn a_poll_of_the_events_is_at_most_64_kib_and_the_polls_lose_nothing() {
+fn the_audit_allowlist_drops_what_it_cannot_pin_and_forwards_no_text() {
     let rig = Setup::all().start();
-    let line = |n: usize| format!("{{\"class\":\"gate\",\"kind\":\"k{n:05}\",\"payload\":\"{}\"}}\n", "p".repeat(200));
-    std::fs::write(&rig.events, (0..1000).map(line).collect::<String>()).unwrap();
-    let size = std::fs::metadata(&rig.events).unwrap().len();
+    for line in [
+        r#"{"ts":1,"class":"audit","door":"cli","command":"mail.send","status":"ok","message":"LETTER-SENTINEL","untrusted_data":"FORWARD-SENTINEL"}"#,
+        r#"{"class":"audit","command":"no-ts-here"}"#,
+        r#"{"ts":2,"class":"secret","command":"secret-class"}"#,
+        r#"{"ts":3,"class":"audit","command":"node add osaka"}"#,
+        r#"{"ts":4,"class":"audit","command":"unknown-door","door":"elsewhere"}"#,
+        r#"{"ts":5,"class":"audit","command":"status-text","status":"parked (superseding osaka)"}"#,
+        "not json",
+        r#"["audit"]"#,
+        r#"{"ts":6,"class":"gate","status":"proposed","admitted":false,"argv":["--token=ARG-SENTINEL"]}"#,
+    ] {
+        append(&rig.audit, line);
+    }
+    let answer = rig.tail("?audit=0");
+    let ts: Vec<u64> = answer["events"].as_array().unwrap().iter().map(|entry| entry["event"]["ts"].as_u64().unwrap()).collect();
+    assert_eq!(ts, [1, 6]);
+    let shown = answer.to_string();
+    for sentinel in ["LETTER-SENTINEL", "FORWARD-SENTINEL", "ARG-SENTINEL", "secret-class", "no-ts-here", "node add", "elsewhere", "parked"] {
+        assert!(!shown.contains(sentinel), "{sentinel} reached the answer: {shown}");
+    }
+    assert_eq!(answer["events"][1]["event"], json!({"ts": 6, "class": "gate", "status": "proposed"}));
+}
+
+/// Both streams' defaults, with no flag for either: the audit log is `<aoide-home>/log`, and the feed is `$XDG_RUNTIME_DIR/aoide/events.jsonl`
+/// of the perch's own runtime dir. Then `$AOIDE_DAEMON_EVENTS` when it is absolute, and the runtime dir's file when it is not.
+#[test]
+fn the_defaults_are_aoides_own_log_and_the_feed_beside_the_socket_or_the_env_path() {
+    let rig = Setup { audit: false, daemon: false, ..Setup::all() }.start();
+    std::fs::write(rig.home.join("log"), "{\"ts\":1,\"class\":\"audit\",\"command\":\"from-the-default-log\"}\n").unwrap();
+    let feed = rig.perch.runtime.path().join("aoide").join("events.jsonl");
+    std::fs::create_dir_all(feed.parent().unwrap()).unwrap();
+    std::fs::write(&feed, "{\"v\":0,\"ts\":2,\"class\":\"gate\",\"kind\":\"from-the-runtime-dir\"}\n").unwrap();
+    let answer = rig.tail("");
+    assert_eq!(streams_and_kinds(&answer), pairs(&[("audit", "from-the-default-log"), ("daemon", "from-the-runtime-dir")]));
+    assert_eq!(answer["files"], json!({"audit": path_str(&rig.home.join("log")), "daemon": path_str(&feed)}));
+
+    let env_feed = rig.home.join("env-events.jsonl");
+    std::fs::write(&env_feed, "{\"v\":0,\"ts\":3,\"class\":\"audit\",\"kind\":\"from-the-env\"}\n").unwrap();
+    let from_env = Setup {
+        audit: false,
+        daemon: false,
+        env: vec![("AOIDE_DAEMON_EVENTS".into(), path_str(&env_feed))],
+        ..Setup::all()
+    }
+    .start();
+    let answer = from_env.tail("");
+    assert_eq!(answer["files"]["daemon"], json!(path_str(&env_feed)), "the absolute variable");
+    assert_eq!(streams_and_kinds(&answer), pairs(&[("daemon", "from-the-env")]));
+
+    let relative = Setup {
+        audit: false,
+        daemon: false,
+        env: vec![("AOIDE_DAEMON_EVENTS".into(), "relative/events.jsonl".into())],
+        ..Setup::all()
+    }
+    .start();
+    let feed = relative.perch.runtime.path().join("aoide").join("events.jsonl");
+    assert_eq!(relative.tail("")["files"]["daemon"], json!(path_str(&feed)), "a relative variable is none, so the runtime dir's file");
+}
+
+/// The runner's environment: `AOIDE_AUDIT_LOG` only when `--aoide-audit-log` was given, and with that path; the daemon's feed never, under
+/// any name, whatever the perch's own environment holds.
+#[test]
+fn the_runner_gives_aoide_the_audit_flag_only_and_never_the_feed_path() {
+    let rig = Setup { env: vec![("AOIDE_DAEMON_EVENTS".into(), "/nonexistent-minerva-test/daemon-events.jsonl".into())], ..Setup::all() }.start();
+    rig.snapshot();
+    let calls = rig.calls();
+    assert!(calls.len() >= 3, "{calls:?}");
+    for call in &calls {
+        let env = call["aoide_env"].as_object().unwrap();
+        assert_eq!(env.get("AOIDE_AUDIT_LOG"), Some(&json!(path_str(&rig.audit))), "the explicit flag, and that path: {env:?}");
+        assert!(!env.contains_key("AOIDE_DAEMON_EVENTS"), "{env:?}");
+        assert!(!env.values().any(|value| value == &json!(path_str(&rig.daemon))), "the feed's path reached aoide: {env:?}");
+    }
+    // With no audit flag the runner names no audit file (aoide writes its own default), and still never the feed.
+    let flagless = Setup { audit: false, ..Setup::all() }.start();
+    flagless.snapshot();
+    let calls = flagless.calls();
+    assert!(calls.len() >= 3, "{calls:?}");
+    for call in &calls {
+        let env = call["aoide_env"].as_object().unwrap();
+        assert!(!env.contains_key("AOIDE_AUDIT_LOG"), "no flag, no AOIDE_AUDIT_LOG: {env:?}");
+        assert!(!env.values().any(|value| value == &json!(path_str(&flagless.daemon))), "{env:?}");
+    }
+}
+
+/// `after=`, one bare key, a repeat, an unknown key and anything that is not digits are each a 400; the three ways to ask for both or one
+/// are a 200.
+#[test]
+fn the_events_route_takes_each_cursor_once_and_nothing_else() {
+    let rig = Setup::all().start();
+    for bad in [
+        "after=0", "after=", "after", "audit=", "audit=x", "audit=-1", "audit=1.5", "audit=%31", "audit=1&audit=2", "daemon=1&daemon=1",
+        "audit=1&after=2", "audit=1&x=2", "x=1", "audit=1&", "AUDIT=1", "audit=1=2", "audit=99999999999999999999999",
+    ] {
+        let answer = rig.perch.get(&format!("/hub/mesh/events?{bad}"));
+        assert_eq!(answer.status, 400, "{bad}: {}", answer.head);
+    }
+    for good in ["", "?audit=0", "?daemon=0", "?audit=0&daemon=0", "?daemon=0&audit=0"] {
+        assert_eq!(rig.perch.get(&format!("/hub/mesh/events{good}")).status, 200, "{good}");
+    }
+}
+
+/// A link at either path is not followed, and a FIFO is not opened for a read that waits. Each is a 502 that names its stream, and the text
+/// planted behind the link is not in any answer.
+#[test]
+fn a_link_or_a_fifo_at_either_path_is_not_read() {
+    let rig = Setup::all().start();
+    let planted = rig.home.join("planted.jsonl");
+    std::fs::write(&planted, "{\"ts\":1,\"class\":\"audit\",\"command\":\"PLANTED-SENTINEL\"}\n").unwrap();
+    std::os::unix::fs::symlink(&planted, &rig.audit).unwrap();
+    let answer = rig.perch.get("/hub/mesh/events");
+    assert_eq!(answer.status, 502, "{}", answer.head);
+    assert!(answer.body.contains("the audit log"), "{}", answer.body);
+    assert!(!answer.body.contains("PLANTED-SENTINEL"), "{}", answer.body);
+
+    let rig = Setup::all().start();
+    make_fifo(&rig.daemon);
+    let answer = rig.perch.get("/hub/mesh/events");
+    assert_eq!(answer.status, 502, "{}", answer.head);
+    assert!(answer.body.contains("the daemon feed"), "{}", answer.body);
+}
+
+fn kinds_of(answer: &Value) -> Vec<String> {
+    streams_and_kinds(answer).into_iter().map(|(_, word)| word).collect()
+}
+
+/// A poll of the daemon's feed reads 64 KiB of the file at most, the polls together lose and repeat nothing, and the first poll (no cursor)
+/// is the newest window and starts on a whole line.
+#[test]
+fn a_poll_of_the_daemon_feed_is_at_most_64_kib_and_the_polls_lose_nothing() {
+    let rig = Setup::all().start();
+    let line = |n: usize| format!("{{\"v\":0,\"class\":\"gate\",\"kind\":\"k{n:05}\",\"payload\":\"{}\"}}\n", "p".repeat(200));
+    std::fs::write(&rig.daemon, (0..1000).map(line).collect::<String>()).unwrap();
+    let size = len(&rig.daemon);
     assert!(size > 3 * 64 * 1024);
 
     let (mut after, mut seen) = (0u64, Vec::new());
     let mut calls = 0;
     while after < size {
-        let answer = rig.perch.get(&format!("/hub/mesh/events?after={after}"));
-        assert!(answer.body.len() <= 64 * 1024 + 100, "a poll answered {} bytes", answer.body.len());
+        let answer = rig.perch.get(&format!("/hub/mesh/events?daemon={after}"));
+        // The window is 64 KiB of the file, and each record is answered with a few bytes of envelope around it.
+        assert!(answer.body.len() <= 2 * 64 * 1024, "a poll answered {} bytes", answer.body.len());
         let tail = json_of(&answer, "events");
-        let next = tail["next"].as_u64().unwrap();
+        let next = tail["next"]["daemon"].as_u64().unwrap();
         assert!(next > after && next - after <= 64 * 1024, "{after} -> {next}");
-        seen.extend(kinds(&tail));
+        seen.extend(kinds_of(&tail));
         (after, calls) = (next, calls + 1);
     }
     assert!(calls >= 4, "{calls}");
     assert_eq!(seen, (0..1000).map(|n| format!("k{n:05}")).collect::<Vec<_>>());
 
     let newest = rig.tail("");
-    assert_eq!(newest["next"], size);
-    assert_eq!(kinds(&newest).last().map(String::as_str), Some("k00999"));
-    let first = &kinds(&newest)[0];
-    assert_ne!(first, "k00000", "the first poll is the end of the file and not all of it");
-    assert_eq!(kinds(&newest).len(), 1000 - first[1..].parse::<usize>().unwrap(), "from a whole line to the end, none missing");
-}
-
-/// A feed that is not there yet is an empty one (and a cursor from one that was is past its end, so it starts over), and with no
-/// `--aoide-events` there is nothing to tail: the file next to the socket is not guessed at.
-#[test]
-fn a_missing_feed_is_empty_and_no_flag_means_no_feed() {
-    let rig = Setup::all().start();
-    assert_eq!(rig.tail(""), json!({"events": [], "next": 0, "reset": false}));
-    assert_eq!(rig.tail("?after=40"), json!({"events": [], "next": 0, "reset": true}), "a cursor from a feed that is gone starts over");
-    std::fs::write(&rig.events, "{\"class\":\"audit\",\"kind\":\"there\"}\n").unwrap();
-    assert_eq!(kinds(&rig.tail("")), ["there"]);
-
-    let flagless = Setup { events: false, ..Setup::all() }.start();
-    std::fs::write(&flagless.events, "{\"class\":\"audit\",\"kind\":\"beside-the-socket\"}\n").unwrap();
-    assert_eq!(flagless.tail(""), json!({"events": [], "next": 0, "reset": false}));
-    flagless.snapshot();
-    assert!(
-        flagless.calls().iter().all(|call| call["aoide_env"].get("AOIDE_AUDIT_LOG").is_none()),
-        "no flag, no AOIDE_AUDIT_LOG: {:?}",
-        flagless.calls()
-    );
-}
-
-/// A feed that is a link is not followed (502); the only query is `after=<digits>`.
-#[test]
-fn the_events_route_takes_one_offset_and_reads_a_plain_file() {
-    let rig = Setup::all().start();
-    for bad in ["after=", "after=-1", "after=x", "after=1.5", "after=%31", "after=1&after=2", "after=1&x=2", "x=1", "after"] {
-        let answer = rig.perch.get(&format!("/hub/mesh/events?{bad}"));
-        assert_eq!(answer.status, 400, "{bad}: {}", answer.head);
-    }
-    let elsewhere = rig.home.join("elsewhere.jsonl");
-    std::fs::write(&elsewhere, "{\"class\":\"audit\",\"kind\":\"planted\"}\n").unwrap();
-    std::os::unix::fs::symlink(&elsewhere, &rig.events).unwrap();
-    let answer = rig.perch.get("/hub/mesh/events?after=0");
-    assert_eq!(answer.status, 502, "{}", answer.head);
-    assert!(!answer.body.contains("planted"));
+    assert_eq!(newest["next"]["daemon"], size);
+    let kinds = kinds_of(&newest);
+    assert_eq!(kinds.last().map(String::as_str), Some("k00999"));
+    assert_ne!(kinds[0], "k00000", "the first poll is the end of the file and not all of it");
+    assert_eq!(kinds.len(), 1000 - kinds[0][1..].parse::<usize>().unwrap(), "from a whole line to the end, none missing");
 }
 
 // ---------------------------------------------------------------------------
@@ -701,8 +919,9 @@ async fn ctx_for(dir: &Path, aoide: Option<PathBuf>, home: Option<PathBuf>) -> p
         browser_health: None,
         aoide,
         aoide_home: home,
+        aoide_audit_log: None,
         aoide_daemon_socket: None,
-        aoide_events: None,
+        aoide_daemon_events: None,
         minerva: None,
         term_token_file: None,
         mail_token_file: None,
@@ -793,7 +1012,7 @@ async fn nodes_without_a_program_or_a_registry_is_a_shorter_list() {
 fn the_mesh_routes_are_behind_the_token_and_answer_get_only() {
     let rig = Setup::all().start();
     let addr = &rig.perch.addr;
-    for path in ["/hub/mesh", "/hub/mesh/", "/hub/mesh/events", "/hub/mesh/events?after=0", "/hub/mesh/nodes"] {
+    for path in ["/hub/mesh", "/hub/mesh/", "/hub/mesh/events", "/hub/mesh/events?audit=0", "/hub/mesh/nodes"] {
         let bare = Request::new(addr, "GET", path).send(addr);
         assert_eq!((bare.status, bare.body.as_str()), (401, ""), "{path} with no credential: {}", bare.head);
         let wrong = Request::new(addr, "GET", path).bearer("Bearer not-the-token").send(addr);

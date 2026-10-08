@@ -13,8 +13,8 @@
 //   graphView(graph)        the stage graph: counts and a list
 //   outboxView(outbox, now) `data` of `aoide mail outbox --json`: what waits, and why
 //   noteLines(data)         the perch's own sentences about what it could not read
-//   eventLine(e)            one audit or gate event as a line
-//   foldFeed / resumeFeed / feedPath / feedView   the events tail held by the page: cursor, reset, a cap, and its honest sentences
+//   eventLine(entry)        one event of an answer, {stream, event}, as a line labelled by its stream
+//   foldFeed / resumeFeed / feedPath / feedView / emptySentence   the two streams held by the page: cursors, resets, a cap, and the sentences
 import { clean } from '../renderers/jev.js';
 
 export const NOT_PROBED = 'presence is not probed: ages are when each roster was last cached';
@@ -229,12 +229,14 @@ export function outboxView(outbox, now = Date.now()) {
 export const noteLines = (data) => list(data && data.errors).map((s) => str(s, 240)).filter(Boolean).slice(0, 8);
 
 // ---------------------------------------------------------------- the events tail
-export const HELD = 200;          // events the page keeps
+// Two streams, held together: the audit log (`audit`) and aoided's feed (`daemon`). Each has its own cursor (`next`), its own file as the
+// page is told it (`files`) and its own reset. Each held line keeps the label of the stream it came from (`cls`).
+export const HELD = 200;          // events the page keeps, both streams together
 export const SHOWN = 40;          // events drawn (newest first); the rest are counted
 export const FEED_STALE_MS = 60000; // a tab reopened after this long starts the tail again instead of catching up through a backlog
-
-export const EVENTS_EMPTY = 'no events to show: the perch tails only the file named by its --aoide-events flag, and that file is empty, missing or not set. '
-  + 'Nothing shown is not the same as nothing happening.';
+export const STREAMS = ['audit', 'daemon'];
+const LABEL = { audit: 'audit log', daemon: 'daemon feed' };
+export const NOT_SAME = 'Nothing shown is not the same as nothing happening.';
 
 // `HH:MM:SS` local, from unix seconds (milliseconds when the number is that big); dashes for anything else.
 export function clock(ts) {
@@ -259,36 +261,51 @@ function payloadText(p) {
   return words.join(' ');
 }
 
-// One event. Two shapes are in the wild, and both are read: the feed aoided keeps (`kind`, `source`, `payload`) and the audit log
-// (`command`, `door`, `status`, `message`). The class is one of two words the perch let through; anything else draws as audit.
-export function eventLine(e) {
+// One event of an answer: `{ stream, event }`, where `event` is the record as its stream keeps it. The line's label is the stream (`audit`
+// or `daemon`), and its text starts with the record's own class (`audit` or `gate`), then what it is, who sent it, its status and its
+// message or payload. Every string is cleaned and cut, as all of this page's strings are.
+export function eventLine(entry) {
+  const e = entry.event;
   const what = str(e.kind, 40) || str(e.command, 40);
   const who = str(e.source, 24) || str(e.door, 24);
   const msg = str(e.message, 100) || payloadText(e.payload);
   return {
     at: clock(e.ts),
-    cls: e.class === 'gate' ? 'gate' : 'audit',
-    text: [what || '?', who ? `(${who})` : '', str(e.status, 24), msg].filter(Boolean).join(' '),
+    cls: entry.stream === 'daemon' ? 'daemon' : 'audit',
+    text: [e.class === 'gate' ? 'gate' : 'audit', what || '?', who ? `(${who})` : '', str(e.status, 24), msg].filter(Boolean).join(' '),
   };
 }
 
-export const emptyFeed = () => ({ lines: [], next: null, why: '', at: 0 });
+export const emptyFeed = () => ({ lines: [], next: { audit: null, daemon: null }, files: { audit: '', daemon: '' }, why: '', at: 0 });
 
-// Take one answer of /hub/mesh/events into what is held. `reset` (the file shrank or went) clears what is held first; the cursor is the
-// answer's `next`. A failed or unreadable answer changes nothing but the sentence for it: a hiccup keeps the lines and the cursor.
+// Take one answer of /hub/mesh/events into what is held. A stream's `reset` clears what that stream held first; its cursor is the answer's
+// `next` for it, and its file is the answer's `files` for it. An entry for a stream that is not one of the two is left out. A failed or
+// unreadable answer changes nothing but the sentence for it: a hiccup keeps the lines and the cursors.
 export function foldFeed(feed, r, now = Date.now()) {
   if (!r || r.status !== 200 || !isObj(r.data) || !Array.isArray(r.data.events)) {
     return { ...feed, why: r && r.status === 200 ? 'the events answer was not in a shape this page reads' : why(r), at: now };
   }
-  const base = r.data.reset === true ? [] : feed.lines;
-  const next = num(r.data.next) != null && r.data.next >= 0 ? r.data.next : feed.next;
-  return { lines: [...base, ...r.data.events.filter(isObj).map(eventLine)].slice(-HELD), next, why: '', at: now };
+  const { events, next, reset, files } = r.data;
+  const kept = feed.lines.filter((line) => !(isObj(reset) && reset[line.cls] === true));
+  const fresh = events.filter((entry) => isObj(entry) && STREAMS.includes(entry.stream) && isObj(entry.event)).map(eventLine);
+  const cursor = { ...feed.next };
+  const shown = { ...feed.files };
+  for (const s of STREAMS) {
+    if (isObj(next) && num(next[s]) != null && next[s] >= 0) cursor[s] = next[s];
+    if (isObj(files) && (typeof files[s] === 'string' || files[s] === null)) shown[s] = str(files[s], 200);
+  }
+  return { lines: [...kept, ...fresh].slice(-HELD), next: cursor, files: shown, why: '', at: now };
 }
 
 // The feed a reopened tab continues: the one it held, or a fresh one when that is older than FEED_STALE_MS.
 export const resumeFeed = (feed, now = Date.now()) => (feed.at && now - feed.at <= FEED_STALE_MS ? feed : emptyFeed());
-// Where the next poll goes: the first poll has no cursor and gets the newest events; the rest pass the last answer's `next`.
-export const feedPath = (feed) => (feed.next == null ? 'mesh/events' : `mesh/events?after=${feed.next}`);
+
+// Where the next poll goes. With no cursor yet (the first poll) it has no query and gets the newest events of both streams. After that both
+// cursors go; a stream with none yet (an answer that named none) is asked from 0, so none of it is skipped.
+export function feedPath(feed) {
+  if (STREAMS.every((s) => feed.next[s] == null)) return 'mesh/events';
+  return `mesh/events?${STREAMS.map((s) => `${s}=${feed.next[s] == null ? 0 : feed.next[s]}`).join('&')}`;
+}
 
 // What the tail draws: the newest events first, how many older ones are held, and the sentence for when there is nothing (or a failure).
 export function feedView(feed) {
@@ -296,8 +313,18 @@ export function feedView(feed) {
   const older = Math.max(0, feed.lines.length - lines.length);
   if (feed.why) return { lines, older, sentence: `the events feed could not be read: ${feed.why}`, cls: 'o' };
   if (!feed.at) return { lines, older, sentence: 'reading the events feed…', cls: 'faint' };
-  if (!lines.length) {
-    return { lines, older, sentence: feed.next > 0 ? `the feed has ${feed.next} bytes and none of it is an audit or gate event` : EVENTS_EMPTY, cls: 'faint' };
-  }
+  if (!lines.length) return { lines, older, sentence: emptySentence(feed), cls: 'faint' };
   return { lines, older, sentence: '', cls: '' };
+}
+
+// The sentence for a tail with nothing in it: each stream's file as the page was told it, and what was read of that file. Bytes read with
+// nothing shown is said as that: the audit log keeps only some of its records and the feed only two classes, so it is not "nothing there".
+export function emptySentence(feed) {
+  const said = STREAMS.map((s) => {
+    const path = feed.files[s];
+    if (!path) return `${LABEL[s]}: no file to read`;
+    const read = feed.next[s] > 0 ? `${feed.next[s]} bytes read, none of them shown` : 'nothing read yet (empty or missing)';
+    return `${LABEL[s]} ${path}: ${read}`;
+  });
+  return `no events to show. ${said.join('; ')}. ${NOT_SAME}`;
 }
