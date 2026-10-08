@@ -40,3 +40,30 @@
 .ge.lit .gl { stroke: var(--fg); }
 .ge.lit .ga { fill: var(--fg); }
 .ge.lit .gel { fill: var(--fg); }
+
+/* the runs (graph/view.js, graph/index.js): the tab's text above and below the drawing. Lines wrap (the panel is 30 to 70 cells wide); a row of
+   the list is one line that gives way at the graph's name. */
+.grun .up { color: var(--green); }
+.grun .gline { white-space: normal; overflow-wrap: anywhere; }
+.grun .gdet { padding-left: calc(2 * var(--cw)); }
+.grun .gbar, .grun .gact { margin-top: calc(var(--ch) * 0.3); }
+.grun .glist { margin-top: calc(var(--ch) * 0.3); }
+.grun .grow-row { display: flex; gap: var(--cw); white-space: pre; }
+.grun .grow-row .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.grun .gmark { flex: none; width: var(--cw); }
+.grun .gid, .grun .gwhen { flex: none; }
+.grun .grow-row.gsel .gid { color: var(--bright); }
+
+.grun .gform { margin: calc(var(--ch) * 0.4) 0; padding-left: var(--cw); border-left: 1px solid var(--line); }
+.grun .gfield { display: flex; gap: var(--cw); align-items: baseline; }
+.grun .gk { flex: none; min-width: calc(6 * var(--cw)); }
+.grun input { flex: 1; min-width: 0; background: transparent; color: var(--fg); border: 0; border-bottom: 1px solid var(--line); font: inherit; padding: 0;
+  border-radius: 0; outline: none; caret-color: var(--bright); }
+.grun input:focus { border-bottom-color: var(--bright); }
+.grun input::placeholder { color: var(--faint); }
+
+.grun .grunv { margin-top: calc(var(--ch) * 0.6); }
+.grun .gwrap { margin: calc(var(--ch) * 0.4) 0; }
+.grun .gstat { margin-top: calc(var(--ch) * 0.3); }
+.grun .gsteps { margin-top: calc(var(--ch) * 0.4); }
+.grun .gstep { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
