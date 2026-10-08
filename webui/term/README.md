@@ -101,6 +101,7 @@ mesh/                the left panel's mesh tab: the nodes this machine knows (Me
 terms/               the web terminals: the terminals tab in the right panel and the terminal panes
 notes/               the notepad: the notes tab in the left panel and the note pane
 allow/               the allow rules of a chat: a section of the loaded tab
+install/             the update keys overlay ([ update keys ] on the start screen's install block; adds and removes need the terminal arm)
 tests/               node tests of the pure modules: node --test "webui/term/tests/*.test.mjs" (tests/README.md)
 brand/owl.svg        copy of webui/owl-green.svg (the door serves only this dir)
 themes/              base16 schemes (*.yaml) + manifest.json, the list the page offers
