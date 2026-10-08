@@ -13,7 +13,7 @@ plain `cargo test` compiles none; the integration tests that need one are
 | `fake_eidolon/asks.rs` | the door's open asks: `FAKE_ASKS` (ids unique per process; a replay of the model's calls and the turn markers), `FAKE_LAG` (a `lagged` frame, no loss), `409` for a second answer and `422` for one not offered | built (A1a) |
 | `fake_eidolon/agent.rs` | an agent's tool call into the perch: `FAKE_AGENT_CALL` | AG: after a say, the fake door calls the perch from its own socket (and from an `sh -c curl` child, which is refused); honours http_proxy and no_proxy as reqwest does |
 | `fake_aoide.rs` | the `aoide` CLI | stub until R2a: says so on stderr, exits 99 (the code "anything else" gets) |
-| `fake_minerva.rs` | the installer's `minerva` | stub until R4: says so on stderr, exits 2 |
+| `fake_minerva.rs` | the installer's `minerva` | R4: answers the five argv the install routes run over a fixture dir (`MINERVA_FAKE_DIR`), refuses everything else with exit 2, logs every call (argv, stdin, env names) as one JSON line |
 
 `fake_eidolon.rs` is the only file that calls the seams: `workflow` and `meta` are dispatched by subcommand, after the global flags
 (`--config`, `--yolo`) are parsed into a `Cmd`, and each `run(&Cmd) -> i32` is the process's exit code; the `asks` and `agent` hooks are called

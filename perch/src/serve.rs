@@ -1548,7 +1548,6 @@ mod tests {
         for (method, path) in [
             ("GET", "/hub/runs/r1/log"),
             ("GET", "/hub/meta/health"),
-            ("GET", "/hub/install"),
             ("POST", "/hub/install/jev"),
             ("GET", "/hub/term"),
             ("GET", "/hub/term/events"),

@@ -59,7 +59,7 @@ no other test file.
 | `aoide.rs` | R2a | `fake_aoide` refuses every argv with exit 99 |
 | `mesh.rs` | R2b | `/hub/mesh` and `/hub/mesh/events` are a 404 behind the gate (pinned in `http.rs` until this file took them over) |
 | `meta.rs` | R3 | `/hub/meta/...` is a 404 behind the gate; the fake's `tools`, `plugins` and `policy-rows` refuse |
-| `install.rs` | R4 | `/hub/install[...]` is a 404 behind the gate; `fake_minerva` refuses every argv |
+| `install.rs` | R4 | done: the notice, keys list and inspect, the arm (bearer only, never a page), add and remove spending it once, listed/mismatch/unknown/updated/Nix answers, writes that outlive the client, the child's env list |
 | `agent.rs` | AG | done: scoped tokens, attribution to a door (its children refused), files on exit by identity, refused starts leave nothing |
 | `term.rs` | T1b | `/hub/term[/...]` is a 404 behind the gate |
 | `term_stream.rs` | T1c | `/hub/term/events` is a 404 behind the gate |
