@@ -6,8 +6,11 @@
 #   release-files.sh resign DIR    re-stamp the existing latest.json with a fresh `released`/`expires` and the current keys_serial,
 #                                  WITHOUT rebuilding anything. Then sign it again (see below). Do this at least every 30 days:
 #                                  a manifest older than that still works, but members are told "release info is stale".
+# This is a bash script (here-strings, arrays, shopt): run it with bash, not sh.
 # Both modes first check DIR/keys.json, before anything is written: a keys.json that revokes an id with no revoke_fp entry for it, names
 # a fingerprint that is not 16 hex digits, or has a revoke/revoke_fp list it cannot read is refused (exit 1, one sentence, nothing written).
+# That checks those two lists and the outer braces, not the whole JSON: a keys.json malformed elsewhere passes here, and every client
+# refuses it whole.
 # Neither signs nor publishes: signing is the operator's step (installer/README.md, "Releasing"):
 #   minisign -S -s KEY -m latest.json SHA256SUMS minerva-*-linux-x86_64.tar.gz     (the bundle's .minisig only on a rebuild)
 #   if DIR holds keys.json, re-sign it too (keys.json.minisig) and keep its own "expires" date in the future.

@@ -542,7 +542,8 @@ impl Trust {
         Ok(k)
     }
 
-    /// Remove an added key. The compiled-in key cannot be removed here (a rotation revokes it).
+    /// Remove an added key. The compiled-in key cannot be removed here (a rotation revokes it). Its `.json` stays: it names the key's
+    /// parent, so a later revocation of that parent still reaches this id (`descendants`). `all()` lists a key by its `.pub` alone.
     pub fn remove(&self, id: &str) -> Result<KeyInfo> {
         let all = self.all();
         let k = all.iter().find(|k| k.id.eq_ignore_ascii_case(id)).ok_or_else(|| refuse(Refusal::NotFound, format!("no key {id} (try: minerva keys list)")))?.clone();
@@ -553,7 +554,6 @@ impl Trust {
             ));
         }
         fs::remove_file(self.dir.join(format!("{}.pub", k.id)))?;
-        let _ = fs::remove_file(self.dir.join(format!("{}.json", k.id)));
         Ok(k)
     }
 
@@ -751,7 +751,8 @@ pub fn plan_rotation(trust: &Trust, json: &[u8], sig: Option<&str>, today: &str)
     // file); else the keys dir or the compiled-in key; else the fingerprint this machine's record already has for that id (a revocation
     // listed again, or a rotation a crash cut short after the record was saved). A key the file names with none of those is refused,
     // the whole file with it. A given fingerprint that is not the one this machine holds under that id names another key, so the whole
-    // file is refused.
+    // file is refused. So is one that is not the record's fingerprint for that id (a record that has one), and the same holds for a key
+    // held here and for a key a revoked key added: the record's fingerprint and the bytes on this machine must agree.
     let known: Vec<KeyInfo> = adds.iter().map(|(k, _)| k.clone()).chain(trust.all()).collect();
     let fp_of = |id: &str| known.iter().find(|k| k.id.eq_ignore_ascii_case(id)).map(|k| fp_hex(&k.fingerprint));
     let recorded = |id: &str| st.revoked.iter().find(|r| r.id.eq_ignore_ascii_case(id)).and_then(|r| r.fp.clone());
@@ -778,17 +779,40 @@ pub fn plan_rotation(trust: &Trust, json: &[u8], sig: Option<&str>, today: &str)
             (Some(g), Some(h)) if g != h => {
                 bail!("keys.json revokes key {id} with fingerprint {g}, but this machine holds key {id} with fingerprint {h}; refusing the whole file, nothing changed")
             }
+            // A fingerprint the file gives must be the one the record has for this id, when the record has one: another one names another key.
+            (Some(g), _) => {
+                if let Some(r) = recorded(&id)
+                    && r != g
+                {
+                    bail!("keys.json revokes key {id} with fingerprint {g}, but this machine's record has fingerprint {r} for it; refusing the whole file, nothing changed");
+                }
+                Some(g)
+            }
+            // The same check for a key held here: its bytes must be the ones the record has for this id.
+            (None, Some(h)) => {
+                if let Some(r) = recorded(&id)
+                    && r != h
+                {
+                    bail!("this machine holds key {id} with fingerprint {h}, but its record has fingerprint {r} for it; refusing the whole file, nothing changed");
+                }
+                Some(h)
+            }
             // Named, with no fingerprint from the file, no key here and none in the record: its bytes cannot be checked, so the same bytes
             // under a fresh id would pass. Refused whole. (Keys a revoked key added are not named here: their fingerprint if this machine
             // holds their bytes, else the id alone.)
             (None, None) => Some(recorded(&id).ok_or_else(|| anyhow!("keys.json revokes {id} without its fingerprint; the maintainer lists every revoked key in revoke_fp"))?),
-            (g, h) => g.or(h),
         };
         push_revoke(&mut revokes, &id, fp);
         // what the revoked key added before this file goes with it (keys added by this very file are the signer's
         // own succession, e.g. "A adds B and revokes A", and stay)
         for d in trust.descendants(&id) {
             let fp = fp_of(&d);
+            if let Some(h) = &fp
+                && let Some(r) = recorded(&d)
+                && r != *h
+            {
+                bail!("this machine holds key {d}, which key {id} added, with fingerprint {h}, but its record has fingerprint {r} for it; refusing the whole file, nothing changed");
+            }
             push_revoke(&mut revokes, &d, fp);
         }
     }
@@ -1151,6 +1175,60 @@ pub mod tests {
     }
 
     #[test]
+    fn a_fingerprint_that_differs_from_the_records_refuses_the_whole_file() {
+        // the record holds one fingerprint for a never-held id; a signed file that gives another for it names another key: refused whole,
+        // and the serial and the record do not move
+        let (pk, sk) = keypair();
+        let (never, _) = keypair();
+        let (_t, tr) = trust_with(&pk);
+        let fp = fp_hex(&parse_pub(&never, Source::Manual).unwrap().fingerprint);
+        let first = format!(r#"{{"schema":1,"serial":1,"expires":"2030-01-01","add":[],"revoke":[],"revoke_fp":[{{"id":"{}","fp":"{fp}"}}]}}"#, id_of(&never));
+        apply_rotation(&tr, first.as_bytes(), &sign(&sk, first.as_bytes()), "2026-10-06").unwrap();
+        let second = format!(r#"{{"schema":1,"serial":2,"expires":"2030-01-01","add":[],"revoke":[],"revoke_fp":[{{"id":"{}","fp":"0123456789abcdef"}}]}}"#, id_of(&never));
+        let e = apply_rotation(&tr, second.as_bytes(), &sign(&sk, second.as_bytes()), "2026-10-06").unwrap_err();
+        assert!(format!("{e:#}").contains("this machine's record has fingerprint"), "{e:#}");
+        let st = tr.state().unwrap();
+        assert_eq!((st.serial, st.revoked.len(), st.revoked[0].fp.as_deref()), (1, 1, Some(fp.as_str())), "a refused file records nothing");
+    }
+
+    #[test]
+    fn a_held_key_whose_record_fingerprint_is_another_refuses_the_whole_file() {
+        // this machine holds the key, and its record has another fingerprint for the id: a file that revokes it without one is refused whole
+        let (a_pk, a_sk) = keypair();
+        let (held, _) = keypair();
+        let (_t, tr) = trust_with(&a_pk);
+        let r1 = rotation(1, "2030-01-01", &[&held], &[]);
+        apply_rotation(&tr, r1.as_bytes(), &sign(&a_sk, r1.as_bytes()), "2026-10-06").unwrap();
+        let mut st = tr.state().unwrap();
+        st.revoked.push(Revoked { id: id_of(&held), on: "2026-10-06".into(), by: id_of(&a_pk), fp: Some("0123456789abcdef".into()) });
+        tr.save_state(&st).unwrap();
+        let r2 = rotation(2, "2030-01-01", &[], &[&id_of(&held)]);
+        let e = apply_rotation(&tr, r2.as_bytes(), &sign(&a_sk, r2.as_bytes()), "2026-10-06").unwrap_err();
+        assert!(format!("{e:#}").contains("its record has fingerprint 0123456789abcdef"), "{e:#}");
+        assert_eq!(tr.state().unwrap().serial, 1, "a refused file records nothing");
+    }
+
+    #[test]
+    fn a_descendant_whose_record_fingerprint_is_another_refuses_the_whole_file() {
+        // A adds HELD, HELD adds DESC; DESC's record has another fingerprint than its bytes: revoking A (through HELD) is refused whole
+        let (a_pk, a_sk) = keypair();
+        let (held, held_sk) = keypair();
+        let (desc, _) = keypair();
+        let (_t, tr) = trust_with(&a_pk);
+        let r1 = rotation(1, "2030-01-01", &[&held], &[]);
+        apply_rotation(&tr, r1.as_bytes(), &sign(&a_sk, r1.as_bytes()), "2026-10-06").unwrap();
+        let r2 = rotation(2, "2030-01-01", &[&desc], &[]);
+        apply_rotation(&tr, r2.as_bytes(), &sign(&held_sk, r2.as_bytes()), "2026-10-06").unwrap();
+        let mut st = tr.state().unwrap();
+        st.revoked.push(Revoked { id: id_of(&desc), on: "2026-10-06".into(), by: id_of(&held), fp: Some("0123456789abcdef".into()) });
+        tr.save_state(&st).unwrap();
+        let r3 = rotation(3, "2030-01-01", &[], &[&id_of(&a_pk)]);
+        let e = apply_rotation(&tr, r3.as_bytes(), &sign(&a_sk, r3.as_bytes()), "2026-10-06").unwrap_err();
+        assert!(format!("{e:#}").contains("its record has fingerprint 0123456789abcdef"), "{e:#}");
+        assert_eq!(tr.state().unwrap().serial, 2, "a refused file records nothing");
+    }
+
+    #[test]
     fn a_held_key_revoked_without_a_fingerprint_is_recorded_with_its_own() {
         // the compiled-in key is on this machine: revoked by its id alone, the record still gets the fingerprint computed here
         let (pk, sk) = keypair();
@@ -1412,6 +1490,22 @@ pub mod tests {
         assert_eq!(recorded(id_of(&gone)), None, "its bytes are gone from this machine: the id alone");
         assert!(st.revoked.iter().any(|r| r.id == id_of(&gone)), "the id is still revoked");
         assert!(tr.trusted("2026-10-06").unwrap().is_empty(), "A is revoked, and nothing it added is trusted");
+    }
+
+    #[test]
+    fn a_descendant_removed_by_trust_remove_is_still_revoked_by_id() {
+        // A adds GONE, and GONE is removed the way `keys remove` removes it, before A is revoked: GONE's id is still recorded, so the same id
+        // is refused. Its bytes are not known here any more, so the same bytes under a fresh id are not refused (the residual the README names).
+        let (a_pk, a_sk) = keypair();
+        let (gone, _) = keypair();
+        let (_t, tr) = trust_with(&a_pk);
+        let r1 = rotation(1, "2030-01-01", &[&gone], &[]);
+        apply_rotation(&tr, r1.as_bytes(), &sign(&a_sk, r1.as_bytes()), "2026-10-06").unwrap();
+        tr.remove(&id_of(&gone)).unwrap();
+        let r2 = rotation(2, "2030-01-01", &[], &[&id_of(&a_pk)]);
+        apply_rotation(&tr, r2.as_bytes(), &sign(&a_sk, r2.as_bytes()), "2026-10-06").unwrap();
+        assert!(tr.state().unwrap().revoked.iter().any(|r| r.id == id_of(&gone) && r.fp.is_none()), "its id is recorded");
+        assert_eq!(kind_of(tr.add_manual(&gone)), "revoked", "the same id is refused");
     }
 
     #[test]

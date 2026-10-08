@@ -214,8 +214,9 @@ client that does not hold it takes it from `revoke_fp`, or from its own record w
 revocation listed again keeps the fingerprint it was given, and its serial still moves. Otherwise `minerva update` refuses the whole file
 and nothing is written (the serial does not move): `keys.json revokes <id> without its fingerprint; the maintainer lists every revoked key
 in revoke_fp`. `release-files.sh` refuses such a file before it is released (see "Releasing"). A key a revoked key added is not named in
-the file. A machine that still holds its bytes records their fingerprint; one that does not records the id alone, and does not trust it
-either, since its bytes are gone from it.
+the file: this machine revokes it with its parent. A machine that still holds its bytes records their fingerprint; one that does not records
+the id alone, and does not trust it either, since its bytes are gone from it. A fingerprint the file gives, or that this machine's bytes give,
+must be the one its record already has for that id, when the record has one; a different one refuses the whole file.
 
 Rules: `serial` must be higher than the last applied but at most 16 higher (a leaked key cannot burn the counter with a huge
 serial); a serial that is not higher is "already applied" and is answered BEFORE the signature or expiry is looked at, so
@@ -232,7 +233,8 @@ of the 32 key bytes, in 4 groups of 4, e.g. `0F7A 3A5C 447E C7EF`; 64 bits, enou
 digest) and want it typed back (from the terminal, never a pipe; spaces and case do not matter) or passed with `--confirm FP` by a
 program whose user already typed it. The key id alone does NOT pass: an id is only 8 bytes the file itself claims, a forged `.pub` can
 carry any id. `add` refuses a key id that already exists with different key bytes. The compiled-in key cannot
-be removed by hand; only a signed rotation revokes it. `hoot keys ...` passes through to WSL.
+be removed by hand; only a signed rotation revokes it. `remove` is not a revocation: it records nothing for the key it removes, not even its
+id, so `add` (fingerprint typed back) or a rotation can bring the same bytes back. `hoot keys ...` passes through to WSL.
 
 **What `add` refuses** (nothing is written, and the keys dir is left as it was): a key whose id, or whose key bytes under any other id,
 was revoked (`revoked`); a key whose id a DIFFERENT key uses (`collision`); a key already in the list, under its id or under another id
@@ -241,7 +243,7 @@ the compiled-in key, under its id or its bytes (`compiled`; once that key was re
 keeps the key's fingerprint, and the fingerprint is the sha-256 of the 32 key bytes, so the same bytes under a fresh id are refused too.
 The fingerprint comes from this machine's own copy of the key when it had one, from the signed file (`revoke_fp`, above), or from this
 machine's record for that id. A revocation with no fingerprint anywhere refuses by id only. There are two ways to get one, and both are
-accepted residuals, not closed holes:
+accepted residuals, not closed holes (a key whose `.json` is gone is a third, below):
 
 - **A record written before fingerprints were kept** (a development install; nothing was released). Its bytes are not known here, so
   the same bytes under a fresh id are accepted by hand and by a rotation, until a signed file names that key in `revoke_fp` and the record
@@ -249,9 +251,13 @@ accepted residuals, not closed holes:
 - **A key that a revoked key added, whose `.pub` is no longer in the keys dir.** It is not trusted here, so only its id is blocked, and
   the same bytes under a fresh id are accepted by `keys add` (fingerprint typed back) or by a rotation. Its bytes left a directory only
   this user can write, and whoever can write there can trust any key directly. The `.pub` goes by `minerva keys remove`, by a hand
-  delete, move or rename, or when it cannot be read or parsed (it is then skipped, so it counts as gone). The maintainer closes it with a
-  signed file that names the key's fingerprint in `revoke_fp` (the maintainer holds the key's bytes, so the fingerprint is at hand); the
-  file does not need to list the key in `revoke`.
+  delete, move or rename, or when it cannot be read or parsed (it is then skipped, so it counts as gone). `keys remove` keeps the key's
+  `.json`, which names its parent, so the parent's later revocation still blocks the id. The maintainer closes it with a signed file that
+  names the key's fingerprint in `revoke_fp` (the maintainer holds the key's bytes, so the fingerprint is at hand); the file does not need
+  to list the key in `revoke`.
+- **A key that a revoked key added, whose `.json` is gone as well.** A revocation finds a key's children through their `.json`, which names
+  the parent. Without it the key is not walked, so it is not revoked and stays trusted while its `.pub` is in the keys dir. That needs a
+  hand delete of the `.json` in the keys dir, which only this user can make: the same trust as the bullet above.
 
 **For the perch.** A perch route that adds a key runs `minerva keys inspect - --json` with the public key on stdin (answer
 `{"id","fingerprint","comment"}`), shows the fingerprint to the person, and when they have typed the FINGERPRINT back runs
@@ -449,7 +455,10 @@ re-stamps `latest.json`, then `minisign -S -s KEY -m latest.json` and re-upload 
 `expires`. A re-signed `keys.json` keeps its `revoke_fp` entry for every id in `revoke` (operator step 2). Both modes of `release-files.sh` check
 `keys.json` before they write anything: a file that revokes an id with no `revoke_fp` entry, names a fingerprint that is not 16 hex digits,
 or has a `revoke` or `revoke_fp` list the script cannot read is refused (exit 1, one sentence, nothing written; the missing-fingerprint
-refusal names the id). A file with neither list, or with entries that are all there, passes as before.
+refusal names the id). A file with neither list, or with entries that are all there, passes as before. The script is bash: run it with
+`bash`, not `sh`. Its check reads those two lists and the outer braces only, so it is not a JSON validator: a `keys.json` malformed
+elsewhere (an `add` entry, a stray brace) passes it, and every client then refuses the whole file. Check the file with a JSON parser
+before you sign it, for example `python3 -m json.tool keys.json >/dev/null`.
 
 The updater fetches `https://github.com/dxcently/Minerva/releases/latest/download/latest.json` (+ `.minisig`, then the
 bundle named in it). The exe and `install.sh` are for people; only `latest.json`, the bundle and their signatures
@@ -462,7 +471,7 @@ keys): good signature installs, tampered bundle refused, wrong key refused, miss
 refused, rollback and forward, Nix refused, notice once a day / silent on failure / bad signature gives no notice,
 install/rerun/upgrade/prune/uninstall layout, WSL list parsing, PATH list edits, key rotation (good, unknown signer, revoked
 signer, revoked compiled-in key, manual add/remove and the refusals of `add`, a revoked key under a fresh id by hand and in a rotation, a rotation that revokes a key with no fingerprint (refused whole,
-nothing written), a revocation listed again keeps the fingerprint it was given, a fingerprint that is not 16 hex digits, expiry, replay, open keys dir, a crash while the keys dir is made, a fault between its record and its rename leaving no keys dir), and the plugin lifecycle (install, trust, foreign
+nothing written), a revocation listed again keeps the fingerprint it was given, a fingerprint that the record or the bytes on this machine contradict refuses the file, a key removed by hand before its parent is revoked keeps its id blocked, a fingerprint that is not 16 hex digits, expiry, replay, open keys dir, a crash while the keys dir is made, a fault between its record and its rename leaving no keys dir), and the plugin lifecycle (install, trust, foreign
 plugin kept, update keeps trust, uninstall removes only ours) when `MINERVA_TEST_EIDOLON` names an eidolon binary (otherwise that
 one test says it was skipped). The Windows pieces (registry,
 shortcut, WSL calls) are exercised by running the exe with the test options above, never against the real settings.
@@ -475,7 +484,7 @@ scripts' start-up flags (the perch start with `--help` outputs captured from an 
 environment, and a second perch on another port), and `bash -n` on both scripts. `nix_allow_web.rs` checks that `nix/minerva.sh keys
 allow-web` refuses and arms nothing: it prints the Nix sentence, exits 1, sends no request and makes no runtime file. `release_files.rs`
 runs `release-files.sh` on temp release dirs: a keys.json that revokes an id with no `revoke_fp` entry (or has a list it cannot read) is
-refused in both modes with nothing written, and the forms it must accept (mixed case, spread over lines) pass. Nothing in `cargo test` parses `hoot.ps1`: that is done by hand, from the
+refused in both modes with nothing written, and the forms it must accept (mixed case, spread over lines, a file with neither list) pass. Nothing in `cargo test` parses `hoot.ps1`: that is done by hand, from the
 Windows side (Windows PowerShell 5.1 is the parser that matters), from the repository root, and must print `0`, the number of parse
 errors:
 

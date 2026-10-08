@@ -134,6 +134,17 @@ fn no_keys_json_passes_as_it_always_did() {
 }
 
 #[test]
+fn a_keys_json_with_neither_list_passes() {
+    // no revoke and no revoke_fp: nothing to check, so the release carries the serial as it always did
+    let env = Env::new();
+    let keys = r#"{"schema":1,"serial":3,"expires":"2030-01-01","add":[]}"#;
+    let dir = release(&env, "neither", Some(keys));
+    let (code, _, err) = run(&env, &[p(&dir)]);
+    assert_eq!(code, 0, "{err}");
+    assert!(fs::read_to_string(dir.join("latest.json")).unwrap().contains(r#""keys_serial":3"#));
+}
+
+#[test]
 fn resign_runs_the_same_check_and_writes_nothing_on_a_refusal() {
     let env = Env::new();
     let good = format!(r#"{{"serial":3,"revoke":["{ID}"],"revoke_fp":[{{"id":"{ID}","fp":"{FP}"}}]}}"#);
