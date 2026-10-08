@@ -253,8 +253,9 @@ export function clock(ts) {
 // hand-edit watcher's `file` (docs/architecture/AOIDED.md).
 const PAYLOAD_KEYS = { gate: ['id', 'name', 'originAddr', 'url', 'direction'], audit: ['file'] };
 
-// A mail command's `message` is a letter's text, so it is never drawn (the perch does not send it either). A mail command is one whose first
-// word, before a `.`, `/` or `-`, is `mail` in any letter case: the same rule the perch applies.
+// A mail command's `message` is a letter's text, so it is never drawn. The perch sends a `message` only for aoided's start record, so this is
+// a second guard in the page, not a copy of the perch's rule. A mail command is one whose first word, before a `.`, `/` or `-`, is `mail` in
+// any letter case.
 const isMail = (command) => typeof command === 'string' && /^mail([./-]|$)/i.test(command);
 
 // A payload as `key=value` words: the first four of the class's fields whose value is text, a number or a boolean, each cut short.

@@ -805,7 +805,8 @@ fn a_link_or_a_fifo_at_either_path_is_not_read_and_the_other_stream_still_answer
 }
 
 /// A letter's text does not reach the page: a `mail.read` line carries the body in its `message`, and no byte of the answer has it. The same
-/// body under any command that is not aoided's start record is not forwarded either: `a_message_is_forwarded_for_a_start_record_and_for_no_other`.
+/// body under any command that is not aoided's start record is not forwarded either:
+/// `a_message_is_forwarded_for_a_start_record_and_for_no_other_record`.
 #[test]
 fn a_mail_letter_is_in_no_answer_byte() {
     let rig = Setup::all().start();
