@@ -135,7 +135,7 @@ letters that is about 3 KiB of stdout per letter: about 1,400 letters fit a plai
 
 Where those numbers come from. The 2 × is observed: aoide 0.0.26 prints each letter twice, and both copies are JSON-escaped. The 12 ×
 for control bytes follows from the escaping (`\u00XX` is six bytes, in each of the two copies), and the ~1 KiB per entry is the envelope
-around each letter, an estimate. Neither is measured on a control-byte letter: the fixtures hold printable text only, so the 12 × is
+aoide prints around each of the two escaped copies; it is estimated, not measured. Neither is measured on a control-byte letter: the fixtures hold printable text only, so the 12 × is
 derived and not checked against aoide. Past a cap a read is refused whole and never cut: a plain read that is too big arms a reread, and a
 reread too big to print is a loss the page names.
 

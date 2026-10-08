@@ -45,6 +45,8 @@
 //! **For M3.** [`send`] is the whole of it for the agent too: [`Letter`] names the sender ([`Sender::MinervaAgent`]) and the origin
 //! (`agent:<chat>`), and the checks, the node rules, the argv and the row are the same.
 
+use std::sync::Arc;
+
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -354,13 +356,27 @@ async fn resolve(ctx: &Ctx, letter: &Letter) -> Result<(), Refusal> {
 async fn deliver(ctx: &Ctx, aoide: &Aoide, dir: &std::path::Path, letter: Letter, to: To) -> Result<Sent, Refusal> {
     let sha = harnox::crypto::hex(&harnox::crypto::sha256(letter.text.as_bytes()));
     let address = format!("{}/{}", letter.node, aoide::MAILBOX);
-    // Once aoide has been spawned the letter may be spooled, whatever came back: the attempt is on record as `unknown`, with the msgid
-    // when one was read, and the page is told to look at the outbox before it sends again.
+    let timeout = mail::knob_ms(ctx, "mail_send_ms", aoide::SEND_TIMEOUT);
+    let run = aoide.for_send(timeout).run(&shape_of(&letter, to)).await;
+    settle(&ctx.mail, dir, letter, &sha, &address, run).await
+}
+
+/// What became of a letter once its run gave back `run`. A letter aoide took is a row and the answer, with a warning when the row could not
+/// be written or the send was not complete. Once aoide has been spawned the letter may be spooled, whatever came back: a run that may
+/// have spooled ([`unknown_row_after_spawn`]) is an unknown row, with the msgid when one was read, and a 502 that says to check the outbox
+/// before sending again. A spawn failure, and a run that never started, write no row.
+async fn settle(
+    mail_state: &Arc<mail::State>,
+    dir: &std::path::Path,
+    letter: Letter,
+    sha: &str,
+    address: &str,
+    run: Result<Reply, Error>,
+) -> Result<Sent, Refusal> {
     let unknown = |why: String| {
         Refusal::new(StatusCode::BAD_GATEWAY, format!("{why}; the letter may or may not have been sent: check `aoide mail outbox` for {address} before sending it again"))
     };
-    let timeout = mail::knob_ms(ctx, "mail_send_ms", aoide::SEND_TIMEOUT);
-    match aoide.for_send(timeout).run(&shape_of(&letter, to)).await {
+    match run {
         Ok(reply) => {
             let took = parse_took(&reply);
             if !took.accepted {
@@ -368,11 +384,11 @@ async fn deliver(ctx: &Ctx, aoide: &Aoide, dir: &std::path::Path, letter: Letter
                 return Err(Refusal::conflict(took.error.unwrap_or_else(|| format!("aoide did not accept the letter for {address}"))));
             }
             if took.msgid.is_none() {
-                let _ = record(ctx, dir, row_of(&letter, &sha, &address, None, "unknown", "unknown")).await;
+                let _ = record(mail_state, dir, row_of(&letter, sha, address, None, "unknown", "unknown")).await;
                 return Err(unknown("aoide answered in a shape the perch does not read".to_string()));
             }
-            let row = row_of(&letter, &sha, &address, took.msgid.as_deref(), &took.disposition, &took.status);
-            let mut warning = record(ctx, dir, row).await.err();
+            let row = row_of(&letter, sha, address, took.msgid.as_deref(), &took.disposition, &took.status);
+            let mut warning = record(mail_state, dir, row).await.err();
             if !took.complete && warning.is_none() {
                 warning = Some(format!("aoide did not complete the send to {address}: check `aoide mail outbox` before sending it again"));
             }
@@ -381,7 +397,7 @@ async fn deliver(ctx: &Ctx, aoide: &Aoide, dir: &std::path::Path, letter: Letter
                 disposition: took.disposition,
                 delivery: took.delivery,
                 status: took.status,
-                to: address,
+                to: address.to_string(),
                 mesh: letter.mesh,
                 error: took.error,
                 warning,
@@ -390,12 +406,12 @@ async fn deliver(ctx: &Ctx, aoide: &Aoide, dir: &std::path::Path, letter: Letter
         Err(Error::Failed(reply)) if certain(&reply) => Err(refused_by_aoide(&reply, &letter.node)),
         Err(Error::Failed(reply)) => {
             let why = refused_by_aoide(&reply, &letter.node).why;
-            let _ = record(ctx, dir, row_of(&letter, &sha, &address, None, "unknown", "unknown")).await;
+            let _ = record(mail_state, dir, row_of(&letter, sha, address, None, "unknown", "unknown")).await;
             Err(unknown(why))
         }
         Err(Error::Refused(why)) => Err(Refusal::bad(why)),
         Err(e) if unknown_row_after_spawn(&e) => {
-            let _ = record(ctx, dir, row_of(&letter, &sha, &address, None, "unknown", "unknown")).await;
+            let _ = record(mail_state, dir, row_of(&letter, sha, address, None, "unknown", "unknown")).await;
             Err(unknown(e.to_string()))
         }
         // No binary configured: aoide never ran, so nothing was spooled and there is no row.
@@ -542,10 +558,10 @@ fn row_of(letter: &Letter, sha: &str, to: &str, msgid: Option<&str>, disposition
 }
 
 /// Appends the row to `<home>/mail/sent.jsonl`, under the lock, on a blocking thread. `Err` is the sentence for the `warning`.
-async fn record(ctx: &Ctx, dir: &std::path::Path, row: Value) -> Result<(), String> {
-    let (ctx, dir, line) = (ctx.clone(), dir.to_path_buf(), row.to_string());
+async fn record(mail_state: &Arc<mail::State>, dir: &std::path::Path, row: Value) -> Result<(), String> {
+    let (mail_state, dir, line) = (mail_state.clone(), dir.to_path_buf(), row.to_string());
     let done = tokio::task::spawn_blocking(move || {
-        let _held = ctx.mail.sent.lock().unwrap_or_else(|e| e.into_inner());
+        let _held = mail_state.sent.lock().unwrap_or_else(|e| e.into_inner());
         mail::ensure_dir(&dir)?;
         mail::append_lines(&dir.join("sent.jsonl"), &[line])
     })
@@ -731,5 +747,35 @@ mod tests {
         ] {
             assert!(!unknown_row_after_spawn(&e), "{e} did not start, so there is no row");
         }
+    }
+
+    /// The post-run mapping, given a run's result: a started child that could not be followed is one unknown row and a 502 that says the
+    /// letter may or may not have gone; a spawn failure is a 502 with no row. The row is the only place the guard arm's write shows.
+    #[tokio::test]
+    async fn a_started_run_that_could_not_be_followed_writes_one_row_and_a_spawn_failure_writes_none() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("mail");
+        let state = Arc::new(mail::State::default());
+        let sha = "b".repeat(64);
+        let started = Error::Started("waiting for aoide: gone".to_string());
+        let refusal = settle(&state, &dir, letter("osaka", None, false, "a note", "text"), &sha, "osaka/minerva", Err(started))
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.code, StatusCode::BAD_GATEWAY);
+        assert!(refusal.why.contains("may or may not have been sent") && refusal.why.contains("osaka/minerva"), "{}", refusal.why);
+        let text = std::fs::read_to_string(dir.join("sent.jsonl")).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let row: Value = serde_json::from_str(lines[0]).unwrap();
+        let got = (row["msgid"].clone(), row["disposition"].clone(), row["status"].clone());
+        assert_eq!(got, (Value::Null, json!("unknown"), json!("unknown")));
+        assert_eq!((row["to"].clone(), row["sha256"].clone()), (json!("osaka/minerva"), json!(sha)));
+        let spawn = Error::Spawn("/nonexistent/aoide: No such file or directory".to_string());
+        let refusal = settle(&state, &dir, letter("osaka", None, false, "a note", "text"), &sha, "osaka/minerva", Err(spawn))
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.code, StatusCode::BAD_GATEWAY);
+        assert!(!refusal.why.contains("may or may not"), "{}", refusal.why);
+        assert_eq!(std::fs::read_to_string(dir.join("sent.jsonl")).unwrap().lines().count(), 1, "a spawn failure writes no row");
     }
 }
