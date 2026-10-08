@@ -672,7 +672,7 @@ fn a_call_that_passes_the_gate_reaches_the_modules_route() {
     let (id, pid, _) = live(&perch);
     say(&perch, &id);
     let lines = agent_lines_after(&perch, pid, 3);
-    assert!(lines.contains(&format!("agent pid={pid} via=door term/list 404 ")), "the term module's stub, past the gate: {lines:?}");
+    assert!(lines.contains(&format!("agent pid={pid} via=door term/list 200 []")), "the term module's list, past the gate: {lines:?}");
     assert!(lines.contains(&format!("agent pid={pid} via=door mail/send 404 ")), "the mail module's stub, past the gate: {lines:?}");
     assert!(lines.contains(&format!("agent pid={pid} via=door term/whoami 200 {{\"chat\":\"{id}\"}}")), "{lines:?}");
     // The same two calls from the door's child curl never get that far.
