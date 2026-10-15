@@ -166,6 +166,11 @@ struct Rig {
 #[cfg(feature = "test-bins")]
 impl Rig {
     fn new() -> Self {
+        Self::with_flags(Vec::new())
+    }
+
+    /// [`Rig::new`], with more of the perch's own flags (a `--home` a second perch reads its `terms.json` back from).
+    fn with_flags(extra: Vec<OsString>) -> Self {
         let files = Files::new();
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("calls.txt");
@@ -173,6 +178,7 @@ impl Rig {
         let perch = Perch::builder()
             .hub()
             .args(files.flags())
+            .args(extra)
             .envs(files.fake_env())
             .env("SHELL", "/bin/sh")
             .env("FAKE_AGENT_CALL", format!("@{}", script.display()))
@@ -267,8 +273,10 @@ fn list_marks_the_chats_own_terminals_and_no_others() {
     let rig = Rig::new();
     let (a, pid_a, _) = live(&rig.perch);
     let (b, pid_b, _) = live(&rig.perch);
+    let (c, pid_c, _) = live(&rig.perch);
     let operator = open_as_operator(&rig.perch);
     let ours = open_by(&rig, &a, pid_a);
+    let third = open_by(&rig, &c, pid_c);
 
     let from_a = rig.one(&a, pid_a, "term/list:{}");
     assert_eq!(from_a.code(), 200, "{}", from_a.text);
@@ -276,6 +284,9 @@ fn list_marks_the_chats_own_terminals_and_no_others() {
     assert_eq!(mine["mine"], true, "the terminal this chat opened is its own");
     assert_eq!(mine["by"], "agent");
     assert_eq!(mine["chat"], a.as_str());
+    assert_eq!(mine["alive"], true, "a running terminal is listed alive");
+    assert_eq!(mine["hold"], false, "and it is not on hold until the operator holds it");
+    assert!(mine["title"].is_string() && mine["fg"].is_string(), "the row names its title and foreground: {mine}");
     let theirs = listed(&from_a.body, &operator);
     assert_eq!(theirs["mine"], false, "the operator's terminal is not the agent's");
     assert_eq!(theirs["by"], "operator");
@@ -284,6 +295,7 @@ fn list_marks_the_chats_own_terminals_and_no_others() {
     assert_eq!(from_b.code(), 200, "{}", from_b.text);
     assert_eq!(listed(&from_b.body, &ours)["mine"], false, "a terminal another chat opened is listed, and is not mine");
     assert_eq!(listed(&from_b.body, &operator)["mine"], false);
+    assert_eq!(listed(&from_b.body, &third)["mine"], false, "a third chat's terminal is listed too, and is not mine");
 }
 
 #[cfg(feature = "test-bins")]
@@ -308,15 +320,19 @@ fn open_takes_the_chats_folder_and_refuses_a_fifth_terminal() {
 fn open_then_send_then_read_for_the_text_answers_with_it() {
     let rig = Rig::new();
     let (a, pid, _) = live(&rig.perch);
+    // The quiet clock is a minute, so only the text can answer the read early: a read that ignores `for` waits out its 20 s.
     let calls = "term/open:{}\n\
                  term/send:{\"id\":\"$id\",\"text\":\"echo ho$((2*3))\",\"keys\":[\"enter\"]}\n\
-                 term/read:{\"id\":\"$id\",\"wait\":{\"for\":\"ho6\",\"timeout_s\":20}}";
+                 term/read:{\"id\":\"$id\",\"wait\":{\"for\":\"ho6\",\"idle_ms\":60000,\"timeout_s\":20}}";
+    let started = Instant::now();
     let made = rig.run(&a, pid, calls);
+    let took = started.elapsed();
     let codes: Vec<u16> = made.iter().map(Answered::code).collect();
     assert_eq!(codes, [201, 200, 200]);
     assert!(made[1].body["seq"].is_u64(), "a send answers the terminal's seq: {}", made[1].text);
     assert!(made[2].body["text"].as_str().unwrap().contains("ho6"), "the read waited for the output: {}", made[2].text);
     assert_eq!(made[2].body["alive"], true);
+    assert!(took < Duration::from_secs(15), "the read answered on its text, not at its 20 s timeout: {took:?}");
 }
 
 #[cfg(feature = "test-bins")]
@@ -372,6 +388,9 @@ fn the_operators_hold_refuses_an_agents_send_with_423_and_its_reads_still_answer
     let ours = open_by(&rig, &a, pid);
     let on = rig.perch.post_json(&format!("/hub/term/{ours}/hold"), serde_json::json!({ "hold": true }));
     assert_eq!(on.status, 200, "{}", on.body);
+    let listing = rig.one(&a, pid, "term/list:{}");
+    assert_eq!(listing.code(), 200, "{}", listing.text);
+    assert_eq!(listed(&listing.body, &ours)["hold"], true, "the list says the operator holds it");
 
     let made = rig.run(
         &a,
@@ -385,6 +404,9 @@ fn the_operators_hold_refuses_an_agents_send_with_423_and_its_reads_still_answer
 
     let off = rig.perch.post_json(&format!("/hub/term/{ours}/hold"), serde_json::json!({ "hold": false }));
     assert_eq!(off.status, 200, "{}", off.body);
+    let released = rig.one(&a, pid, "term/list:{}");
+    assert_eq!(released.code(), 200, "{}", released.text);
+    assert_eq!(listed(&released.body, &ours)["hold"], false, "and not once it is let go");
     let again = rig.one(&a, pid, &format!("term/send:{{\"id\":\"{ours}\",\"text\":\"echo back$((1+1))\",\"keys\":[\"enter\"]}}"));
     assert_eq!(again.code(), 200, "a send after the hold is off: {}", again.text);
 }
@@ -430,6 +452,16 @@ fn a_stop_during_a_long_wait_exits_within_three_seconds() {
     let _ = rig.perch.stop();
     let took = started.elapsed();
     assert!(took < Duration::from_secs(3), "a stop ends a held read at once, and it took {took:?}");
+    // The held read is answered on the way down: the door logs the 503 the stop gives it, not an error for want of an answer.
+    assert!(
+        wait_record(&rig.perch, Duration::from_secs(5), |records| records.iter().any(|line| line.starts_with(&format!("agent pid={pid} ")) && line.contains(" term/read "))),
+        "the door logged the held read: {:?}",
+        rig.perch.fake_records()
+    );
+    let logged = rig.lines(pid).into_iter().find(|line| line.contains(" term/read ")).unwrap();
+    let answered = Answered::parse(&logged);
+    assert_eq!(answered.code(), 503, "{}", answered.text);
+    assert_eq!(answered.why(), "the perch is shutting down");
 }
 
 #[cfg(feature = "test-bins")]
@@ -562,4 +594,68 @@ fn the_term_token_is_in_no_argv_environment_stdout_stderr_or_the_doors_log() {
     let term = rig.files.term_token();
     assert_no_secret(&rig.perch, &[&term]);
     assert!(!rig.perch.fake_records().iter().any(|line| line.contains(&term)), "the door's log names no token");
+}
+
+#[cfg(feature = "test-bins")]
+#[test]
+fn an_ended_terminal_keeps_its_screen_and_refuses_an_agents_input() {
+    let rig = Rig::new();
+    let (a, pid, _) = live(&rig.perch);
+    let ours = open_by(&rig, &a, pid);
+    let typed = rig.run(
+        &a,
+        pid,
+        &format!("term/send:{{\"id\":\"{ours}\",\"text\":\"echo ab$((3*7))\",\"keys\":[\"enter\"]}}\nterm/read:{{\"id\":\"{ours}\",\"wait\":{{\"for\":\"ab21\",\"timeout_s\":20}}}}"),
+    );
+    let codes: Vec<u16> = typed.iter().map(Answered::code).collect();
+    assert_eq!(codes, [200, 200]);
+
+    let exit = rig.one(&a, pid, &format!("term/send:{{\"id\":\"{ours}\",\"text\":\"exit\",\"keys\":[\"enter\"]}}"));
+    assert_eq!(exit.code(), 200, "{}", exit.text);
+    // A read with no wait answers at once, so the shell's end is polled for, one read at a time, up to a deadline.
+    let read_it = format!("term/read:{{\"id\":\"{ours}\"}}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut read = rig.one(&a, pid, &read_it);
+    while read.code() == 200 && read.body["alive"] == true && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        read = rig.one(&a, pid, &read_it);
+    }
+    assert_eq!(read.code(), 200, "{}", read.text);
+    assert_eq!(read.body["alive"], false, "the shell ended: {}", read.text);
+    assert!(!read.body["exit"].is_null(), "an ended shell names its exit: {}", read.text);
+    assert!(read.body["text"].as_str().unwrap().contains("ab21"), "the ended terminal keeps the screen it left: {}", read.text);
+
+    let refused = rig.one(&a, pid, &format!("term/send:{{\"id\":\"{ours}\",\"text\":\"echo late\",\"keys\":[\"enter\"]}}"));
+    assert_eq!(refused.code(), 409, "{}", refused.text);
+    assert_eq!(refused.why(), "that terminal's shell has ended");
+}
+
+#[cfg(feature = "test-bins")]
+#[test]
+fn an_ended_terminal_read_back_from_terms_json_answers_an_agent_from_its_saved_screen() {
+    let home = tempfile::tempdir().unwrap();
+    let flags: Vec<OsString> = vec!["--home".into(), home.path().into()];
+    // The first perch is stopped with its shell alive: the shutdown ends the shell and keeps its screen in `terms.json` under the home.
+    let mut first = Rig::with_flags(flags.clone());
+    let (a, pid, _) = live(&first.perch);
+    let ours = open_by(&first, &a, pid);
+    let typed = first.run(
+        &a,
+        pid,
+        &format!("term/send:{{\"id\":\"{ours}\",\"text\":\"echo ab$((3*7))\",\"keys\":[\"enter\"]}}\nterm/read:{{\"id\":\"{ours}\",\"wait\":{{\"for\":\"ab21\",\"timeout_s\":20}}}}"),
+    );
+    let codes: Vec<u16> = typed.iter().map(Answered::code).collect();
+    assert_eq!(codes, [200, 200]);
+    let _ = first.perch.stop();
+
+    // The second perch reads the file back: the terminal is ended, and an agent reads the screen the shell left.
+    let second = Rig::with_flags(flags);
+    let (b, pid_b, _) = live(&second.perch);
+    let read = second.one(&b, pid_b, &format!("term/read:{{\"id\":\"{ours}\"}}"));
+    assert_eq!(read.code(), 200, "{}", read.text);
+    assert_eq!(read.body["alive"], false, "a shell the shutdown ended: {}", read.text);
+    assert!(read.body["text"].as_str().unwrap().contains("ab21"), "the screen it left, read back from terms.json: {}", read.text);
+    let refused = second.one(&b, pid_b, &format!("term/send:{{\"id\":\"{ours}\",\"text\":\"echo late\",\"keys\":[\"enter\"]}}"));
+    assert_eq!(refused.code(), 409, "{}", refused.text);
+    assert_eq!(refused.why(), "that terminal's shell has ended");
 }

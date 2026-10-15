@@ -662,8 +662,9 @@ fn whoami_keeps_the_hosts_fetch_metadatas_and_methods_gates() {
     assert_eq!(at(7), format!("term/whoami 200 {chat}"), "and the plain call");
 }
 
-/// A call that passes the gate reaches the module's route with the chat in its extensions. Until T2 and M3 land the routes are the
-/// empty 404 of their stubs, which is neither the gate's 401 (no credential) nor its 403 (no door): the door got through.
+/// A call that passes the gate reaches the module's route with the chat in its extensions. The term module's `list` answers 200 with an
+/// empty list (T2, no terminal open yet). `mail/send` is still the empty 404 stub until M3 lands: that 404 is neither the gate's 401 (no
+/// credential) nor its 403 (no door), so the door got through.
 #[cfg(feature = "test-bins")]
 #[test]
 fn a_call_that_passes_the_gate_reaches_the_modules_route() {

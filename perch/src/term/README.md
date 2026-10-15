@@ -325,7 +325,7 @@ Each frame is one `data: {json}` line. Every frame has a string `type`; the term
 | `term-hold` | `id`, `hold` | a hold change |
 | `term-exit` | `id`, `code`, `signal` | the shell ended |
 | `term-closed` | `id` | a close, or a relist that no longer lists the terminal |
-| `term-input` | `id`, `by` (`"agent"`), `chat`, `text` | an agent's input. `text` is the picture with CR and LF shown as the return sign, tab as the tab sign, other pictures as `^X`, cut at 200 characters |
+| `term-input` | `id`, `by` (`"agent"`), `chat`, `text` | an agent's input. `text` is the picture with CR and LF shown as the return sign, tab as the tab sign, other pictures as `^X`, cut at 80 characters, then an ellipsis |
 | `hub-stream-end` | `reason` (`"stopping"`) | the perch stops; exactly once |
 
 **Snapshots.** `snap::picture` copies the visible cells, the cursor, the modes and the scroll region under the screen lock; `snap::encode`

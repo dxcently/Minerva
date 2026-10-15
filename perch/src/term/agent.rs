@@ -20,6 +20,7 @@
 //! **The wait (`read`).** The answer is held until one of these, whichever comes first: the text it names is on the screen; the screen
 //! has been quiet for `idle_ms` (output and input both count as activity); the time is up; the shell has ended. That is what the tool's
 //! own description promises. A wait is woken by output and by its own quiet timer, and a perch stop ends it with a `503`.
+//! An `idle_ms` of 0 is quiet at once, so the answer comes at once, text or not: a `for` is waited for only with an `idle_ms` above 0.
 //!
 //! **The guard (D9).** A `send` whose text names what an agent may not run is refused before a byte is typed, with the guard's sentence
 //! and a `403`. [`crate::guard::refuses_term_text`] is a hint, not a gate, and it does not depend on whether the policy rows are on.
