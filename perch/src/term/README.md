@@ -359,9 +359,9 @@ so the 16 ms bound is for output ticks only.
   `term-closed` goes out without one. A close that is not lagged is flushed first.
 * The primary screen behind the alternate one: a snapshot taken on the alternate screen is the alternate screen alone.
 * History: a snapshot is the visible screen. An exact replay (`snap` false) carries the history, since it is the whole ring.
-* `note_input` (the hook for T2) only stamps and announces an agent's input that the perch does not write itself, pictured the way
-  `agent_input` pictures it and cut at 80 characters. `agent_input` announces its own input, so a route calls one of the two for a
-  given input, never both.
+* `note_input` (T1c) only stamps and announces an agent's input that the perch does not write itself, pictured the way
+  `agent_input` pictures it and cut at 80 characters. `agent_input` announces its own input, and no route calls `note_input`: the agent
+  route (T2) calls `agent_input`, so one input is announced once.
 
 ## For the slices that build on this
 
@@ -417,7 +417,7 @@ the coalescing's due time, the snapshot's modes and colours, the scroll region (
 it, origin mode inside one, a region the page ignores), the underline's style and colour, and the `term-input` frame that `note_input`
 announces (an agent's input only; the operator's typing is not an event). `term::screen` covers how the guard keeps the region as the
 page takes each sequence, and that a resize starts it over. The frame is pinned here; T2's `term_agent.rs` pins the route that calls
-`note_input`.
+`agent_input`, and the `term-input` frame it puts on the stream.
 
 Limits worth knowing: an exited terminal's session is swept when it is closed or expires, not the moment its shell exits (the zombie
 shell holds the session id until then); `fg` is the foreground group's `comm` and is empty for an ended terminal.
