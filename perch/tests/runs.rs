@@ -396,6 +396,187 @@ fn a_request_that_is_not_a_run_is_refused_before_anything_is_made() {
     assert!(!site.home.join("runs").exists() && !site.home.join("runs.json").exists(), "nothing was made for a request that was refused");
 }
 
+/// A loopback port nothing listens on: bound, read and let go.
+fn closed_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
+}
+
+// ---------------------------------------------------------------------------
+// The chat tag (RT): refused when it is not a chat, and when the perch does not know it, before anything is made
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_chat_that_is_not_a_chat_id_is_a_400_and_nothing_is_made() {
+    let site = site();
+    let perch = site.quiet(&["--run-graphs", "wiki-hop"]);
+    let long = "a".repeat(129);
+    for chat in [json!(7), json!(true), json!({}), json!(""), json!("../x"), json!("a/b"), json!("a\nb"), json!("%2e"), json!(".x"), json!(long)] {
+        let answer = perch.post_json("/hub/runs", json!({ "graph": "wiki-hop", "chat": chat }));
+        assert_eq!(answer.status, 400, "chat {chat}: {}{}", answer.head, answer.body);
+        assert!(body(&answer)["error"].is_string(), "chat {chat}: {}", answer.body);
+    }
+    // 128 bytes of letters is the most the shape takes: it is refused for being unknown, not for its shape.
+    let most = "a".repeat(128);
+    let answer = perch.post_json("/hub/runs", json!({ "graph": "wiki-hop", "chat": most }));
+    assert_eq!(answer.status, 404, "{}{}", answer.head, answer.body);
+    assert_eq!(body(&answer)["error"], "no such chat", "{}", answer.body);
+    assert!(!site.home.join("runs").exists() && !site.home.join("runs.json").exists(), "nothing was made for a chat that is refused");
+}
+
+#[test]
+fn a_chat_the_perch_does_not_know_is_a_404_with_a_sentence_and_nothing_is_made() {
+    let site = site();
+    // jev is down (a closed port), so a start with no chat is a 503. The unknown chat is refused before the services are asked about.
+    let jev = format!("http://127.0.0.1:{}/health", closed_port());
+    let perch = site.quiet(&["--run-graphs", "wiki-hop", "--jev-health", jev.as_str()]);
+    let answer = perch.post_json("/hub/runs", json!({ "graph": "wiki-hop", "chat": "c0ffee99" }));
+    assert_eq!(answer.status, 404, "{}{}", answer.head, answer.body);
+    assert_eq!(body(&answer)["error"], "no such chat", "{}", answer.body);
+    let plain = perch.post_json("/hub/runs", json!({ "graph": "wiki-hop" }));
+    assert_eq!(plain.status, 503, "a start with no chat is asked about jev: {}{}", plain.head, plain.body);
+    assert!(!site.home.join("runs").exists() && !site.home.join("runs.json").exists(), "nothing was made for an unknown chat");
+}
+
+#[test]
+fn the_list_takes_one_chat_and_keeps_fifty_of_its_runs() {
+    let site = site();
+    // 130 finished runs written before the perch starts: 60 of chat aa, 60 of chat bb, and 10 with no chat.
+    let mut runs = serde_json::Map::new();
+    for n in 1..=130u64 {
+        let mut run = json!({ "graph": "wiki-hop", "state": "done", "started_ms": n, "ended_ms": n + 1, "exit": 0 });
+        match n {
+            1..=60 => run["chat"] = json!("aa"),
+            61..=120 => run["chat"] = json!("bb"),
+            _ => {}
+        }
+        runs.insert(format!("r{n}"), run);
+    }
+    std::fs::write(site.home.join("runs.json"), Value::Object(runs).to_string()).unwrap();
+    let perch = site.quiet(&[]);
+    let listed = |path: &str| -> Vec<String> {
+        let answer = perch.get(path);
+        assert_eq!(answer.status, 200, "{path}: {}{}", answer.head, answer.body);
+        body(&answer).as_array().unwrap_or_else(|| panic!("the list is an array: {}", answer.body)).iter().map(|row| row["rid"].as_str().unwrap().to_string()).collect()
+    };
+    // Newest first, and the chat's own fifty, though 130 runs are kept: a chat's strip is not cut by the other chats' runs.
+    let run_range = |from: u64, to: u64| -> Vec<String> { (from..=to).rev().map(|n| format!("r{n}")).collect() };
+    let aa = listed("/hub/runs?chat=aa");
+    assert_eq!(aa.len(), 50, "{aa:?}");
+    assert_eq!((aa[0].as_str(), aa[49].as_str()), ("r60", "r11"));
+    assert_eq!(aa, run_range(11, 60));
+    assert_eq!(listed("/hub/runs?chat=bb"), run_range(71, 120));
+    assert_eq!(listed("/hub/runs"), run_range(81, 130), "no query is every run, as it was");
+    assert_eq!(listed("/hub/runs?chat=gone"), Vec::<String>::new(), "a chat with no runs lists none");
+}
+
+#[test]
+fn a_list_query_other_than_one_chat_is_a_400() {
+    let site = site();
+    let perch = site.quiet(&[]);
+    for query in ["chat=", "chat=a&chat=b", "x=1", "limit=5", "chat=a&x=1", "chat=a%2Fb", "chat=..", "chat=a=b"] {
+        let answer = perch.get(&format!("/hub/runs?{query}"));
+        assert_eq!(answer.status, 400, "?{query}: {}{}", answer.head, answer.body);
+        assert!(body(&answer)["error"].is_string(), "?{query}: {}", answer.body);
+    }
+    // An empty query is no filter at all.
+    assert_eq!(perch.get("/hub/runs?").status, 200);
+    assert_eq!(rows(&perch), Vec::<Value>::new());
+}
+
+#[test]
+fn a_chat_written_into_runs_json_by_hand_is_left_off_the_row() {
+    let site = site();
+    let long = "x".repeat(200);
+    let runs = json!({
+        "r1": { "graph": "wiki-hop", "state": "done", "started_ms": 1, "chat": "../etc" },
+        "r2": { "graph": "wiki-hop", "state": "done", "started_ms": 2, "chat": "a b" },
+        "r3": { "graph": "wiki-hop", "state": "done", "started_ms": 3, "chat": "<b>x</b>" },
+        "r4": { "graph": "wiki-hop", "state": "done", "started_ms": 4, "chat": long },
+        "r5": { "graph": "wiki-hop", "state": "done", "started_ms": 5, "chat": "ok1" }
+    });
+    std::fs::write(site.home.join("runs.json"), runs.to_string()).unwrap();
+    let perch = site.quiet(&[]);
+    let listed = rows(&perch);
+    assert_eq!(listed.len(), 5, "{listed:?}");
+    for row in &listed {
+        let rid = row["rid"].as_str().unwrap();
+        let detail = one(&perch, rid);
+        if rid == "r5" {
+            assert_eq!((row["chat"].as_str(), detail["chat"].as_str()), (Some("ok1"), Some("ok1")), "{row} {detail}");
+        } else {
+            assert!(row.get("chat").is_none() && detail.get("chat").is_none(), "{rid}: {row} {detail}");
+        }
+    }
+    // The filter reads the same tag: the one run whose tag is an id is the one a chat lists.
+    let only = rows_at(&perch, "/hub/runs?chat=ok1");
+    assert_eq!(only.iter().map(|row| row["rid"].as_str().unwrap()).collect::<Vec<_>>(), ["r5"]);
+}
+
+#[test]
+fn a_chat_that_is_not_a_string_is_no_tag_and_one_odd_tag_sets_no_run_aside() {
+    let site = site();
+    // A number, an object, an array and a bool, each on its own run, and a good tag on a fifth: every run is listed, and runs.json stays.
+    let runs = json!({
+        "r1": { "graph": "wiki-hop", "state": "done", "started_ms": 1, "chat": 7 },
+        "r2": { "graph": "wiki-hop", "state": "done", "started_ms": 2, "chat": { "x": 1 } },
+        "r3": { "graph": "wiki-hop", "state": "parked", "started_ms": 3, "chat": [1] },
+        "r4": { "graph": "wiki-hop", "state": "done", "started_ms": 4, "chat": true },
+        "r5": { "graph": "wiki-hop", "state": "done", "started_ms": 5, "chat": "ok1" }
+    });
+    std::fs::write(site.home.join("runs.json"), runs.to_string()).unwrap();
+    let perch = site.quiet(&[]);
+    let listed = rows(&perch);
+    assert_eq!(listed.len(), 5, "every run is listed: {listed:?}");
+    for row in &listed {
+        let rid = row["rid"].as_str().unwrap();
+        let detail = one(&perch, rid);
+        if rid == "r5" {
+            assert_eq!((row["chat"].as_str(), detail["chat"].as_str()), (Some("ok1"), Some("ok1")), "{row} {detail}");
+        } else {
+            assert!(row.get("chat").is_none() && detail.get("chat").is_none(), "{rid}: {row} {detail}");
+        }
+    }
+    assert_eq!(one(&perch, "r3")["state"], "parked", "a parked run is listed as parked");
+    let set_aside = std::fs::read_dir(&site.home).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("runs.json.bad-"));
+    assert!(!set_aside, "no odd tag set runs.json aside");
+    assert_eq!(rows_at(&perch, "/hub/runs?chat=ok1").iter().map(|row| row["rid"].as_str().unwrap()).collect::<Vec<_>>(), ["r5"]);
+}
+
+#[test]
+fn a_tag_of_any_json_shape_loads_and_only_a_chat_id_answers() {
+    let site = site();
+    // Eleven shapes as the file holds them (serde_json's Value cannot hold 1e400, so the file is written as text): a number past f64's
+    // range, a string that is not text, a nesting past 128 levels, and the rest. Every run is listed and runs.json stays where it is; only
+    // `ok1` and the escaped `\u0061A` (which is `aA`) answer a chat.
+    let deep = "[".repeat(200) + &"]".repeat(200);
+    let text = r#"{"r1":{"graph":"wiki-hop","state":"done","started_ms":1,"chat":1e400},"r2":{"graph":"wiki-hop","state":"done","started_ms":2,"chat":-1e400},"r3":{"graph":"wiki-hop","state":"done","started_ms":3,"chat":"\ud800"},"r4":{"graph":"wiki-hop","state":"done","started_ms":4,"chat":@DEEP@},"r5":{"graph":"wiki-hop","state":"done","started_ms":5,"chat":"\u0061A"},"r6":{"graph":"wiki-hop","state":"done","started_ms":6,"chat":"ok1"},"r7":{"graph":"wiki-hop","state":"done","started_ms":7,"chat":7},"r8":{"graph":"wiki-hop","state":"done","started_ms":8,"chat":{"x":1}},"r9":{"graph":"wiki-hop","state":"done","started_ms":9,"chat":[1]},"r10":{"graph":"wiki-hop","state":"done","started_ms":10,"chat":true},"r11":{"graph":"wiki-hop","state":"done","started_ms":11,"chat":null}}"#.replace("@DEEP@", &deep);
+    std::fs::write(site.home.join("runs.json"), text).unwrap();
+    let perch = site.quiet(&[]);
+    let listed = rows(&perch);
+    assert_eq!(listed.len(), 11, "every run is listed: {listed:?}");
+    for row in &listed {
+        let rid = row["rid"].as_str().unwrap();
+        let detail = one(&perch, rid);
+        let want = match rid {
+            "r5" => Some("aA"),
+            "r6" => Some("ok1"),
+            _ => None,
+        };
+        assert_eq!((row["chat"].as_str(), detail["chat"].as_str()), (want, want), "{rid}: {row} {detail}");
+    }
+    let set_aside = std::fs::read_dir(&site.home).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("runs.json.bad-"));
+    assert!(!set_aside, "no tag set runs.json aside");
+    assert_eq!(rows_at(&perch, "/hub/runs?chat=aA").iter().map(|row| row["rid"].as_str().unwrap()).collect::<Vec<_>>(), ["r5"]);
+    assert_eq!(rows_at(&perch, "/hub/runs?chat=ok1").iter().map(|row| row["rid"].as_str().unwrap()).collect::<Vec<_>>(), ["r6"]);
+}
+
+/// `GET <path>` as a list, for a path that carries a query.
+fn rows_at(perch: &Perch, path: &str) -> Vec<Value> {
+    let answer = perch.get(path);
+    assert_eq!(answer.status, 200, "{path}: {}{}", answer.head, answer.body);
+    body(&answer).as_array().unwrap_or_else(|| panic!("the list is an array: {}", answer.body)).clone()
+}
+
 // ---------------------------------------------------------------------------
 // The health answer and the health gate
 // ---------------------------------------------------------------------------
@@ -1282,6 +1463,149 @@ mod flow {
         let perch = site.perch(&health_flags(), &[("FAKE_WORKFLOW_CASE", "a")]);
         assert_eq!(started(&perch, json!({})), "r1");
         wait_run(&perch, "r1", "done", Duration::from_secs(15));
+    }
+
+    /// A chat the perch knows the way a page sees one: a log in `<home>/sessions`, which `list` reads.
+    fn seed_chat(site: &Site, id: &str) {
+        std::fs::create_dir_all(site.home.join("sessions")).unwrap();
+        std::fs::write(site.home.join("sessions").join(format!("{id}.eid")), "").unwrap();
+    }
+
+    /// Every file under `dir`, at any depth.
+    fn files_under(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(files_under(&path));
+            } else {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_run_started_beside_a_chat_keeps_the_chat_on_every_answer() {
+        let site = site();
+        let _reaper = Reaper(site.home.clone());
+        seed_chat(&site, "c0ffee01");
+        let perch = site.perch(&[], &[("FAKE_WORKFLOW_CASE", "a")]);
+        let answer = perch.post_json("/hub/runs", json!({ "graph": "wiki-hop", "chat": "c0ffee01" }));
+        assert_eq!(answer.status, 202, "{}{}", answer.head, answer.body);
+        assert_eq!(body(&answer), json!({ "rid": "r1", "state": "running", "chat": "c0ffee01" }));
+        let done = wait_run(&perch, "r1", "done", Duration::from_secs(15));
+        assert_eq!(done["chat"], "c0ffee01", "the detail: {done}");
+        assert_eq!(rows(&perch)[0]["chat"], "c0ffee01", "the list row");
+        assert_eq!(rows_at(&perch, "/hub/runs?chat=c0ffee01").iter().map(|row| row["rid"].as_str().unwrap()).collect::<Vec<_>>(), ["r1"]);
+        assert_eq!(site.store()["r1"]["chat"], "c0ffee01", "runs.json keeps it");
+        // The chat never reached eidolon, and nothing the run wrote carries it: not the argv, not its config, args, logs or journal.
+        assert!(perch.fake_records().iter().all(|line| !line.contains("c0ffee01")), "{:?}", perch.fake_records());
+        let files = files_under(&site.dir("r1"));
+        assert!(files.len() >= 4, "{files:?}");
+        for file in files {
+            let text = String::from_utf8_lossy(&std::fs::read(&file).unwrap_or_default()).to_string();
+            assert!(!text.contains("c0ffee01") && !file.to_string_lossy().contains("c0ffee01"), "{}", file.display());
+        }
+    }
+
+    #[test]
+    fn a_run_with_no_chat_is_what_it_was_before() {
+        let site = site();
+        let _reaper = Reaper(site.home.clone());
+        let perch = site.perch(&[], &[("FAKE_WORKFLOW_CASE", "a")]);
+        let first = start(&perch, json!({}));
+        assert_eq!(first.status, 202, "{}{}", first.head, first.body);
+        assert_eq!(body(&first), json!({ "rid": "r1", "state": "running" }), "exactly the answer it was");
+        wait_run(&perch, "r1", "done", Duration::from_secs(15));
+        let second = perch.post_json("/hub/runs", json!({ "graph": "wiki-hop", "chat": null }));
+        assert_eq!(second.status, 202, "{}{}", second.head, second.body);
+        assert_eq!(body(&second), json!({ "rid": "r2", "state": "running" }), "a null chat is no chat");
+        wait_run(&perch, "r2", "done", Duration::from_secs(15));
+        for rid in ["r1", "r2"] {
+            assert!(one(&perch, rid).get("chat").is_none(), "{rid}: the detail has no chat");
+            assert!(site.store()[rid].get("chat").is_none(), "{rid}: runs.json has no chat");
+        }
+        assert!(rows(&perch).iter().all(|row| row.get("chat").is_none()), "the list has no chat");
+    }
+
+    #[test]
+    fn a_chat_the_perch_remembers_but_cannot_list_is_known() {
+        let site = site();
+        let _reaper = Reaper(site.home.clone());
+        // A chat with a folder remembered in chat-cwds.json and no log: the list does not have it, the perch's memory does.
+        let folder = site.base.path().join("chat-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let folder = folder.canonicalize().unwrap();
+        std::fs::write(site.home.join("chat-cwds.json"), json!({ "c0ffee02": folder.display().to_string() }).to_string()).unwrap();
+        let perch = site.perch(&[], &[("FAKE_WORKFLOW_CASE", "a")]);
+        let answer = perch.post_json("/hub/runs", json!({ "graph": "wiki-hop", "chat": "c0ffee02" }));
+        assert_eq!(answer.status, 202, "{}{}", answer.head, answer.body);
+        assert_eq!(body(&answer)["chat"], "c0ffee02");
+        wait_run(&perch, "r1", "done", Duration::from_secs(15));
+    }
+
+    #[test]
+    fn the_holder_409_names_its_chat() {
+        let site = site();
+        let _reaper = Reaper(site.home.clone());
+        seed_chat(&site, "c0ffee01");
+        seed_chat(&site, "c0ffee02");
+        let perch = site.perch(&[], &[("FAKE_WORKFLOW_CASE", "b")]);
+        let parked = perch.post_json("/hub/runs", json!({ "graph": "wiki-hop", "chat": "c0ffee01" }));
+        assert_eq!(parked.status, 202, "{}{}", parked.head, parked.body);
+        wait_run(&perch, "r1", "parked", Duration::from_secs(15));
+        // A start with no chat, and one beside the other chat: both are the holder's 409, and it names the holder's chat, not the asker's.
+        for asked in [None, Some("c0ffee02")] {
+            let mut request = json!({ "graph": "wiki-hop" });
+            if let Some(chat) = asked {
+                request["chat"] = json!(chat);
+            }
+            let busy = perch.post_json("/hub/runs", request);
+            assert_eq!(busy.status, 409, "{asked:?}: {}{}", busy.head, busy.body);
+            assert_eq!((body(&busy)["run"].as_str(), body(&busy)["chat"].as_str()), (Some("r1"), Some("c0ffee01")), "{asked:?}: {}", busy.body);
+            assert!(body(&busy)["error"].as_str().unwrap().contains("r1"), "{}", busy.body);
+        }
+        assert_eq!(workflow_lines(&perch, "run").len(), 1, "one child");
+    }
+
+    #[test]
+    fn an_unknown_chat_is_a_404_even_while_a_run_holds_the_browser() {
+        let site = site();
+        let _reaper = Reaper(site.home.clone());
+        seed_chat(&site, "c0ffee01");
+        let perch = site.perch(&[], &[("FAKE_WORKFLOW_CASE", "b")]);
+        assert_eq!(started(&perch, json!({})), "r1");
+        wait_run(&perch, "r1", "parked", Duration::from_secs(15));
+        // The existence check runs before the holder check: the answer is about the chat, not the browser.
+        let unknown = perch.post_json("/hub/runs", json!({ "graph": "wiki-hop", "chat": "c0ffee99" }));
+        assert_eq!(unknown.status, 404, "{}{}", unknown.head, unknown.body);
+        assert_eq!(body(&unknown)["error"], "no such chat", "{}", unknown.body);
+        assert_eq!(workflow_lines(&perch, "run").len(), 1, "no child was started for it");
+    }
+
+    #[test]
+    fn cancel_and_abandon_answers_carry_the_chat() {
+        let site = site();
+        let _reaper = Reaper(site.home.clone());
+        seed_chat(&site, "c0ffee01");
+        let (case, named) = cases(&site, "b");
+        let perch = site.perch(&[], &[("FAKE_WORKFLOW_CASE", &named), HOLD]);
+        let parked = perch.post_json("/hub/runs", json!({ "graph": "wiki-hop", "chat": "c0ffee01" }));
+        assert_eq!(parked.status, 202, "{}{}", parked.head, parked.body);
+        wait_run(&perch, "r1", "parked", Duration::from_secs(15));
+        let abandoned = perch.post("/hub/runs/r1/abandon");
+        assert_eq!(abandoned.status, 200, "{}{}", abandoned.head, abandoned.body);
+        assert_eq!(body(&abandoned)["state"], "abandoned");
+        assert_eq!(body(&abandoned)["chat"], "c0ffee01", "{}", abandoned.body);
+        // A run that is held and then cancelled, beside the same chat: its cancel answer names the chat too.
+        pick(&case, "d");
+        let held_start = perch.post_json("/hub/runs", json!({ "graph": "wiki-hop", "chat": "c0ffee01" }));
+        assert_eq!(held_start.status, 202, "{}{}", held_start.head, held_start.body);
+        held(&site, "r2");
+        let cancelled = cancel(&perch, "r2");
+        assert_eq!(cancelled.status, 200, "{}{}", cancelled.head, cancelled.body);
+        assert_eq!((body(&cancelled)["state"].as_str(), body(&cancelled)["chat"].as_str()), (Some("cancelled"), Some("c0ffee01")), "{}", cancelled.body);
     }
 }
 

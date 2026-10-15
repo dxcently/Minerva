@@ -18,11 +18,12 @@ Every handler has one signature, `(ctx, req, rest) -> Response<BoxBody>`; `rest`
 ## Routes
 
 ```text
-GET  /hub/runs                      [row], newest first, 50 at most
-POST /hub/runs {graph, args?}       202 {rid, state: "running"}
-       400 body is not {graph: string, args?: object}, or args over 64 KiB     413 a body over the cap
-       404 a graph outside --run-graphs, or with no <plugins>/jev/workflows/<g>.rn
-       409 {run} a run is running or parked: there is one shared browser
+GET  /hub/runs[?chat=<id>]          [row], newest first, 50 at most; with ?chat=<id>, that chat's runs (newest first, 50 at most)
+       400 any other query: a chat= with no id, a repeated chat, another key, a chat that is not an id
+POST /hub/runs {graph, args?, chat?}  202 {rid, state: "running"} (and chat, when one was given)
+       400 body is not {graph: string, args?: object, chat?: a chat's id}, or args over 64 KiB     413 a body over the cap
+       404 a graph outside --run-graphs, or with no <plugins>/jev/workflows/<g>.rn; or a chat the perch does not know ("no such chat")
+       409 {run, chat?} a run is running or parked: there is one shared browser (chat is the holder's chat)
        503 jev or the browser service is down (the sentence says how to start it), or no --home / --plugins-dir
 GET  /hub/runs/<rid>                row + question? report? refused? and out, err (the last 4 KiB the child printed)
 POST /hub/runs/<rid>/answer {text}  202 {rid, state: "running"}   400 empty, over 1 KiB, a control character   409 not parked   503 a service is down
@@ -40,8 +41,24 @@ GET  /hub/runs/graphs/<g>           {name, sha256, bytes, graph}: <plugins>/jev/
 A refusal's body is `{error, why}` (one sentence under both names) plus `run` or `state` where it names one. Unknown or malformed run
 ids, and unknown paths, are the empty 404; a wrong method is the empty 405.
 
-A **row** is `{rid, graph, state, started_ms, ended_ms?, exit?, why?, args?, resumes, stopping?}`. `exit` is the child's exit code when
+A **row** is `{rid, graph, state, started_ms, ended_ms?, exit?, why?, args?, chat?, resumes, stopping?}`. `exit` is the child's exit code when
 this perch reaped it (137 is SIGKILL); an adopted run has none.
+
+## The chat tag
+
+A start may name the chat the page had open: `chat`, a chat's id (a letter or digit, then letters, digits, `.`, `_` or `-`, 128 bytes at
+most). A chat is known when the perch remembers its folder or lists it, which is the rule the operator's terminal uses. The tag is the
+page's claim: a label, never proof or authority, and nothing is granted because of it. It is checked when a run is started (an unknown
+chat is a 404 and makes nothing, before the holder and the services are asked about) and when `runs.json` is read (a tag that is not a
+JSON string is no tag, of any type, depth or range, and a tag that is not an id is left off the row; only a tag that is not valid
+JSON, or a run with `chat` twice, sets the file aside, like any file that does not parse).
+It never reaches eidolon:
+not the argv, the run's `config.toml`, `args.json`, the child's environment, a path, a file name or a log line. `?chat=<id>` filters
+before the 50 cap, and a chat that is unknown lists `[]`. A deleted chat's tagged runs stay listed under its id: emptying the trash
+does not reach `runs.json`. Pruning at 500 is across all chats, so another chat's runs can
+push out a chat's old ones. A perch from before RT reads a tagged `runs.json`, but its next write drops every tag, because the file is
+written whole. A tag that is not an id stays in the file and is left off every answer, and the next write keeps it;
+a tag that is not a JSON string is dropped by that write.
 
 ## States
 
