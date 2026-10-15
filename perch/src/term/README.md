@@ -140,7 +140,7 @@ Colour queries see the **default theme**, not the page's current one (the perch 
 **For T4a (the page's swallow list).** The perch is the only answerer; the page's xterm must swallow exactly the queries the perch
 answers and answer none of them, or the shell reads two answers. That list is: **DA1** (`CSI c`), **DA2** (`CSI > c`), **DSR** `CSI 5 n`
 and `CSI 6 n`, **DECRQM** (`CSI Ps $ p` and `CSI ? Ps $ p`), **`CSI 18 t`**, and **OSC 4, 10, 11 and 12** with a `?`. **DECRQSS**
-(`DCS $ q`) and **XTVERSION** (`CSI > 0 q`) are never answered by either side. Nothing else is on the list.
+(`DCS $ q`) and **XTVERSION** (`CSI > 0 q`) are never answered by either side. The page swallows both as well, so neither side replies to them. Nothing else is on the list.
 
 ## What the guard does to the bytes
 

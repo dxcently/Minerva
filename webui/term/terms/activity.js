@@ -83,9 +83,10 @@ async function poll() {
   baseline = true;
 }
 
-// Starts the poll and hooks the stream's own events in. Once; the page calls it at boot (terms/index.js).
+// Starts the poll and hooks the stream's own events in. Once; the page calls it at boot (terms/index.js). With no document (node's tests
+// import this folder) there is no page to poll for, and a live interval would keep the test process from ending.
 export function startActivity() {
-  if (polling) return;
+  if (polling || typeof document === 'undefined') return;
   setHooks({ event: (ev) => report(ev) });
   polling = setInterval(poll, POLL_MS);
 }
