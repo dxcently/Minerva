@@ -1,0 +1,15 @@
+{
+ "id": "J1",
+ "title": "jev service: decision log off switch, checkpoint and loaded state in /health",
+ "what": "jev/server.py (Minerva-owned):\n- JEV_DECISIONS_LOG=off disables _log_decision entirely (ruling 1: no data collection for training).\n- /health gains:\n  - decisions_log: 'off' or the path\n  - ckpt: basename of JEVLIKE_CKPT\n  - loaded {jevlike, openjev}: true only once that model is loaded in-process\n- The existing status, jevlike and openjev keys keep their meaning (files present).\n- Only if D2 = (b): an OPENJEV_DTYPE=bfloat16 knob for the openjev load.",
+ "owns_files": [
+  "jev/server.py",
+  "jev/test_server.py"
+ ],
+ "depends_on": [],
+ "tests": "In jev's existing test_server.py, using FastAPI TestClient with the models stubbed:\n- with JEV_DECISIONS_LOG=off, no file appears after a choose, and /health says decisions_log 'off'\n- without it, /health names the path\n- /health has ckpt, and loaded is false before any call\nRun under a temp HOME and XDG_CACHE_HOME.",
+ "live_check": "X1 reads /health from the real service.",
+ "size": "S",
+ "risk": "Your running jev service keeps the old code until you restart it, and R1a refuses page runs until /health says off. The page shows the restart command.",
+ "security_review": false
+}

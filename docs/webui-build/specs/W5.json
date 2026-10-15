@@ -1,0 +1,19 @@
+{
+ "id": "W5",
+ "title": "Loaded and diff tabs: fill from /hub/meta; host the loaded sections",
+ "what": "panes/loaded.js:\n- persona -> 'the web door does not name a persona'\n- the effort row is removed\n- gate:\n  - the mode plus 'new chats: <default_mode> (minerva.toml | unset → yolo)'\n  - the guard line: 'guard rows on (~/.config/eidolon/minerva-guard.rn)' or 'guard rows are off: <why>'\n  - when the member had enabled = false: 'eidolon's gate is on in Minerva auto (your config turns it off elsewhere)'\n- policy: the file, and `[ show rules ]` unfolds /hub/meta/policy\n- tools: the full list with used counts merged, used first\n- MCP -> 'eidolon has no MCP client list; its connectors: mneme ✓ melete ✗'\n- 'plugins' shows the folded /hub/meta/plugins text\n- renders registry.loadedSections (A2's 'allowed here', M3's 'agent mail')\n- door mode keeps 'needs the hub'\npanes/diff.js: the branch from /hub/meta/git; '+/− and PR state are not read: Minerva never runs git on a folder (its filters could run code)'.",
+ "owns_files": [
+  "webui/term/panes/loaded.js",
+  "webui/term/panes/diff.js",
+  "webui/term/tests/loaded.test.mjs"
+ ],
+ "depends_on": [
+  "R3",
+  "S0W-b"
+ ],
+ "tests": "loaded.test.mjs:\n- the merge of the full tool list with used counts, and its order\n- the guard line for on, off-with-why and the stub",
+ "live_check": "fake perch on PORT=48129:\n- tools, plugins, policy, the guard line and the default mode show\n- the diff tab shows the branch of a temp `git init` dir\n- read_page has no 'not available yet' in these tabs",
+ "size": "M",
+ "risk": "None.",
+ "security_review": false
+}

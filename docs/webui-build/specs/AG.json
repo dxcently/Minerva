@@ -1,0 +1,22 @@
+{
+ "id": "AG",
+ "title": "Agent gate: scoped term and mail tokens, chat attribution by socket",
+ "what": "src/agent/:\n- token.rs:\n  - At start, when the flags are given, mint a term token and a mail token (harnox::crypto::random_token).\n  - Write each with write_atomic_0600 to --term-token-file / --mail-token-file, then verify owner and mode 0600; refuse to start otherwise.\n  - --agent-url-file gets http://<bound>/.\n  - All three are removed on clean exit and rotate every start. Off by default, so tests never touch HOME. No token is ever in argv or env (hub.md 10.4).\n- authenticate(ctx, req, scope): the Bearer is compared in constant time (subtle) against that scope's token only. A master bearer or cookie on an agent path gets 404. A scoped token anywhere else stays the ordinary 401.\n- attrib.rs, from the Peer extension:\n  1. Find the /proc/net/tcp (and tcp6) row whose local address equals the peer and whose remote address equals the bound address; take its inode.\n  2. Find the live door pid from registry.door_pids() whose /proc/<pid>/fd holds socket:[inode].\n  3. Map the pid to the chat id.\n  Door pids only, with no ancestor walk. Refused with 403 'term tools work in chats this Minerva opened': a bash or curl child of a door, subagent children, the TUI and workflow runs.\n- POST /hub/term/a/whoami and /hub/mail/a/whoami -> {chat}.\n- fake_eidolon/agent.rs: with FAKE_AGENT_CALL=<verb>:<json> the fake door process itself calls the perch from its own socket, and it can also spawn `sh -c curl` (the child case).",
+ "owns_files": [
+  "perch/src/agent/mod.rs",
+  "perch/src/agent/token.rs",
+  "perch/src/agent/attrib.rs",
+  "perch/src/agent/README.md",
+  "perch/src/bin/fake_eidolon/agent.rs",
+  "perch/tests/agent.rs"
+ ],
+ "depends_on": [
+  "S0P-a",
+  "S0P-b"
+ ],
+ "tests": "tests/agent.rs:\n- the token files are 0600, rotate across restarts and are gone after SIGTERM; no flags means no files\n- a master bearer on /hub/term/a/whoami gets 404; the term token on /hub/sessions gets 401; the mail token on term routes gets 401\n- the fake door's whoami returns its chat id; a curl from the test process gets 403; the door's `sh -c curl` child gets 403\n- 1000 attributions with 16 doors take under 1 s",
+ "live_check": "fake perch on PORT=48112 with --term-token-file under the temp HOME: curl whoami from the shell gets 403; the fake door's call returns its id.",
+ "size": "M",
+ "risk": "This is a guard rail, not a boundary: a same-uid process can read the master token (hub.md:302). The token files persist on disk, and a crash leaves a stale, rotated one. A second perch with the flags under the same HOME overwrites the first one's files; only your main perch passes them.",
+ "security_review": true
+}

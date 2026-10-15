@@ -1,0 +1,26 @@
+{
+ "id": "XS",
+ "title": "Cross-feature security review of the agent-facing surfaces",
+ "what": "One fresh review, after the slices merge, by a reviewer who is not any slice's executor. It covers:\n(1) the terminal security table:\n  - who may write input; cross-origin\n  - tokens in a URL or env; a token used off its prefix; refusal of a door's children\n  - T1a's reply_kind() allow-list: no doubled answers, no clipboard, no pixel size, only listed kinds reach the writer\n  - OSC 52; links\n(2) the matcher:\n  - user tools shadowing names\n  - exact command is not exact effect\n  - origin joined by call_id (unknown never matches)\n  - structural asks; door-lifetime binding; the first-answer race\n  - the watcher line cap and reconnect\n  - shutdown with answers in flight\n(3) interplay:\n  - an 'allow every term_send' rule in auto means silent shell typing; the row says so\n  - yolo agents typing into terminals you opened (sudo-cached or root shells), steered by term_read text\n  - guard rows against term_send (aoide words refused; ssh in a terminal is the intended path)\n  - agents reading every web terminal, secrets included, which go to the provider\n  - agent mail: opt-in, hourly cap, origin line, --from=minerva-agent\n  - the stale aoide 0.0.25 first on PATH\n(4) G1's guard file in your eidolon config dir: written 0600 and atomically; its fallback is never silent; the shared permits are not widened (a guard that compiles but lets every verdict through would be the worst case: test it)\n(5) key add/remove:\n  - the arm is single-use, bound to one FP, bearer-only\n  - the 'FP rewritten in-origin' hole is stated in the UI\n  - agents via the CLI are slowed only by G1's keys rows, and that is stated\n(6) hostile remote text in cards, mesh and term_read\n(7) token files on disk: 0600, rotation, stale after a crash\nFindings with file:line evidence go back to the owning slice; re-review after the fixes.",
+ "owns_files": [],
+ "depends_on": [
+  "T2",
+  "T3",
+  "T4a",
+  "A1b",
+  "A2",
+  "M2",
+  "M3",
+  "N2b",
+  "G1",
+  "R4",
+  "W7",
+  "I1",
+  "AG"
+ ],
+ "tests": "Review only: a written finding list with evidence.",
+ "live_check": "Probes by curl against a fake perch on PORT=48137 (no browser).",
+ "size": "M",
+ "risk": "None; it lowers risk.",
+ "security_review": true
+}

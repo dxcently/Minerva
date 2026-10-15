@@ -1,0 +1,21 @@
+{
+ "id": "T4b",
+ "title": "Terminal panes: pop-out, keys and focus, menus, : commands, transcript rows (no app.js edits)",
+ "what": "terms/pane.js, the 'term' pane kind:\n- title `⌨ <title> ▾ [proj] ●`\n- menu: copy, paste, select all, clear, split right ▸, split down ▸, back to the stack, end terminal… (confirmed)\n- glyphs: + (split), × (back to the stack, toast 'terminal back in ⌨'; the process keeps running)\n- host: a padded outer div with an unpadded inner div (position:relative; z-index:0), so fit measures right and xterm stays under the frame\n- resize: ResizeObserver debounced 120 ms -> fit.proposeDimensions -> optimistic resize + POST resize; the perch's term-size is final\n- ⇱ opens a pane along the long side; the stack keeps the placeholder; closing the pane moves the same element back\nterms/keys.js:\n- keyOwner and focusOwner for .tview\n- attachCustomKeyEventHandler: ctrl+c copies with a selection, else goes to the PTY; ctrl+shift+c copies; ctrl+v and ctrl+shift+v use the native paste (bracketed when enabled)\n- right-click opens our menu, unless the app has mouse tracking (then shift+right-click)\n- beforeunload guard armed only while focus is in a terminal (D11)\n- i or ⏎ on a focused frame focuses the terminal\nRegistrations through S0W-b's registries; app.js is not edited:\n- whereOwners: 'term' for .tview\n- commands, per D11 item 3:\n  - override `term` to open a web terminal at the focused chat's cwd\n  - add `window` (`:window term|edit|files`), which calls the old native launcher p.s.launch (app.js:525)\n- keyRows: ':term :edit :files' becomes ':term (web terminal) · :window term|edit|files (native)'\n- splitExtras: 'terminal ▸ [ new terminal (here: <cwd>) | in folder… | each terminal not in a pane ]'\n- the status line for a term pane: title · cols×rows · cwd · agent\nrenderers/term.js draws term_* transcript rows (input summary, read text folded, 'open in ⌨'), plus one line in renderers/index.js.",
+ "owns_files": [
+  "webui/term/terms/pane.js",
+  "webui/term/terms/keys.js",
+  "webui/term/renderers/term.js",
+  "webui/term/renderers/index.js (one line)",
+  "webui/term/tests/termkeys.test.mjs"
+ ],
+ "depends_on": [
+  "T4a",
+  "W1"
+ ],
+ "tests": "termkeys.test.mjs:\n- keyOwner claims only .tview descendants\n- the copy/paste decision table\n- a term pane's split items drop mirror and anchor on the pane id\n- the `term` override and the `window` command resolve as registered",
+ "live_check": "fake perch on PORT=48133:\n- ⇱ then × move the same element (identity check in the console)\n- ctrl+b, ctrl+i and alt+w reach the shell while the rails stay put\n- an ask arriving while a terminal has focus does not take it, and the status shows ▶ waiting\n- dragging a divider resizes the PTY (the text route shows the new width)\n- `:term` opens a web terminal; `:window term` calls the native launcher (fake door logs it)\n- console clean",
+ "size": "M",
+ "risk": "- Browser-reserved chords (ctrl+w/t/n) cannot be captured; only the guard asks.\n- ResizeObserver does not fire in a background tab (app.js:1449).",
+ "security_review": false
+}

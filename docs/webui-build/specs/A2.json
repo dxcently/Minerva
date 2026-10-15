@@ -1,0 +1,23 @@
+{
+ "id": "A2",
+ "title": "Allow for the rest of this chat: ask row, settled marking, loaded-tab list",
+ "what": "panes/asks.js choices(): for an approval ask in perch mode with mode != yolo, add a row after `no`:\n- bash: `allow \"<command>\" for this chat`. A command over 200 chars folds to its first line plus '(N chars, matched exactly)' and unfolds on click; it is never greyed for length.\n- any other tool: `allow every <tool> for this chat`\n- term_send: `allow every term_send for this chat (types into terminals without asking)`\n- greyed with a reason for:\n  - background calls\n  - structural name rules ('eidolon asks about this call's shape, not its name')\n  - asks whose call origin is unknown\ncore/state.js send(): a choice with allow:true posts hubPost('sessions/<id>/allow', {ask_id}) instead of the door's /api/answer. A 409 keeps 'answered elsewhere'.\nThe settled row with note === RULE_NOTE renders '→ yes · allowed by this chat's rule' (display only).\nallow/list.js (a loaded section):\n- 'allowed here': one row per rule, with its origin, and `[ revoke ]`\n- empty: 'nothing: every ask comes to you'\n- refetched on a RULE_NOTE settle and after a mode switch",
+ "owns_files": [
+  "webui/term/allow/list.js",
+  "webui/term/allow/rows.js",
+  "webui/term/allow/README.md",
+  "webui/term/panes/asks.js",
+  "webui/term/core/state.js (send() only)",
+  "webui/term/tests/allow.test.mjs"
+ ],
+ "depends_on": [
+  "A1b",
+  "W6",
+  "S0W-b"
+ ],
+ "tests": "allow.test.mjs:\n- the row availability table (yolo none, background greyed, structural name rule greyed, unknown origin greyed, a 300-char command offered and folded)\n- RULE_NOTE detection\n- the payload is {ask_id} only; the page never sends a tool, command or origin",
+ "live_check": "fake perch on PORT=48136 with FAKE_ASKS:\n- allow settles with the rule note, and a second identical ask auto-settles\n- the loaded tab lists the rule; revoke\n- a mode switch empties the list",
+ "size": "M",
+ "risk": "A script in the page's origin can turn any pending ask into a rule (attacker D is accepted, hub.md:300).",
+ "security_review": true
+}

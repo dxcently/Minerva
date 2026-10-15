@@ -1,0 +1,21 @@
+{
+ "id": "T1a",
+ "title": "Terminal host: PTY + alacritty screen copy + allow-listed replies (no routes)",
+ "what": "src/term/mod.rs, Terms (State for ctx.term):\n- ids t<n>; at most 16 terminals including exited ones (an exited terminal is kept 30 min or until closed)\n- each terminal holds: PTY master; child (pid = pgid = sid); Mutex<alacritty Term> with scrolling_history 2000 and OSC 52 disabled; raw ring 512 KiB with seq = byte offset; owner {by: operator|agent, chat?}; agent_last_ms; hold; title; fg (comm of tcgetpgrp); cols/rows; last_ms; exit\npty.rs:\n- spawn: openpty + spawn_command run as a job on the existing Spawner thread (spawn.rs gains a generic job kind), so terminal forks never interleave with door forks\n- program: CommandBuilder::new_default_prog() (login shell)\n- cwd: the given one, which the caller checked, else HOME\n- env: the perch's own plus TERM=xterm-256color, COLORTERM=truecolor, LANG=C.UTF-8 when unset, MINERVA_TERM=<id>; never a token\n- reader: one std thread per terminal: Term.advance -> ring -> notify; above ~8 MiB/s it sleeps 10 ms per slice\n- writer: one thread per terminal with a bounded 64 KiB queue\n- exit: spawn_blocking(child.wait)\n- close: killpg(sid, SIGHUP) and SIGHUP to tcgetpgrp; drop the master; wait 2 s; sweep /proc/*/stat for session == sid and SIGKILL each; reap\n- shutdown(ctx): the same for every terminal concurrently, bounded at 2.5 s\nThe perch is the only answerer, through one function, reply_kind(event) -> Option<bytes>, that every alacritty event passes:\n- Event::PtyWrite (alacritty's own answers: DA, DSR/CPR, DECRQM, keyboard mode, CSI 18t text-area size in chars) goes to the writer.\n- ColorRequest (OSC 4/10/11/12) is answered from the default theme's palette, fixed in the perch.\n- TextAreaSizeRequest (pixels, CSI 14t) is declined, because the perch knows no pixel size.\n- ClipboardLoad and ClipboardStore are always refused.\n- Anything else is dropped.\n- XTVERSION and DECRQSS go unanswered: alacritty does not answer them and the page swallows them, so an app that asks waits out its own timeout. Documented in the README.\nscreen.rs:\n- text(lines ≤ 400, max_chars ≤ 7000) -> {text, cursor, alt_screen, seq}; title; resize (cols 20-400, rows 5-200) on both PTY and Term\nterms.json (statefile pattern, 0600):\n- each ended terminal's last screen text (≤ 64 KiB), so the page and term_read can say 'ended when the perch stopped' (D3)",
+ "owns_files": [
+  "perch/src/term/mod.rs",
+  "perch/src/term/pty.rs",
+  "perch/src/term/screen.rs",
+  "perch/src/term/README.md",
+  "perch/src/spawn.rs (one generic job kind)"
+ ],
+ "depends_on": [
+  "S0P-a",
+  "S0P-b"
+ ],
+ "tests": "In-crate unit tests with a real /bin/sh:\n- spawn, write 'echo hi' + CR, and text() contains hi within 2 s\n- resize changes the Term's columns\n- a `sleep 1000 &` child is gone from /proc after close\n- `printf` of a DSR query gets exactly one reply on the shell's stdin\n- reply allow-list: an OSC 52 read, a CSI 14t and an XTVERSION produce no write; an OSC 11 query gets exactly one palette answer; a unit test over reply_kind() covers every Event variant\n- the 17th spawn is refused\n- the child env has MINERVA_TERM and no master-token value\n- shutdown() ends every shell within 2.5 s\n- terms.json is 0600 and keeps the last screen",
+ "live_check": "No routes yet; `cargo test` in WSL.",
+ "size": "M",
+ "risk": "- portable-pty sets FD_CLOEXEC non-atomically (unix.rs:63-65). The Spawner thread narrows the window and the sweep covers it.\n- A process that calls setsid itself escapes the sweep; this is documented.\n- Terminals end with the perch; no holder process.\n- Colour queries see the default theme, not the page's current one.",
+ "security_review": true
+}

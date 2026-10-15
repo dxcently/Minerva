@@ -1,0 +1,18 @@
+{
+ "id": "W2a",
+ "title": "Run model: journal records to decision steps, from the run's own graph (pure)",
+ "what": "graph/jevrun.js is an incremental reducer over `log --json` lines.\nThe graph:\n- It joins the jev_graph 'jev-page next=' ToolResults into the exact graph text the run used (interp.rn:751-800) and reads states, floor and margin (state meta, then meta.jev.defaults) and the entail threshold from it.\n- If no pages were journaled, it takes the installed graph passed in, labelled 'drawn from the installed graph; may differ from the one this run used'.\nOutput:\n- meta {graph, start, goal}; status, plus unresumable {step, reason}; active state, visited states, path\n- steps[], each with:\n  - n, state, ts_ms and duration_ms\n  - page {url, title, heading, chars}\n  - arrival {equals {heading, goal, hit}; entail {score, threshold, hit} | error}\n  - jev {context_cut (first 192 bytes, UTF-8 safe), options_cut [32-byte cuts], collisions [[i, j]]}\n  - menu {options [{label, p}], source chooser|rule|single, top1, top2, floor, margin, floorOk, marginOk}\n  - park {call_id, prompt, answer?, invalid?}\n  - pick {label, index, how}\n  - action {tool, input, result | error}\n- budgets {decisions, actions, escalations: used/cap; host steps used/200}\n- spend[]\nUnknown record kinds are ignored.",
+ "owns_files": [
+  "webui/term/graph/jevrun.js",
+  "webui/term/tests/jevrun.test.mjs"
+ ],
+ "depends_on": [
+  "S0W-a",
+  "F0"
+ ],
+ "tests": "Against F0:\n- (a) arrived; path right; each pick equals the click ref mapped through the snapshot\n- (b) a park with reason 'top x under floor 0.35'; the answer gives pick.how = answer\n- (c) unresumable, naming the errored jev_choose step\n- (d) cancelled\n- (e) failed, even though the door said completed\n- (f) rule and single picks\n- (g) an entail error, then an unresumable park\n- (h) an invalid answer re-parks and uses an escalation\n- the graph is rebuilt from the journal pages (its sha matches the PIN in the fixture)\n- the cut collision flag\n- feeding records one at a time equals feeding them all at once",
+ "live_check": "Pure module; W2b-1 and W2b-2 carry the live check.",
+ "size": "M",
+ "risk": "jev_graph page framing is read from journaled text. If the plugin's page format changes, the fallback label appears instead of a wrong drawing.",
+ "security_review": false
+}

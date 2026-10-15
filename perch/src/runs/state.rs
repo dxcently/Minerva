@@ -2,10 +2,11 @@
 //! `GET|POST /hub/runs`, `GET /hub/runs/<rid>`, `POST /hub/runs/<rid>/answer|cancel|abandon`.
 //!
 //! ```text
-//!   GET  /hub/runs                 [row], newest first, 50 at most
-//!   POST /hub/runs {graph, args?}  202 {rid, state: "running"}
-//!        400 a body that is not {graph: string, args?: object}, or args over 64 KiB      404 a graph outside --run-graphs, or with no
-//!        workflows/<g>.rn          409 {run} a run is running or parked (one shared Chromium)
+//!   GET  /hub/runs[?chat=<id>]     [row], newest first, 50 at most; with ?chat= only that chat's runs
+//!        400 a query that is not ?chat=<a chat's id>
+//!   POST /hub/runs {graph, args?, chat?}  202 {rid, state: "running"}, with chat too when one was given
+//!        400 a body that is not {graph: string, args?: object, chat?: id}, or args over 64 KiB     404 a graph outside --run-graphs, or with no
+//!        workflows/<g>.rn, or a chat the perch does not know      409 {run, chat?} a run is running or parked (one shared Chromium)
 //!        503 jev or the browser service is down (the sentence names its start command), or there is no --home / --plugins-dir
 //!   GET  /hub/runs/<rid>           row + {question?, report?, refused?, out, err}: the tails of the child's stdout and stderr
 //!   POST /hub/runs/<rid>/answer {text}   202 {rid, state: "running"}: a parked run is resumed with --answer=<text>
@@ -14,7 +15,7 @@
 //!   POST /hub/runs/<rid>/abandon   200 row: a parked run becomes abandoned, no child is started; 409 if it is not parked
 //! ```
 //!
-//! **A row** is `{rid, graph, state, started_ms, ended_ms?, exit?, why?, args?, resumes, stopping?}`. `state` is one of
+//! **A row** is `{rid, graph, state, started_ms, ended_ms?, exit?, why?, args?, chat?, resumes, stopping?}`. `state` is one of
 //!
 //! ```text
 //!   running    a child (the first `workflow run`, or a `workflow resume`) is alive
@@ -34,7 +35,8 @@
 //!
 //! **What a person can ask of eidolon** is closed: the argv is built here from the run's own record (see [`super::proc`]), and the only text
 //! that reaches it from a request is the graph name (a bare name from `--run-graphs`), the args (a JSON object on stdin, from a file) and the
-//! answer (one `--answer=<text>` argument, 1 KiB, no control character).
+//! answer (one `--answer=<text>` argument, 1 KiB, no control character). The chat tag is none of these: it is a label in `runs.json` and a
+//! list's filter, and it never reaches eidolon.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::DirBuilderExt as _;
@@ -44,10 +46,12 @@ use std::sync::Mutex;
 use anyhow::{Context as _, Result};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 
 use crate::serve::{body_of, json, problem, status, BoxBody, Ctx};
+use crate::sessions;
 
 /// The most runs `runs.json` keeps, and the most a listing shows.
 pub const KEPT: usize = 500;
@@ -55,6 +59,8 @@ pub const LISTED: usize = 50;
 /// A start's body: the args (64 KiB at most) and the room for `{"graph": ...}` around them.
 const ARGS_MAX: usize = 64 * 1024;
 const START_CAP: usize = ARGS_MAX + 4096;
+/// A start's `chat` that is not a chat's id (the shape `sessions::id_ok` takes).
+const CHAT_SHAPE: &str = "chat is a chat's id: a letter or digit, then letters, digits, '.', '_' or '-', 128 bytes at most";
 /// An answer: 1 KiB of text and its JSON.
 pub const ANSWER_MAX: usize = 1024;
 const ANSWER_CAP: usize = 8 * 1024;
@@ -145,10 +151,14 @@ pub struct Run {
     pub refused: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<Value>,
+    /// The chat the page had open when the run was started: a label, checked when it is written and when it is read, and never sent to
+    /// eidolon (see the README's "The chat tag").
+    #[serde(default, deserialize_with = "tag_or_none", skip_serializing_if = "Option::is_none")]
+    pub chat: Option<String>,
 }
 
 impl Run {
-    fn new(graph: &str, args: Option<Value>) -> Self {
+    fn new(graph: &str, args: Option<Value>, chat: Option<String>) -> Self {
         Self {
             graph: graph.to_string(),
             state: Phase::Running,
@@ -167,8 +177,19 @@ impl Run {
             report: None,
             refused: None,
             args,
+            chat,
         }
     }
+}
+
+/// A chat that is not a JSON string is no tag, of any type, depth or range. One odd tag in a hand-edited runs.json must not set every run
+/// aside: serde refuses the whole map over one bad field. The tag is read as its raw JSON text, which `RawValue` checks by syntax alone
+/// (no value is built, so a number past f64's range and a nesting past a `Value`'s 128 levels are no error), and that text is kept only
+/// when `from_str::<String>` reads it as a string, so a string that is not text (a lone surrogate) is no tag either. A tag that is not
+/// valid JSON, or a run with `chat` twice, still fails the whole file: no reader of one field can save a document that does not parse.
+fn tag_or_none<'de, D: Deserializer<'de>>(de: D) -> std::result::Result<Option<String>, D::Error> {
+    let raw = Option::<Box<RawValue>>::deserialize(de)?;
+    Ok(raw.and_then(|raw| serde_json::from_str::<String>(raw.get()).ok()))
 }
 
 /// `r<digits>`, nine at most: the only shape of a run id, and so the only thing a request can join to a path.
@@ -293,8 +314,9 @@ impl Store {
         Ok(Some(out))
     }
 
-    /// The next run, if none holds the browser: its id and its directory (`<home>/runs/<rid>`, `0700`) made in the same step.
-    pub(crate) fn begin(&self, home: &Path, graph: &str, args: Option<Value>) -> std::result::Result<String, Begin> {
+    /// The next run, if none holds the browser: its id and its directory (`<home>/runs/<rid>`, `0700`) made in the same step. The chat tag is
+    /// in the same write as the row, so a run never exists without it.
+    pub(crate) fn begin(&self, home: &Path, graph: &str, args: Option<Value>, chat: Option<String>) -> std::result::Result<String, Begin> {
         let mut inner = self.inner.lock().unwrap();
         if let Some((rid, _)) = inner.runs.iter().find(|(_, run)| run.state.holds()) {
             return Err(Begin::Busy(rid.clone()));
@@ -322,9 +344,9 @@ impl Store {
             }
         };
         let mut all = inner.runs.clone();
-        all.insert(rid.clone(), Run::new(graph, args));
+        all.insert(rid.clone(), Run::new(graph, args, chat));
         while all.len() > KEPT {
-            // The oldest run that is over: never one that holds the browser.
+            // The oldest run that is over, of any chat: never one that holds the browser.
             let Some(oldest) = all.iter().filter(|(_, run)| !run.state.holds()).map(|(rid, _)| rid.clone()).min_by_key(|rid| rid_number(rid)) else { break };
             all.remove(&oldest);
         }
@@ -379,6 +401,10 @@ fn row(rid: &str, run: &Run) -> Value {
     }
     if let Some(args) = &run.args {
         map.insert("args".into(), args.clone());
+    }
+    // A tag a hand-edited runs.json carries that is not a chat's id is left off, so no page is handed a path or markup.
+    if let Some(chat) = run.chat.as_deref().filter(|chat| sessions::id_ok(chat)) {
+        map.insert("chat".into(), chat.into());
     }
     if run.stop.is_some() && run.state == Phase::Running {
         map.insert("stopping".into(), true.into());
@@ -467,7 +493,7 @@ pub async fn route(ctx: &Ctx, req: Request<Incoming>, rest: &str) -> Response<Bo
     match verb(req.method(), rest) {
         Verb::Nobody => status(StatusCode::NOT_FOUND),
         Verb::NotAllowed => status(StatusCode::METHOD_NOT_ALLOWED),
-        Verb::List => list(ctx),
+        Verb::List => list(ctx, req.uri().query()),
         Verb::Create => create(ctx, req).await,
         Verb::One(rid) => one(ctx, rid),
         Verb::Answer(rid) => answer(ctx, req, rid).await,
@@ -476,8 +502,23 @@ pub async fn route(ctx: &Ctx, req: Request<Incoming>, rest: &str) -> Response<Bo
     }
 }
 
-fn list(ctx: &Ctx) -> Response<BoxBody> {
-    let rows: Vec<Value> = ctx.runs.store.all().iter().take(LISTED).map(|(rid, run)| row(rid, run)).collect();
+/// `?chat=<id>`, the one query the list takes: the id as it is, with no percent-decoding (a `%` is not an id's character, so an encoded one
+/// is refused like any other). No query, or an empty one, is no filter. Any other pair is a sentence, not a filter.
+fn chat_query(query: Option<&str>) -> std::result::Result<Option<&str>, &'static str> {
+    let Some(query) = query.filter(|query| !query.is_empty()) else { return Ok(None) };
+    match query.split_once('=') {
+        Some(("chat", chat)) if sessions::id_ok(chat) => Ok(Some(chat)),
+        _ => Err("the only query is ?chat=<a chat's id>"),
+    }
+}
+
+fn list(ctx: &Ctx, query: Option<&str>) -> Response<BoxBody> {
+    let chat = match chat_query(query) {
+        Ok(chat) => chat,
+        Err(why) => return problem(StatusCode::BAD_REQUEST, why),
+    };
+    // The filter is before the cap, so one chat's strip keeps its own newest runs whatever the other chats did.
+    let rows: Vec<Value> = ctx.runs.store.all().iter().filter(|(_, run)| chat.is_none_or(|chat| run.chat.as_deref() == Some(chat))).take(LISTED).map(|(rid, run)| row(rid, run)).collect();
     json(StatusCode::OK, &rows)
 }
 
@@ -512,6 +553,12 @@ async fn create(ctx: &Ctx, req: Request<Incoming>) -> Response<BoxBody> {
     if args_text.len() > ARGS_MAX {
         return problem(StatusCode::BAD_REQUEST, "args are 64 KiB at most");
     }
+    // The chat the page had open: absent or null is no tag. A label only, never a path, an argument or an environment value.
+    let chat = match body.get("chat") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(chat)) if sessions::id_ok(chat) => Some(chat.clone()),
+        Some(_) => return problem(StatusCode::BAD_REQUEST, CHAT_SHAPE),
+    };
     // The name is a bare name from the operator's list before it is joined to any path.
     if !crate::graph_name_ok(graph) || !ctx.opts.run_graphs.iter().any(|offered| offered == graph) {
         return status(StatusCode::NOT_FOUND);
@@ -526,17 +573,26 @@ async fn create(ctx: &Ctx, req: Request<Incoming>) -> Response<BoxBody> {
     let Some(home) = ctx.registry.home().map(Path::to_path_buf) else {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "this perch has no --home, so it has nowhere to keep runs", Value::Null);
     };
+    // A chat the perch does not know is refused before the holder and the services are asked about, so a refused start makes nothing.
+    if let Some(chat) = chat.clone() {
+        let registry = ctx.registry.clone();
+        match tokio::task::spawn_blocking(move || chat_known(&registry, &chat)).await {
+            Ok(true) => {}
+            Ok(false) => return refuse(StatusCode::NOT_FOUND, "no such chat", Value::Null),
+            Err(_) => return problem(StatusCode::INTERNAL_SERVER_ERROR, "the chat could not be read"),
+        }
+    }
     // The cheap refusal first, and again where the run is made: between the two another start may have won.
     if let Some(rid) = ctx.runs.store.holder() {
-        return busy(&rid);
+        return busy(ctx, &rid);
     }
     if let Err(refusal) = super::health::gate(ctx).await {
         return *refusal;
     }
     let kept = (args_text.len() <= KEEP_ARGS).then_some(args);
-    let rid = match ctx.runs.store.begin(&home, graph, kept) {
+    let rid = match ctx.runs.store.begin(&home, graph, kept, chat.clone()) {
         Ok(rid) => rid,
-        Err(Begin::Busy(rid)) => return busy(&rid),
+        Err(Begin::Busy(rid)) => return busy(ctx, &rid),
         Err(Begin::Io(why)) => {
             tracing::warn!(%why, "perch: a run could not be begun");
             return refuse(StatusCode::SERVICE_UNAVAILABLE, "that run could not be started: its folder could not be made", Value::Null);
@@ -553,14 +609,30 @@ async fn create(ctx: &Ctx, req: Request<Incoming>) -> Response<BoxBody> {
         });
         return refuse(StatusCode::SERVICE_UNAVAILABLE, &why, Value::Null);
     }
-    json(StatusCode::ACCEPTED, &serde_json::json!({ "rid": rid, "state": "running" }))
+    let mut answer = serde_json::json!({ "rid": rid, "state": "running" });
+    if let Some(chat) = chat {
+        answer["chat"] = chat.into();
+    }
+    json(StatusCode::ACCEPTED, &answer)
 }
 
-fn busy(rid: &str) -> Response<BoxBody> {
+/// Whether `id` is a chat this perch knows, asked the way the operator's terminal asks (`term::routes::chat_folder`, its twin): the folder
+/// it was started in is remembered (a door it holds, or `chat-cwds.json`), or the list has it. One shared `Registry::knows` for both is a
+/// follow-up for the sessions and term owners.
+fn chat_known(registry: &sessions::Registry, id: &str) -> bool {
+    sessions::id_ok(id) && (registry.known_cwd(id).is_some() || registry.list().iter().any(|row| row.id == id))
+}
+
+/// The 409 of a start while a run holds the browser: the holder's id, and its chat when it has one, so the page can say which chat holds it.
+fn busy(ctx: &Ctx, rid: &str) -> Response<BoxBody> {
+    let mut extra = serde_json::json!({ "run": rid });
+    if let Some(chat) = ctx.runs.store.get(rid).and_then(|run| run.chat).filter(|chat| sessions::id_ok(chat)) {
+        extra["chat"] = chat.into();
+    }
     refuse(
         StatusCode::CONFLICT,
         &format!("run {rid} is still going or parked, and there is one shared browser: finish it, cancel it or abandon it first"),
-        serde_json::json!({ "run": rid }),
+        extra,
     )
 }
 
@@ -735,14 +807,14 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Store::default();
         store.open(file(home.path()));
-        let first = store.begin(home.path(), "wiki-hop", None).ok().unwrap();
+        let first = store.begin(home.path(), "wiki-hop", None, None).ok().unwrap();
         assert_eq!(first, "r1");
         assert!(home.path().join("runs/r1").is_dir(), "the folder is made with the id");
-        assert!(matches!(store.begin(home.path(), "wiki-hop", None), Err(Begin::Busy(rid)) if rid == "r1"), "running holds it");
+        assert!(matches!(store.begin(home.path(), "wiki-hop", None, None), Err(Begin::Busy(rid)) if rid == "r1"), "running holds it");
         store.edit("r1", |run| run.state = Phase::Parked).unwrap();
-        assert!(matches!(store.begin(home.path(), "wiki-hop", None), Err(Begin::Busy(_))), "so does parked");
+        assert!(matches!(store.begin(home.path(), "wiki-hop", None, None), Err(Begin::Busy(_))), "so does parked");
         store.edit("r1", |run| run.state = Phase::Abandoned).unwrap();
-        assert_eq!(store.begin(home.path(), "wiki-hop", None).ok().unwrap(), "r2", "an end lets the next begin");
+        assert_eq!(store.begin(home.path(), "wiki-hop", None, None).ok().unwrap(), "r2", "an end lets the next begin");
         assert_eq!(store.all().iter().map(|(rid, _)| rid.as_str()).collect::<Vec<_>>(), ["r2", "r1"], "newest first");
     }
 
@@ -751,12 +823,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Store::default();
         store.open(file(home.path()));
-        store.begin(home.path(), "g", None).ok().unwrap();
+        store.begin(home.path(), "g", None, None).ok().unwrap();
         store.edit("r1", |run| run.state = Phase::Done).unwrap();
         std::fs::remove_file(file(home.path())).unwrap();
         let fresh = Store::default();
         fresh.open(file(home.path()));
-        assert_eq!(fresh.begin(home.path(), "g", None).ok().unwrap(), "r2", "r1's folder is still there");
+        assert_eq!(fresh.begin(home.path(), "g", None, None).ok().unwrap(), "r2", "r1's folder is still there");
     }
 
     #[test]
@@ -764,7 +836,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Store::default();
         store.open(file(home.path()));
-        let rid = store.begin(home.path(), "g", None).ok().unwrap();
+        let rid = store.begin(home.path(), "g", None, None).ok().unwrap();
         assert!(matches!(store.resume(&rid), Err(Resume::NotParked(Phase::Running))));
         store.edit(&rid, |run| run.state = Phase::Parked).unwrap();
         let before = store.resume(&rid).ok().unwrap();
@@ -781,7 +853,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Store::default();
         store.open(file(home.path()));
-        let rid = store.begin(home.path(), "g", None).ok().unwrap();
+        let rid = store.begin(home.path(), "g", None, None).ok().unwrap();
         assert_eq!(std::fs::metadata(file(home.path())).unwrap().permissions().mode() & 0o777, 0o600);
         // A directory where the file goes: the rename over it fails, and the memory keeps what it had.
         std::fs::remove_file(file(home.path())).unwrap();
@@ -796,7 +868,7 @@ mod tests {
         let store = Store::default();
         store.open(file(home.path()));
         for _ in 0..KEPT + 3 {
-            let rid = store.begin(home.path(), "g", None).ok().unwrap();
+            let rid = store.begin(home.path(), "g", None, None).ok().unwrap();
             store.edit(&rid, |run| run.state = Phase::Done).unwrap();
         }
         let all = store.all();
@@ -817,12 +889,105 @@ mod tests {
 
     #[test]
     fn a_row_says_stopping_only_while_a_stop_is_pending() {
-        let mut run = Run::new("g", None);
+        let mut run = Run::new("g", None, None);
         assert!(row("r1", &run).get("stopping").is_none());
         run.stop = Some(Stop::Cancel);
         assert_eq!(row("r1", &run)["stopping"], Value::Bool(true));
         run.state = Phase::Cancelled;
         assert!(row("r1", &run).get("stopping").is_none(), "an end is not stopping");
         assert_eq!(row("r1", &run)["state"], "cancelled");
+    }
+
+    #[test]
+    fn the_list_takes_one_chat_or_no_query() {
+        assert_eq!(chat_query(None), Ok(None));
+        assert_eq!(chat_query(Some("")), Ok(None));
+        assert_eq!(chat_query(Some("chat=aa")), Ok(Some("aa")));
+        assert_eq!(chat_query(Some("chat=c0ffee01")), Ok(Some("c0ffee01")));
+        let longest = format!("chat={}", "a".repeat(128));
+        assert_eq!(chat_query(Some(longest.as_str())), Ok(Some(&longest[5..])));
+        let too_long = format!("chat={}", "a".repeat(129));
+        for bad in ["chat=", "chat=a&chat=b", "x=1", "limit=5", "chat=a&x=1", "chat=a%2Fb", "chat=..", "chat=a=b", "chat", "chat=a b", "chat=a/b", "chat=%2e", too_long.as_str()] {
+            assert!(chat_query(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_row_carries_the_chat_only_when_it_is_a_chats_id() {
+        let mut run = Run::new("g", None, Some("c0ffee01".into()));
+        assert_eq!(row("r1", &run)["chat"], "c0ffee01");
+        let long = "x".repeat(129);
+        for bad in ["../etc", "a b", "<b>x</b>", "", long.as_str()] {
+            run.chat = Some(bad.to_string());
+            assert!(row("r1", &run).get("chat").is_none(), "{bad:?}");
+        }
+        run.chat = None;
+        assert!(row("r1", &run).get("chat").is_none());
+    }
+
+    #[test]
+    fn a_chat_is_in_the_same_write_as_the_new_run_and_an_edit_keeps_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::default();
+        store.open(file(home.path()));
+        let rid = store.begin(home.path(), "g", None, Some("c0ffee01".into())).ok().unwrap();
+        let saved: BTreeMap<String, Run> = serde_json::from_str(&std::fs::read_to_string(file(home.path())).unwrap()).unwrap();
+        assert_eq!(saved[&rid].chat.as_deref(), Some("c0ffee01"), "on disk straight after begin");
+        store.edit(&rid, |run| run.state = Phase::Done).unwrap();
+        assert_eq!(store.get(&rid).unwrap().chat.as_deref(), Some("c0ffee01"), "an edit leaves the tag as it was");
+    }
+
+    #[test]
+    fn a_chat_that_is_not_a_string_is_no_tag_and_the_file_still_loads() {
+        let home = tempfile::tempdir().unwrap();
+        let text = r#"{"r1":{"graph":"g","state":"done","started_ms":1,"chat":7},"r2":{"graph":"g","state":"done","started_ms":2,"chat":{"x":1}},"r3":{"graph":"g","state":"parked","started_ms":3,"chat":[1]},"r4":{"graph":"g","state":"done","started_ms":4,"chat":true},"r5":{"graph":"g","state":"done","started_ms":5,"chat":null},"r6":{"graph":"g","state":"done","started_ms":6,"chat":"ok1"}}"#;
+        std::fs::write(file(home.path()), text).unwrap();
+        // The load a perch makes when it opens runs.json: one odd tag must not set the whole file aside.
+        let store = Store::default();
+        store.open(file(home.path()));
+        assert!(file(home.path()).exists(), "runs.json is where it was, not set aside");
+        let runs: BTreeMap<String, Run> = store.all().into_iter().collect();
+        assert_eq!(runs.len(), 6, "one odd tag does not set every run aside");
+        assert_eq!(runs["r3"].state, Phase::Parked, "a parked run is still parked");
+        for rid in ["r1", "r2", "r3", "r4", "r5"] {
+            assert!(runs[rid].chat.is_none(), "{rid}: a tag that is not a string is no tag");
+        }
+        assert_eq!(runs["r6"].chat.as_deref(), Some("ok1"));
+    }
+
+    #[test]
+    fn a_chat_nested_past_the_depth_limit_is_no_tag_and_the_file_still_loads() {
+        let home = tempfile::tempdir().unwrap();
+        // Two hundred levels: a Value stops at serde_json's 128, but an ignored key of this depth always loaded.
+        let deep = "[".repeat(200) + &"]".repeat(200);
+        let text = format!(r#"{{"r1":{{"graph":"g","state":"done","started_ms":1,"chat":{deep}}},"r2":{{"graph":"g","state":"done","started_ms":2,"chat":"ok1"}}}}"#);
+        std::fs::write(file(home.path()), text).unwrap();
+        let store = Store::default();
+        store.open(file(home.path()));
+        assert!(file(home.path()).exists(), "runs.json is where it was, not set aside");
+        let runs: BTreeMap<String, Run> = store.all().into_iter().collect();
+        assert_eq!(runs.len(), 2, "a deep tag does not set every run aside");
+        assert!(runs["r1"].chat.is_none(), "a deep tag is no tag");
+        assert_eq!(runs["r2"].chat.as_deref(), Some("ok1"));
+    }
+
+    #[test]
+    fn a_tag_serde_json_cannot_read_as_a_value_is_no_tag_and_the_file_still_loads() {
+        let home = tempfile::tempdir().unwrap();
+        // A number past f64's range (both signs), a string that is not text (a lone surrogate) and a nesting past 128 levels are no tag;
+        // the escaped `\u0061A` is the id `aA`, and `ok1` is one: only those two answer a chat.
+        let deep = "[".repeat(200) + &"]".repeat(200);
+        let text = r#"{"r1":{"graph":"g","state":"done","started_ms":1,"chat":1e400},"r2":{"graph":"g","state":"done","started_ms":2,"chat":-1e400},"r3":{"graph":"g","state":"done","started_ms":3,"chat":"\ud800"},"r4":{"graph":"g","state":"done","started_ms":4,"chat":@DEEP@},"r5":{"graph":"g","state":"done","started_ms":5,"chat":"\u0061A"},"r6":{"graph":"g","state":"done","started_ms":6,"chat":"ok1"},"r7":{"graph":"g","state":"done","started_ms":7,"chat":7},"r8":{"graph":"g","state":"done","started_ms":8,"chat":{"x":1}},"r9":{"graph":"g","state":"done","started_ms":9,"chat":[1]},"r10":{"graph":"g","state":"done","started_ms":10,"chat":true},"r11":{"graph":"g","state":"done","started_ms":11,"chat":null}}"#.replace("@DEEP@", &deep);
+        std::fs::write(file(home.path()), text).unwrap();
+        let store = Store::default();
+        store.open(file(home.path()));
+        assert!(file(home.path()).exists(), "runs.json is where it was, not set aside");
+        let runs: BTreeMap<String, Run> = store.all().into_iter().collect();
+        assert_eq!(runs.len(), 11, "no odd tag sets a run aside");
+        for rid in ["r1", "r2", "r3", "r4", "r7", "r8", "r9", "r10", "r11"] {
+            assert!(runs[rid].chat.is_none(), "{rid}: a tag that is not a JSON string that reads as text is no tag");
+        }
+        assert_eq!(runs["r5"].chat.as_deref(), Some("aA"), "an escaped id is the id it decodes to");
+        assert_eq!(runs["r6"].chat.as_deref(), Some("ok1"));
     }
 }

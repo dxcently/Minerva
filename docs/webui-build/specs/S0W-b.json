@@ -1,0 +1,27 @@
+{
+ "id": "S0W-b",
+ "title": "Page seams 2: registries (tabs, pane kinds, menus, commands, key rows, where/focus/key owners, frame taps, loaded sections, composer extras), stream slots",
+ "what": "core/registry.js exports small registries. app.js consumes them so feature folders never edit app.js again:\n- rightTabs / leftTabs: {name, icon, component, global}.\n  - RIGHT_TABS, LEFT_TABS, RAIL_ICONS and INSPECTOR are built from the base plus the registry.\n  - A saved tab name still validates.\n  - A `global` tab renders in Right() with no focused pane (app.js:1404-1407).\n  - Each rail icon accepts a badge signal.\n- paneKinds: kind -> {Pane, title(p), status(p), close(p), cwd(p)}.\n  - ui.xpanes = signal([{id, kind, ...}]) shares ui.tree and paneSeq.\n  - Tiles renders xpanes through the registry, and the Home check (app.js:1473) counts them.\n  - closePane, picker and longSide work for either list.\n  - inspected = the focused chat || ui.lastChat, used by Right() and stack ordering.\n  - The ~30 p.s/p.sid sites stay on ui.panes, untouched.\n- splitExtras [(p, dir) -> items]; chatMenuItems [(row) -> items] merged into the sidebar chat menus.\n- commands [{name, help, run}] merged into COMMANDS. A registered name OVERRIDES the base entry (app.js:525's `term`), logged once at boot.\n- keyRows: the key-reference rows (app.js:500's ':term :edit :files' among them) become a keyed list a registration can replace.\n- loadedSections [component] rendered in the loaded tab; composerExtras [component] rendered above a chat's composer.\n- keyOwners [(el) -> bool]: the first line of the document keydown returns when an owner claims the target, before the 'even while typing' block (app.js:1638).\n- focusOwners: steer()'s busy check (:366) and returnTo (:339) consult them, so a claimed focus is never stolen.\n- whereOwners [(el) -> name|null]: whereNow (app.js:1525) asks them first, so T4b's 'term' needs no app.js edit.\n- frameTaps [(sid, frame) -> void]: core/state.js's frame dispatch (:589's switch) calls each tap once per frame, inside try/catch, before the switch.\n- extraStreams = signal(0): capped() allows MAX_SIDS - extraStreams distinct chat streams.\nAlso:\n- panes/session.js exports Title and Glyphs and renders composerExtras.\n- index.html links vendor/xterm.css (from V0).\n- Stubs:\n  - terms/index.js registers the rightTab 'terms' (⌨︎, global) with one line: 'terminals: the ⌨ stack lands with slice T4a'.\n  - notes/index.js registers the leftTab 'notes' (✎) likewise.\n  - allow/list.js is an empty loaded section.\n  - allow/README.md.",
+ "owns_files": [
+  "webui/term/app.js",
+  "webui/term/index.html",
+  "webui/term/core/registry.js",
+  "webui/term/core/state.js (frameTaps call only)",
+  "webui/term/core/README.md",
+  "webui/term/panes/session.js",
+  "webui/term/terms/index.js",
+  "webui/term/notes/index.js",
+  "webui/term/allow/list.js",
+  "webui/term/allow/README.md",
+  "webui/term/tests/registry.test.mjs"
+ ],
+ "depends_on": [
+  "S0W-a",
+  "V0"
+ ],
+ "tests": "tests/registry.test.mjs (pure):\n- tab tables merge in order, and old saved names still validate\n- the capped() arithmetic with extraStreams\n- precedence of keyOwners and whereOwners\n- a command override replaces the base entry, and the key row follows it\n- a throwing frameTap does not stop the others or the dispatch\n- xpane add/remove keeps the tile tree consistent\nReverting the registry wiring fails it.",
+ "live_check": "fake perch on PORT=48104:\n- Chat panes split, close and pick as before.\n- The ⌨ and ✎ rails show their lines, and ⌨ renders with no pane focused.\n- A test-only xpane kind, registered from the console, tiles, focuses and closes.\n- A test command override shows in `:` completion.\n- A test frameTap logs frames of the fake door.\n- A capped toast appears at 4 - extraStreams.\n- The console is clean.",
+ "size": "M",
+ "risk": "Focus and key routing are global. The keyOwner early return must come before the ctrl+b/ctrl+i/alt+w block, or those keys double-fire. A command override can hide a base command; the boot log line names it.",
+ "security_review": false
+}

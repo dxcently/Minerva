@@ -1,0 +1,19 @@
+{
+ "id": "W3",
+ "title": "Graph tab: the chat's turn graph",
+ "what": "As pass 1. graph/turns.js derives the TurnGraph from the focused Session's rows (turn -> calls -> asks -> verdicts, web-ui.md §8) and draws it with draw.js. A verdict attaches to a call only when exactly one open call has that tool name (upstream gap 14); otherwise it gets its own labelled node. One import line in graph/index.js.",
+ "owns_files": [
+  "webui/term/graph/turns.js",
+  "webui/term/graph/index.js (one line)",
+  "webui/term/tests/turns.test.mjs"
+ ],
+ "depends_on": [
+  "W2b-1",
+  "W2c"
+ ],
+ "tests": "turns.test.mjs: turn count, calls grouped per turn, the verdict attach rule including the ambiguous case.",
+ "live_check": "fake perch on PORT=48127: a chat on the fake door shows its turns; switching the focused pane switches graphs; picking a run shows the run.",
+ "size": "M",
+ "risk": "Heuristic verdict attachment until gap 14.",
+ "security_review": false
+}

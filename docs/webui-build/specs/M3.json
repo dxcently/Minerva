@@ -1,0 +1,22 @@
+{
+ "id": "M3",
+ "title": "Agent mail send (opt-in per chat) + plugins/mail",
+ "what": "Perch side:\n- <home>/mail-agents.json {id: {on, at}} (statefile pattern, 0600). Off by default. A fork has a new id, so it starts off.\n- POST /hub/sessions/<id>/mailsend {on}, operator only.\n- POST /hub/mail/a/send {node, mesh?, subject, text}, through AG's mail scope:\n  - 403 'agent mail is off for this chat' unless the chat has opted in\n  - node verified or self; text ≤ 64 KiB; at most 10 per hour per chat (429)\n  - the same argv as an operator send, but with --from=minerva-agent, so Aoide's letter and the receiver's card both say an agent sent it (ruling 4: origin in the record). The chat id stays local.\n  - sent.jsonl line with origin agent:<chat> and from 'minerva-agent'\nplugins/mail (MIT): plugin.rn, tools/send.rn (tool mail_send, mutating, un-vouched so it asks in manual and auto), README, LICENSE. The service descriptor uses the mail token file and the url file.\nPage: webui/term/notes/agentmail.js registers a loaded section, 'agent mail: off [ turn on ]' / 'on since 14:02 [ turn off ]', plus the last agent sends.",
+ "owns_files": [
+  "perch/src/mail/agent.rs",
+  "perch/tests/mail_agent.rs",
+  "plugins/mail/**",
+  "webui/term/notes/agentmail.js"
+ ],
+ "depends_on": [
+  "M2",
+  "AG",
+  "T3",
+  "N2a"
+ ],
+ "tests": "tests/mail_agent.rs with FAKE_AGENT_CALL:\n- off gives 403; turning on then gives 202 with an origin line\n- the argv has --from=minerva-agent\n- the 11th send within an hour gives 429\n- a test-process curl gets 403\n- a fork id is off\nplugins/mail/tests/shape.sh against a stub server on 127.0.0.1:48119.",
+ "live_check": "fake perch on PORT=48120: toggle the opt-in in the loaded tab, run a fake-door send, and see the sent row.",
+ "size": "M",
+ "risk": "The opt-in is per chat id and lives on disk. A chat rooted at $HOME could write mail-agents.json directly (the same exposure chat-modes.json already has). The XS review states it. --from is attribution, not proof.",
+ "security_review": true
+}

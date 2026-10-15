@@ -1,0 +1,25 @@
+{
+ "id": "R1a",
+ "title": "Runs: process, state, health gate, start / answer / cancel / abandon (/hub/runs)",
+ "what": "Per-run dir and config:\n- <home>/runs/<rid>/ holds config.toml: <home>/config.toml through toml parse and display, with sessions_dir set to the run dir and swarm disabled (the key behind cfg.swarm_enabled(), main.rs:1963).\n- [policy] is copied unchanged, so a run uses the same policy file and therefore the same shared permits store (permits.rs:78-80; G1 keeps it shared).\n- The run's .eid is then the only one there, and runs never join the roster.\nHealth (moved here from R1b, because the start gate needs it): runs/health.rs.\n- GET /hub/runs/health probes --jev-health and --browser-health with a 1 s timeout, cached 5 s.\n- J1's ckpt, loaded and decisions_log are passed through verbatim.\nRoutes:\n- GET /hub/runs\n- POST /hub/runs {graph, args}: 202 {rid}\n  - 400: bad body, args not an object, or args over 64 KiB\n  - 404: a graph outside --run-graphs, or one with no workflows/<g>.rn\n  - 409 {run}: while any run is running OR parked (one shared Chromium)\n  - 409 {why}: unless jev's /health says decisions_log 'off' (ruling 1). A missing field counts as on. The sentence: 'jev is logging decisions for training; restart it with JEV_DECISIONS_LOG=off: <the start command>'\n  - 503 {why}: jev or the browser service is down (with its start command), or there is no --home\n- GET /hub/runs/<rid>: state running | parked | done | failed | cancelled | abandoned | refused | lost, exit, output tails\n- POST /hub/runs/<rid>/answer {text}: at most 1 KiB, no control chars, passed as --answer=<text>; the same decisions_log gate (a resume calls jev); 409 if not parked or a child is alive\n- POST /hub/runs/<rid>/cancel: killpg SIGTERM, 5 s grace, then SIGKILL\n- POST /hub/runs/<rid>/abandon: parked only; the state becomes abandoned and no child is started\nProcess:\n- The pending.rs pattern: own process group, stdin carries the args JSON (--args -), always --provider mock, never yolo, never the manual config, wall clock MINERVA_PERCH_RUN_MS (default 15 min, read via --knob).\n- Lifetime per D3:\n  - (a) detach: no kill_on_drop; the Group guard is disarmed; stdout/stderr go to out.log and err.log in the run dir, not pipes; runs::adopt re-finds a live pid whose /proc cmdline names `workflow` and this run dir.\n  - (b) on_shutdown sends SIGTERM to the live run and waits 5 s.\n- With no live pid, the state comes from the latest WorkflowEnd, reading only `kind` keys. A run with no end is `lost`.\n- State lives in <home>/runs.json: 0600, write_atomic_0600; a corrupt file is moved to .bad-<ts>.",
+ "owns_files": [
+  "perch/src/runs/mod.rs",
+  "perch/src/runs/proc.rs",
+  "perch/src/runs/state.rs",
+  "perch/src/runs/health.rs",
+  "perch/src/runs/README.md",
+  "perch/src/bin/fake_eidolon/workflow.rs",
+  "perch/tests/runs.rs",
+  "perch/src/pending.rs (visibility only)"
+ ],
+ "depends_on": [
+  "S0P-a",
+  "S0P-b",
+  "F0"
+ ],
+ "tests": "tests/runs.rs, with fake_eidolon replaying F0 fixtures at FAKE_WORKFLOW_STEP_MS. Health test servers run on 127.0.0.1:48140 (jev) and :48141 (browser), in-test only.\n- Requests and argv:\n  - 401 without a token; `../x` and an unknown graph give 404; array args and 65 KiB args give 400\n  - the argv has --provider mock and --args -; no token is in argv or env\n  - the per-run config.toml has swarm disabled, sessions_dir set to the run dir, and [policy] identical to config.toml's\n  - an answer of -1 arrives as --answer=-1\n- Health gate:\n  - decisions_log 'off' lets a start through\n  - a path value, a missing field (old /health) and jev down each refuse, with the sentence and no child started\n  - an answer is refused the same way\n- Cap and concurrency:\n  - a second start while one is parked gives 409 naming it; after abandon, a start succeeds\n  - a second answer while resuming gives 409\n- Ending a run:\n  - cancel: the process group is gone, the state is cancelled and the fake journals WorkflowEnd\n  - the wall-clock knob kills the run\n  - (D3 a) SIGTERM to the perch leaves the child running; the restarted perch adopts it; after `kill -9` of the child, the state comes from the log\n- runs.json is 0600 and a corrupt one is set aside.\n- Health handles up and down, with J1's fields passed through and an old /health without them.\n- The existing secrets-at-trace test still passes.",
+ "live_check": "fake perch on PORT=48106 plus curl, with a test jev /health on 48140 saying off:\n- start, see parked, answer, done\n- then start, park, abandon, start again\n- switch the test /health to a path: a start answers 409 with the sentence",
+ "size": "M",
+ "risk": "Under detach, a run outlives the perch with no wall clock; the host's 200-step cap is the only bound. That is stated in the UI. The gate trusts what jev's /health says; it cannot see the file.",
+ "security_review": false
+}

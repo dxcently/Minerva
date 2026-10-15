@@ -1,0 +1,25 @@
+{
+ "id": "X0",
+ "title": "Smoke with real eidolon (mock only): every feature in the page",
+ "what": "Setup:\n- Build into /tmp/minerva-x0-target. Perch on 127.0.0.1:48022 under `env -i` with temp HOME and XDG_CONFIG/DATA/STATE/CACHE/RUNTIME, PATH and LANG only.\n- No provider env keys or files; member config default_model mock; swarm off.\n- Before and after: a manifest of the real ~/.config/eidolon and ~/Minerva (path, size, mtime, sha256; contents never printed), with the real home taken from getent passwd.\n- Temp config plugins:\n  - jev and fake-browser copies with ports rewritten to 48091 (stub_service, whose /health says decisions_log off since P1) and token_file paths absolute under the temp HOME\n  - plugins/term and plugins/mail copies, with token and url files under the temp HOME, granted\n  - a test-only user tool term_probe.rn in the temp tools_dir with manifest name `grep` (the mock's 2nd scripted call, catalog.rs:877-881). Through eidolon::tool_call it runs:\n    - term_whoami, then term_open\n    - term_send 'echo probe' + enter\n    - term_send of an ssh line, then read with a wait, then list\n    - mail_send to self\n  - The ssh line is 'ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityFile=/dev/null -o PubkeyAuthentication=no -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=3 -p 48029 127.0.0.1 true'. Port 48029 is asserted closed first, so it ends in 'Connection refused' and never reaches your sshd. OpenSSH reads ~/.ssh from the passwd home, not $HOME, so the flags, not the temp HOME, keep your keys and config out.\n- aoide 0.0.26 with temp AOIDE_ROOT, AOIDE_AUDIT_LOG, AOIDE_DAEMON_SOCKET and XDG_RUNTIME_DIR.\n- fake_minerva in installed mode.\n- hello.model == mock checked before EVERY send.\nWalk (orchestrator, browser pane, one check at a time):\n- pass 1 rows:\n  - chats: new chat (inbox and project); send, queue, approve and deny; fork latest and from a reply; rename, pin, archive, trash, restore\n  - files and models: files tab, tree, image viewer; model menu (a non-mock model fails closed: no credentials exist)\n  - the three modes; a saved chat read-only, then continue\n  - the loaded (with the guard line), diff, run, graph and mesh tabs\n  - runs: start, park, answer, cancel, abandon, can't-resume; a start refused while a second stub /health reports a log path\n- terminals: open, type, pop out, back, take over, reload repaint\n- `:term` (web), `:window term` (native launcher logged), `:note`\n- the agent terminal through the probe:\n  - yolo (runs), auto (term_send asks), manual (all ask)\n  - with ⌨ closed, the badge, the toast and the rail switch\n- guard rows by `eidolon policy` on the X0 config:\n  - denied in yolo with their sentences: 'aoide mail send x', 'ssh h', 'minerva keys add k.pub'\n  - a vouched browser verb still silent in auto\n- notes: create, autosave, conflict, rename, trash and restore\n- send to this machine -> card -> composer, with no say; hand-off\n- agent mail: 403 when off, 202 when on, the sent origin line, the card's minerva-agent line\n- allow-for-chat in manual: allow; auto-answer if the mock repeats; revoke; a mode switch clears\n- install: notice, keys inspect and add with an arm\nAlso record:\n- that no workflow appears in /hub/sessions\n- that `mail outbox --json` changes no state mtimes\n- whether the mock repeats its script on a 2nd send\nOutput: a pass/fail table with screenshots in scratch. Fixes go back to the slice that owns the file.",
+ "owns_files": [],
+ "depends_on": [
+  "XS",
+  "D1",
+  "W2b-2",
+  "W3",
+  "T4b",
+  "N2b",
+  "M3",
+  "A2",
+  "W4",
+  "W5",
+  "W6",
+  "W7"
+ ],
+ "tests": "This is the end-to-end check itself.",
+ "live_check": "Pass means:\n- every row passes and the console is clean\n- there is no ModelSpend in any run or chat log\n- no request leaves loopback, and the ssh probe's connect is refused on 48029\n- the ~/.config/eidolon and ~/Minerva manifests are identical",
+ "size": "L",
+ "risk": "- If tool_call from a user tool cannot reach plugin tools, the agent rows fall back to T2's fake-door proof and say so.\n- If the mock does not repeat its script, allow auto-answer is proven by A1b's fake only.\n- The ssh probe proves only the live feed of an ssh command; no ssh session is made.",
+ "security_review": false
+}

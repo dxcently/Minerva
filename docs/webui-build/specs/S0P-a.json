@@ -1,0 +1,30 @@
+{
+ "id": "S0P-a",
+ "title": "Perch seams (src): route arms, every submodule stub, Ctx state, hooks, flags, peer address, agent gate branch, door-keyed sink",
+ "what": "(1) serve.rs hub(): arms before the GET/POST fallbacks. Each delegates to <mod>::route(ctx, req, rest), a stub that answers 404, so behavior is unchanged:\n- /hub/runs[/..] -> runs; /hub/mesh[/..] -> mesh; /hub/meta/.. -> meta; /hub/install[/..] -> install\n- /hub/term[/..] -> term; /hub/notes[/..] -> notes; /hub/mail[/..] -> mail\n- session verbs allow (GET, POST), revoke (POST) and mailsend (POST) -> allow::{list, create, revoke}, mail::optin\n(2) Every <mod>/mod.rs written here already holds its full internal dispatch to the submodules later slices fill. Each submodule is a stub with a fixed signature (`pub async fn <verb>(ctx: &Ctx, req: Request<Incoming>, rest: &str) -> Response<Body>`) answering 404:\n- runs: proc, state, health (R1a); log, graphs (R1b)\n- term: pty, screen (T1a); routes (T1b); stream, snap (T1c); agent (T2)\n- mail: send, recv (M2); agent (M3)\n- allow: matcher, store (A1b)\n- agent: token, attrib (AG)\nNo later slice adds a `mod` line or a route arm. The owner of each mod.rs (R1a, T1a, M2, A1b, AG) fills only the State type there.\n(3) The agent prefixes /hub/term/a/ and /hub/mail/a/ branch in gate 1 to agent::authenticate(ctx, req, scope) BEFORE the master/cookie check. The stub refuses everything with 401 (fail closed). A master bearer or cookie never authenticates there. Every other path keeps today's gate.\n(4) The accept loop keeps the peer SocketAddr (serve.rs:107) and inserts it as a request extension, Peer.\n(5) Ctx gains:\n- opts: Arc<Options>\n- stop: CancellationToken, for perch-owned streams and waits\n- runs, mesh, meta, install, term, notes, mail, allow, agent: Arc<<mod>::State> (Default stubs)\n(6) Hooks:\n- lib.rs run(), after the bind: agent::start(&ctx)?, runs::adopt(&ctx), mail::start(&ctx).\n- serve::run cancel arm, in this order: ctx.stop.cancel(); term::shutdown(&ctx).await; runs::on_shutdown(&ctx).await; registry.stop_all(); the drain.\n- lib.rs, after the drain: agent::on_exit(&ctx) (removes token and url files), beside the token-file removal.\n(7) watch::open gains `sink: Arc<dyn watch::Sink>`.\n- Sink::hello(key, &hello) and Sink::frame(key, &frame) take a DoorKey {pid, port}, because watch::open runs before registry.insert (serve.rs:704-718). The chat id is bound later through sessions::id_of_pid.\n- The default methods are no-ops.\n- The one caller (serve.rs:775) passes ctx.allow.clone(). Nothing else in watch.rs changes.\n(8) sessions.rs: id_of_pid(pid) -> Option<String> and door_pids() -> Vec<(String, u32)>, both read-only and live doors only.\n(9) main.rs and Options gain:\n- --plugins-dir, --run-graphs (default wiki-hop), --jev-health, --browser-health\n- --aoide (explicit path; default ~/.local/bin/aoide if executable; never a PATH lookup), --aoide-home, --aoide-daemon-socket, --aoide-events\n- --minerva, --term-token-file, --mail-token-file, --agent-url-file\n- a hidden repeatable --knob k=v, so later slices add test knobs without touching main.rs\n(10) --knob doors=off refuses every door start (new chat, resume, continue, fork, mode or model switch) with 403 'chats are off on this perch'. It is for X2's demo perch.\n(11) Stub modules src/{runs,aoide,mesh,meta,install,agent,term,notes,mail,allow,guard}/{mod.rs,README.md}, with lines in src/README.md.\n- guard::refuses_term_text(&str) -> Option<&'static str> returns None.\n- guard::status() -> GuardStatus {on:false, file:None, why:'not built yet'}.\nRust hand-formatted at about 140 columns; never rustfmt.",
+ "owns_files": [
+  "perch/src/serve.rs",
+  "perch/src/lib.rs",
+  "perch/src/main.rs",
+  "perch/src/watch.rs (open() signature + Sink trait + DoorKey only)",
+  "perch/src/sessions.rs (id_of_pid, door_pids only)",
+  "perch/src/README.md",
+  "perch/src/runs/{mod.rs,proc.rs,state.rs,health.rs,log.rs,graphs.rs,README.md}",
+  "perch/src/aoide/{mod.rs,README.md}",
+  "perch/src/mesh/{mod.rs,README.md}",
+  "perch/src/meta/{mod.rs,README.md}",
+  "perch/src/install/{mod.rs,README.md}",
+  "perch/src/agent/{mod.rs,token.rs,attrib.rs,README.md}",
+  "perch/src/term/{mod.rs,pty.rs,screen.rs,routes.rs,stream.rs,snap.rs,agent.rs,README.md}",
+  "perch/src/notes/{mod.rs,README.md}",
+  "perch/src/mail/{mod.rs,send.rs,recv.rs,agent.rs,README.md}",
+  "perch/src/allow/{mod.rs,matcher.rs,store.rs,README.md}",
+  "perch/src/guard/{mod.rs,README.md}"
+ ],
+ "depends_on": [],
+ "tests": "- The existing suite (tests/http.rs, tests/manual_policy.rs) passes unchanged, including the /hub/mesh and /hub/events 404 pins.\n- New in-crate unit tests:\n  - agent_scope(path) maps only /hub/term/a/<verb> and /hub/mail/a/<verb>\n  - the arm matcher does not match /hub/terminal, /hub/termx or /hub/notesx\n  - a master bearer on /hub/term/a/list gets 401 from the stub\n  - --knob doors=off gives 403 on POST /hub/sessions and leaves GET /hub/sessions at 200\n  - a recording Sink receives the door's DoorKey on hello\n- Reverting the arm order fails the prefix test.\n- cargo clippy -D warnings is clean.\n- CARGO_TARGET_DIR=/tmp/minerva-slices-target, never ~/perch-target.",
+ "live_check": "Build in WSL. Start `perch --bind 127.0.0.1:48101 --home $T/home` with temp HOME and XDG_* (RUNTIME included). curl with the bearer header file:\n- /hub/sessions 200\n- /hub/runs 404\n- /hub/term 404\n- /hub/term/a/list 401\nSIGTERM: the process exits and the token file is gone.",
+ "size": "M",
+ "risk": "The shutdown order must keep 'close the watcher before SIGTERM' (hub.md §2). The extra Ctx fields must not change the gate order (token 401 before path parsing). The stub signatures fix the later slices' entry points, so get them right once.",
+ "security_review": true
+}

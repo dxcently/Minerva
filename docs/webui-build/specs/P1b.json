@@ -1,0 +1,17 @@
+{
+ "id": "P1b",
+ "title": "Re-vendor eidolon-plugins into Minerva",
+ "what": "After you push P1, or explicitly allow vendoring the local commit, copy that upstream commit over Minerva/eidolon-plugins as a plain snapshot with no hand edits. Update the VENDORED.md row: revision, date, and a note on the snapshot max.",
+ "owns_files": [
+  "eidolon-plugins/**",
+  "VENDORED.md"
+ ],
+ "depends_on": [
+  "P1"
+ ],
+ "tests": "`bash eidolon-plugins/tests/jev/pin.sh --check eidolon-plugins/jev` passes. `diff -r` against the upstream commit (excluding .git) is empty.",
+ "live_check": "None; it is a copy.",
+ "size": "S",
+ "risk": "Vendoring a commit that is not on GitHub breaks the VENDORED.md promise. Wait for the push.",
+ "security_review": false
+}

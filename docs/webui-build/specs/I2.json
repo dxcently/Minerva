@@ -1,0 +1,21 @@
+{
+ "id": "I2",
+ "title": "Installer key hardening (from the R4 security review)",
+ "why": "R4's review found that the installer's own key store (installer/src/keys.rs), which /hub/install drives through `minerva keys`, can be made to trust a key again after it was revoked, and a few smaller gaps. The update keys are the trust root of `minerva update`, so this slice closes them in the installer itself. The findings are in I2-findings.md: arm-2 and arm-5 belong here. process-beside-overrides-flag and process-fake-misstates-real-remove were already closed in R4's merge (d8c5353); skip them.",
+ "what": "installer/src/keys.rs and its callers:\n- Revocation by fingerprint (arm-2):\n  - state.json records revoked fingerprints, not only ids;\n  - add_manual and a signed rotation refuse a key whose fingerprint was revoked, whatever id it comes under;\n  - trusted() filters by fingerprint.\n- add_manual:\n  - refuses an id already present, even with the same bytes;\n  - never rewrites a rotation key's meta;\n  - refuses a fingerprint already present under another id.\n- ensure_dir (the update-keys dir) is made atomically: build a temp dir beside it, write state.json, fsync it and the dir, then rename. A crash never leaves a half-made dir that reads as 'no keys'.\n- `keys list --json`: on a usage or I/O error, print {\"error\":{\"kind\",\"sentence\"}} on stdout and exit non-zero, like the other --json verbs. Never a bare text line.\n- arm-5: under Nix, `hoot keys allow-web` (the Nix wrapper nix/minerva.sh or the hoot script, whichever owns the verb) says plainly that keys are managed through nix, matching the perch's 404 kind nix sentence, and arms nothing.\n- Fix the PRE-EXISTING installer clippy failures so `cargo clippy --offline --all-targets -- -D warnings` in installer/ is clean: build.rs doc-overindent x3, and warnings in wslparse, install, keys, notice, update, plugins and minerva.rs. Mechanical fixes only; no behaviour change outside the items above.",
+ "owns_files": [
+  "installer/src/keys.rs",
+  "installer/src/*.rs (clippy-only changes, plus the callers of the keys API)",
+  "installer/build.rs (clippy only)",
+  "installer/tests/*",
+  "installer/README.md",
+  "nix/minerva.sh (arm-5 only)",
+  "bin/hoot (arm-5 only, if the verb lives there)"
+ ],
+ "depends_on": ["I1", "R4"],
+ "tests": "- A revoked key's bytes re-added by hand under a fresh id are refused, and so is a rotation carrying them.\n- trusted() never lists a key whose fingerprint is revoked.\n- add_manual refuses an existing id with the same bytes, and a fingerprint under another id.\n- A rotation key's meta is unchanged after any add_manual.\n- ensure_dir: simulate a crash between steps (a leftover temp dir, a missing state.json) and check the next run neither trusts nothing nor everything.\n- keys list --json error shape.\n- The Nix allow-web sentence, with nothing armed.\n- perch/tests/install.rs still passes against fake_minerva. The perch's contract with minerva is unchanged; if it must change, STOP and report.",
+ "live_check": "None against the operator's install. Run every test under a temp HOME with MINERVA_HOME and XDG_CONFIG_HOME in it.",
+ "size": "M",
+ "risk": "This is the trust root of updates. A bug that refuses everything is safe; a bug that trusts a revoked key is not. Fail closed. Never run the real `minerva update`, never touch the real prefix or ~/.config/minerva.",
+ "security_review": true
+}

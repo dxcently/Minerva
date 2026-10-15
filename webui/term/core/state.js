@@ -752,8 +752,8 @@ export class Session {
   verdict(f) {
     const v = this.verdicts.value;
     this.verdicts.value = (v.length >= VERDICT_CAP ? v.slice(1 - VERDICT_CAP) : v).concat(f);
-    const cands = this.open.value.filter((c) => c.name === f.tool && !c.verdict.value);
-    if (cands.length === 1) cands[0].verdict.value = f;
+    const cands = this.open.value.filter((c) => c.name === f.tool);
+    if (cands.length === 1 && !cands[0].verdict.value) cands[0].verdict.value = f;
     else this.addRow({ kind: 'verdict', f });
   }
 

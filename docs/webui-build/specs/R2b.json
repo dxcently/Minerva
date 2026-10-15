@@ -1,0 +1,18 @@
+{
+ "id": "R2b",
+ "title": "Mesh view: /hub/mesh, /hub/mesh/events (network-free)",
+ "what": "GET /hub/mesh:\n- available; aoide {path, version}\n- daemon {socket, ping_ms|null}: --aoide-daemon-socket receives only {\"v\":0,\"op\":\"ping\"}, with a 1 s timeout\n- registry: nodes.json through an allowlist (name, url, verified, autogate, addedAt, grants|allows, via); pubkey, tokenFile and bearerSecret are dropped; both shapes (before and after P-CHARTER) are read\n- cache: node-cache/*.json, at most 64 files of at most 64 KiB each, as text with their age\n- graph: stage/graph.json, at most 2 MiB\n- mesh: `mesh --json`, cached 60 s\n- outbox: `mail outbox --json`, cached 60 s\n- errors: sentences\nGET /hub/mesh/events?after=<offset> tails --aoide-events, keeps only audit and gate classes, returns at most 64 KiB per call, and restarts at 0 when the file shrank.\nExports mesh::nodes(ctx) -> [{name, verified, meshes}] for M2. meshes comes from mesh --json, so a multi-mesh node can be offered a choice.\nNever runs node list, session, send, pair, spawn, allow, node status, node pull, dispatch or anything on the A2A door.\nAudit log: Aoide's own (Aoide's rule).",
+ "owns_files": [
+  "perch/src/mesh/mod.rs",
+  "perch/src/mesh/README.md",
+  "perch/tests/mesh.rs"
+ ],
+ "depends_on": [
+  "R2a"
+ ],
+ "tests": "tests/mesh.rs:\n- the fake log holds only --version, mesh --json and mail outbox --json\n- no pubkey, tokenFile or bearerSecret in any response; reverting the allowlist fails this\n- both registry shapes parse\n- hostile cache text (HTML, script, ANSI) comes back as a JSON string\n- no aoide and no state gives available:false plus a sentence\n- the events tail filters classes and handles truncate-in-place\n- two GETs within 60 s cause one mesh --json\n- a test UnixListener sees one ping and no subscribe or dispatch\n- nodes() lists meshes per node\n- 401 without a token",
+ "live_check": "fake perch on PORT=48108 with the fixture state.",
+ "size": "M",
+ "risk": "schemaVersion stayed \"0\" through P-CHARTER, so shape drift is invisible. X0 checks that `mail outbox --json` touches no state.",
+ "security_review": false
+}

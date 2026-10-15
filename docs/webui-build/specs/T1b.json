@@ -1,0 +1,17 @@
+{
+ "id": "T1b",
+ "title": "Terminal operator routes",
+ "what": "src/term/routes.rs, for the operator (cookie on same-origin, or the master bearer):\n- GET /hub/term -> [{id, title, fg, by, chat?, cwd, cols, rows, alive, exit?, seq, last_ms, agent_last_ms?, hold, ended?}]. agent_last_ms lets the page notice agent activity while its terminal stream is closed.\n- POST /hub/term {chat?, cwd?, cols?, rows?, title?} -> 201 {id}\n  - 409 at the cap; 422 when the cwd is outside every --root (registry.cwd_under_a_root); 404 for an unknown chat\n  - the default cwd is the chat's known_cwd, else HOME\n- POST /hub/term/<t>/input: Content-Type application/octet-stream only (415 otherwise), ≤ 64 KiB (413), 409 when exited, 503 when the writer queue is full\n- POST /hub/term/<t>/resize {cols, rows}; POST /hub/term/<t>/hold {hold}; POST /hub/term/<t>/close -> 202\n- GET /hub/term/<t>/text?lines=N -> {text, cursor, alt_screen} (copy screen text)\nIds match ^t[0-9]{1,6}$, so 'a' and 'events' are never ids.",
+ "owns_files": [
+  "perch/src/term/routes.rs",
+  "perch/tests/term.rs"
+ ],
+ "depends_on": [
+  "T1a"
+ ],
+ "tests": "tests/term.rs, with a real /bin/sh:\n- create, input 'echo hi' + CR, and the text route shows hi\n- resize; hold toggles; close removes `sleep 1000 &`\n- a cwd outside the roots gets 422; text/plain input 415; 65 KiB input 413; the 17th create 409\n- no credential gets 401; a cookie with Sec-Fetch-Site cross-site gets 401 (gate 1 does not count it; the bearer with cross-site gets 403); DELETE gets 405",
+ "live_check": "fake perch on PORT=48113 + curl with the bearer: create, input, text, close.",
+ "size": "M",
+ "risk": "Input is code execution. The gates are the existing ones: cookie with same-origin, SameSite=Strict, no CORS. No new credential path.",
+ "security_review": true
+}
