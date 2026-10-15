@@ -542,6 +542,34 @@ fn a_chat_that_is_not_a_string_is_no_tag_and_one_odd_tag_sets_no_run_aside() {
     assert_eq!(rows_at(&perch, "/hub/runs?chat=ok1").iter().map(|row| row["rid"].as_str().unwrap()).collect::<Vec<_>>(), ["r5"]);
 }
 
+#[test]
+fn a_tag_of_any_json_shape_loads_and_only_a_chat_id_answers() {
+    let site = site();
+    // Eleven shapes as the file holds them (serde_json's Value cannot hold 1e400, so the file is written as text): a number past f64's
+    // range, a string that is not text, a nesting past 128 levels, and the rest. Every run is listed and runs.json stays where it is; only
+    // `ok1` and the escaped `\u0061A` (which is `aA`) answer a chat.
+    let deep = "[".repeat(200) + &"]".repeat(200);
+    let text = r#"{"r1":{"graph":"wiki-hop","state":"done","started_ms":1,"chat":1e400},"r2":{"graph":"wiki-hop","state":"done","started_ms":2,"chat":-1e400},"r3":{"graph":"wiki-hop","state":"done","started_ms":3,"chat":"\ud800"},"r4":{"graph":"wiki-hop","state":"done","started_ms":4,"chat":@DEEP@},"r5":{"graph":"wiki-hop","state":"done","started_ms":5,"chat":"\u0061A"},"r6":{"graph":"wiki-hop","state":"done","started_ms":6,"chat":"ok1"},"r7":{"graph":"wiki-hop","state":"done","started_ms":7,"chat":7},"r8":{"graph":"wiki-hop","state":"done","started_ms":8,"chat":{"x":1}},"r9":{"graph":"wiki-hop","state":"done","started_ms":9,"chat":[1]},"r10":{"graph":"wiki-hop","state":"done","started_ms":10,"chat":true},"r11":{"graph":"wiki-hop","state":"done","started_ms":11,"chat":null}}"#.replace("@DEEP@", &deep);
+    std::fs::write(site.home.join("runs.json"), text).unwrap();
+    let perch = site.quiet(&[]);
+    let listed = rows(&perch);
+    assert_eq!(listed.len(), 11, "every run is listed: {listed:?}");
+    for row in &listed {
+        let rid = row["rid"].as_str().unwrap();
+        let detail = one(&perch, rid);
+        let want = match rid {
+            "r5" => Some("aA"),
+            "r6" => Some("ok1"),
+            _ => None,
+        };
+        assert_eq!((row["chat"].as_str(), detail["chat"].as_str()), (want, want), "{rid}: {row} {detail}");
+    }
+    let set_aside = std::fs::read_dir(&site.home).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("runs.json.bad-"));
+    assert!(!set_aside, "no tag set runs.json aside");
+    assert_eq!(rows_at(&perch, "/hub/runs?chat=aA").iter().map(|row| row["rid"].as_str().unwrap()).collect::<Vec<_>>(), ["r5"]);
+    assert_eq!(rows_at(&perch, "/hub/runs?chat=ok1").iter().map(|row| row["rid"].as_str().unwrap()).collect::<Vec<_>>(), ["r6"]);
+}
+
 /// `GET <path>` as a list, for a path that carries a query.
 fn rows_at(perch: &Perch, path: &str) -> Vec<Value> {
     let answer = perch.get(path);
