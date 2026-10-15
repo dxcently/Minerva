@@ -303,16 +303,28 @@ fn list_marks_the_chats_own_terminals_and_no_others() {
 fn open_takes_the_chats_folder_and_refuses_a_fifth_terminal() {
     let rig = Rig::new();
     let (a, pid, _) = live(&rig.perch);
-    let made = rig.run(&a, pid, &"term/open:{}\n".repeat(5));
+    let titled = rig.one(&a, pid, "term/open:{\"title\":\"w\",\"cols\":100,\"rows\":30}");
+    assert_eq!(titled.code(), 201, "{}", titled.text);
+    let made = rig.run(&a, pid, &"term/open:{}\n".repeat(4));
     let codes: Vec<u16> = made.iter().map(Answered::code).collect();
-    assert_eq!(codes, [201, 201, 201, 201, 409]);
-    assert_eq!(made[4].why(), "this chat has 4 terminals open; close one first");
+    assert_eq!(codes, [201, 201, 201, 409]);
+    assert_eq!(made[3].why(), "this chat has 4 terminals open; close one first");
 
     let work = rig.perch.work.canonicalize().unwrap().display().to_string();
-    for answer in &made[..4] {
-        let row = operator_row(&rig.perch, &answer.id()).unwrap();
+    let mut ids = vec![titled.id()];
+    ids.extend(made[..3].iter().map(Answered::id));
+    for id in &ids {
+        let row = operator_row(&rig.perch, id).unwrap();
         assert_eq!(row["cwd"], work.as_str(), "a shell starts in the folder its chat was given");
     }
+
+    let sized = operator_row(&rig.perch, &titled.id()).unwrap();
+    assert_eq!((sized["cols"].as_u64(), sized["rows"].as_u64()), (Some(100), Some(30)), "the size the chat asked for: {sized}");
+    let plain = operator_row(&rig.perch, &made[0].id()).unwrap();
+    assert_eq!((plain["cols"].as_u64(), plain["rows"].as_u64()), (Some(120), Some(32)), "a plain open is 120 by 32: {plain}");
+    let listing = rig.one(&a, pid, "term/list:{}");
+    assert_eq!(listing.code(), 200, "{}", listing.text);
+    assert_eq!(listed(&listing.body, &titled.id())["title"], "w", "the chat's list names the title it gave");
 }
 
 #[cfg(feature = "test-bins")]
@@ -332,6 +344,10 @@ fn open_then_send_then_read_for_the_text_answers_with_it() {
     assert!(made[1].body["seq"].is_u64(), "a send answers the terminal's seq: {}", made[1].text);
     assert!(made[2].body["text"].as_str().unwrap().contains("ho6"), "the read waited for the output: {}", made[2].text);
     assert_eq!(made[2].body["alive"], true);
+    let cursor = made[2].body.get("cursor");
+    assert!(cursor.is_some_and(|cursor| cursor.is_object() || cursor.is_null()), "the read names its cursor: {}", made[2].text);
+    assert!(made[2].body["alt_screen"].is_boolean(), "the read names whether a full-screen program is up: {}", made[2].text);
+    assert!(made[2].body["seq"].is_u64(), "the read names the terminal's seq: {}", made[2].text);
     assert!(took < Duration::from_secs(15), "the read answered on its text, not at its 20 s timeout: {took:?}");
 }
 

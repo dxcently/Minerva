@@ -467,3 +467,42 @@ async fn close(terms: &Terms, chat: &str, req: Request<Incoming>) -> Response<Bo
         None => problem(StatusCode::NOT_FOUND, NO_TERMINAL),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::key_bytes;
+
+    /// Each named key presses the bytes a shell reads for it (the normal-mode forms `key_bytes` names), and a name that is no key presses
+    /// nothing. The checks are collected, so one run names every name it gets wrong.
+    #[test]
+    fn every_named_key_presses_its_bytes_and_an_unknown_name_presses_none() {
+        let keys: [(&str, &[u8]); 14] = [
+            ("enter", b"\r"),
+            ("tab", b"\t"),
+            ("esc", b"\x1b"),
+            ("backspace", b"\x7f"),
+            ("up", b"\x1b[A"),
+            ("down", b"\x1b[B"),
+            ("right", b"\x1b[C"),
+            ("left", b"\x1b[D"),
+            ("home", b"\x1b[H"),
+            ("end", b"\x1b[F"),
+            ("pgup", b"\x1b[5~"),
+            ("pgdn", b"\x1b[6~"),
+            ("ctrl-a", b"\x01"),
+            ("ctrl-z", b"\x1a"),
+        ];
+        let mut wrong: Vec<String> = Vec::new();
+        for (name, bytes) in keys {
+            if key_bytes(name).as_deref() != Some(bytes) {
+                wrong.push(format!("{name} presses {:?}, not {bytes:?}", key_bytes(name)));
+            }
+        }
+        for name in ["ctrl-A", "ctrl-", "ctrl-1", "nope"] {
+            if key_bytes(name).is_some() {
+                wrong.push(format!("{name} is no key, and presses {:?}", key_bytes(name)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+}

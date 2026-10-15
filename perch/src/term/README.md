@@ -193,6 +193,13 @@ and fill the buffer behind a full queue, with the `^C` at the back of both.
 (control characters as their pictures, `^M` as `␍`) and cut to 80 characters. Whether this chat may drive this terminal at all is the
 route's decision (T2), made before it calls.
 
+## What an agent's terminal tools expose
+
+- **Reads are not limited to the agent's own terminals.** `term/read` of any web terminal, the operator's included, sends that terminal's
+  screen to the model provider, secrets included (ruling 2). Whatever is on the screen can reach the provider.
+- **That text is untrusted.** It can carry prompt injection, and nothing in the perch filters it before the model reads it.
+- **In yolo the door's policy answers yes to `term_send`, and the perch never asks.** The text guard (D9) only judges one send's text.
+
 ## Chats and the cap (D5)
 
 An agent's terminal is for a chat: `OpenSpec` with `owner.by == Agent` and no chat is `OpenError::NoChat`. A chat holds at most
