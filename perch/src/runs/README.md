@@ -50,11 +50,13 @@ A start may name the chat the page had open: `chat`, a chat's id (a letter or di
 most). A chat is known when the perch remembers its folder or lists it, which is the rule the operator's terminal uses. The tag is the
 page's claim: a label, never proof or authority, and nothing is granted because of it. It is checked when a run is started (an unknown
 chat is a 404 and makes nothing, before the holder and the services are asked about) and when `runs.json` is read (a tag that is not a
-string is no tag, and a tag that is not an id is left off the row, so one odd tag never sets the file aside). It never reaches eidolon:
+string is no tag, and a tag that is not an id is left off the row, so a tag of the wrong JSON type never sets the file aside;
+a tag nested past serde_json's depth limit still does, as any malformed file does). It never reaches eidolon:
 not the argv, the run's `config.toml`, `args.json`, the child's environment, a path, a file name or a log line. `?chat=<id>` filters
 before the 50 cap, and a chat that is unknown or was deleted lists `[]`. Pruning at 500 is across all chats, so another chat's runs can
 push out a chat's old ones. A perch from before RT reads a tagged `runs.json`, but its next write drops every tag, because the file is
-written whole.
+written whole. A tag that is not an id stays in the file and is left off every answer, and the next write keeps it;
+a tag that is not a string is dropped by that write.
 
 ## States
 
