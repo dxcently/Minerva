@@ -75,7 +75,7 @@ test('the stubs register themselves: terms last on the right (global), notes on 
   assert.equal(terms.global, true);
   assert.equal(notes.icon, '✎');
   assert.equal(notes.global, false);
-  assert.equal(terms.component().props.children, 'terminals: the ⌨ stack lands with slice T4a');
+  assert.equal(typeof terms.component, 'function');
   assert.equal(typeof notes.component, 'function', 'the notepad (slice N2a, tests/notes.test.mjs) is no one-line stub any more; its rail badge is the signal cards.js holds');
   assert.equal(typeof notes.badge.peek, 'function');
   assert.equal(R.loadedSections.peek().length, 1, 'allow/list.js is the one loaded section');
