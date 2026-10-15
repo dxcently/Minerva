@@ -7,8 +7,9 @@
 //! compiled stand-in and so need `--features test-bins`; the ones that only ask and are refused (the gate, the shapes, the health
 //! answer) run without it, and none of those can reach a spawn: they start a perch whose `--eidolon` is a path that does not exist.
 //!
-//! The health tests serve the services' `/health` themselves, on 48140 (jev) and 48141 (the browser service), and take [`ports`] so two
-//! of them never ask for the same port. No other test file uses those ports.
+//! The health tests serve the services' `/health` themselves, each on a loopback port the OS picks, and hand the perch that port through
+//! `--jev-health` and `--browser-health`, so two suites at once never ask for the same one. A "down" service is a port that was bound
+//! and let go, so nothing listens there. Only the test that never connects keeps literal addresses.
 //!
 //! Mutations that were run by hand, each by itself, and what stopped it (the tests that failed; every other test of the file passed):
 //!
@@ -34,16 +35,12 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::*;
 use serde_json::{json, Value};
 
-const JEV_PORT: u16 = 48140;
-const BROWSER_PORT: u16 = 48141;
-const JEV_HEALTH: &str = "http://127.0.0.1:48140/health";
-const BROWSER_HEALTH: &str = "http://127.0.0.1:48141/health";
 /// The member's `config.toml` the home's is generated from: tables a run must carry over unchanged, and a swarm it must turn off.
 const MEMBER: &str = "thinking_budget = 4000\n\n[policy]\nenabled = true\nyolo = false\n\n[swarm]\nenabled = true\n";
 
@@ -158,39 +155,40 @@ impl Site {
 // The services' /health, stood in for
 // ---------------------------------------------------------------------------
 
-/// Taken for the whole of a test that asks the perch about the two health ports.
-static PORTS: Mutex<()> = Mutex::new(());
-
-fn ports() -> MutexGuard<'static, ()> {
-    PORTS.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 enum Answering {
     With(u16, String),
     /// Takes the connection and never says anything.
     Mute,
 }
 
-/// A service's `/health` on a fixed loopback port for as long as it is alive; dropping it frees the port.
+/// A service's `/health` on a loopback port for as long as it is alive; dropping it frees the port.
 struct Stub {
+    port: u16,
     seen: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Stub {
-    fn answering(port: u16, body: &str) -> Self {
+    /// Answers 200 with `body` on a port the OS picks.
+    fn answering(body: &str) -> Self {
+        Self::serve(0, Answering::With(200, body.to_string()))
+    }
+
+    /// Answers 200 with `body` on `port` again: a service that was down and is back at the address the perch was told.
+    fn answering_on(port: u16, body: &str) -> Self {
         Self::serve(port, Answering::With(200, body.to_string()))
     }
 
-    fn failing(port: u16, status: u16, body: &str) -> Self {
-        Self::serve(port, Answering::With(status, body.to_string()))
+    fn failing(status: u16, body: &str) -> Self {
+        Self::serve(0, Answering::With(status, body.to_string()))
     }
 
-    fn mute(port: u16) -> Self {
-        Self::serve(port, Answering::Mute)
+    fn mute() -> Self {
+        Self::serve(0, Answering::Mute)
     }
 
+    /// Binds `port` (0 is one the OS picks) and serves on it, until dropped.
     fn serve(port: u16, how: Answering) -> Self {
         let deadline = Instant::now() + Duration::from_secs(3);
         let listener = loop {
@@ -203,6 +201,7 @@ impl Stub {
                 Err(e) => panic!("127.0.0.1:{port}: {e}"),
             }
         };
+        let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
         let (seen, stop) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)));
         let thread = {
@@ -241,7 +240,7 @@ impl Stub {
                 }
             })
         };
-        Self { seen, stop, thread: Some(thread) }
+        Self { port, seen, stop, thread: Some(thread) }
     }
 
     /// The request heads it has been sent.
@@ -581,8 +580,21 @@ fn rows_at(perch: &Perch, path: &str) -> Vec<Value> {
 // The health answer and the health gate
 // ---------------------------------------------------------------------------
 
-fn health_flags() -> [&'static str; 4] {
-    ["--jev-health", JEV_HEALTH, "--browser-health", BROWSER_HEALTH]
+/// The `--jev-health` and `--browser-health` flags for these two loopback ports: a stub's, or ports nothing listens on.
+fn health_flags(jev: u16, browser: u16) -> Vec<String> {
+    let (jev, browser) = (format!("http://127.0.0.1:{jev}/health"), format!("http://127.0.0.1:{browser}/health"));
+    vec!["--jev-health".into(), jev, "--browser-health".into(), browser]
+}
+
+/// `flags` as the `&str`s that a perch's arguments take.
+fn refs(flags: &[String]) -> Vec<&str> {
+    flags.iter().map(String::as_str).collect()
+}
+
+/// Two loopback ports nothing listens on: both are bound at once, so they differ, and then let go.
+fn closed_ports() -> (u16, u16) {
+    let (first, second) = (TcpListener::bind(("127.0.0.1", 0)).unwrap(), TcpListener::bind(("127.0.0.1", 0)).unwrap());
+    (first.local_addr().unwrap().port(), second.local_addr().unwrap().port())
 }
 
 fn health(perch: &Perch) -> Value {
@@ -596,11 +608,10 @@ const START: &str = "minerva services start";
 
 #[test]
 fn health_says_what_each_service_says_of_itself_and_nothing_more() {
-    let _ports = ports();
-    let jev = Stub::answering(JEV_PORT, &jev_says("off"));
-    let browser = Stub::answering(BROWSER_PORT, &browser_says());
+    let jev = Stub::answering(&jev_says("off"));
+    let browser = Stub::answering(&browser_says());
     let site = site();
-    let perch = site.quiet(&health_flags());
+    let perch = site.quiet(&refs(&health_flags(jev.port, browser.port)));
     let said = health(&perch);
     // J1's seven fields ride along as jev said them; its own extra one does not, and neither does the browser's pid.
     assert_eq!(
@@ -617,32 +628,31 @@ fn health_says_what_each_service_says_of_itself_and_nothing_more() {
     assert_eq!((jev.heads().len(), browser.heads().len()), (1, 1), "two reads, one probe each: {:?} {:?}", jev.heads(), browser.heads());
     // The probe is a plain GET of the path it was given and carries no credential of the perch's.
     let head = jev.heads()[0].to_ascii_lowercase();
-    assert!(head.starts_with("get /health http/1.1\r\n") && head.contains("host: 127.0.0.1:48140"), "{head:?}");
+    assert!(head.starts_with("get /health http/1.1\r\n") && head.contains(&format!("host: 127.0.0.1:{}", jev.port)), "{head:?}");
     assert!(!head.contains("authorization") && !head.contains("cookie") && !head.contains(&perch.token.trim().to_ascii_lowercase()), "{head:?}");
 }
 
 #[test]
 fn a_decision_log_path_rides_along_and_an_old_jev_just_lacks_the_fields() {
-    let _ports = ports();
     {
-        let (_jev, _browser) = (Stub::answering(JEV_PORT, &jev_says("/var/lib/jev/decisions.ndjson")), Stub::answering(BROWSER_PORT, &browser_says()));
+        let (jev, browser) = (Stub::answering(&jev_says("/var/lib/jev/decisions.ndjson")), Stub::answering(&browser_says()));
         let site = site();
-        let said = health(&site.quiet(&health_flags()));
+        let said = health(&site.quiet(&refs(&health_flags(jev.port, browser.port))));
         assert_eq!(said["jev"]["up"], true, "{said}");
         assert_eq!(said["jev"]["decisions_log"], "/var/lib/jev/decisions.ndjson", "the page shows it; the perch does not judge it: {said}");
     }
     // A jev from before J1 has `status` and nothing else: the page says unknown for the rest, so the keys are absent, not null.
-    let (_jev, _browser) = (Stub::answering(JEV_PORT, "{\"status\":\"ok\"}"), Stub::answering(BROWSER_PORT, &browser_says()));
+    let (jev, browser) = (Stub::answering("{\"status\":\"ok\"}"), Stub::answering(&browser_says()));
     let site = site();
-    let said = health(&site.quiet(&health_flags()));
+    let said = health(&site.quiet(&refs(&health_flags(jev.port, browser.port))));
     assert_eq!(said["jev"], json!({ "configured": true, "up": true, "start": START, "status": "ok" }));
 }
 
 #[test]
 fn a_service_that_is_down_says_why_and_how_to_start_it() {
-    let _ports = ports();
     let site = site();
-    let said = health(&site.quiet(&health_flags()));
+    let (jev, browser) = closed_ports();
+    let said = health(&site.quiet(&refs(&health_flags(jev, browser))));
     for service in ["jev", "browser"] {
         assert_eq!(said[service], json!({ "configured": true, "up": false, "start": START, "why": "connection refused" }), "{service}: {said}");
     }
@@ -650,20 +660,18 @@ fn a_service_that_is_down_says_why_and_how_to_start_it() {
 
 #[test]
 fn what_a_service_answers_that_is_not_a_health_is_down_with_the_reason() {
-    let _ports = ports();
-    let (_jev, _browser) = (Stub::failing(JEV_PORT, 500, "oops"), Stub::answering(BROWSER_PORT, "this is not json"));
+    let (jev, browser) = (Stub::failing(500, "oops"), Stub::answering("this is not json"));
     let site = site();
-    let said = health(&site.quiet(&health_flags()));
+    let said = health(&site.quiet(&refs(&health_flags(jev.port, browser.port))));
     assert_eq!((said["jev"]["up"].as_bool(), said["jev"]["why"].as_str()), (Some(false), Some("answered 500")), "{said}");
     assert_eq!((said["browser"]["up"].as_bool(), said["browser"]["why"].as_str()), (Some(false), Some("the answer is not a JSON object")), "{said}");
 }
 
 #[test]
 fn a_service_that_does_not_answer_is_down_within_about_a_second() {
-    let _ports = ports();
-    let (_jev, _browser) = (Stub::mute(JEV_PORT), Stub::answering(BROWSER_PORT, &browser_says()));
+    let (jev, browser) = (Stub::mute(), Stub::answering(&browser_says()));
     let site = site();
-    let perch = site.quiet(&health_flags());
+    let perch = site.quiet(&refs(&health_flags(jev.port, browser.port)));
     let asked = Instant::now();
     let said = health(&perch);
     assert!(asked.elapsed() < Duration::from_secs(3), "a probe is bounded: {:?}", asked.elapsed());
@@ -698,8 +706,9 @@ fn no_health_flag_is_nothing_to_wait_for() {
 
 #[test]
 fn a_start_against_a_service_that_is_down_is_a_503_that_names_how_to_start_it() {
-    let _ports = ports();
     let site = site();
+    // Both ports are free until a stub takes one: the perch is told these two addresses once, for the whole test.
+    let (jev_port, browser_port) = closed_ports();
     let jev_down = "jev is not running (connection refused); start it with: minerva services start";
     let browser_down = "the browser service is not running (connection refused); start it with: minerva services start";
     let refused = |perch: &Perch| -> String {
@@ -709,13 +718,13 @@ fn a_start_against_a_service_that_is_down_is_a_503_that_names_how_to_start_it() 
         assert_eq!(said["error"], said["why"], "one sentence under both names: {said}");
         said["error"].as_str().unwrap().to_string()
     };
-    let perch = site.quiet(&health_flags());
+    let perch = site.quiet(&refs(&health_flags(jev_port, browser_port)));
     // jev down, the browser up.
-    let browser = Stub::answering(BROWSER_PORT, &browser_says());
+    let browser = Stub::answering_on(browser_port, &browser_says());
     assert_eq!(refused(&perch), jev_down);
     // The other way round.
     drop(browser);
-    let jev = Stub::answering(JEV_PORT, &jev_says("off"));
+    let jev = Stub::answering_on(jev_port, &jev_says("off"));
     assert_eq!(refused(&perch), browser_down);
     // Both: each sentence, joined, so one answer says everything that has to be started.
     drop(jev);
@@ -727,11 +736,10 @@ fn a_start_against_a_service_that_is_down_is_a_503_that_names_how_to_start_it() 
 
 #[test]
 fn a_start_asks_the_services_again_instead_of_trusting_the_last_answer() {
-    let _ports = ports();
-    let jev = Stub::answering(JEV_PORT, &jev_says("off"));
-    let _browser = Stub::answering(BROWSER_PORT, &browser_says());
+    let jev = Stub::answering(&jev_says("off"));
+    let browser = Stub::answering(&browser_says());
     let site = site();
-    let perch = site.quiet(&health_flags());
+    let perch = site.quiet(&refs(&health_flags(jev.port, browser.port)));
     assert_eq!(health(&perch)["jev"]["up"], true, "the page has just seen it up, and that answer is cached for five seconds");
     drop(jev);
     let answer = start(&perch, json!({}));
@@ -1430,12 +1438,12 @@ mod flow {
 
     #[test]
     fn a_decision_log_never_stops_a_run_and_a_resume_waits_for_the_services() {
-        let _ports = ports();
-        let jev = Stub::answering(JEV_PORT, &jev_says("/var/lib/jev/decisions.ndjson"));
-        let _browser = Stub::answering(BROWSER_PORT, &browser_says());
+        let jev = Stub::answering(&jev_says("/var/lib/jev/decisions.ndjson"));
+        let browser = Stub::answering(&browser_says());
         let site = site();
         let _reaper = Reaper(site.home.clone());
-        let perch = site.perch(&health_flags(), &[("FAKE_WORKFLOW_CASE", "b")]);
+        let (jev_port, browser_port) = (jev.port, browser.port);
+        let perch = site.perch(&refs(&health_flags(jev_port, browser_port)), &[("FAKE_WORKFLOW_CASE", "b")]);
         // jev logs its decisions to a file: the graph tab shows that, and the operator decides. The perch starts the run.
         assert_eq!(started(&perch, json!({})), "r1");
         wait_run(&perch, "r1", "parked", Duration::from_secs(15));
@@ -1449,18 +1457,17 @@ mod flow {
         let still = one(&perch, "r1");
         assert_eq!((still["state"].as_str(), still["resumes"].as_u64()), (Some("parked"), Some(0)), "{still}");
         assert!(workflow_lines(&perch, "resume").is_empty(), "no child was started for a refused answer");
-        let _jev = Stub::answering(JEV_PORT, &jev_says("off"));
+        let _jev = Stub::answering_on(jev_port, &jev_says("off"));
         assert_eq!(answer_to(&perch, "r1", "0").status, 202);
         wait_run(&perch, "r1", "done", Duration::from_secs(15));
     }
 
     #[test]
     fn a_jev_from_before_j1_starts_a_run_too() {
-        let _ports = ports();
-        let (_jev, _browser) = (Stub::answering(JEV_PORT, "{\"status\":\"ok\"}"), Stub::answering(BROWSER_PORT, &browser_says()));
+        let (jev, browser) = (Stub::answering("{\"status\":\"ok\"}"), Stub::answering(&browser_says()));
         let site = site();
         let _reaper = Reaper(site.home.clone());
-        let perch = site.perch(&health_flags(), &[("FAKE_WORKFLOW_CASE", "a")]);
+        let perch = site.perch(&refs(&health_flags(jev.port, browser.port)), &[("FAKE_WORKFLOW_CASE", "a")]);
         assert_eq!(started(&perch, json!({})), "r1");
         wait_run(&perch, "r1", "done", Duration::from_secs(15));
     }
