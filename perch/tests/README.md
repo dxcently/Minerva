@@ -54,7 +54,7 @@ no other test file.
 
 | File | Slice | The pin today |
 |---|---|---|
-| `runs.rs` | R1a, RT | built: start, park, answer, cancel, abandon, adopt, the health gate, the chat tag and `?chat=` (RT), against the fake's `workflow` (`FAKE_WORKFLOW_*`) |
+| `runs.rs` | R1a | built: start, park, answer, cancel, abandon, adopt, the health gate, against the fake's `workflow` (`FAKE_WORKFLOW_*`) |
 | `runs_log.rs` | R1b | built: `log?after` while a run steps, one child per unchanged journal, the query refusals, the graphs list and file, names outside `--run-graphs` |
 | `aoide.rs` | R2a | `fake_aoide` refuses every argv with exit 99 |
 | `mesh.rs` | R2b | `/hub/mesh` and `/hub/mesh/events` are a 404 behind the gate (pinned in `http.rs` until this file took them over) |

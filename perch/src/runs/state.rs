@@ -46,6 +46,7 @@ use std::sync::Mutex;
 use anyhow::{Context as _, Result};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -181,10 +182,55 @@ impl Run {
     }
 }
 
-/// A chat that is not a string is no tag. One odd tag in a hand-edited runs.json must not set every run aside: serde refuses the
-/// whole map over one bad field.
+/// A chat that is not a string is no tag, of any JSON type and any depth. One odd tag in a hand-edited runs.json must not set every
+/// run aside: serde refuses the whole map over one bad field. The nested value is skipped with `IgnoredAny`, which is not depth-limited
+/// (a `Value` is, at serde_json's 128 levels).
 fn tag_or_none<'de, D: Deserializer<'de>>(de: D) -> std::result::Result<Option<String>, D::Error> {
-    Ok(Option::<Value>::deserialize(de)?.and_then(|value| value.as_str().map(str::to_owned)))
+    struct Tag;
+
+    impl<'de> Visitor<'de> for Tag {
+        type Value = Option<String>;
+
+        fn expecting(&self, out: &mut std::fmt::Formatter) -> std::fmt::Result {
+            out.write_str("a chat tag")
+        }
+
+        fn visit_str<E>(self, text: &str) -> std::result::Result<Self::Value, E> {
+            Ok(Some(text.to_owned()))
+        }
+
+        fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_i64<E>(self, _: i64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_u64<E>(self, _: u64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+    }
+
+    de.deserialize_any(Tag)
 }
 
 /// `r<digits>`, nine at most: the only shape of a run id, and so the only thing a request can join to a path.
@@ -948,5 +994,21 @@ mod tests {
             assert!(runs[rid].chat.is_none(), "{rid}: a tag that is not a string is no tag");
         }
         assert_eq!(runs["r6"].chat.as_deref(), Some("ok1"));
+    }
+
+    #[test]
+    fn a_chat_nested_past_the_depth_limit_is_no_tag_and_the_file_still_loads() {
+        let home = tempfile::tempdir().unwrap();
+        // Two hundred levels: a Value stops at serde_json's 128, but an ignored key of this depth always loaded.
+        let deep = "[".repeat(200) + &"]".repeat(200);
+        let text = format!(r#"{{"r1":{{"graph":"g","state":"done","started_ms":1,"chat":{deep}}},"r2":{{"graph":"g","state":"done","started_ms":2,"chat":"ok1"}}}}"#);
+        std::fs::write(file(home.path()), text).unwrap();
+        let store = Store::default();
+        store.open(file(home.path()));
+        assert!(file(home.path()).exists(), "runs.json is where it was, not set aside");
+        let runs: BTreeMap<String, Run> = store.all().into_iter().collect();
+        assert_eq!(runs.len(), 2, "a deep tag does not set every run aside");
+        assert!(runs["r1"].chat.is_none(), "a deep tag is no tag");
+        assert_eq!(runs["r2"].chat.as_deref(), Some("ok1"));
     }
 }
