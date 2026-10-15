@@ -101,10 +101,10 @@ function Term({ row, pos, linked, open, now, pane, typing, line, bell }) {
       <span class="tage">${M.ageText(row.started_ms, now)}</span>
       ${typing && html`<span class="ttype">agent typing</span>`}
       ${!row.alive && html`<span class="tend">${row.ended ? 'ended when the perch stopped' : 'exited'}</span>`}
+      ${line && html`<span class="tline" title=${line}>${'› ' + line}</span>`}
       ${row.alive && html`<${K} cls="thold" title=${row.hold ? 'the agent may type here again' : 'the agent may not type here until you hand back'} on=${() => setHold(id, !row.hold)}>${row.hold ? '[ hand back ]' : '[ take over ]'}</${K}>`}
       <${K} cls="tpop" title="pop this terminal out into a pane" on=${() => { if (typeof host.openXPane === 'function') host.openXPane('term', { term: id }); }}>⇱</${K}>
     </div>
-    ${open && line && html`<div class="tline">${'› ' + line}</div>`}
     ${pane ? html`<div class="tpane"><${K} cls="tgo" on=${() => { if (typeof host.focusPane === 'function') host.focusPane(pane.id); }}>→ in a pane</${K}></div>`
       : open ? html`<${Clip} id=${id} />` : null}
   </div>`;

@@ -279,8 +279,9 @@ export function onFrame(f, now = Date.now()) {
     case 'term-title': patchRow(id, { title: str(f.title), fg: str(f.fg) }); return;
     case 'term-hold': patchRow(id, { hold: f.hold === true }); return;
     case 'term-exit': {
-      const exit = f.exit && typeof f.exit === 'object' ? f.exit : {};
-      patchRow(id, { alive: false, fg: '', exit: { code: Number.isInteger(exit.code) ? exit.code : null, signal: Number.isInteger(exit.signal) ? exit.signal : null } });
+      // The perch sends the code and the signal flat, beside the id (its frame table); the roster row keeps them nested under `exit`.
+      const code = Number.isInteger(f.code) ? f.code : null, signal = Number.isInteger(f.signal) ? f.signal : null;
+      patchRow(id, { alive: false, fg: '', exit: { code, signal } });
       return;
     }
     case 'term-closed': removeRow(id); return;

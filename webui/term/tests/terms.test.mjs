@@ -1,7 +1,8 @@
 // The web terminals (terms/): the page's side of the terminal stream and the screens, pure: no DOM, no network. The stream and the input are
-// reached through fetch and sse.stream only where a test does not call them; the screen is injected through the model's hooks, and the
-// activity folder's taps and gate are called directly. The last tests read the sources, for what only a source can hold (no innerHTML, one
-// window.open, no literal colour, one lane poll).
+// reached through fetch, which each test that needs one stubs (and afterEach puts back); the screen is injected through the model's hooks,
+// or built on a stand-in for xterm (fakeXterm) with the page's few globals stubbed (withPage). The activity folder's taps and gate are
+// called directly. The last tests read the sources, for what only a source can hold (no innerHTML, one window.open, no literal colour,
+// one lane poll, the line in every header).
 import { test, mock, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -9,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import * as M from '../terms/model.js';
 import * as V from '../terms/view.js';
 import * as A from '../terms/activity.js';
-import { host } from '../core/registry.js';
+import { host, extraStreams } from '../core/registry.js';
 
 // As LF: a checkout with core.autocrlf has CRLF sources, and the source scans search for single lines.
 const src = (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8').replace(/\r\n/g, '\n');
@@ -18,9 +19,16 @@ const termsSrc = () => readdirSync(fileURLToPath(new URL('../terms/', import.met
 const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
 const bytesOf = (s) => new Uint8Array(Buffer.from(s, 'utf8'));
 const tick = () => new Promise((r) => setTimeout(r, 0));
+const settle = () => new Promise((r) => setImmediate(r));   // not the timers a test may mock: promises settle, the clock does not move
 const row = (over = {}) => ({ id: 't1', title: '', fg: 'bash', by: 'operator', cwd: '/w', cols: 120, rows: 32, alive: true, seq: 0, started_ms: 1000, last_ms: 0, hold: false, ...over });
+const realFetch = globalThis.fetch;
 
-afterEach(() => { mock.restoreAll(); M._reset(); host.toast = undefined; host.focused = undefined; host.showTab = undefined; });
+afterEach(() => {
+  mock.restoreAll();
+  M._reset();
+  host.toast = undefined; host.focused = undefined; host.showTab = undefined; host.chatStreams = undefined;
+  globalThis.fetch = realFetch;
+});
 
 // ---------------------------------------------------------------- the stack's order and its freeze
 test('the stack ranks the inspected chat first, then the most recent output', () => {
@@ -217,7 +225,18 @@ test('onFrame: a size, a title, a hold and an exit change the row and nothing el
   M.onFrame({ type: 'term-exit', id: 't1', code: 0, signal: null });
   const r = M.roster.peek()[0];
   assert.deepEqual([r.cols, r.rows, r.title, r.fg, r.hold, r.alive], [80, 24, 'vim  x', '', true, false]);
+  assert.equal(r.exit.code, 0, 'the exit code the perch sent');
   assert.deepEqual(sizes, [['t1', 80, 24]]);
+});
+
+test('a term-exit carries the perch\'s flat code and signal into the row (a null is no value)', () => {
+  M.onFrame({ type: 'term-list', terms: [row({ id: 't2' }), row({ id: 't3' })] });
+  M.onFrame({ type: 'term-exit', id: 't2', code: 3, signal: null });
+  M.onFrame({ type: 'term-exit', id: 't3', code: null, signal: 9 });
+  const [a, b] = M.roster.peek();
+  assert.deepEqual(a.exit, { code: 3, signal: null });
+  assert.deepEqual(b.exit, { code: null, signal: 9 });
+  assert.equal(a.alive, false);
 });
 
 test('a list replaces the roster: a terminal no longer listed is dropped with its screen, one still listed keeps its entry', () => {
@@ -294,6 +313,270 @@ test('links open only as http or https: any other scheme is refused, and the tex
   assert.equal(V.linkUrl('not a url'), null);
 });
 
+// ---------------------------------------------------------------- the screen, on a stand-in for xterm
+// The page's globals a screen reads (the document, the colours, the reduced-motion query): stood in for, and put back after.
+function withPage(fn, { reduced = false } = {}) {
+  const keys = ['document', 'getComputedStyle', 'matchMedia'];
+  const saved = keys.map((k) => [k, k in globalThis, globalThis[k]]);
+  globalThis.document = { documentElement: {}, body: fakeEl(), createElement: () => fakeEl() };
+  globalThis.getComputedStyle = () => ({ getPropertyValue: () => '' });
+  globalThis.matchMedia = () => ({ matches: reduced });
+  try { return fn(); } finally {
+    for (const [k, had, v] of saved) { if (had) globalThis[k] = v; else delete globalThis[k]; }
+  }
+}
+
+// An element as far as the screens need it: one parent at a time (appending moves it, as the DOM does), and its children.
+function fakeEl() {
+  const el = {
+    parent: null, children: [],
+    appendChild(c) {
+      if (c.parent) c.parent.children = c.parent.children.filter((x) => x !== c);
+      c.parent = el;
+      el.children.push(c);
+      return c;
+    },
+    setAttribute() {},
+  };
+  return el;
+}
+
+// A stand-in for xterm's Terminal: what the screen makes it with (its options), what it registers on the parser, and its bell.
+function fakeXterm() {
+  const made = { options: null, csi: [], dcs: [], osc: [], bell: null };
+  class Terminal {
+    constructor(opts) {
+      made.options = opts;
+      this.element = fakeEl();
+      this.parser = {
+        registerCsiHandler: (id, fn) => made.csi.push({ id, fn }),
+        registerDcsHandler: (id, fn) => made.dcs.push({ id, fn }),
+        registerOscHandler: (n, fn) => made.osc.push({ id: n, fn }),
+      };
+    }
+    loadAddon() {}
+    open(parent) { parent.appendChild(this.element); }
+    onData() {}
+    onBinary() {}
+    onBell(cb) { made.bell = cb; }
+    resize() {}
+    dispose() {}
+  }
+  class FitAddon {}
+  return { x: { Terminal, FitAddon }, made };
+}
+
+// The screen of one terminal, made as the page makes it (view.js create), on the stand-in. The entry is the model's own.
+function screenFor(id) {
+  M.applyList([row({ id })]);
+  const e = M.live.get(id);
+  e.host = fakeEl();
+  const fake = fakeXterm();
+  V.create(e, fake.x);
+  return fake.made;
+}
+
+test('a screen is made with the page\'s link handler, the terminal\'s own font and a blinking cursor; its bell flashes the header', () => {
+  withPage(() => {
+    const made = screenFor('t7');
+    assert.equal(made.options.linkHandler, V.LINKS, 'the link handler is the page\'s, never xterm\'s default');
+    assert.equal(made.options.cursorBlink, true, 'no reduced motion: the cursor blinks');
+    assert.equal(made.options.fontFamily, V.FONT);
+    made.bell();
+    assert.equal(typeof M.bellAt.peek().t7, 'number', 'a bell is the header\'s flash');
+  });
+});
+
+test('under reduced motion the cursor does not blink', () => {
+  withPage(() => {
+    assert.equal(screenFor('t8').options.cursorBlink, false);
+  }, { reduced: true });
+});
+
+test('a terminal\'s one element moves between hosts and is never in two: a mount moves it, an unmount by a former host leaves it, the host gives it back to the shelf', () => {
+  withPage(() => {
+    screenFor('t11');
+    const e = M.live.get('t11');
+    const first = e.host, second = fakeEl();
+    assert.equal(first.children.length, 1, 'made in its first host');
+    V.mountTerm('t11', second);
+    assert.equal(first.children.length, 0, 'moved, not copied');
+    assert.equal(second.children.length, 1);
+    assert.equal(V.mountedIn('t11'), second);
+    V.unmountTerm('t11', first);
+    assert.equal(second.children.length, 1, 'a former host leaves it alone');
+    V.unmountTerm('t11', second);
+    assert.equal(second.children.length, 0);
+    assert.equal(V.mountedIn('t11'), null, 'and it is on the shelf, shown by no host');
+    assert.equal(globalThis.document.body.children.length, 1, 'the shelf is out of sight, in the body');
+  });
+});
+
+test('the queries are swallowed on the screen\'s own parser: 7 CSI forms, DECRQSS, and OSC 4/10/11/12, each taken exactly when its form is the query', () => {
+  withPage(() => {
+    const made = screenFor('t9');
+    const q = (n) => V.QUERIES.find((x) => x.name === n);
+    const csi = (n) => made.csi.find((r) => r.id === q(n).id);
+    assert.equal(made.csi.length, 7);
+    assert.equal(made.dcs.length, 1, 'DECRQSS');
+    assert.deepEqual(made.osc.map((r) => r.id).sort((a, b) => a - b), [4, 10, 11, 12]);
+    assert.equal(csi('DA1').fn([]), true, 'DA1 is taken: xterm writes no reply');
+    assert.equal(csi('DSR').fn([6]), true);
+    assert.equal(csi('DSR').fn([0]), false, 'a CSI 0 n is not a status request: left to xterm');
+    assert.equal(csi('XTVERSION').fn([0]), true, 'XTVERSION is taken, so neither side answers');
+    assert.equal(made.dcs[0].fn(), true, 'DECRQSS is taken');
+    assert.equal(made.osc.find((r) => r.id === 11).fn('11;?'), true, 'an OSC 11 asking is taken');
+    assert.equal(made.osc.find((r) => r.id === 11).fn('11;rgb:00/00/00'), false, 'setting a colour is not');
+  });
+});
+
+test('a link opens only on ctrl or cmd, only as http or https, in a new tab with noopener; any other scheme is refused and said', () => {
+  const opened = [], toasts = [];
+  const had = 'window' in globalThis, savedWindow = globalThis.window;
+  globalThis.window = { open: (...a) => opened.push(a) };
+  host.toast = (text, err) => toasts.push({ text, err });
+  try {
+    V.LINKS.activate({ ctrlKey: false, metaKey: false }, 'https://example.org/');
+    assert.equal(opened.length, 0, 'a plain click opens nothing');
+    V.LINKS.activate({ ctrlKey: true }, 'https://example.org/a');
+    V.LINKS.activate({ metaKey: true }, 'http://example.org/b');
+    assert.deepEqual(opened, [['https://example.org/a', '_blank', 'noopener'], ['http://example.org/b', '_blank', 'noopener']]);
+    V.LINKS.activate({ ctrlKey: true }, 'javascript:alert(1)');
+    V.LINKS.activate({ ctrlKey: true }, 'file:///etc/passwd');
+    assert.equal(opened.length, 2, 'no other scheme reaches window.open');
+    assert.deepEqual(toasts.map((t) => t.err), [true, true], 'each refused link is said');
+    assert.equal(V.LINKS.allowNonHttpProtocols, false);
+    V.LINKS.activate(undefined, 'https://example.org/');
+    assert.equal(opened.length, 2, 'no event, no open, no throw');
+  } finally {
+    if (had) globalThis.window = savedWindow; else delete globalThis.window;
+  }
+});
+
+// ---------------------------------------------------------------- the stream, the roster, the bounds
+test('the terminal stream takes one of the four connection slots: with three chat streams it opens and holds one; with four it says slot', () => {
+  globalThis.fetch = () => new Promise(() => {});   // the connection never answers: it stays open for the test
+  host.chatStreams = () => 3;
+  assert.equal(M.startStream(), true);
+  assert.equal(extraStreams.peek(), 1, 'the terminal stream holds a slot');
+  assert.equal(M.streamUp(), true);
+  M.stopStream();
+  assert.equal(extraStreams.peek(), 0, 'and gives it back');
+  host.chatStreams = () => 4;
+  assert.equal(M.startStream(), false);
+  assert.equal(M.status.peek(), 'slot');
+  assert.equal(extraStreams.peek(), 0, 'no slot, no stream');
+  assert.equal(M.streamUp(), false);
+});
+
+test('the stream closes 10 s after the last view gives back; a view that comes back inside that keeps it open', () => {
+  globalThis.fetch = () => new Promise(() => {});
+  host.chatStreams = () => 0;
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const give1 = M.watch();
+    assert.equal(M.streamUp(), true);
+    give1();
+    mock.timers.tick(M.STOP_AFTER - 1);
+    assert.equal(M.streamUp(), true, 'not before 10 s');
+    const give2 = M.watch();
+    mock.timers.tick(M.STOP_AFTER * 2);
+    assert.equal(M.streamUp(), true, 'a view is showing: the stream stays');
+    give2();
+    mock.timers.tick(M.STOP_AFTER - 1);
+    assert.equal(M.streamUp(), true);
+    mock.timers.tick(1);
+    assert.equal(M.streamUp(), false, 'at 10 s, closed');
+    assert.equal(M.status.peek(), 'closed');
+    assert.equal(extraStreams.peek(), 0, 'and the slot is given back');
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('the roster keeps the perch\'s table of 16: a 17th terminal is not kept and has no entry', () => {
+  M.applyList(Array.from({ length: 17 }, (_, i) => row({ id: 't' + (i + 1) })));
+  assert.equal(M.roster.peek().length, M.MAX_TERMS);
+  assert.equal(M.roster.peek().at(-1).id, 't16');
+  assert.equal(M.live.has('t17'), false);
+});
+
+test('output past 2 MiB unparsed resyncs the terminal once: the seq is forgotten, and no second resync while the reset is on its way', () => {
+  const pending = [];
+  const e = {
+    id: 't5', term: { write: (bytes, cb) => { if (cb) pending.push(cb); } }, fit: null, host: null, pend: null,
+    seq: 9, queue: [], backlog: 0, loading: false, resyncing: false, follow: false,
+  };
+  M.live.set('t5', e);
+  const MB = new Uint8Array(1024 * 1024);
+  V.push(e, MB, false);
+  V.push(e, MB, false);
+  assert.equal(e.seq, 9, 'two MiB is the bound, not past it');
+  V.push(e, new Uint8Array(1), false);
+  assert.equal(e.seq, undefined, 'past it: the next connection asks for a reset');
+  assert.equal(e.resyncing, true);
+  e.seq = 12;
+  V.push(e, MB, false);
+  assert.equal(e.seq, 12, 'not again while the reset is on its way');
+  while (pending.length) pending.shift()();
+  assert.equal(e.backlog, 0, 'the screen has parsed what it was given');
+});
+
+test('an input the perch refuses is said once, is not sent again, and the next key goes out as a new call', async () => {
+  const calls = [], toasts = [];
+  globalThis.fetch = async (url, o) => { calls.push([url, o.method]); return { status: 409, text: async () => '' }; };
+  host.toast = (text, err) => toasts.push({ text, err });
+  M.applyList([row({ id: 't6' })]);
+  M.typed('t6', bytesOf('ls\r'));
+  await settle();
+  await settle();
+  assert.deepEqual(calls, [['/hub/term/t6/input', 'POST']], 'one POST, and it is not retried');
+  assert.deepEqual(toasts, [{ text: 'input not sent: the terminal has ended', err: true }], 'said once');
+  M.typed('t6', bytesOf('y'));
+  await settle();
+  await settle();
+  assert.equal(calls.length, 2, 'a new key goes out as a new call');
+});
+
+test('an input call with no answer is a refusal at INPUT_MS (10 s), not before', async () => {
+  const toasts = [];
+  globalThis.fetch = (url, o) => new Promise((_, reject) => { o.signal.addEventListener('abort', () => reject(new Error('aborted'))); });
+  host.toast = (text, err) => toasts.push({ text, err });
+  M.applyList([row({ id: 't6' })]);
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    M.typed('t6', bytesOf('x'));
+    await settle();
+    mock.timers.tick(M.INPUT_MS - 1);
+    await settle();
+    assert.equal(toasts.length, 0, 'still waiting at 9.999 s');
+    mock.timers.tick(1);
+    await settle();
+    assert.deepEqual(toasts, [{ text: 'input not sent: no answer from the perch', err: true }]);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('the bounds are the spec\'s: the roster poll, the stream\'s close, the input\'s timeout and chunk, the backlog, the table, the lines, the rows', () => {
+  assert.deepEqual({
+    POLL_MS: M.POLL_MS, STOP_AFTER: M.STOP_AFTER, INPUT_MS: M.INPUT_MS, ROW_MS: M.ROW_MS, MAX_CHUNK: M.MAX_CHUNK, BACKLOG_MAX: M.BACKLOG_MAX,
+    MAX_TERMS: M.MAX_TERMS, LINE_MAX: M.LINE_MAX, TITLE_MAX: M.TITLE_MAX, LIVE_ROWS: V.LIVE_ROWS, GAP_MS: A.GAP_MS,
+  }, {
+    POLL_MS: 5000, STOP_AFTER: 10000, INPUT_MS: 10000, ROW_MS: 1000, MAX_CHUNK: 65536, BACKLOG_MAX: 2097152,
+    MAX_TERMS: 16, LINE_MAX: 200, TITLE_MAX: 80, LIVE_ROWS: 8, GAP_MS: 10000,
+  });
+  assert.equal(V.FONT, '"Cascadia Mono", Consolas, monospace');
+});
+
+test('an agent\'s line is cut to LINE_MAX characters and a title to TITLE_MAX, both as text', () => {
+  M.applyList([row({ id: 't1' })]);
+  M.onFrame({ type: 'term-input', id: 't1', by: 'agent', chat: 'c1', text: 'y'.repeat(1000) }, 3000);
+  assert.equal(M.agentLine.peek().t1.length, M.LINE_MAX);
+  assert.equal(V.titleText('z'.repeat(300)).length, M.TITLE_MAX);
+  assert.equal(V.titleText('<b>x'), '<b>x', 'a title is text: markup is shown, never made');
+});
+
 // ---------------------------------------------------------------- the activity folder
 test('the frame tap sees only the agent\'s term_open and term_send, and a term_send names a real terminal id', () => {
   const call = (name, input, type = 'tool-call-started') => ({ type, id: 'c1', name, input });
@@ -357,6 +640,20 @@ test('the badge is not raised while the ⌨ tab shows, and an open raises the ra
   assert.match(toasts[1], /opened t73$/);
 });
 
+test('an agent opening a terminal is one toast: the open with no id yet only raises the badge, and the id\'s open that follows says it once', () => {
+  const toasts = [];
+  host.toast = (text) => toasts.push(text);
+  A.tabShown.value = false;
+  A.badge.value = false;
+  A.report({ kind: 'open', id: null, chat: 'c4' }, 500000);
+  assert.equal(toasts.length, 0, 'no toast for an open with no id');
+  assert.equal(A.badge.peek(), true, 'the rail icon has its dot');
+  A.report({ kind: 'open', id: 't90', chat: 'c4' }, 500100);
+  A.report({ kind: 'open', id: 't90', chat: 'c4' }, 500200);
+  assert.equal(toasts.length, 1, 'one toast for the terminal; a repeat inside 10 s is not said again');
+  assert.match(toasts[0], /^agent in c4 opened t90$/);
+});
+
 test('the roster diff: a new agent terminal is an open, one whose agent input moved is a type; nothing on a first look', () => {
   assert.deepEqual(M.diffRoster(null, [row({ id: 't1', by: 'agent' })]), [], 'a first look is a baseline');
   const prev = [row({ id: 't1' }), row({ id: 't2', by: 'agent', agent_last_ms: 5 })];
@@ -385,6 +682,14 @@ test('a poll that finds an agent terminal raises the badge through report: the d
 });
 
 // ---------------------------------------------------------------- the sources: what only the text can hold
+test('the agent\'s last input line is in every header: the fold does not hide it', () => {
+  const tab = src('../terms/tab.js');
+  const line = tab.match(/\$\{line && html`<span class="tline"[^`]*`\}/);
+  assert.ok(line, 'the header renders the line, when there is one');
+  assert.doesNotMatch(line[0], /open/, 'the fold does not gate it');
+  assert.doesNotMatch(tab, /open && line/, 'no block row under the header that only an open terminal shows');
+});
+
 test('no page source writes HTML from a string, evaluates a string, or sets a colour as a literal', () => {
   for (const [f, s] of termsSrc()) {
     assert.doesNotMatch(s, /innerHTML|insertAdjacentHTML|dangerouslySetInnerHTML|\beval\(|new Function/, f);

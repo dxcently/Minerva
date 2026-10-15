@@ -55,13 +55,16 @@ const switched = new Set(); // terminals whose open already switched the rail to
 const showTerms = () => { if (typeof host.showTab === 'function') host.showTab('r', 'terms'); };
 
 // One event, said: the rail switched (an open by the focused chat, once per terminal), the badge set (unless the tab shows), a toast.
+// An open with no id yet (the tool call's start) raises the badge only: the terminal's id comes with the open the stream or the next poll
+// sees, and that one is said, so one terminal is one toast.
 export function report(ev, now = Date.now()) {
   if (!ev || (ev.kind !== 'open' && ev.kind !== 'type')) return;
   if (ev.kind === 'open' && ev.id && ev.chat && focusedChat() === ev.chat && !switched.has(ev.id)) { switched.add(ev.id); showTerms(); }
-  if (!gate.allow(ev.kind + ' ' + (ev.id || ev.chat || ''), now)) return;
+  if (ev.kind === 'open' && !ev.id) { if (!tabShown.peek()) badge.value = true; return; }
+  if (!gate.allow(ev.kind + ' ' + ev.id, now)) return;
   if (!tabShown.peek()) badge.value = true;
   const who = 'agent in ' + chatName(ev.chat);
-  const text = ev.kind === 'type' ? `${who} is typing in ${ev.id}` : ev.id ? `${who} opened ${ev.id}` : `${who} is opening a terminal`;
+  const text = ev.kind === 'type' ? `${who} is typing in ${ev.id}` : `${who} opened ${ev.id}`;
   if (typeof host.toast === 'function') host.toast(text, false, { label: '[ show ]', on: showTerms });
 }
 

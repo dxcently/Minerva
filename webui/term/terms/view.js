@@ -64,7 +64,7 @@ export function linkUrl(text) {
   try { u = new URL(String(text)); } catch { return null; }
   return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null;
 }
-const LINKS = {
+export const LINKS = {
   allowNonHttpProtocols: false,
   activate(ev, text) {
     if (!ev || !(ev.ctrlKey || ev.metaKey)) return;
@@ -108,7 +108,7 @@ const enc = new TextEncoder();
 const latin1 = (s) => Uint8Array.from(s, (c) => c.charCodeAt(0) & 0xff);
 
 // ---------------------------------------------------------------- one screen
-function create(e, x) {
+export function create(e, x) {
   const row = roster.peek().find((r) => r.id === e.id);
   const t = new x.Terminal({
     cols: row ? row.cols : 120, rows: row ? row.rows : 32, scrollback: 2000,
@@ -148,7 +148,7 @@ function ensure(id) {
 
 // Bytes to a screen. A reset is the RIS sequence written in order, so it lands after what is already waiting to be parsed. Past
 // BACKLOG_MAX unparsed bytes the terminal is resynced (the stream reconnects and sends a reset), once until that reset arrives.
-function push(e, bytes, reset) {
+export function push(e, bytes, reset) {
   if (!e.term) {
     if (reset) e.queue = [];
     e.queue.push({ bytes, reset });

@@ -130,7 +130,7 @@ event is a compile error until someone judges it):
 | `ColorRequest` (OSC 4/10/11/12 `?`) | the default phosphor palette's colour, only as `ESC ]` + digits/`;:/`/lower-case + BEL or ST, at most 64 bytes |
 | `ClipboardLoad`, `ClipboardStore` (OSC 52) | nothing (and `osc52` is `Disabled` in the config as well) |
 | `TextAreaSizeRequest` (`CSI 14 t`, pixels) | nothing |
-| XTVERSION, DECRQSS | nothing, ever (alacritty does not ask; neither is in the list for the page to swallow either) |
+| XTVERSION, DECRQSS | nothing, ever (alacritty does not ask; the page swallows them too, see below) |
 | kitty keyboard query (`CSI ? u`) | nothing (alacritty answers it only with `kitty_keyboard` on, which this config leaves off) |
 | everything else (`Title`, `Bell`, `Wakeup`, `Exit`, ...) | nothing |
 

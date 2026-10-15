@@ -25,7 +25,7 @@
 .ttype { color: var(--orange); }
 .thold { color: var(--cyan); }
 .tpop { color: var(--faint); }
-.tline { padding: 0 var(--cw); color: var(--faint); white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+.tline { flex: 1 1 6ch; min-width: 0; color: var(--faint); white-space: pre; overflow: hidden; text-overflow: ellipsis; }
 .tpane { padding: 0 var(--cw); }
 .tgo { color: var(--cyan); }
 
