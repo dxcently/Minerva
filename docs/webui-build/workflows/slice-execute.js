@@ -10,9 +10,11 @@ export const meta = {
   ],
 }
 
-const A = args
+const A = typeof args === 'string' ? JSON.parse(args) : args // the launcher sometimes hands args over as JSON text
+if (!A || typeof A.slice !== 'string' || !A.spec || !A.prompt) return { stage: 'args', error: 'args missing slice, spec or prompt', got: typeof args }
 const M = A.model || 'haiku'
-const SCR = '<old scratchpad>'
+const RM = A.review_model || M // verifier and security review; the executor and fixer stay on M
+const SCR = '<the orchestrator scratchpad>'
 const SL = SCR + '\\slices'
 
 const RULES = `Hard rules for every agent in this job:
@@ -55,9 +57,9 @@ const where = A.worktree
 // resume_commit: the executor already committed but its report was lost; go straight to the verifier.
 const exec = A.resume_commit ? {
   finished: true, commit: A.resume_commit, worktree_windows: A.worktree, worktree_wsl: A.wsl, branch: A.branch,
-  tests: '(not reported: the executor stopped before its report; run every check yourself and report counts)',
-  report: '(not reported: the executor stopped before its report; read `git log` and the whole diff, and check every item yourself. ' +
-    'If a live check or a security inventory was asked for, say whether it exists.)',
+  tests: A.exec_tests || '(not reported: the executor stopped before its report; run every check yourself and report counts)',
+  report: A.exec_report || ('(not reported: the executor stopped before its report; read `git log` and the whole diff, and check every item yourself. ' +
+    'If a live check or a security inventory was asked for, say whether it exists.)'),
   blockers: '',
 } : await agent(`You are the executor for slice ${A.slice} of the Minerva web UI build.
 
@@ -110,7 +112,7 @@ EXECUTOR'S TESTS:
 ${exec.tests}
 
 Return verdict "pass" only when there is no gap that matters. A gap is something concrete to change, with the evidence and the exact fix.`,
-    { label: `verify:${A.slice}:${round}`, phase: 'Verify', schema: VERDICT, model: M })
+    { label: `verify:${A.slice}:${round}`, phase: 'Verify', schema: VERDICT, model: RM })
   rounds.push({ round, verdict })
   if (!verdict || verdict.verdict === 'pass' || round === 2) break
   log(`${A.slice}: round ${round}: ${verdict.gaps.length} gaps, fixing`)
@@ -141,7 +143,7 @@ let review = null
 if (A.review && verdict && verdict.verdict === 'pass') {
   phase('Review')
   review = await workflow({ scriptPath: A.review.script }, {
-    model: M, slice: A.slice, worktree: W, wsl: WW, branch: exec.branch, commit: head, base: A.base,
+    model: RM, slice: A.slice, worktree: W, wsl: WW, branch: exec.branch, commit: head, base: A.base,
     spec: A.spec, plan: SCR + '\\pass2-final.json', brief: SL + '\\BRIEF.md', inventory: A.inventory,
     scratch: SCR + '\\review-' + A.slice, port: A.port, lenses: A.review.lenses,
   })
