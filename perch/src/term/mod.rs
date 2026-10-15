@@ -75,6 +75,11 @@ const RECORD_MARGIN: Duration = Duration::from_millis(150);
 /// Agent terminals one chat may hold when the caller names no cap (D5). Ended ones that have not been closed count, and are let go
 /// first when the chat wants another.
 pub const AGENT_CHAT_CAP: usize = 4;
+/// Places in the table that only the operator can take (U21d): four, so an agent's terminals, every chat's together, see at most
+/// [`AGENT_SLOTS`] of the [`MAX_TERMS`]. Four chats at four running terminals each cannot lock the operator out.
+const OPERATOR_SLOTS: usize = 4;
+/// The most of the table agents' terminals may hold, every chat's together ([`MAX_TERMS`] less [`OPERATOR_SLOTS`]).
+pub const AGENT_SLOTS: usize = MAX_TERMS - OPERATOR_SLOTS;
 /// The most `terms.json` is read from: a file larger than this is not ours (the perch writes at most [`MAX_TERMS`] records of 64 KiB).
 const MAX_FILE: u64 = 2 * 1024 * 1024;
 /// How far in the future a record's end may be before it is taken for a lie and moved back to now.
@@ -295,10 +300,21 @@ pub enum Missing {
     Ended,
 }
 
+/// Why an agent's close did not end a terminal ([`Terms::close_as_agent`]). T2 maps `NotFound` to 404, `NotYours` to 403 and `Held` to 423.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseError {
+    NotFound,
+    /// Not one the chat opened: the operator's own terminals and another chat's are not an agent's to close.
+    NotYours,
+    /// The operator has it on hold, and closing it is the operator's to do.
+    Held,
+}
+
 /// Why `open` did not. T1b maps `Cap` and `ChatCap` to 409, `Cwd` to 422.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpenError {
-    /// [`MAX_TERMS`] are held already.
+    /// [`MAX_TERMS`] are held already, or an agent's open would take the agents past [`AGENT_SLOTS`] (the operator's places are not
+    /// the agents' to take).
     Cap,
     /// The chat has as many agent terminals open as `chat_cap` allows ([`AGENT_CHAT_CAP`] when the caller names none).
     ChatCap,
@@ -579,8 +595,9 @@ impl Terms {
     /// Open a terminal: a login shell in `spec.cwd` (else `$HOME`) on a new PTY, forked on the spawner thread.
     ///
     /// An agent's terminal (`spec.owner.by` is [`By::Agent`]) is for a chat: with none, `NoChat`. The chat holds at most `chat_cap`
-    /// ([`AGENT_CHAT_CAP`] when `None`) of them, ended ones that were not closed counting; when it is full, or the table is, its own
-    /// oldest ended terminal is closed to make room (and `Change::Closed` says so), else the open is refused.
+    /// ([`AGENT_CHAT_CAP`] when `None`) of them, and every agent together at most [`AGENT_SLOTS`] of the table, ended ones that were not
+    /// closed counting; when one of those is full, or the table is, the chat's own oldest ended terminal is closed to make room (and
+    /// `Change::Closed` says so), else the open is refused. The operator's places are never the agents' to take.
     pub async fn open(&self, spec: OpenSpec) -> Result<String, OpenError> {
         if self.stopping.load(Ordering::Acquire) || self.host.stop.is_cancelled() {
             return Err(OpenError::Stopping);
@@ -648,16 +665,21 @@ impl Terms {
                 ended.sort();
             }
             let total = inner.entries.len() + inner.reserved.len();
+            // Every agent's terminal, of every chat: they hold at most AGENT_SLOTS of the table, and the rest is the operator's.
+            let agents = inner.entries.iter().filter(|e| e.owner().by == By::Agent).count()
+                + inner.reserved.iter().filter(|(_, o)| o.by == By::Agent).count();
             let cap = chat_cap.unwrap_or(AGENT_CHAT_CAP);
-            // What must go for the chat to hold one more, and for the table to: ended terminals of the chat, as many as it takes.
+            // What must go for the chat to hold one more, for the agents to, and for the table to: ended terminals of the chat. One let
+            // go lowers all three counts at once, so the largest of the three is how many must go.
             let by_chat = if chat.is_some() { (held + 1).saturating_sub(cap) } else { 0 };
+            let by_share = if chat.is_some() { (agents + 1).saturating_sub(AGENT_SLOTS) } else { 0 };
             let by_table = (total + 1).saturating_sub(MAX_TERMS);
             if chat.is_some() && running >= cap {
                 return Err(OpenError::ChatCap);
             }
-            let evict = by_chat.max(by_table);
+            let evict = by_chat.max(by_share).max(by_table);
             if evict > ended.len() {
-                return Err(if by_table > ended.len() { OpenError::Cap } else { OpenError::ChatCap });
+                return Err(if by_table > ended.len() || by_share > ended.len() { OpenError::Cap } else { OpenError::ChatCap });
             }
             let mut evicted = Vec::new();
             for (_, gone) in ended.into_iter().take(evict) {
@@ -751,8 +773,35 @@ impl Terms {
         })
     }
 
+    /// Close a terminal as an agent of `chat` (T2): it is gone from the list now, as [`Terms::close`] does it. The owner rule and the
+    /// operator's hold are checked here, under the table's lock, so no route can skip either: a terminal the chat did not open is
+    /// [`CloseError::NotYours`], and one the operator has on hold is [`CloseError::Held`], and it stays.
+    pub fn close_as_agent(&self, chat: &str, id: &str) -> Result<Hangup, CloseError> {
+        let entry = {
+            let mut inner = lock(&self.inner);
+            let at = inner.entries.iter().position(|e| e.id() == id).ok_or(CloseError::NotFound)?;
+            let entry = &inner.entries[at];
+            if !entry.owner().is_agents_of(chat) {
+                return Err(CloseError::NotYours);
+            }
+            if matches!(entry, Entry::Live(term) if term.hold()) {
+                return Err(CloseError::Held);
+            }
+            inner.entries.remove(at)
+        };
+        self.hub.emit(Change::Closed(id.to_string()));
+        Ok(match entry {
+            Entry::Live(term) => self.hang(term, CLOSE_GRACE),
+            Entry::Ended(_) => {
+                self.write_state(None);
+                Hangup(None)
+            }
+        })
+    }
+
     /// Close a terminal: it is gone from the list now, and its whole session is hung up and swept (see `pty`) in the background. The
-    /// returned [`Hangup`] can be waited for. `None` when there is no such terminal.
+    /// returned [`Hangup`] can be waited for. `None` when there is no such terminal. This is the operator's close, unchecked: an
+    /// agent's goes through [`Terms::close_as_agent`].
     pub fn close(&self, id: &str) -> Option<Hangup> {
         let entry = {
             let mut inner = lock(&self.inner);
