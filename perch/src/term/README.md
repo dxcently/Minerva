@@ -211,8 +211,8 @@ tab states; the rest were found in review and are written here so that no reader
 - **A read leaves no record (U21c).** It sends no stream event and no log line, so the operator's ⌨ tab shows the sends and not the
   reads, and nothing shows which terminal an agent read. Whether a read should show (chat, terminal id, lines, no text) is the
   operator's call and a later slice.
-- **`list` is a second route for untrusted text.** Every chat sees every web terminal's id, title and foreground command (`fg`, the
-  program in the foreground). A title is what the program wrote, cut at 80 characters with controls dropped (an OSC from a remote host
+- **`list` is a second route for untrusted text.** Every chat sees every web terminal's id, title, foreground command (`fg`, the
+  program in the foreground), who opened it (`by`) and the owning chat's id (`chat`). A title is what the program wrote, cut at 80 characters with controls dropped (an OSC from a remote host
   or a catted file is text in every agent's `list`). A normal shell title, `user@host:path`, tells the provider the operator's user,
   host and folder on every `list` call.
 - **The master bearer file is readable from an agent's shell.** It is `$XDG_RUNTIME_DIR/minerva/perch-<port>.token` (`lib.rs`), mode
