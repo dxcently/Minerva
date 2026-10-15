@@ -1,0 +1,21 @@
+{
+ "id": "R4",
+ "title": "Perch: install notice and update keys (/hub/install)",
+ "what": "minerva = <canonical dir of the perch exe>/minerva if executable, else --minerva; never a PATH lookup. A perch exe under /nix/store gives {installed:false, managed:'nix'}.\nRoutes:\n- GET /hub/install: from `minerva status --json`; {installed:false, why} without it; never the network, never update\n- GET /hub/install/keys: `keys list --json`\n- POST /hub/install/keys/inspect {pubkey ≤ 4 KiB}: `keys inspect - --json`, key on stdin\n- POST /hub/install/keys/add {pubkey, confirm}\n  - confirm is normalized to 16 hex; the guard per D4 (b2: an unexpired arm for exactly that FP, consumed on use)\n  - runs `keys add - --confirm <FP> --json`\n  - 200 {added}; 409 {why}; 403 {why: 'in a terminal: hoot keys allow-web <FP>, then add within 2 minutes'}\n- POST /hub/install/keys/remove {id, confirm}: only keys whose source is 'added by hand' (ruling 6: the installer contract names `keys remove <id> --confirm <FP>`), under the same guard\n- POST /hub/install/keys/arm {fingerprint}: bearer only (the cookie gets 403); one arm per FP; 120 s; single use\nFixed argv, key bytes on stdin, 5 s timeout, 64 KiB output cap, one key write at a time.\nNever: update, rotation, jev-setup.",
+ "owns_files": [
+  "perch/src/install/mod.rs",
+  "perch/src/install/README.md",
+  "perch/src/bin/fake_minerva.rs",
+  "perch/tests/install.rs"
+ ],
+ "depends_on": [
+  "S0P-a",
+  "S0P-b",
+  "I1"
+ ],
+ "tests": "tests/install.rs with fake_minerva logging argv and stdin:\n- the key is on stdin and never in argv; --confirm is always present\n- a wrong confirm gives 409 and leaves the fake keys dir untouched\n- not installed gives installed:false with no child; the nix path gives managed:'nix'\n- the notice: newer, equal, corrupt cache\n- arm: a cookie gets 403; an arm works once, only for its FP, and not after 120 s (knob shortens it); an add without an arm gets 403\n- remove is refused for compiled-in and rotation keys\n- no route ever runs update or remove-all",
+ "live_check": "fake perch on PORT=48111 with fake_minerva in installed and not-installed modes. This box has no real minerva.",
+ "size": "M",
+ "risk": "This is the trust root of updates. Page-added keys never expire and survive a release-key revocation (keys.rs:337-352). The arm guards only against script in the page's origin. An agent running as your uid can use the keys CLI or read the bearer; G1's keys rows are the only speed bump there.",
+ "security_review": true
+}

@@ -1,0 +1,20 @@
+{
+ "id": "W2b-2",
+ "title": "Graph tab steps: arrival, jev's view, bars, verdict, park, action, end",
+ "what": "graph/steps.js, park.js and context.js. Each step is a frame of 6-8 lines, with the rest folded:\n- heading and url; time per step\n- arrival: 'heading ≠ goal', 'entail 0.12 < 0.80' (the threshold from the run's graph)\n- ProbBars for the top 8, then 'more… (56)'\n- jev's view (context.js), folded by default: the context as jevlike sees it (192 bytes) and each option cut to 32 bytes, with collisions flagged 'tie after the cut: margin 0'\n- verdict: 'top 0.41 ≥ floor 0.35 · margin 0.03 < 0.05 → asked a person' | 'picked by rule (label equals goal)' | 'only one option'\n- park as an inline ask: numbered 0-based options with p; click selects, `[ answer ]`, `[ stop ]`; disabled with eidolon's reason when the run cannot resume or a child runs\n- action: 'clicked \"Nile River\" → Nile — Wikipedia'\nEnd, from the last jev_mark: 'arrived at \"Nile\" in 3 decisions, 1 asked' | 'failed: <reason>' (even when the door said completed) | 'exhausted' | 'stopped'.",
+ "owns_files": [
+  "webui/term/graph/steps.js",
+  "webui/term/graph/park.js",
+  "webui/term/graph/context.js",
+  "webui/term/tests/steps.test.mjs"
+ ],
+ "depends_on": [
+  "W2b-1",
+  "W1"
+ ],
+ "tests": "steps.test.mjs over F0 a-h through W2a:\n- verdict sentences\n- the cut-collision flag\n- case (e) reads failed despite exit 0\n- case (h) shows the re-park and the escalation used\n- disabled-answer reasons",
+ "live_check": "fake perch on PORT=48126:\n- answer a park by click and see done\n- case (c) shows the answer disabled with the errored step named\n- screenshots",
+ "size": "M",
+ "risk": "None beyond inspector width.",
+ "security_review": false
+}

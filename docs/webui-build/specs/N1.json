@@ -1,0 +1,19 @@
+{
+ "id": "N1",
+ "title": "Notes storage and routes (/hub/notes)",
+ "what": "src/notes/: <home>/notes (0700), files 0600 via write_atomic_0600.\nNames and files:\n- a name matches ^[a-z0-9][a-z0-9-]{0,47}$\n- new notes get names::birth_name; rename uses names::slug(title) with -2 on a clash\n- only regular files directly inside: no symlinks (symlink_metadata), no dotfiles\n- the title is the first non-empty line, at most 120 chars, control chars dropped\nCaps: 256 KiB per write (413); at most 2000 listed; UTF-8 with no NUL. The sha256 of the file is the etag.\nRoutes:\n- GET /hub/notes -> [{name, title, size, mtime}]\n- POST /hub/notes {text?, title?} -> 201 {name}\n- GET /hub/notes/<n> -> {name, text, sha, mtime}\n- POST /hub/notes/<n> {text, base} -> 200 {sha, mtime} | 409 {sha} | 413\n- POST /hub/notes/<n>/rename {title}\n- POST /hub/notes/<n>/trash -> 204\n- GET /hub/notes/trash; POST /hub/notes/trash/<n>/restore (409 on a name clash); POST /hub/notes/trash/empty {confirm:true}\n- POST /hub/notes/<n>/send delegates to mail::send_note (a stub until M2)\nTrash: <home>/trash/notes/, by atomic rename. The chat trash only reads *.eid, so the two cannot collide.\nExports notes::create(ctx, title, text) for M2's 'save as note'.",
+ "owns_files": [
+  "perch/src/notes/mod.rs",
+  "perch/src/notes/README.md",
+  "perch/tests/notes.rs"
+ ],
+ "depends_on": [
+  "S0P-a",
+  "S0P-b"
+ ],
+ "tests": "tests/notes.rs:\n- name grammar; a symlink inside is refused; a dotfile is ignored\n- 256 KiB + 1 gets 413; NUL gets 400\n- a stale base gets 409 with the current sha\n- rename clash gets -2; trash and restore; a restore clash gets 409; empty needs confirm and removes only *.md\n- files are 0600 and the dir 0700\n- 401 without a token",
+ "live_check": "fake perch on PORT=48117 + curl.",
+ "size": "M",
+ "risk": "Two tabs editing one note: the sha etag turns that into a visible conflict, never a silent overwrite.",
+ "security_review": false
+}

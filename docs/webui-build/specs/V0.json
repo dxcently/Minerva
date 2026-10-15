@@ -1,0 +1,26 @@
+{
+ "id": "V0",
+ "title": "Vendoring: update.sh --add; dagre + graphlib + xterm + addon-fit",
+ "what": "vendor/update.sh gains `--add <pkg> <ver>`. It trusts the registry's dist.integrity once and appends the pin to VERSIONS, as --bump does for packages that are already pinned (update.sh:62). Pins and takes:\n- @dagrejs/dagre 3.1.1 dist/dagre.esm.js -> vendor/dagre.js ('@dagrejs/graphlib' rewritten to './graphlib.js')\n- @dagrejs/graphlib 4.0.5 ESM -> vendor/graphlib.js\n- @xterm/xterm 6.0.0 lib/xterm.mjs -> vendor/xterm.js and css/xterm.css -> vendor/xterm.css\n- @xterm/addon-fit 0.11.0 lib/addon-fit.mjs -> vendor/addon-fit.js ('@xterm/xterm' rewritten to './xterm.js' if present)\n- LICENSE-dagre, LICENSE-graphlib, LICENSE-xterm, LICENSE-xterm-addon-fit\nFinal checks: no bare import (existing), and a new check for `eval(` or `new Function`, because the CSP has no unsafe-eval.\nNever vendor the webgl, canvas (5.x only), clipboard (OSC 52) or web-links addons.\nAdd vendor/README.md.\nStop and report:\n- if dagre's ESM needs more than graphlib (fallback: a hand-made layered layout)\n- if xterm.mjs fails a check (the terminal plan then needs your call)",
+ "owns_files": [
+  "webui/term/vendor/update.sh",
+  "webui/term/vendor/VERSIONS",
+  "webui/term/vendor/README.md",
+  "webui/term/vendor/dagre.js",
+  "webui/term/vendor/graphlib.js",
+  "webui/term/vendor/xterm.js",
+  "webui/term/vendor/xterm.css",
+  "webui/term/vendor/addon-fit.js",
+  "webui/term/vendor/LICENSE-dagre",
+  "webui/term/vendor/LICENSE-graphlib",
+  "webui/term/vendor/LICENSE-xterm",
+  "webui/term/vendor/LICENSE-xterm-addon-fit",
+  "webui/term/tests/vendor.test.mjs"
+ ],
+ "depends_on": [],
+ "tests": "- `sh vendor/update.sh --check` verifies tarball sha512 against VERSIONS, and a second run is byte-identical.\n- vendor.test.mjs lays out a 3-node graph with vendor/dagre.js under node.\n- A static scan asserts that xterm.js exports Terminal and has no bare import, no eval and no new Function.",
+ "live_check": "fake perch on PORT=48105 (after S0P-b): in the browser pane console, `const {Terminal} = await import('/vendor/xterm.js')` opens a Terminal into a detached div with no CSP violation logged.",
+ "size": "M",
+ "risk": "Needs registry.npmjs.org, which update.sh's design already allows. The bare-import regex may false-positive on strings inside minified code, so inspect once by hand.",
+ "security_review": false
+}

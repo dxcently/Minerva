@@ -1,0 +1,20 @@
+{
+ "id": "T2",
+ "title": "Agent terminal routes (term_* backend)",
+ "what": "src/term/agent.rs, behind AG's gate (term token plus an attributed chat). JSON bodies are at most 16 KiB.\nReach (ruling 2): list, read and send work on ANY terminal opened from the web, whoever opened it. [ take over ] (423 while held) is the operator's per-terminal stop.\n- POST /hub/term/a/list -> [{id, title, fg, by, chat, mine, alive, hold}]\n- POST /hub/term/a/open {title?, cols? (120), rows? (32)} -> {id}\n  - only if D5 = (b)\n  - cwd = the chat's known_cwd\n  - at most 4 open per chat\n- POST /hub/term/a/read {id, lines? (screen rows, ≤ 400), max_chars? (7000), wait? {for? (literal substring ≤ 200 chars), idle_ms? (500), timeout_s ≤ 60}} -> {text, cursor, seq, alive, exit?, alt_screen}\n  - the wait happens in the perch and selects on ctx.stop, so a perch stop never waits it out\n- POST /hub/term/a/send {id, text? (≤ 4 KiB), keys? (≤ 32 of enter, tab, esc, backspace, up, down, left, right, home, end, pgup, pgdn, ctrl-a..ctrl-z)} -> {seq}\n  - 423 while held\n  - 403 with the guard's sentence when guard::refuses_term_text(text) (D9)\n  - sets agent_last_ms and emits term-input\n- POST /hub/term/a/close {id}: only terminals that chat opened (D5 b)\nEnded terminals answer read from terms.json.",
+ "owns_files": [
+  "perch/src/term/agent.rs",
+  "perch/tests/term_agent.rs"
+ ],
+ "depends_on": [
+  "T1b",
+  "T1c",
+  "AG",
+  "G1"
+ ],
+ "tests": "tests/term_agent.rs, using fake_eidolon's FAKE_AGENT_CALL:\n- open, send 'echo hi' + enter, read waiting for 'hi'\n- list shows mine:true for its own and lists every other web terminal\n- another chat's agent terminal and a terminal you opened are both readable and writable (ruling 2)\n- close of a terminal the chat did not open gives 403\n- hold gives 423\n- the term token from the test process gets 403\n- the 5th open gets 409\n- a read timeout is honored\n- perch SIGTERM during a 60 s wait exits in under 3 s\n- a term-input frame appears on the stream, and GET /hub/term shows agent_last_ms\n- text naming aoide is refused when the guard is on",
+ "live_check": "fake perch on PORT=48115: a fake door scripts open/send/read while `curl -N` shows the term-input and term-out frames.",
+ "size": "M",
+ "risk": "- term_read hands untrusted remote text to the model.\n- Agents can read every web terminal, secrets included, and that text goes to the provider.\n- In yolo they type without asking.\nAll three are stated in the ⌨ tab and the docs.",
+ "security_review": true
+}

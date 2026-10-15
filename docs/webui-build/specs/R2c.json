@@ -1,0 +1,30 @@
+{
+ "id": "R2c",
+ "title": "Both Aoide event streams in the mesh tab: the audit log and the daemon feed",
+ "operator_decision": "2026-10-07, the user chose 'Both streams': two flags, the audit log and the daemon feed, each defaulting to aoide's own path; the tail merges them, marked by source; perch-open.sh passes nothing extra; read-only.",
+ "why": "Today the perch has one flag, --aoide-events, with no default, so in production the mesh tab's feed is empty. The runner also hands that same path to every aoide call as AOIDE_AUDIT_LOG, so pointing the flag at aoided's feed would make aoide append audit records INTO the daemon's feed. Two named files with aoide's own defaults fix both.",
+ "what": "Perch:\n- Replace --aoide-events with two flags.\n  - --aoide-audit-log <PATH>: absolute only. The default is the file aoide itself appends to under the runner's environment: <aoide-home>/log, where aoide-home is --aoide-home, else ~/.aoide. Check this against Aoide's own CONTRACTS.md (C:\\Users\\dxcen\\Projects\\Aoide\\CONTRACTS.md, read-only, docs only) and say which section you used. If aoide's precedence differs, follow aoide and say so.\n  - --aoide-daemon-events <PATH>: absolute only. The default is $AOIDE_DAEMON_EVENTS from the perch's own environment when it is absolute, else $XDG_RUNTIME_DIR/aoide/events.jsonl. This mirrors how mesh's default_socket() reads XDG_RUNTIME_DIR.\n  - One resolver function per path. The mesh view and the runner both use it, so they can never disagree.\n- The runner (perch/src/aoide) passes AOIDE_AUDIT_LOG ONLY when --aoide-audit-log was given explicitly. It never passes the daemon feed path to any call.\n- GET /hub/mesh/events?audit=N&daemon=M:\n  - Each cursor is optional and digits only. Any other key, a repeat or a non-digit gets 400.\n  - The answer is {events:[{stream:\"audit\"|\"daemon\", event:{...}}], next:{audit,daemon}, reset:{audit,daemon}, files:{audit, daemon}}.\n  - The event object is passed through unchanged inside `event`. It already has its own `source` field, so never overwrite it.\n  - files shows each path tilde-abbreviated (the existing tilde()), or null when that stream has no usable path.\n  - Read at most 64 KiB per file per call. A file shorter than its cursor is a reset to 0 (the feed is 1 MiB truncate-in-place). A missing file is an empty stream.\n  - Merge order: by ts, then stream (audit first), then file order. Stable.\n- Daemon feed filter: keep the existing CLASSES filter (audit, gate). secret and notification records are never forwarded.\n- Audit log filter:\n  - Find the record shape of aoide's audit log in CONTRACTS.md and the Aoide wiki (docs/Aoide-Wiki), docs only.\n  - Forward only an allowlist of record kinds and fields that carry no secret value or name, no message body or subject, no SAS, pubkey, nonce, commitment or token.\n  - When the shape is unclear, drop the record and say so in the README.\n  - Never parse or forward argv or env captured in a record unless you show it is safe.\n- Files are opened as today: rawfile::open_regular, O_NOFOLLOW | O_NONBLOCK, regular file only, under a cap. A link or a FIFO is not read. Nothing is ever written to either file by the perch.\nPage (webui/term/mesh):\n- view.js reads the new shape and keeps one cursor per stream.\n- Each line shows a small source label: `audit` or `daemon`. The label is plain text, never markup from the record.\n- The empty-state sentence names both files from `files`, or says which stream has no path.\n- Polls stay as W4 made them: lane.js, every 5 s, none while the tab is hidden.",
+ "permissions_granted_by_orchestrator": [
+  "perch/src/main.rs: the two flags, removing --aoide-events, and its parse test",
+  "perch/src/lib.rs: the Options fields only",
+  "perch/src/serve.rs: ONLY the test Options literal that sets aoide_events (about line 1443)"
+ ],
+ "owns_files": [
+  "perch/src/mesh/mod.rs",
+  "perch/src/mesh/README.md",
+  "perch/src/aoide/mod.rs",
+  "perch/src/aoide/README.md",
+  "perch/tests/mesh.rs",
+  "perch/tests/aoide.rs",
+  "webui/term/mesh/view.js",
+  "webui/term/mesh/README.md",
+  "webui/term/tests/mesh.test.mjs",
+  "webui/term/tests/fixtures/aoide/*"
+ ],
+ "depends_on": ["R2a", "R2b", "W4"],
+ "tests": "- perch/tests/mesh.rs:\n  - both streams merged in ts order with the stream labels;\n  - the cursors advance per stream, and truncation resets only that stream;\n  - a missing file is an empty stream;\n  - a link or a FIFO at either path is not read;\n  - secret and notification classes are dropped;\n  - the audit allowlist drops unknown shapes;\n  - 400 for ?after=, ?audit=x, a repeated key and an unknown key;\n  - the defaults resolve from --aoide-home and from AOIDE_DAEMON_EVENTS and XDG_RUNTIME_DIR given to the perch process. Point every one of these at TEMP paths. A test perch must never read the real $XDG_RUNTIME_DIR/aoide or ~/.aoide; if the harness cannot set the perch's env, STOP and report.\n- tests/aoide.rs or the runner unit tests:\n  - AOIDE_AUDIT_LOG is passed only with the explicit flag;\n  - the daemon path is never passed.\n- main.rs parse test: the two flags parse; --aoide-events is gone.\n- Page: node tests for the new shape, the two cursors, the labels and the empty-state sentence. Normalise CRLF before reading a source file.",
+ "live_check": "fake perch on PORT=48131 with temp --aoide-home and both flags pointed at temp files. Append lines to each file and curl /hub/mesh/events with cursors. Then --stop. List the browser-pane steps for the orchestrator: the mesh tab shows both labels and polls every 5 s.",
+ "size": "S",
+ "risk": "Read-only tails of two files another program writes. The privacy risk is forwarding a secret, a message or key material from the audit log: the allowlist must fail closed. The default daemon path is the operator's real runtime dir in production, which is intended, but it must never be read by a test.",
+ "security_review": false
+}

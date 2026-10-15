@@ -6211,3 +6211,10 @@ kept as shortcuts; bare `hoot` opens Minerva without starting llama; opening a
 chat switches the pane and splitting is explicit; the perch titles chats from
 eidolon's own outputs (reverses D4). This settles the 2026-10-03 pending
 one-time-code ruling.
+
+## 2026-10-15 - The web UI build's rulings live in docs/webui-build
+
+The operator's rulings for the web UI build (D1-D6, D9-D12 and no decision-log gate, settled 2026-10-07) are in
+`docs/webui-build/specs/BRIEF.md`, and the later ones are in `docs/webui-build/TRACK.md`. Quote them as `WB-D<n>`: this file
+and docs/design use D-numbers for other things. Decisions the operator still owes are U1-U21 in `docs/webui-build/README.md`.
+Development moves to another machine after a clean stopping point; everything needed is kept in this repo or the rook mneme vault.

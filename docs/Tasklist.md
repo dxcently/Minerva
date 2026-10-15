@@ -1,5 +1,11 @@
 # Tasklist
 
+## Status - 2026-10-15
+
+The live task state is `docs/webui-build/README.md` (the status of every slice, open decisions U1-U21, flakes, follow-ups, what to do
+first), with the running log in `docs/webui-build/TRACK.md`. Next: GP-a; T2 after U21; T4a's fix round. Everything below in this file
+is history from 2026-09-19.
+
 ## Takeover status — 2026-09-19, Minerva
 
 - **Done:** Minerva product naming with `hoot` retained as launcher/CLI;

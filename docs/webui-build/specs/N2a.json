@@ -1,0 +1,27 @@
+{
+ "id": "N2a",
+ "title": "Notes in the page: ✎ tab, note pane, autosave, :note",
+ "what": "notes/index.js registers:\n- the left tab ✎ 'notes'\n- the 'note' pane kind\n- the command `:note [title]`: a new note, its pane opened at once, from anywhere (the operator's 'quickly make … notes')\nIt imports the stubs notes/{cards,send,handoff,agentmail}.js.\nnotes/tab.js:\n- `[ + new note ]`; notes newest first (title, age)\n- 'received (n)' and 'sent' slots (N2b)\n- folded trash with restore and `[ empty… ]` (confirmed)\nnotes/pane.js:\n- the TUI frame with the note name in the top border; a plain textarea\n- bottom border: `[ send to node ]` (N2b) `[ rename ]` `[ trash ]` and the save state: 'saved · 2s' | 'saving…' | 'conflict: [ reload ] [ keep mine ]'\nnotes/store.js:\n- autosave 800 ms after the last key, on blur, on pane close and on visibilitychange hidden\n- one save in flight; POST with the base sha; 409 means conflict\n- a failed save keeps the text in localStorage (try/catch) and shows 'not saved'\nThe focus state is named 'notepad' (a whereOwner), because app.js:58 already uses 'note'.",
+ "owns_files": [
+  "webui/term/notes/index.js",
+  "webui/term/notes/tab.js",
+  "webui/term/notes/pane.js",
+  "webui/term/notes/store.js",
+  "webui/term/notes/notes.css",
+  "webui/term/notes/README.md",
+  "webui/term/notes/cards.js (stub)",
+  "webui/term/notes/send.js (stub)",
+  "webui/term/notes/handoff.js (stub)",
+  "webui/term/notes/agentmail.js (stub)",
+  "webui/term/tests/notes.test.mjs"
+ ],
+ "depends_on": [
+  "N1",
+  "S0W-b"
+ ],
+ "tests": "notes.test.mjs:\n- the autosave scheduler (debounce, one in flight, the conflict path)\n- title derivation\n- `:note groceries` creates with that title",
+ "live_check": "fake perch on PORT=48134:\n- create, type, see saved\n- `:note x` from a chat pane opens a new note pane\n- two tabs on one note show the conflict UI\n- rename; trash and restore",
+ "size": "M",
+ "risk": "None beyond lost-text paths, which are covered by localStorage.",
+ "security_review": false
+}

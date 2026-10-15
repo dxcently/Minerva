@@ -1,0 +1,21 @@
+{
+ "id": "P1",
+ "title": "wiki-hop: cap the link snapshot (upstream eidolon-plugins, local commit only)",
+ "what": "Held until D1 (value and OK to commit locally).\n- In ~/Projects/eidolon-plugins (the upstream checkout, not the vendored copy), add \"max\": <D1, default 100> to the reading-state browser_snapshot input in jev/graphs/wiki-hop.json.\n- Run tests/jev/pin.sh so the PIN in jev/workflows/wiki-hop.rn matches.\n- Add a long fake article to tests/jev/fake-browser/site/ (over 8,000 chars and more links than max) and make the fake snapshot honor max.\n- Add tests/jev/wiki-hop-long.sh.\n- guard.sh must also require a temp XDG_RUNTIME_DIR and swarm off.\n- tests/jev/stub_service.py /health (line 81) gains \"decisions_log\": \"off\". The stub writes no decisions, and Minerva's run gate (R1a) reads this field.\n- Commit locally under your identity with no co-author. Do NOT push. Say in the message that any max also skips eidolon's spill (dispatch.rs:843-879).",
+ "owns_files": [
+  "~/Projects/eidolon-plugins/jev/graphs/wiki-hop.json",
+  "~/Projects/eidolon-plugins/jev/workflows/wiki-hop.rn",
+  "~/Projects/eidolon-plugins/tests/jev/fake-browser/site/<Long_article>.txt",
+  "~/Projects/eidolon-plugins/tests/jev/fake-browser/fb.sh",
+  "~/Projects/eidolon-plugins/tests/jev/fake-browser/tools/snapshot.rn",
+  "~/Projects/eidolon-plugins/tests/jev/wiki-hop-long.sh",
+  "~/Projects/eidolon-plugins/tests/jev/guard.sh",
+  "~/Projects/eidolon-plugins/tests/jev/stub_service.py"
+ ],
+ "depends_on": [],
+ "tests": "wiki-hop-long.sh runs under a temp HOME and XDG_* (RUNTIME included):\n- final_state is not failed, and there is no 'truncated in transport'.\n- Reverting the one graph line makes it fail with that text.\n- pin.sh --check passes.\n- tests/jev/wiki-hop.sh still ends with final_state arrived.\n- curl of the stub's /health shows decisions_log off.",
+ "live_check": "Run both scripts and show their final_state lines. Real Wikipedia is X1's job.",
+ "size": "S",
+ "risk": "The stub service binds 8091, which is hard-coded in the plugin. Check it is free, or rewrite the port in the temp copy. If the fake browser does not honor max, the test proves only the spill bypass.",
+ "security_review": false
+}

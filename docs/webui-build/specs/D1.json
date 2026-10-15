@@ -1,0 +1,34 @@
+{
+ "id": "D1",
+ "title": "Docs: the design docs match what was built",
+ "what": "web-ui.md:\n- §8 graph row (both graphs in one tab; the decision-log gate)\n- §9 mesh v1 (no probing) plus notes and mail cards (amends P5: a card is text, never auto-fed)\n- §11 terminals (supersedes 'Not planned' at :480), including agent activity with ⌨ closed\n- §7.1 ask focus (a focused terminal is never stolen from)\n- allow-for-chat (supersedes :354, :520), with its three narrowings\n- the gap-7 run-tab sentence; Q6 resolved\n- the request lane and the connection budget\nhub.md:\n- graph runs (routes, per-run config, poll, cap counts parked, the decision-log gate, D3)\n- mesh corrected\n- 'Never: send' amended (operator mail send, hand-off, opt-in mail_send with --from=minerva-agent; never conduct)\n- a terminals section (routes, frames, lifecycle, limits, reply allow-list, token and attribution, security table)\n- notes, mail, allow and install routes; the key guard\n- guard rows: where the file lives and why (the shared permits store), the fallback; auto is no longer 'stock unchanged'\n- 10.4: agent tokens are 0600 files, never env or argv\nAlso:\n- perch/README.md route table\n- the lib.rs route list doc comment\n- webui/term/README.md: layout (graph/, mesh/, install/, terms/, notes/, allow/, tests/, vendor/); the connection budget and the lane; the Terminal section at :185-196; vendoring; the registries",
+ "owns_files": [
+  "docs/design/web-ui.md",
+  "docs/design/hub.md",
+  "perch/README.md",
+  "perch/src/lib.rs (doc comment only)",
+  "webui/term/README.md"
+ ],
+ "depends_on": [
+  "R1b",
+  "R2b",
+  "R3",
+  "R4",
+  "W2b-2",
+  "W3",
+  "W4",
+  "W5",
+  "W6",
+  "W7",
+  "T4b",
+  "N2b",
+  "M3",
+  "A2",
+  "G1"
+ ],
+ "tests": "`grep -rn 'not available yet' webui/term` returns only the generic Soon helper. `grep -n 'Not planned' docs/design/web-ui.md` no longer names terminals.",
+ "live_check": "None.",
+ "size": "M",
+ "risk": "None.",
+ "security_review": false
+}

@@ -1,0 +1,14 @@
+{
+ "id": "X3",
+ "title": "Live feature walk for you: terminals, agent feed, notepad, mail cards, allow, keys (isolated perches 48030/48031)",
+ "what": "Runs demo_plan part B:\n- isolated perches under env -i with temp HOME and temp Aoide roots, a mock-only door and the probe tool\n- the ssh probe is X0's closed-port line. Optionally, if /usr/sbin/sshd exists, a throwaway sshd on 127.0.0.1:48039 with a temp host key, `AuthorizedKeysFile none` and the same client flags, so you see a real handshake end in 'Permission denied'.\n- you type in the terminals and drive the page\n- a two-node mail attempt between two temp Aoide roots on loopback, time-boxed to 15 min, with a precise report if pairing two local roots is not possible\n- teardown on your word",
+ "owns_files": [],
+ "depends_on": [
+  "X0"
+ ],
+ "tests": "None; it is a demo.",
+ "live_check": "Screenshots of each step. After teardown:\n- ports 48030, 48031, 48039, 48710 and 48711 are free\n- the 47820 perch pid is unchanged\n- ~/.aoide mtimes are unchanged (unless D12 = a for the mesh view)\n- the ~/.config/eidolon and ~/Minerva manifests are identical",
+ "size": "M",
+ "risk": "Pairing two local roots may need steps aoide does not offer on loopback. The mail step then proves self delivery only.",
+ "security_review": false
+}

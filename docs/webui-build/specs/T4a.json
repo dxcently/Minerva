@@ -1,0 +1,25 @@
+{
+ "id": "T4a",
+ "title": "Terminals in the page: model, xterm view, the ⌨ stack, agent activity with ⌨ closed",
+ "what": "terms/model.js:\n- roster signal: metadata only, last_ms updated at most once a second per terminal\n- live Map id -> {term, fit, host, pend, inflight}\n- the stream opens while ⌨ is visible or a terminal pane exists, sets extraStreams per D11, and closes 10 s after the last view\n- input: one POST in flight per terminal, the rest joined; never retried (a refusal toasts); pastes over 64 KiB in sequential chunks; input never enters the poll lane\n- backpressure: over ~2 MB pending in term.write, drop and reconnect for a reset\nterms/view.js:\n- lazy `await import('../vendor/xterm.js')` and fit, after document.fonts.load\n- ONE Terminal per terminal, moved between hosts (host.appendChild(term.element)), never duplicated\n- theme from --base0X (no hex), re-applied on theme change; the D11 font; no cursor blink under reduced motion\n- queries swallowed with parser.registerCsiHandler, registerDcsHandler and registerOscHandler for DA, DSR/CPR, DECRQM, DECRQSS, XTVERSION and OSC 4/10/11/12 (the perch answers, T1a)\n- linkHandler: http(s) only, on ctrl+click, noopener; no clipboard addon; titles as text ≤ 80 chars; onBell flashes the header\nterms/tab.js, the ⌨ tab:\n- a top line when the inspected chat is in yolo: 'yolo: agents type into these terminals without asking. [ take over ] stops them.'\n- `[ new terminal ]` at the inspected chat's cwd, else home (right-click: in folder…)\n- groups: 'this chat', then 'others'\n- order rank [linked to inspected chat ? 0 : 1, -last_ms], applied with CSS order (no DOM moves), frozen while hovered or focused, recomputed at most every 2 s\n- each item:\n  - header: ● alive / ○ exited / 'ended when the perch stopped', age, 'agent typing' for 2 s after a term-input, the agent's last input line, `[ take over ]` / `[ hand back ]` (hold), ⇱\n  - a clipped live view: 1:1 cells, last 8 rows, follows the cursor, never resizes the PTY\n- fold kept in localStorage minerva.termfold; by default the focused chat's terminals and the 2 newest are open\n- a popped-out item shows '→ in a pane' (click focuses that pane)\n- a capture-phase wheel listener scrolls the stack\n- door mode: 'terminals need Minerva's server'\n- with no free stream slot: 'terminals need a stream slot: close or stop one chat'\nterms/activity.js, agent activity when ⌨ is not showing (the operator's 'live feed … in the sidebar'):\n- a frameTaps entry (S0W-b) sees tool-call-started for term_open/term_send on every open chat stream\n- while the terminal stream is closed, GET /hub/term (roster only) every 5 s through the lane catches chats with no open pane, via agent_last_ms and new agent terminals\n- either raises a ⌨ rail badge and a toast ('agent in <chat> opened t4' / 'is typing in t4', at most one per terminal per 10 s) with [ show ]\n- per D11 item 5, a term_open from the focused chat switches the right rail to ⌨ once per terminal; keyboard focus never moves",
+ "owns_files": [
+  "webui/term/terms/index.js",
+  "webui/term/terms/model.js",
+  "webui/term/terms/view.js",
+  "webui/term/terms/tab.js",
+  "webui/term/terms/activity.js",
+  "webui/term/terms/terms.css",
+  "webui/term/terms/README.md",
+  "webui/term/tests/terms.test.mjs"
+ ],
+ "depends_on": [
+  "T1c",
+  "S0W-b",
+  "V0"
+ ],
+ "tests": "terms.test.mjs (pure):\n- order() with the freeze\n- fold defaults\n- the input coalescer (order kept, joining, one in flight)\n- base64 frame decode across split UTF-8\n- the xtermTheme mapping\n- the list of swallowed queries\n- the activity tap filter (only tool-call-started of term_open/term_send) and its 10 s rate limit\n- the roster diff that raises the badge",
+ "live_check": "fake perch on PORT=48132, real /bin/sh terminals:\n- open from ⌨ and type ls\n- with 3 open, the newest output rises without stealing focus\n- take over / hand back\n- after a reload, vim's arrow keys still work (snap restores DECCKM)\n- a DSR query gets exactly one reply\n- typing latency stays under ~100 ms while the graph tab polls a stepping fake run (700 ms steps) and the tools list loads for the first time (measure keydown → term-out echo in the console)\n- with ⌨ closed, a fake-door term_open raises the badge and the toast, and the rail switches for the focused chat only\n- console clean",
+ "size": "M",
+ "risk": "- Rendering cost of up to 16 live DOM-renderer views is unmeasured; folded views are display:none.\n- Two emulators: a missing query handler gives doubled replies.",
+ "security_review": true
+}
