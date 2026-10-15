@@ -3730,3 +3730,15 @@ What ran, all on the BotForge practice VM, GLM 5.3 as the scored brain, jev
   (`logs/agents/ux-slices.review.md`) found a reload sign-out bug, cookie-minted
   codes, a CSRF gap, the config replacing the member's config, and shared
   scratch; all fixed. Open: N5 logout, N7 localhost, N11 old-chat fold, N12.
+
+## 2026-10-15 - Web UI build: 35 slices merged; development moves to another machine
+
+- The 49-slice web UI build (plan: `docs/webui-build/plan/pass2-final.json`) ran from 2026-10-07 to 2026-10-15 as worktree slices:
+  an executor builds, an independent verifier checks, up to two fix rounds, a security review for flagged slices, and the orchestrator
+  squash-merges. Its record is `docs/webui-build/`: specs, the running log `TRACK.md`, reviews and the workflow scripts.
+- 35 slices are on master, the last three being T1c `08c01fa` (the terminal stream), W3 `5aa2a19` (the chat's turn graph) and RT
+  `4bcfa09` (a run keeps the chat it was started beside). Master at 4bcfa09: perch 919 pass, 0 fail, 1 ignored; clippy clean both
+  ways; page suite 396/396 at 5aa2a19.
+- Not merged at the move: T2 and T4a (fix rounds written: `docs/webui-build/specs/T2-fix4.md`, `T4a-fix2.md`), and M2, R2c, A1b,
+  I2 and SA3, held on the operator. Status and the open decisions U1-U21: `docs/webui-build/README.md`.
+- Setting up a fresh machine and the standing rules: the 2026-10-15 section at the top of `HANDOFF.md`.

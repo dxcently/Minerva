@@ -1,0 +1,20 @@
+{
+ "id": "W7",
+ "title": "Start screen: install notice, update keys overlay, plugins and jev status",
+ "what": "panes/home.js install block, from GET /hub/install:\n- notice: 'Minerva 0.2.0 available — run: hoot update'\n- 'no installed Minerva here (development server)' / 'managed by Nix: update through nix'\n- plugins: 'installed by Minerva: browser 0.x (stock) …', with the tail 'trust and service state are not recorded here'\n- jev: 'not set up' | 'set up, not running' | 'running (pid N)', plus 'the openjev weights are not tracked'\n`[ update keys ]` opens install/keys.js in the overlay:\n- a list (id, fingerprint, source, expires)\n- paste a .pub, then `[ inspect ]`: the fingerprint large in 4 groups of 4, with id and comment (comment as untrusted text)\n- type the fingerprint back\n- the step-up line per D4: 'in a terminal: hoot keys allow-web 0F7A 3A5C 447E C7EF (valid 2 minutes)'\n- `[ add key ]` and the result sentence\n- 'compare with the maintainer's published fingerprint, not only this page'\n- 'agents run as you: an agent can add a key through the CLI without this page; Minerva's guard rows only slow that down'\n- `[ remove ]` on keys added by hand only (ruling 6), under the same step-up\nNever update.",
+ "owns_files": [
+  "webui/term/panes/home.js",
+  "webui/term/install/keys.js",
+  "webui/term/install/README.md",
+  "webui/term/tests/keys.test.mjs"
+ ],
+ "depends_on": [
+  "R4",
+  "S0W-a"
+ ],
+ "tests": "keys.test.mjs:\n- fingerprint normalization (spaces and case ignored) and the comparison helper\n- a wrong fingerprint never enables `[ add key ]`\n- remove is shown only for 'added by hand'",
+ "live_check": "fake perch on PORT=48131 with fake_minerva in installed mode (the full add with an arm made by curl as the bearer) and not-installed mode.",
+ "size": "M",
+ "risk": "If a script in the page's origin rewrites the fingerprint shown, every guard confirms the attacker's key. The page says to compare out of band.",
+ "security_review": false
+}

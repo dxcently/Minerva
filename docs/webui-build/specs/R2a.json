@@ -1,0 +1,21 @@
+{
+ "id": "R2a",
+ "title": "Aoide runner + fake_aoide (shared by mesh and mail)",
+ "what": "src/aoide/mod.rs: Aoide {bin (from --aoide; never a PATH lookup), root, audit_log, daemon_socket, runtime_dir}.\nrun(shape) takes an enum of fixed argv shapes only:\n- Version\n- MeshJson\n- MailOutboxJson\n- MailRead {reread}: `mail read --for minerva --json [--reread]` with AOIDE_SESSION_ID=minerva-perch set on that call only\n- MailSend {to: Node(name)|SelfNode, from: Minerva|MinervaAgent, mesh: Option, subject, hold, text}:\n  - argv: `mail send --json --to=<node>/minerva --from=<minerva|minerva-agent> [--mesh=<m>] --subject=<s> [--hold] -- <text>`\n  - from is a fixed enum, never free text\n  - hold with SelfNode is refused before any spawn, because aoide requires <node>/<name> for --hold\nArgv rules: always the --flag=value form (door.rs:165-176), `--` before the text; node, mesh and mailbox match ^[a-z0-9][a-z0-9-]*$; the subject is one line of at most 120 chars.\nLimits: 10 s timeout that kills the child (mail reads take a blocking flock on .stage.lock); 1 MiB stdout cap; one log line per call naming the verb and exit code, never the text.\nOn failure, aoide's own sentence is returned so callers can surface it (e.g. 'trusted in more than one mesh').\nfake_aoide:\n- logs argv and AOIDE_SESSION_ID as JSON lines to FAKE_AOIDE_LOG\n- accepts only those shapes; mail read exits 99 unless the reader is minerva-perch; anything else exits 99\n- replays scripted outputs from a fixture dir: mesh, outbox, mail entries incl. letters (from minerva and minerva-agent), receipts, a broken AOIDE-LETTER, unknown-node, unpaired-node and a multi-mesh refusal",
+ "owns_files": [
+  "perch/src/aoide/mod.rs",
+  "perch/src/aoide/README.md",
+  "perch/src/bin/fake_aoide.rs",
+  "perch/tests/aoide.rs",
+  "perch/tests/fixtures/aoide/**"
+ ],
+ "depends_on": [
+  "S0P-a",
+  "S0P-b"
+ ],
+ "tests": "tests/aoide.rs, through the public perch::aoide API with CARGO_BIN_EXE_fake_aoide:\n- exact argv for every shape, including --from=minerva-agent and --mesh=<m>\n- text starting with --, containing --help, newlines or unicode arrives as the last argv element byte for byte\n- refused before any spawn: a subject with a newline; a mesh name outside the grammar; hold with self\n- a subject equal to a command word passes in the = form\n- the reader env is set only on reads\n- the timeout kills a fake that sleeps\n- the stdout cap holds\n- the multi-mesh refusal sentence is returned verbatim\n- no PATH lookup: a stale `aoide` first on PATH is never run",
+ "live_check": "None (library); X0 runs the real 0.0.26 on a temp root.",
+ "size": "S",
+ "risk": "aoide's --json output shapes are not in `schema --json`; parse defensively.",
+ "security_review": false
+}

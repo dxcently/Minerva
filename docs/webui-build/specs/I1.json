@@ -1,0 +1,23 @@
+{
+ "id": "I1",
+ "title": "Installer: status --json, keys --json, the key arm verb (D4), perch-open flags",
+ "what": "installer/src/bin/minerva.rs plus a new installer/src/status.rs:\n- `minerva status --json`, network-free:\n  - version\n  - notice {line, latest, stale, checked} | null, read from <prefix>/state/minerva/update-check only (a parse failure means null)\n  - plugins [{name, version, how}] from plugins.json\n  - jev {set_up, running, pid?} from the marker and pidfile\n- `keys add|remove --json`: {added|removed: id}, or {error: {kind: mismatch|revoked|collision|compiled|unsafe|not-found, sentence}}; exit codes unchanged.\n- D4 = b2: `minerva web --keys-arm <FP>` -> bin/perch-open.sh --keys-arm <FP> [--port P] [--token-file F].\n  - It reads the bearer token into a 0600 header file and POSTs /hub/install/keys/arm {fingerprint}.\n  - --port and --token-file default to your perch's, and exist so tests never read the real token or reach 47820.\n  - bin/hoot.ps1 gets `hoot keys allow-web <FP>`; nix/minerva.sh the same.\n  - D4 = b instead gives --keys-code <FP>, which prints a code.\n- bin/perch-open.sh and nix/minerva.sh pass:\n  - --term-token-file $HOME/.config/eidolon/minerva-term.token\n  - --mail-token-file $HOME/.config/eidolon/minerva-mail.token\n  - --agent-url-file $HOME/.config/eidolon/minerva-perch.url\n  - --aoide $HOME/.local/bin/aoide when it exists\n  - --plugins-dir\n- installer/README.md: the perch contract section (status, --json, arm, the override flags).",
+ "owns_files": [
+  "installer/src/bin/minerva.rs",
+  "installer/src/status.rs",
+  "installer/src/keys.rs (--json error kinds only)",
+  "installer/README.md",
+  "installer/tests/**",
+  "bin/perch-open.sh",
+  "bin/hoot.ps1",
+  "nix/minerva.sh"
+ ],
+ "depends_on": [
+  "S0P-a"
+ ],
+ "tests": "Installer cargo tests:\n- status --json with a fixture prefix: cache present, corrupt and absent; no plugins.json; jev states\n- add/remove --json error kinds, and an unchanged keys dir on mismatch\n- perch-open.sh --keys-arm --port 48110 --token-file <tmp>/t against a stub HTTP server on 127.0.0.1:48110, with HOME set to a temp dir whose default token path holds a DIFFERENT sentinel token. It asserts:\n  - the stub received exactly the override token, and only through -H @<0600 file>\n  - the token never appears in argv\n  - nothing connected to 47820 (a listener there would record it)\nAlso: bash -n on the scripts; a PowerShell parse of hoot.ps1 from the Windows side.",
+ "live_check": "Run perch-open.sh --keys-arm with the overrides against the stub, and print the received request headers (token redacted).",
+ "size": "M",
+ "risk": "perch-open.sh is how your perch starts. A flag the old perch binary does not know would fail its start, so the flags go in only together with the perch release that knows them (same bundle).",
+ "security_review": true
+}

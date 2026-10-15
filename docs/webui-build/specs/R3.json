@@ -1,0 +1,21 @@
+{
+ "id": "R3",
+ "title": "Perch: sources for the loaded and diff tabs (/hub/meta)",
+ "what": "As pass 1:\n- GET /hub/meta/tools: `eidolon [--config C] tools`, parsed as a stream -> [{name, approval, plugin?, first description line}], cached 10 min, never --live\n- GET /hub/meta/plugins: {text}, capped\n- GET /hub/meta/policy?mode=auto|manual|yolo:\n  - {mode, file as a ~ path, rows: `policy-rows` text}\n  - plus guard {on, file, why?} from guard::status() (S0P-a's stub until G1)\n  - after G1, auto and yolo name the guard file\n- GET /hub/meta/connectors: {mneme, melete} booleans only, never URLs or token paths\n- GET /hub/meta/home: {default_mode, source}\n- GET /hub/meta/git?session=<id>: the branch or detached sha from <cwd>/.git/HEAD (following a gitdir file), without running git; cwd from tree::base",
+ "owns_files": [
+  "perch/src/meta/mod.rs",
+  "perch/src/meta/README.md",
+  "perch/src/bin/fake_eidolon/meta.rs",
+  "perch/tests/meta.rs",
+  "perch/src/tree.rs (visibility only)"
+ ],
+ "depends_on": [
+  "S0P-a",
+  "S0P-b"
+ ],
+ "tests": "tests/meta.rs:\n- exact argv with --config and never --live\n- a second GET inside the TTL starts no child\n- connectors never contain http or token\n- mode=manual uses config-manual.toml\n- policy carries the guard object (stub: on false)\n- git HEAD cases: a branch, a detached HEAD, a worktree .git file, no repo (branch:null), and a .git symlinked outside the root (refused)\n- 401 without a token",
+ "live_check": "fake perch on PORT=48109 + curl. X0 checks the shape of real `eidolon tools` output.",
+ "size": "M",
+ "risk": "Stock command text is shown verbatim and may change between eidolon versions.",
+ "security_review": false
+}

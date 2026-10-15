@@ -1,0 +1,22 @@
+{
+ "id": "W4",
+ "title": "Mesh tab: honest, network-free, no probing",
+ "what": "As pass 1. mesh/view.js is pure (snapshot -> rows and sentences). mesh/index.js draws:\n- header: 'aoide 0.0.26 · ~/.local/bin/aoide · aoided ● 3 ms', or a sentence saying it is not available\n- nodes table: node · verified · grants · meshes · added · roster cached Xm ago, plus 'presence is not probed: ages are when each roster was last cached'\n- the mesh --json drift\n- the stage graph: counts and a list\n- the outbox\n- the audit/gate tail, polled every 5 s through the lane while visible\nRemote strings are drawn as text only. Mail cards live in the notes tab, not here.",
+ "owns_files": [
+  "webui/term/mesh/index.js",
+  "webui/term/mesh/view.js",
+  "webui/term/mesh/mesh.css",
+  "webui/term/mesh/README.md",
+  "webui/term/tests/mesh.test.mjs",
+  "webui/term/tests/fixtures/aoide/**"
+ ],
+ "depends_on": [
+  "R2b",
+  "S0W-a"
+ ],
+ "tests": "mesh.test.mjs over R2a's fixture copies:\n- both registry shapes\n- the not-available sentence\n- hostile text stays a plain string (view.js returns strings, never markup)",
+ "live_check": "fake perch on PORT=48128 with the fixtures; door mode keeps its 'peers' line.",
+ "size": "M",
+ "risk": "Stale ages are shown as stale, never as presence.",
+ "security_review": false
+}

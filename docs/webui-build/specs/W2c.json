@@ -1,0 +1,19 @@
+{
+ "id": "W2c",
+ "title": "Graph drawing: projection and SVG (dagre from V0)",
+ "what": "- graph/project.js: raw graph JSON -> states [{path, kind}] and edges [{from, to, kind, event}], mirroring jev_graph's projection for flat and compound states, always / on / onDone, and root on (ERROR).\n- graph/draw.js: SVG in the TUI look (square boxes, monospace labels, edge labels; classes current, visited, final and failed), laid out with vendor/dagre.js.",
+ "owns_files": [
+  "webui/term/graph/project.js",
+  "webui/term/graph/draw.js",
+  "webui/term/tests/project.test.mjs"
+ ],
+ "depends_on": [
+  "S0W-a",
+  "V0"
+ ],
+ "tests": "project.test.mjs over all six eidolon-plugins/jev/graphs/*.json:\n- wiki-hop gives exactly 4 states (open, reading, arrived, failed)\n- its edges: open->reading always; reading->arrived twice, by guard; reading->reading on PICK and EMPTY; *->failed on ERROR\n- the other five do not throw",
+ "live_check": "Rendered inside the graph tab once W2b-1 lands.",
+ "size": "M",
+ "risk": "None beyond dagre's API.",
+ "security_review": false
+}

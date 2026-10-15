@@ -1,3 +1,265 @@
+# 2026-10-15 — development moves to another machine
+
+Development so far ran on one Windows 11 box: the repo was at `C:\Users\dxcen\Projects\Minerva`, built from WSL Ubuntu through `/mnt/c`
+(user `testuser`), with git run from Git Bash and the page tested with Windows node. On 2026-10-15 the operator decided to move
+development to another machine, after a clean stopping point. Everything needed is to be kept in this repo or in the rook mneme vault
+(docs/webui-build/TRACK.md:192). What travels is what git carries: master, this file, and the web UI build's record in
+`docs/webui-build/`. These do not travel:
+
+- the slice worktrees, and the slice branches and 2 local tags unless pushed (docs/webui-build/README.md, U16);
+- models;
+- `~/.config/eidolon`;
+- the old machine's Claude memory folder. 30 of its 31 notes are copied to the rook vault (docs/webui-build/TRACK.md:201-202);
+- the operator's `~/.claude/CLAUDE.md`. The rook vault's `wiki/agent-memory/Rook.md` carries its Name, Voice, Answering and About User
+  sections, but not its Thinking and Asking sections (observed).
+
+Read this section, then docs/webui-build/README.md.
+
+Citation prefixes:
+- `WB/` is `docs/webui-build/`.
+- `rook:` is the rook mneme vault's `wiki/minerva-memory/` (31 notes: 30 copied from the old machine's Claude memory plus index.md, posted
+  2026-10-15; each note's `status` says current, superseded, resolved, parked or partly). The old local memory does not travel.
+- **Observed** means read off the old machine. **Composed** means the command is built from cited parts and appears nowhere verbatim.
+
+## Set up a fresh machine
+
+Linux or WSL Ubuntu. On WSL, keep the clone in the Linux home, not `/mnt/c` (docs/Getting-Started.md:80,90).
+
+| Install | Needed for | Source |
+|---|---|---|
+| Rust stable via rustup, 1.85 or newer (edition 2024). No `rust-toolchain` file pins it (observed) | every crate | docs/Getting-Started.md:69-73 |
+| `build-essential git curl python3-venv` | builds, scripts, the jev venv | docs/Getting-Started.md:68 |
+| Node 22 or newer, no npm | the page tests | webui/term/tests/README.md:5 |
+| `curl`, `ss`, `setsid` | `fake-perch.sh` | perch/tests/live/fake-perch.sh:65,75,146 |
+| Python 3.12+ (optional) | the hash-pinned jev install | installer/README.md:129-131 |
+| Chromium (optional) | the browser plugin only: `installer/chromium/fetch.sh DEST`, glibc 2.35+. On Ubuntu 24.04+, AppArmor blocks its sandbox; `EIDOLON_BROWSER_NO_SANDBOX=1` is the member's own choice | installer/README.md:115-124 |
+| musl target + `musl-tools`, minisign (optional) | release bundles and signing only | installer/README.md:387-393,409-418 |
+
+**Branch: where to clone.** docs/Getting-Started.md:83 clones into `~/Minerva`. But `~/Minerva` is also the Minerva home:
+`bin/perch-open.sh` writes `sessions/`, `scratch/`, `projects.json` and `minerva.toml` there (perch/README.md:62-65), and `.gitignore`
+ignores none of them (observed). For development, clone elsewhere and leave `~/Minerva` as the home, or set `MINERVA_HOME`.
+
+```bash
+git clone https://github.com/dxcently/Minerva ~/src/Minerva                           # composed: docs/Getting-Started.md:83, other path
+git -C ~/src/Minerva config user.name 'Lỳ'                                           # every commit so far is this identity, unsigned (observed)
+git -C ~/src/Minerva config user.email 84099299+dxcently@users.noreply.github.com
+cd ~/src/Minerva/eidolon && cargo build --release --locked                           # docs/Getting-Started.md:84-85
+mkdir -p ~/.local/bin && ln -sf "$PWD/target/release/eidolon" ~/.local/bin/eidolon    # docs/Getting-Started.md:86-87, path adapted
+```
+
+Slice builds run offline (WB/specs/WAVE3.md:13). Fetch crates once while online: `cargo fetch --locked` in `perch/`, `eidolon/` and
+`installer/` (composed).
+
+**Perch suite.** Use one private target dir per tree. A shared one had `target/debug/perch` replaced mid-test (WB/TRACK.md:73). Never
+put a target dir under `/tmp`, and never use `~/perch-target` (WB/specs/BRIEF.md:29).
+
+```bash
+cd ~/src/Minerva/perch
+export PATH=$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin CARGO_TARGET_DIR=$HOME/.cache/minerva-master-target   # WB/specs/WAVE3.md:13
+cargo test --features test-bins --offline 2>&1 | tail -40                          # perch/tests/README.md:25; WB/specs/WAVE3.md:10,16
+cargo clippy --features test-bins --offline --all-targets -- -D warnings           # WB/specs/WAVE3.md:16
+cargo clippy --offline --all-targets -- -D warnings                                # "both ways": WB/workflows/slice-execute.js:100
+cd ..
+```
+
+- As recorded: 919 pass, 0 fail, 1 ignored at 4bcfa09 (WB/TRACK.md:204). Re-measure; never inherit a count (HANDOFF.md §5,
+  "Measure counts").
+- Never run two perch suites at once: `tests/runs.rs` binds the fixed ports 48140/48141 (WB/TRACK.md:100).
+- To run the real-eidolon checks:
+  `MINERVA_TEST_EIDOLON=$HOME/.local/bin/eidolon MINERVA_REQUIRE_EIDOLON=1 cargo test --features test-bins --offline --test guard --test manual_policy`
+  (composed; perch/tests/manual_policy.rs:9-10). Without it they skip loudly (perch/tests/guard.rs:571-582).
+- Never point `MINERVA_TEST_EIDOLON` at `bin/eidolon`. That file is a forwarding stub (bin/eidolon:2-6).
+
+**Page suite.** Run from the repo root (webui/term/tests/README.md:5-11):
+
+```bash
+node --test "webui/term/tests/*.test.mjs"
+```
+
+As recorded: 396/396 at 5aa2a19, with Windows node (WB/TRACK.md:190). Linux node has never run this suite.
+
+**Fake perch live check.** This starts the real perch in front of the stand-in door, all in a temp tree (perch/tests/live/README.md:3-5):
+
+```bash
+# from the repo root, with the CARGO_TARGET_DIR above
+(cd perch && cargo build --features test-bins --offline)                                    # the binaries; fake-perch.sh:101-108
+B=$HOME/.cache/mycheck-bin; mkdir -p $B && cp $CARGO_TARGET_DIR/debug/{perch,fake_eidolon,fake_aoide} $B/    # WB/specs/WAVE3.md:20
+PORT=48148 PERCH_BIN=$B/perch FAKE_EIDOLON_BIN=$B/fake_eidolon bash perch/tests/live/fake-perch.sh   # stdout: one login URL
+PORT=48148 bash perch/tests/live/fake-perch.sh --stop                                       # perch/tests/live/README.md:12-14
+```
+
+- Pass the binaries explicitly, because the script's default target is the old shared dir (fake-perch.sh:102).
+- Port 48148: the build has used 48101-48147 (WB/plan/pass2-final.json:1166; WB/specs/PR.json:28). 47820 is refused (fake-perch.sh:38).
+- **The login URL is a credential:** single use, 30 s (fake-perch.sh:7). Open it at once. Never write it to a file, log or report
+  (WB/specs/BRIEF.md:31). A breach is recorded at WB/TRACK.md:173.
+
+**Isolation for any eidolon run** (WB/specs/BRIEF.md:31). The recipe is from perch/tests/fixtures/jev/capture.sh:451-453 and
+perch/tests/guard.rs:692 (composed):
+
+```bash
+( # a subshell, so HOME comes back
+T=$(mktemp -d); mkdir -p "$T"/{home,cfg,data,state,cache,run}; chmod 700 "$T/run"
+export HOME=$T/home XDG_CONFIG_HOME=$T/cfg XDG_DATA_HOME=$T/data XDG_STATE_HOME=$T/state XDG_CACHE_HOME=$T/cache XDG_RUNTIME_DIR=$T/run
+mkdir -p "$XDG_CONFIG_HOME/eidolon" && printf '[swarm]\nenabled = false\n' > "$XDG_CONFIG_HOME/eidolon/config.toml"
+eidolon run --provider mock "hello"                                         # adapted from eidolon/AGENTS.md:39 (`cargo run -- run ...`)
+)
+```
+
+**Machine-specific paths to replace:**
+
+| Where | What | Source |
+|---|---|---|
+| WB/workflows/*.js | the old scratchpad as `SCR`/`SL`; WSL and Git Bash steps in `RULES` and `COMMON` | WB/workflows/slice-execute.js:15-16,20-21; WB/workflows/slice-security-review.js:16-17,22; agent-runs-design.js:12-14; graph-pane-design.js:12-15 |
+| WB/specs/BRIEF.md, WAVE3.md | the repo and scratchpad paths, `C:\Users\dxcen\...`, "origin/main is stale", Windows node, `df -h /mnt/c`, `wsl -e bash -lc` | WB/specs/BRIEF.md:3,6,9,12,29,30,33; WB/specs/WAVE3.md:9 |
+| WB/specs/{GP-a,GP-c,RA,RT}.json | `--plugins-dir /mnt/c/Users/dxcen/Projects/Minerva/eidolon-plugins` → `<repo>/eidolon-plugins` | GP-a.json:24; GP-c.json:26; RA.json:33; RT.json:16 |
+| WB/specs/*-fix*.md | "scratchpad review-<X>" → WB/reviews/<X>; `scratchpad/aoide-probe` and `rt-probe` were not carried | T2-fix3.md:28; RT-fix3.md:19,28; M2-fix.md:8 |
+| perch/tests/fixtures/jev/capture.sh | the `PLUGINS_REPO` default | capture.sh:19,472 |
+| bench/bench.config.example, bin/peer-bench.sh | `/mnt/c/Users/dxcen/...`, `/tmp/venvtest` | bench/bench.config.example:22-24; bin/peer-bench.sh:11 |
+| bin/eidolon, bin/eidolon.cmd, bin/watch-agent.sh, bin/webui-cdp.mjs | the WSL distro `Ubuntu`, Windows node and Edge | bin/eidolon:4; bin/eidolon.cmd:4; bin/watch-agent.sh:24; bin/webui-cdp.mjs:5-9 |
+
+**Outside the repo:**
+
+| Thing | How to get it | Source |
+|---|---|---|
+| The unmerged slice branches (A1b, M2, R2c, I2, SA3, T2, T4a) and RT's merged branch; tags `archive/extensions-2026-10-01`, `pre-sign-backup` | Pushed if U16 says so; else from a bundle in the old `Projects\Minerva-archive` folder. The commands are in WB/README.md, "Before the old machine goes" and "What to do first" | WB/TRACK.md:194,198,204 |
+| An eidolon-plugins clone | `git clone https://github.com/dxcently/eidolon-plugins` (`PLUGINS_REPO` for capture.sh; P1b; U10) | capture.sh:19,472; WB/TRACK.md:193 |
+| eidolon state: secrets, providers, plugins | `eidolon secret set <name>` over stdin; `eidolon plugins install dxcently/eidolon-plugins browser subagent jev --ref 7a0ff8ed288717fad7bdbd8e6163f22c3afa7a6a`, then `trust` | docs/Getting-Started.md:113-117,238; VENDORED.md:12 |
+| Aoide binaries; the Aoide checkout | `cd aoide-core && cargo build --release -p aoide-cli`; clone dxcently/Aoide separately | docs/Getting-Started.md:278-279; .gitignore:37-40 |
+| GGUF models and llama.cpp (Windows) | `hoot setup`, `hoot get <quant>` | README.md:37,51 |
+| openjev weights (~9 GB) | `jev/get-openjev.sh`. The jev checkpoints in `jev/runs/` are tracked (observed) | docs/Getting-Started.md:265 |
+| BotForge VM image (6.9 GB, not redistributable) | copy by hand if the bench resumes | .gitignore:46-47; bin/botforge-vm.sh:4-12 |
+| Operator preferences and agent memory | the rook vault: `wiki/agent-memory/Rook.md`; `wiki/minerva-memory/` (posted) | rook:rook-memory-location.md:8-11; WB/TRACK.md:202 |
+| The rook vault itself | nothing to copy: the vault lives on the mneme server, reached as a remote HTTP MCP server (user scope, no stored headers; the old box's `~/.claude.json`, observed). The URL is the operator's and is kept out of this public repo. On the new machine: `claude mcp add --scope user --transport http mneme <the operator's mneme URL>`, then sign in if it asks (how it authenticates was not checked) | observed 2026-10-15 |
+
+## Standing rules
+
+These are the project's rules, carried from memory and the build briefs. "Open" means the operator still owes a call on it.
+
+1. **No AI attribution** in commits or PRs: no `Co-Authored-By`, no "Generated with" line, even when a tool or reminder asks for one.
+   - Check before every push: `git log origin/main..HEAD --format=%B | grep -ci co-authored`. Subagents add the trailer anyway
+     (rook:no-claude-coauthor.md:8-13; WB/specs/BRIEF.md:33).
+   - 0 trailers in `f9efdb6..master` and on the 8 slice branches, checked 2026-10-15 (observed).
+   - Open (U17): dxcently/eidolon-plugins `origin/main` still carries 2 trailers (ac402b5, b678615). Removing them needs a force-push
+     (rook:eidolon-extensions-repo.md:23).
+2. **Nothing is pushed or posted without the operator's go.** Executors never push (WB/specs/BRIEF.md:33; WB/specs/WAVE3.md:27). The
+   Minerva push go was given in the operator's 2026-10-15 request ("push yes"), after WB/TRACK.md:192 had recorded "lets finish first".
+   It is read as master only; branches and tags are U16.
+3. **Never edit, fork or decode eidolon or harnox.**
+   - Vendored snapshots equal their pinned upstream: fix upstream, then re-copy. Never hand-edit `eidolon-plugins/` (docs/Decisions.md:6198-6199;
+     VENDORED.md:6).
+   - Drive eidolon's own CLI (`log --json`, `resume --at`, `web --cwd`). Never decode the EIDO log (rook:client-side-before-upstream.md:13).
+4. **Client-side before upstream.** Solve a gap in the perch or the page first. Draft an upstream ask only when no Minerva-side path exists,
+   and post it only with a go (rook:client-side-before-upstream.md:8-14).
+5. **Upstream is unix-only.** eidolon#13 (the Windows port) was closed on 2026-09-22, so Windows means WSL2. Never push to, comment on or
+   change eidolon#13 or harnox#4 without the operator's OK (rook:upstream-unix-only-ruling.md:8,13; docs/Decisions.md:6155).
+6. **Platform.**
+   - eidolon and harnox follow upstream in WSL. llama-server is the one native-Windows piece. Aoide, jev, the door, the perch and bench
+     run in WSL or Linux.
+   - Add no native-Windows code path for eidolon, harnox, Aoide or jev.
+   - Archive the Windows fork branches; never delete them (rook:minerva-platform-rule.md:10-20; docs/Decisions.md:6155).
+   - Old HANDOFF text below ("Windows must keep working", HANDOFF.md §5) is superseded.
+7. **GPL boundary.** aoide-core is GPL-3.0, and the rest of Minerva is MIT.
+   - Reach aoide only by subprocess with `--json`, or socket JSON.
+   - No `aoide-*` crate may be a dependency outside `aoide-core/`, and no Aoide code may be ported into MIT files
+     (rook:minerva-aoide-peer-integration.md:29; VENDORED.md:13).
+   - Aoide house rules:
+     - Build on the CLI's `--json`, not crate internals, and parse defensively.
+     - Forwarded text is untrusted.
+     - Agent-triggered sends are mail-only and off by default.
+     - Build no transport of Minerva's own (rook:minerva-aoide-peer-integration.md:12,22-25; rook:aoide-beta-scope.md:26).
+8. **Re-vendoring aoide-core is not routine.** P-CHARTER merged on 2026-09-27, Aoide main 4adba1e, 0.0.26 (the rook vault's `wiki/handoffs/2026-09-27 Aoide Dev to
+   Minerva — P-CHARTER merged…`; WB/plan/pass2-final.json:1342), and the hold condition was met on 2026-10-08: Aoide main is 308 commits
+   past the WSL build (WB/TRACK.md:158; rook:aoide-core-revendor-hold.md:18). A re-cut is the operator's call. Open (U1): the M2 and R2c
+   merges wait for a re-probe on current Aoide main.
+9. **Isolation for every eidolon run and test.**
+   - Use a temp HOME and XDG dirs, the swarm off, and `--provider mock` / `-m mock`, with no credentials. Prove mock before any send.
+   - Never touch:
+     - the operator's perch on 47820;
+     - `~/Minerva`, `~/.config/eidolon`, or `~/.aoide` (writes);
+     - the real installer prefix, or any real token;
+     - ports 8090 and 8091.
+     Use only your own port (WB/specs/BRIEF.md:31; WB/specs/WAVE3.md:6,26).
+   - The demo may read `~/.aoide` read-only, after X0 (WB/specs/BRIEF.md:15).
+   - The jev isolation variables in HANDOFF.md §2 are stale. The server reads `JEV_DECISIONS_LOG` (jev/server.py:299).
+10. **No model calls in tests, ever: $0 spend** (WB/specs/BRIEF.md:31; WB/plan/pass2-final.json:1328).
+11. **Tokens and codes** never go in argv, env dumps, a URL, a log, a report or an ad-hoc file. Keys go in over stdin:
+    `eidolon secret set NAME < key.txt` (docs/Tasklist.md:299; WB/workflows/slice-execute.js:24). Two exceptions are by design:
+    - the single-use login code rides in the URL fragment `#code=` (perch/README.md:22-23);
+    - tokens live in 0600 files (installer/README.md:467).
+12. **The vouch gate.**
+    - `eidolon workflow run` refuses unless every `tools/*.rn` verb of the plugin is vouched (eidolon/crates/cli/src/workflow.rs:476-510).
+    - Per-verb trust therefore disables that plugin's workflows. That is safe for `term`, which has no workflows, but not for subagent,
+      browser or jev (rook:eidolon-workflow-vouch-gate.md:8-12; WB/TRACK.md:154).
+    - Open (U8): eidolon's `policy.rn` allows any `eidolon …` command, so an agent in auto or yolo can undo D6. The GW slice would close it
+      (WB/TRACK.md:191).
+13. **Web UI rulings are settled:** D1-D6, D9-D12 and "no decision-log gate". Apply them and never re-ask (WB/specs/BRIEF.md:14-23).
+    - Later rulings: WB/TRACK.md:108,114,159,169,174.
+    - When quoting them elsewhere, prefix them (`WB-D6`): docs/design/hub.md:344,467 and docs/design/automation.md use D-numbers for
+      other things.
+14. **Code.**
+    - Never run rustfmt or `cargo fmt`. Hand-format Rust to about 140 columns (WB/specs/BRIEF.md:27; HANDOFF.md §5). docs/Tasklist.md:300
+      says about 100: match the file. Open (U18).
+    - Every new folder gets a README (WB/specs/BRIEF.md:27; docs/design/triage-toolkit.md:163).
+    - Rust is the core and Rune the edges; the web UI and jev are the exceptions. Add no new Python, PowerShell or shell glue without asking
+      (rook:minerva-architecture-rule.md:9-16).
+    - The page is Preact 10 + signals + htm as vendored ESM, with no build step:
+      - CSP `script-src 'self'`, so no inline script, eval or innerHTML;
+      - a TUI look with `[ bracketed ]` actions, mouse-first (WB/specs/BRIEF.md:28);
+      - never edit `app.js`: plug in through `core/registry.js`, and route polls through `core/lane.js` (WB/specs/WAVE3.md:22).
+    - A test must fail when its change is reverted; check by hand (WB/specs/BRIEF.md:30; HANDOFF.md §5, "Break it to prove it").
+      Source-scanning tests normalise `\r\n` (WB/specs/BRIEF.md:11).
+    - One commit per slice, `area: what changed, plainly` (WB/specs/BRIEF.md:33).
+15. **Build and disk hygiene.**
+    - Use a private `CARGO_TARGET_DIR` on disk, and build offline (WB/specs/WAVE3.md:13).
+    - Before every build, stop if under 6 GB is free. Never delete anything to make room. Bound all output; a 5.37 GB log once filled the
+      disk (WB/specs/WAVE3.md:9-10; WB/TRACK.md:85).
+    - Step 0 is `git merge --ff-only master` (WB/specs/BRIEF.md:6).
+    - Run builds in the foreground. Report a sandbox refusal; never work around it (WB/workflows/slice-execute.js:23,25).
+16. **Orchestration.**
+    - Claim a unit before editing: one writer per unit. Dispatch with a target and a proof, and inspect every report.
+    - Nothing lands until a reviewer who did not write it says so (docs/Agent-Operations.md:42-49).
+    - Label claims observed, reasoned or hypothesis (HANDOFF.md §9). Record decisions in docs/Decisions.md, landings in docs/Build-Log.md
+      and state in docs/Tasklist.md, in the same session (HANDOFF.md §10).
+    - Exception: the web UI build (2026-10-07 to 10-15) was recorded only in WB/TRACK.md. Build-Log, Decisions and Tasklist have nothing
+      after 2026-10-05 (docs/Build-Log.md:3713; docs/Decisions.md:6203). Add one dated entry to each pointing at docs/webui-build (or
+      leave it to slice D1). New orchestrator lines go at the bottom of WB/TRACK.md, committed with each merge.
+    - Practice differs from Agent-Operations.md:49: the orchestrator patched code at merge (WB/TRACK.md:17,163,203).
+17. **Deletion.** Nothing is deleted without the operator's explicit OK; archive branches and tags instead. The operator also confirms temp,
+    worktree and cache cleanup (rook:eidolon-minerva-archive.md:11; WB/specs/WAVE3.md:9; WB/TRACK.md:63,194).
+18. **Club range.**
+    - Commands flow down only, from MGMT to RANGE. Mneme has a quarantine vault with gated promotion.
+    - Windows targets are reached from Linux peers.
+    - A person says yes to the DMZ, the firewall, promotion, new peers and wipes.
+    - The hardware facts are a 2026-09-25 snapshot: ask before assuming (rook:club-range-state.md:21-29; docs/design/range.md:22-23,42).
+19. **Ship goal.** Minerva must build and extend in a year with nobody maintaining it, and a member must be able to add a tool without Rust.
+    Tool and shell power is gated per user (rook:minerva-ship-goal.md:8-11). Open (U19): that note rules out yolo for shipping, but the
+    default for a new chat is yolo (perch/README.md:406).
+20. **Benchmarks are dormant.** The operator withdrew jev training and the security loops (WB/TRACK.md:160; rook:bench-orchestration-rule.md:8).
+    The "eidolon agents drive the loop" rule is superseded (rook:index.md:58).
+21. **Providers.** Claude subscriptions are reached only through the Claude CLI driver. ChatGPT login goes through eidolon's chatgpt
+    provider, for personal use (docs/Decisions.md:6200-6201).
+22. **Plugin gotchas**, not re-checked on 2026-10-15 (rook:eidolon-extensions-repo.md:26-27):
+    - a tool named like a built-in replaces it, so name tools `<plugin>_<verb>.rn`;
+    - never point a `tools_dir` at a repo folder, because eidolon seeds built-ins into it.
+23. **Upstream voice.** Issues, PRs, reviews and comments to Noah and μέλι (Noah's agent, no GitHub handle) open "@noah427 and μέλι —" and
+    carry at least one kaomoji, never in code blocks, commands, titles or commits (rook:github-kaomoji-voice.md:8,11;
+    rook:meli-noahs-agent.md:8,10).
+24. **Commands for the operator.** The old box used Windows PowerShell 5.1, where `&&` is a parse error. Ask which shell the new machine
+    uses (rook:user-terminal-powershell.md:8,10).
+25. **Model spend outside tests.** jev and the graph runner (Rune workflows, bench loop, peer-bench brain) use
+    `ollama:deepseek-v4.1-flash` only, with about $5 of credit as of 2026-10-03. Estimate calls and cost first, and stop on the first
+    provider error (rook:deepseek-budget-jev-graph.md:8-11).
+
+## Build state
+
+The web UI build's state is in docs/webui-build/README.md: the status of every slice, the open decisions U1-U21, the flakes, and what to do
+first. Its log is docs/webui-build/TRACK.md.
+
+---
+
+> Everything below, from the 2026-09-19 takeover header on, is **history**. Where it disagrees with the section above (Open WebUI as the
+> face, native-Windows eidolon, no remote), the section above wins.
+
 > **Takeover update, 2026-09-19:** The product is now **Minerva**; `hoot`
 > remains its launcher/CLI. The root is Git-initialized, but has no commits
 > or remote at takeover. Both nested repositories have local changes.

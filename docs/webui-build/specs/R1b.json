@@ -1,0 +1,18 @@
+{
+ "id": "R1b",
+ "title": "Runs: log?after, graphs",
+ "what": "- GET /hub/runs/<rid>/log?after=N: ndjson from `eidolon --config <run cfg> log --json --after N <log>` through titles::run, cached on (mtime, len, after). An unchanged log gives 200 with an empty body and starts no child.\n- GET /hub/runs/graphs and /hub/runs/graphs/<g>: the raw graph JSON (at most 1 MiB) and its sha256, for the new-run form only.\nHealth moved to R1a.",
+ "owns_files": [
+  "perch/src/runs/log.rs",
+  "perch/src/runs/graphs.rs",
+  "perch/tests/runs_log.rs"
+ ],
+ "depends_on": [
+  "R1a"
+ ],
+ "tests": "tests/runs_log.rs:\n- log?after returns only ids above N, in order, while the fake is still sleeping (with a timeout guard)\n- an unchanged log causes no extra fake call (FAKE_LOG count)\n- graphs refuse names outside the list",
+ "live_check": "fake perch on PORT=48107: curl log?after while a fake run steps.",
+ "size": "S",
+ "risk": "Each changed poll starts `eidolon log`, which rewrites <config>/eidolon/system, at most once a second while a run is active. The page's lane keeps it to one in flight.",
+ "security_review": false
+}

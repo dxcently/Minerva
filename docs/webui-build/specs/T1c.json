@@ -1,0 +1,18 @@
+{
+ "id": "T1c",
+ "title": "Terminal stream: one SSE for every terminal, with replay or snap on join",
+ "what": "GET /hub/term/events?since=t1:4096,t3:0. The first frame is term-list.\nJoining:\n- A terminal named in `since` whose seq is still inside the ring resumes as term-out from that seq.\n- Any other terminal gets term-reset {id, seq, data, snap}. data is the whole ring when the ring still starts at byte 0 (exact replay). Otherwise snap.rs synthesizes it from alacritty:\n  - RIS\n  - DECSET for the modes the Term holds: ?1 DECCKM, keypad, ?2004, ?1000/1002/1003/1006, ?1004, ?1049, ?25, DECSTBM\n  - the visible grid with SGR runs\n  - the cursor\nFrames:\n- term-out {id, seq, data b64}, term-size, term-title {id, title, fg}\n- term-input {id, by:'agent', chat, text ≤ 200 chars, control chars shown as ⏎ ^C ⇥}\n- term-exit {id, code, signal}, term-closed, term-hold, term-open\n- hub-stream-end {reason: stopping}\nEvery frame has a string type (sse.js:36). Frames are coalesced per 16 ms, at most 32 KiB raw each, with a ':' keep-alive every 15 s.\nThe Body is hand-written like proxy.rs's Proxied (no new futures dep) and ends when ctx.stop fires, so it never eats RESPONSE_DRAIN.\nEach client keeps its own cursor; a client that falls behind the ring start gets term-reset.\nExports Terms::note_input(id, by, chat, text) for T2.",
+ "owns_files": [
+  "perch/src/term/stream.rs",
+  "perch/src/term/snap.rs",
+  "perch/tests/term_stream.rs"
+ ],
+ "depends_on": [
+  "T1b"
+ ],
+ "tests": "tests/term_stream.rs:\n- replay from a given seq\n- with a 4 KiB ring (--knob term_ring=4096): after the shell sets DECCKM and prints past the ring, term-reset has snap:true and contains the DECCKM set\n- a terminal under the ring size gets an exact replay\n- perch SIGTERM ends the stream and the process exits in under 3 s\n- every frame parses with a string type\n- a keep-alive is seen (knob shortens the interval)",
+ "live_check": "fake perch on PORT=48114: `curl -N` the stream while posting input.",
+ "size": "M",
+ "risk": "The snap is our own VT encoder. A wrong one gives a bad repaint, never code execution. Test the modes TUIs use (vim, htop, less).",
+ "security_review": false
+}

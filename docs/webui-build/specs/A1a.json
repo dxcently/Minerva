@@ -1,0 +1,19 @@
+{
+ "id": "A1a",
+ "title": "Watcher: bounded frame reader, open asks with origin, reconnect",
+ "what": "perch/src/watch.rs:\n- Replace the 4096-byte TurnScan with a frame-line reader. It parses data: lines whose type is hello, turn-state, tool-call-started, ask or ask-settled, up to ASK_LINE_MAX = 64 KiB. Longer lines are skipped: fail closed, a person is asked.\n- call_origin: call_id -> origin (model | script | user), from tool-call-started frames (eidolon/crates/web/src/wire.rs:40-45, :118-122). Bounded to the last 1024 calls per door instance.\n- open_asks: ask_id -> {kind, call_id, tool, input (Value), structural, reason, origin (joined from call_origin; None when that frame was never seen), seen_seq}. Removed on ask-settled and kept per watcher instance (ask ids restart per door process).\n- Reconnect on stream end or `lagged` while the row is live and close was not asked, with backoff from 250 ms to 5 s. Replayed pending asks are deduped by ask_id, and turn-state stays current.\n- close() still cancels and waits before SIGTERM. The reconnect loop checks the close flag first, so a closing door is never reopened (hub.md §2 Stop finding).\n- The sink gets the DoorKey (S0P-a) and is called off the read loop (spawned), never awaited inline.\n- fake_eidolon/asks.rs:\n  - FAKE_ASKS=<file of frames> is emitted after a say, including tool-call-started with origin\n  - a second /api/answer gets 409\n  - FAKE_LAG=1 ends the stream with a lagged frame",
+ "owns_files": [
+  "perch/src/watch.rs",
+  "perch/src/bin/fake_eidolon/asks.rs",
+  "perch/tests/watch.rs"
+ ],
+ "depends_on": [
+  "S0P-a",
+  "S0P-b"
+ ],
+ "tests": "tests/watch.rs:\n- a 100 KiB ask line is skipped and later frames are still read\n- an ask joins the origin of its call_id; an ask whose call frame was skipped has origin None\n- lagged reconnects within 1 s and replayed asks reach the sink once\n- turn-state is still right after the reconnect (restart.rs depends on it)\n- close during backoff never reopens, and the existing stop tests pass unchanged (the door exits; the token file is removed)\n- a slow sink never stalls the reader (a sink that sleeps 2 s; frames keep flowing)",
+ "live_check": "fake perch on PORT=48121 with FAKE_ASKS and FAKE_LAG: perch logs show one reconnect and no duplicate sink calls.",
+ "size": "M",
+ "risk": "The watcher is what makes SIGTERM work on a real door. Any reconnect bug can leave a door that ignores SIGTERM until SIGKILL and leaves its token file behind.",
+ "security_review": true
+}

@@ -1,0 +1,15 @@
+{
+ "id": "X1",
+ "title": "Live pre-flight: one small real round on Wikipedia (orchestrator, no real HOME)",
+ "what": "Setup (critic pass 2: nothing runs with the real HOME):\n- T=$(mktemp -d); HOME=$T/h; XDG_CONFIG/DATA/STATE/CACHE/RUNTIME all under $T/h; swarm off.\n- Before switching HOME, resolve the nix Chromium once with the real PATH (`command -v chromium`, following the store link). Pass it as EIDOLON_BROWSER_CHROME.\n- Install P1's jev and the browser plugin into the temp config. In the copies, rewrite every token_file to an absolute $T/h/.config/eidolon/<name>.token. Trust them, attest the browser service, grant those temp files.\n- Abort unless 8090 and 8091 are free and MemAvailable ≥ 22 GB.\n- Before and after: a manifest of the real ~/.config/eidolon (path, size, mtime, sha256; contents never printed), with the real home taken from getent passwd.\n- jev service: `XDG_RUNTIME_DIR=/run/user/$UID systemd-run --user --scope -p MemoryMax=20G -- env HOME=$T/h XDG_RUNTIME_DIR=$T/h/run … python jev/server.py`, so systemd is reached through the real runtime dir while the service gets the temp env. A watchdog kills it above 20 GB RSS if user systemd is absent. Its env:\n  - JEVLIKE_CKPT per D2 and OPENJEV_DIR as absolute paths (weights read in place, read-only)\n  - HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1, JEV_DECISIONS_LOG=off\n- Browser service: temp HOME, EIDOLON_BROWSER_TOKEN_FILE=$T/h/.config/eidolon/browser.token, EIDOLON_BROWSER_CHROME.\nRun ONE `eidolon workflow run <tmp>/plugins/jev wiki-hop --args - --provider mock --budget-steps 14` with {start: Cat, goal: Nile}, directly (no perch). Stop at the first error.\nReport:\n- snapshot chars and link count under max; whether there is one main and an h1\n- menu size, and whether goal-ward labels (ancient Egypt, Nile, river …) are in the 64-option menu\n- top1/top2 p; entail latency and scores; jev peak RSS; time per step; /health with J1's fields\n- a recommended demo start/goal pair taken from those numbers\nKeep the ndjson in scratch. Tear down. Confirm the ports are free, the 47820 perch pid is unchanged, and the ~/.config/eidolon manifest is identical.",
+ "owns_files": [],
+ "depends_on": [
+  "P1",
+  "J1"
+ ],
+ "tests": "Measurement only.",
+ "live_check": "This is the live check. Pass means:\n- the first page is read (not truncated, h1 present)\n- one decision is made or parked\n- RSS stays under the cap\n- decisions_log reads off\n- the ~/.config/eidolon manifest is unchanged",
+ "size": "S",
+ "risk": "openjev memory (above 16 GB measured means D2 switches to bf16), the Chromium sandbox under a temp HOME, and Wikipedia layout. Stop on the first tool or provider error.",
+ "security_review": false
+}

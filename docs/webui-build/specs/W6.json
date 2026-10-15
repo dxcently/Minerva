@@ -1,0 +1,20 @@
+{
+ "id": "W6",
+ "title": "app.js: precise sentences, ctx limit, dead code",
+ "what": "As pass 1:\n- run tab 'parked' line: 'parks of wait_for calls show no live samples: eidolon's web door sends no park-tick (upstream gap 7)'\n- an empty `:` match: 'no such command; these are the page's own commands (eidolon's web door lists none)'\n- the door-mode ctrl+enter and no-pane texts drop '(arrives with the hub, M2)'\n- ctx gauge: the limit from the /hub/models note via core/ctxlimit.js, '-' when there is none\n- remove the dead hubOff export (core/ui.js)\n- fix the core/state.js comment (/log -> /transcript)\nAfter W6, app.js has no owner; later slices register.",
+ "owns_files": [
+  "webui/term/app.js",
+  "webui/term/core/ui.js",
+  "webui/term/core/state.js (comment only)",
+  "webui/term/core/ctxlimit.js",
+  "webui/term/tests/ctx.test.mjs"
+ ],
+ "depends_on": [
+  "S0W-b"
+ ],
+ "tests": "ctx.test.mjs: '10k ctx' gives 10000; '1M ctx' gives 1000000; no ctx gives null.",
+ "live_check": "fake perch on PORT=48130: ctx N/10k on mock:alpha; `:zz` shows the sentence; console clean.",
+ "size": "S",
+ "risk": "None.",
+ "security_review": false
+}

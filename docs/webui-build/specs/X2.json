@@ -1,0 +1,16 @@
+{
+ "id": "X2",
+ "title": "Live wiki-hop demo for you (isolated perch 48020, no real HOME, chats off)",
+ "what": "Runs demo_plan part A: an isolated demo perch with real Chromium, the real jev service (JEV_DECISIONS_LOG=off, memory cap) and real Wikipedia.\n- Every process runs under a temp HOME (critic pass 2): Chromium through EIDOLON_BROWSER_CHROME, and token files under $DEMO.\n- The demo perch has `--knob doors=off`, so it opens no chats and no model can be reached. There is no credential in the temp HOME anyway.\n- The mesh tab reads the real ~/.aoide only if D12 = (a). Then --aoide-home, --aoide-daemon-socket and --aoide-events name the real paths explicitly; otherwise a temp root.\n- The orchestrator drives the first run, then you open the page with $DEMO/open.sh.\n- Teardown on your word.",
+ "owns_files": [],
+ "depends_on": [
+  "X1",
+  "X0",
+  "D1"
+ ],
+ "tests": "None; it is a demo.",
+ "live_check": "Screenshots of each decision step, the park answered from the page, the end state and the mesh tab. After teardown:\n- 48020, 8090 and 8091 are free\n- the 47820 perch pid is unchanged\n- no decisions.jsonl was written\n- the ~/.config/eidolon and ~/Minerva manifests are identical",
+ "size": "M",
+ "risk": "Fixed service ports; openjev memory; a stale click ref if anything else drives Chromium; Wikipedia layout; Chromium under a temp HOME (X1 proves it first). Stop on the first tool or provider error.",
+ "security_review": false
+}

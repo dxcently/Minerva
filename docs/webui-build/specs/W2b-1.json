@@ -1,0 +1,24 @@
+{
+ "id": "W2b-1",
+ "title": "Graph tab shell: runs, services, new run (with the decision-log gate), poll, cancel / abandon, drawing",
+ "what": "graph/index.js shows the run view when a run is picked or running, otherwise the turn graph (one stub import that W3 fills).\ngraph/runs.js signals, every poll through core/lane.js's hubPoll:\n- GET /hub/runs; start; answer; cancel; abandon\n- poll log?after=N every 1 s while running and the tab is visible, every 5 s while parked; stop when the run ends\n- health every 10 s while visible\ngraph/view.js, top to bottom:\n- services line, e.g. 'jev ● up · jevlike jev-base-v0.pt (weights present; loads on first call) · openjev weights present (loads on first call, ~24 s) · decision log off · browser ● up'\n  - 'checkpoint: unknown' when /health lacks ckpt\n  - a down service shows its start command as text; nothing in the page starts a service\n- runs list; `[ new run ]` (graph menu from /hub/runs/graphs, one field per string param, `[ run ]`)\n  - while jev's decision log is not off, `[ run ]` is greyed with R1a's sentence and the start command ('jev is logging decisions for training; restart it with JEV_DECISIONS_LOG=off: …'); a 409 from the perch shows the same sentence\n  - while a run is parked, new run says why and offers `[ abandon ]`\n- the drawing with the current state lit\n- a status sentence, the path (Cat → …), budgets left\n- `[ cancel ]` while running\n- 'model spend: none' (red if any)\n- steps come from W2b-2's slot",
+ "owns_files": [
+  "webui/term/graph/index.js",
+  "webui/term/graph/runs.js",
+  "webui/term/graph/view.js",
+  "webui/term/graph/graph.css",
+  "webui/term/graph/README.md",
+  "webui/term/tests/runs.test.mjs"
+ ],
+ "depends_on": [
+  "R1b",
+  "W2a",
+  "W2c",
+  "S0W-b"
+ ],
+ "tests": "runs.test.mjs:\n- the poll interval per state\n- the after-cursor never goes backwards and has no duplicates across overlapping polls\n- answer payloads are 0-based index strings as the park prompt prints them (interp.rn:406-449), or 'stop'\n- the parked-cap message\n- the decision-log gate: off enables run; a path, a missing field and 'down' each disable it with the sentence",
+ "live_check": "fake perch on PORT=48125, with fake_eidolon replaying F0 at FAKE_WORKFLOW_STEP_MS=700 and a test jev /health:\n- start from the page; steps arrive and the lit state moves; cancel\n- abandon a parked run, then start another\n- flip the test /health to a log path: `[ run ]` greys with the sentence\n- widths of 34 and 72 cells\n- console clean; screenshots to scratch",
+ "size": "M",
+ "risk": "Space in the inspector is tight; keep the header to 4 lines.",
+ "security_review": false
+}

@@ -1,0 +1,20 @@
+{
+ "id": "A1b",
+ "title": "Allow rules: matcher, store, routes, answerer",
+ "what": "src/allow/ implements watch::Sink. It binds DoorKey -> chat id through sessions::id_of_pid when it first needs it.\nmatcher.rs is pure: fn(rules, ask, door) -> Option<rid>. A rule matches only when all hold:\n- kind == approval; questions are never answered\n- the chat mode is auto or manual\n- the ask was first seen after the rule was created\n- ask.origin is Some and equals rule.origin. A rule made on a model call never answers a script's nested call via tool_call (host.rs:1364-1377); unknown origin never matches.\n- the tool name is byte-exact\n- for bash: input.command is a String equal to rule.command byte for byte after JSON decode (a trailing space, CRLF or a lookalike fails); input.background is absent or false (a 'true' string also fails); timeout_s is ignored; the door's hello cwd equals rule.cwd\n- for any other tool: ask.structural == false\nstore.rs, per D10:\n- (a) memory only, each rule bound to the door pid alive when it was made: any stop, model or mode switch, or perch restart ends it\n- (b) <home>/allow.json, 0600, cleared when the mode recorded at creation differs from the current one\n- at most 32 rules per chat\nRoutes:\n- GET /hub/sessions/<id>/allow -> {mode, rules:[{rid, tool, origin, command?, cwd?, added_ms, uses, last_ms?}]}\n- POST /hub/sessions/<id>/allow {ask_id}\n  - the rule is built from the watcher's own copy of that ask (tool, input, origin); nothing is read from the body but ask_id\n  - the perch answers that ask yes itself\n  - 201 {rule, answered:'yes'|'lost'}\n  - 409: not pending, not an approval, yolo, or the cap\n  - 422: a structural ask with a name rule, a background bash call, or an ask whose origin is unknown\n- POST /hub/sessions/<id>/revoke {rid} -> 204 | 404\nAnswerer: a spawned POST to the door's /api/answer {ask_id, answer:'yes', note: RULE_NOTE}.\n- RULE_NOTE = \"allowed by the operator's rule for this chat (Minerva)\" (ASCII, ≤ 1024 bytes).\n- It selects on ctx.stop, so shutdown never waits on it.\n- 204 means done; 409 means the page won, ignore it.",
+ "owns_files": [
+  "perch/src/allow/mod.rs",
+  "perch/src/allow/matcher.rs",
+  "perch/src/allow/store.rs",
+  "perch/src/allow/README.md",
+  "perch/tests/allow.rs"
+ ],
+ "depends_on": [
+  "A1a"
+ ],
+ "tests": "Pure matcher unit tests for every clause. No match on:\n- a trailing space or a different cwd\n- background:true or 'true'\n- a question\n- yolo\n- a structural name rule\n- an ask pending before the rule\n- a skipped long line\n- a script-origin ask with the same command as a model-origin rule\n- an ask with unknown origin\ntests/allow.rs with fake_eidolon FAKE_ASKS:\n- allow, then a second identical model-origin ask is answered with the note in the body\n- revoke stops it\n- a mode switch (restart) clears; a fork has none\n- a page-first answer (409) is ignored\n- after a lagged reconnect, replayed asks are not double-answered\n- a body carrying tool, command or origin fields cannot shape the rule\n- perch SIGTERM with an answer in flight exits in under 3 s\n- (D10 b) allow.json is 0600 and a corrupt one is set aside",
+ "live_check": "fake perch on PORT=48122 + curl: the scripted ask is auto-settled and the fake's answer log shows RULE_NOTE.",
+ "size": "M",
+ "risk": "- An exact command is not an exact effect: ./build.sh or cargo test run files the model can edit.\n- A user tool registered under the name bash and called by the model has the same name and origin, so it inherits bash rules.\n- The model sees RULE_NOTE.\nAll go to XS.",
+ "security_review": true
+}

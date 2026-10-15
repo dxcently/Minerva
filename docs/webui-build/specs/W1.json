@@ -1,0 +1,22 @@
+{
+ "id": "W1",
+ "title": "jev in chats and saved runs: renderers and saved.js mapping",
+ "what": "As pass 1.\nrenderers/jev.js:\n- jev_choose: bars sorted by p, best marked, margin (top minus runner-up); no floor in chats\n- jev_entail: scores per hypothesis\n- jev_mark: one line\n- exports ProbBars({rows, floor?, margin?, pick?})\nRegister them in renderers/index.js.\ncore/saved.js maps:\n- WorkflowStart -> an x-line\n- WorkflowStep -> tool-call-started {id: call_id, name: tool, input parsed once more, origin: script}\n- ToolResult paired by tool_use_id\n- a park's AskUser -> an ask row with its answer\n- WorkflowEnd -> an x-line",
+ "owns_files": [
+  "webui/term/renderers/jev.js",
+  "webui/term/renderers/index.js",
+  "webui/term/renderers/README.md",
+  "webui/term/core/saved.js",
+  "webui/term/tests/saved.test.mjs",
+  "webui/term/tests/probbars.test.mjs"
+ ],
+ "depends_on": [
+  "S0W-a",
+  "F0"
+ ],
+ "tests": "saved.test.mjs over F0 cases a-h:\n- no 'not shown here' line for any Workflow* record\n- no tool row named '?'\n- every jev_choose paired\nIt fails if saved.js is reverted. probbars.test.mjs checks ordering and argmax first-of-equals.",
+ "live_check": "fake perch on PORT=48124: an F0 fixture copied in as a saved chat shows bars, mark lines and the answered park.",
+ "size": "M",
+ "risk": "None beyond fixture drift.",
+ "security_review": false
+}

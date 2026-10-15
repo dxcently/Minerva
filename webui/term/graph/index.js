@@ -10,7 +10,7 @@ import { mode } from '../core/api.js';
 import { known } from '../core/hub.js';
 import * as R from './runs.js';
 import { Services, RunList, NewRun, RunView } from './view.js';
-import { TurnGraph } from './turns.js'; // the chat's turn graph (turns.js; W3 fills it), { s, sid } like every tab
+import { TurnGraph } from './turns.js'; // the chat's turn graph (turns.js), { s, sid } like every tab
 
 const details = signal(false); // the services line's `[ details ]`
 const allRuns = signal(false); // the list's `[ all N ]`

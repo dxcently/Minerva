@@ -1,0 +1,18 @@
+{
+ "id": "F0",
+ "title": "Capture real wiki-hop journals as fixtures (no network, no model)",
+ "what": "Setup:\n- Temp HOME and XDG_CONFIG/DATA/STATE/CACHE/RUNTIME; swarm off in the temp config (guard.sh asserts both).\n- Copy P1's jev and fake-browser into the temp plugins dir. In the COPY only, rewrite the service ports in tools/choose.rn and entail.rn to 48091, and every token_file to an absolute path under the temp HOME. Trust and grant in the temp config.\n- Run stub_service.py on 48091 and real eidolon `workflow run ... --provider mock`.\nCases:\n- (a) MODE=first, completed\n- (b) MODE=flat, parked, then `workflow resume --answer=0` until done\n- (c) MODE=none: 'chooser unavailable' park, plus the resume refusal text\n- (d) SIGTERM mid-run: cancelled\n- (e) the graph's `failed` final, reported by the door as completed with exit 0 (pre-P1 graph against the long article)\n- (f) a rule pick (label equals goal) and a single-option pick\n- (g) jev_entail errors while the run continues, so the later park cannot resume\n- (h) an invalid park answer that re-parks and uses up an escalation\nFor each case save:\n- the `eidolon log --json` ndjson, which includes the jev_graph page ToolResults\n- the last stdout line, exit code and stderr\nAlso write capture.sh and a README recording the eidolon (bab3813) and plugin commits and the observed shapes (double-JSON input; tool_use_id == call_id).",
+ "owns_files": [
+  "perch/tests/fixtures/jev/**",
+  "webui/term/tests/fixtures/jev/**"
+ ],
+ "depends_on": [
+  "P1",
+  "S0P-b"
+ ],
+ "tests": "- `capture.sh --check` re-runs every case and compares record kinds and order, with ids and timestamps normalized.\n- `grep -c ModelSpend` is 0 in every fixture.\n- HOME, XDG_CONFIG_HOME and XDG_RUNTIME_DIR are asserted temporary before any eidolon call.",
+ "live_check": "This run is the check. Show the tool sequence per case (jq over WorkflowStep.tool), the case (c) refusal text, and case (e)'s exit 0 next to its failed jev_mark.",
+ "size": "M",
+ "risk": "Every eidolon start rewrites <config>/eidolon/system, so it must be the temp config. Never touch ~/.config/eidolon or ~/Minerva.",
+ "security_review": false
+}
