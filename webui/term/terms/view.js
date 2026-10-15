@@ -242,5 +242,6 @@ setHooks({
   },
 });
 
-// The title as the header shows it: plain text, cut to TITLE_MAX characters. (The page never takes a title from the program.)
+// The title as the header shows it: plain text, cut to TITLE_MAX characters. The perch sets it from the program's title sequence, so it is
+// program-chosen text: cut and scrubbed here, the same as the foreground name.
 export const titleText = (s) => clipText(s, TITLE_MAX);

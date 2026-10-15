@@ -73,7 +73,7 @@ async function setHold(id, hold) {
 async function newTerm(chat) {
   const body = chat ? { chat } : {};
   const r = await hubPost('term', body);
-  if (r.status === 201 && r.data && typeof r.data.id === 'string') {
+  if (r.status === 201 && r.data && typeof r.data.id === 'string' && M.TERM_ID.test(r.data.id)) {
     await M.refreshNow();
     toast(`terminal ${r.data.id} opened`);
     return;

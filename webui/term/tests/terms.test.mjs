@@ -845,15 +845,18 @@ test('the folder registers at import: the frame tap, the ⌨ tab on the right wi
 
 // ---------------------------------------------------------------- the foreground name, the screens' gate, the refresh, the reset's chunks
 test('a foreground name is text too: cut to TITLE_MAX and scrubbed, from a roster row and from a title frame', () => {
-  const fg = 'v'.repeat(195) + '‮' + 'zzzz';   // 200 characters, one of them a right-to-left override
+  // 200 characters, with a right-to-left override and a bell inside the first TITLE_MAX: the cut alone would not remove either one
+  const fg = 'v'.repeat(10) + '‮' + 'w'.repeat(5) + '\u0007' + 'z'.repeat(184);
   const v = M.vet({ id: 't30', fg });
   assert.equal(v.fg.length, M.TITLE_MAX, 'vet cuts it');
   assert.doesNotMatch(v.fg, /‮/, 'and the override is gone');
+  assert.doesNotMatch(v.fg, /[\u0000-\u001f]/, 'and the bell is gone');
   M.onFrame({ type: 'term-list', terms: [row({ id: 't30' })] });
   M.onFrame({ type: 'term-title', id: 't30', title: 'x', fg });
   const r = M.roster.peek()[0];
   assert.equal(r.fg.length, M.TITLE_MAX, 'a title frame cuts it the same way');
-  assert.doesNotMatch(r.fg, /‮/);
+  assert.doesNotMatch(r.fg, /‮/, 'and the title frame drops the override too');
+  assert.doesNotMatch(r.fg, /[\u0000-\u001f]/, 'and the bell');
 });
 
 test('a screen waits for the ⌨ tab: a terminal the page holds with the tab not drawn gets no screen and no xterm load; the mount makes one for each', () => {
@@ -993,7 +996,7 @@ const TAB_WIRING = [
   ['a focus inside the stack freezes the order', /querySelector\(':focus'\)/],
   ['the order is recomputed through reorderDue with the freeze', /M\.reorderDue\(Date\.now\(\), lastOrder\.current, frozen\.current\)/],
   ['the yolo line says what it does', /yolo: agents type into these terminals without asking\./],
-  ['a new terminal is said opened only on a 201 with an id', /r\.status === 201 && r\.data && typeof r\.data\.id === 'string'/],
+  ['a new terminal is said opened only on a 201 with a valid id', /r\.status === 201 && r\.data && typeof r\.data\.id === 'string' && M\.TERM_ID\.test\(r\.data\.id\)/],
   ['the new-terminal item in the menu opens the folder line with term', /host\.openCmd\('term '\)/],
   ['the new-terminal key opens on Enter or Space', /e\.key === 'Enter' \|\| e\.key === ' '/],
   ['take over all takes only the linked agent terminals that are alive and not held', /linkedRows\.filter\(\(r\) => r\.by === 'agent' && r\.alive && !r\.hold\)/],
