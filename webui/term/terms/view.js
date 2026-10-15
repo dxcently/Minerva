@@ -128,6 +128,7 @@ export function create(e, x) {
   shells.set(e.id, t);
   watchTheme();
   const waiting = e.queue.splice(0);
+  e.queued = 0;
   for (const c of waiting) push(e, c.bytes, c.reset);
 }
 
@@ -147,17 +148,25 @@ function ensure(id) {
 }
 
 // Bytes to a screen. A reset is the RIS sequence written in order, so it lands after what is already waiting to be parsed. Past
-// BACKLOG_MAX unparsed bytes the terminal is resynced (the stream reconnects and sends a reset), once until that reset arrives.
+// BACKLOG_MAX unparsed bytes the terminal is resynced (the stream reconnects and sends a reset), once until that reset arrives. The
+// reset clears that mark only when its own bytes are parsed, so the backlog it waits behind cannot resync it again. A reset is a
+// snapshot that replaces the screen, so its own bytes are not counted (the ring can be bigger than the bound; counting them would
+// resync on every reset). Before a screen exists the output queues under the same bound: past it the queue is dropped and the
+// terminal resynced, and the output that comes before the reset is not kept.
 export function push(e, bytes, reset) {
+  const n = reset ? 0 : bytes.length;
   if (!e.term) {
-    if (reset) e.queue = [];
+    if (reset) { e.queue = []; e.queued = 0; e.resyncing = false; }
+    else if (e.resyncing) return;
     e.queue.push({ bytes, reset });
+    e.queued += n;
+    if (e.queued > BACKLOG_MAX) { e.queue = []; e.queued = 0; e.resyncing = true; resync(e.id); }
     return;
   }
   const t = e.term;
   if (reset) t.write('\x1bc');
-  e.backlog += bytes.length;
-  t.write(bytes, () => { e.backlog = Math.max(0, e.backlog - bytes.length); follow(e); });
+  e.backlog += n;
+  t.write(bytes, () => { e.backlog = Math.max(0, e.backlog - n); if (reset) e.resyncing = false; follow(e); });
   if (e.backlog > BACKLOG_MAX && !e.resyncing) { e.resyncing = true; resync(e.id); }
 }
 
@@ -213,7 +222,7 @@ export const mountedIn = (id) => { const e = live.get(id); return e && e.host ? 
 setHooks({
   made: (id) => ensure(id),
   out: (id, bytes) => { const e = live.get(id); if (e) push(e, bytes, false); },
-  reset: (id, bytes) => { const e = live.get(id); if (!e) return; e.resyncing = false; push(e, bytes, true); },
+  reset: (id, bytes) => { const e = live.get(id); if (!e) return; push(e, bytes, true); },
   size: (id, cols, rows) => { const t = shells.get(id); if (t) t.resize(cols, rows); },
   gone: (id) => {
     const t = shells.get(id);

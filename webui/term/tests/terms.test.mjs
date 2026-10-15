@@ -10,7 +10,8 @@ import { fileURLToPath } from 'node:url';
 import * as M from '../terms/model.js';
 import * as V from '../terms/view.js';
 import * as A from '../terms/activity.js';
-import { host, extraStreams } from '../core/registry.js';
+import { host, extraStreams, frameTaps, rightTabs } from '../core/registry.js';
+import { detect, mode } from '../core/api.js';
 
 // As LF: a checkout with core.autocrlf has CRLF sources, and the source scans search for single lines.
 const src = (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8').replace(/\r\n/g, '\n');
@@ -22,6 +23,15 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
 const settle = () => new Promise((r) => setImmediate(r));   // not the timers a test may mock: promises settle, the clock does not move
 const row = (over = {}) => ({ id: 't1', title: '', fg: 'bash', by: 'operator', cwd: '/w', cols: 120, rows: 32, alive: true, seq: 0, started_ms: 1000, last_ms: 0, hold: false, ...over });
 const realFetch = globalThis.fetch;
+// The hooks view.js set when it loaded: afterEach puts the model's no-op hooks back, so a test of the screen's hooks calls these.
+const VIEW = { ...M.hooks };
+
+// The page's mode as detect() sets it from the perch's answer: 'perch' is a 200 list, 'door' a 404. Leaves the detect stub in fetch.
+async function modeAs(kind) {
+  globalThis.fetch = async () => (kind === 'perch' ? { status: 200, text: async () => '[]' } : { status: 404, text: async () => '' });
+  await detect();
+  assert.equal(mode(), kind);
+}
 
 afterEach(() => {
   mock.restoreAll();
@@ -43,7 +53,7 @@ test('the stack ranks the inspected chat first, then the most recent output', ()
   assert.deepEqual(M.rankRows(rows, () => false), ['t3', 't2', 't1', 't4'], 'no chat: recency alone');
 });
 
-test('the order is recomputed at most every 2 s, and never while the pointer or the focus is in the stack', () => {
+test('reorderDue: at most every 2 s, and never while frozen (the stack sets that flag on hover or focus)', () => {
   assert.equal(M.reorderDue(10000, 9000, false), false, 'under 2 s since the last');
   assert.equal(M.reorderDue(11000, 9000, false), true, 'at 2 s, free');
   assert.equal(M.reorderDue(20000, 9000, true), false, 'frozen: never, however long');
@@ -669,7 +679,7 @@ test('the roster diff: a new agent terminal is an open, one whose agent input mo
   ]);
 });
 
-test('a poll that finds an agent terminal raises the badge through report: the diff is what the activity folder reads', () => {
+test('a roster diff that finds an agent terminal raises the badge through report', () => {
   const toasts = [];
   host.toast = (text) => toasts.push(text);
   A.tabShown.value = false;
@@ -679,6 +689,157 @@ test('a poll that finds an agent terminal raises the badge through report: the d
   for (const ev of M.diffRoster(before, after)) A.report(ev, 400000);
   assert.equal(A.badge.peek(), true);
   assert.match(toasts[0], /opened t80$/);
+});
+
+// ---------------------------------------------------------------- the table's 17th, the reset, the queue, the poll, the registry (fix round 3)
+test('the 17th terminal from term-open is refused as the list is: no row, no screen, no event', () => {
+  const made = [], events = [];
+  M.setHooks({ made: (id) => made.push(id), event: (ev) => events.push(ev) });
+  M.applyList(Array.from({ length: 16 }, (_, i) => row({ id: 't' + (i + 1) })));
+  made.length = 0;
+  M.onFrame({ type: 'term-open', id: 't17', term: row({ id: 't17', by: 'agent', chat: 'c7' }) });
+  assert.equal(M.roster.peek().length, M.MAX_TERMS, 'the table stays at 16');
+  assert.equal(M.live.has('t17'), false, 'no entry for the 17th');
+  assert.deepEqual(made, [], 'so no screen is made for it');
+  assert.deepEqual(events, [], 'and it is not said');
+});
+
+test('a reset writes the RIS sequence first, then its bytes: the snapshot paints over a clear screen', () => {
+  const writes = [];
+  const e = { id: 't20', term: { write: (b) => writes.push(b) }, fit: null, host: null, pend: null, seq: 0, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
+  M.live.set('t20', e);
+  const snap = bytesOf('snap');
+  V.push(e, snap, true);
+  assert.deepEqual(writes, ['\x1bc', snap]);
+});
+
+test('a reset that arrives while the screen is still over 2 MiB does not resync again; its own bytes clear the mark once parsed', () => {
+  const pending = [];
+  const e = {
+    id: 't21', term: { write: (bytes, cb) => { if (cb) pending.push(cb); } }, fit: null, host: null, pend: null, seq: 9,
+    queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false,
+  };
+  M.live.set('t21', e);
+  const MB = new Uint8Array(1024 * 1024);
+  for (let i = 0; i < 3; i++) V.push(e, MB, false);
+  assert.equal(e.seq, undefined, 'past 2 MiB: resynced');
+  assert.equal(e.resyncing, true);
+  e.seq = 12;
+  VIEW.reset('t21', bytesOf('snap'));   // the stream's reset hook, as view.js holds it
+  assert.equal(e.seq, 12, 'the reset does not forget the seq again');
+  assert.equal(e.resyncing, true, 'the mark stands while the backlog it waits behind is unparsed');
+  while (pending.length) pending.shift()();
+  assert.equal(e.resyncing, false, 'the reset\'s own bytes are parsed: the mark clears');
+  assert.equal(e.backlog, 0);
+});
+
+test('output queued before a screen exists is bounded: past 2 MiB the queue is dropped and the terminal resynced; the reset starts it again', () => {
+  const e = { id: 't22', term: null, fit: null, host: null, pend: null, seq: 5, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
+  M.live.set('t22', e);
+  const MB = new Uint8Array(1024 * 1024);
+  V.push(e, MB, false);
+  V.push(e, MB, false);
+  assert.equal(e.queue.length, 2, 'two MiB is the bound, not past it');
+  V.push(e, new Uint8Array(1), false);
+  assert.equal(e.queue.length, 0, 'past it: the queue is dropped');
+  assert.equal(e.seq, undefined, 'and the terminal is resynced');
+  assert.equal(e.resyncing, true);
+  V.push(e, MB, false);
+  assert.equal(e.queue.length, 0, 'bytes that come while the resync is on its way are not kept');
+  V.push(e, bytesOf('snap'), true);
+  assert.equal(e.queue.length, 1, 'the reset starts the queue again');
+  assert.equal(e.queue[0].reset, true);
+  assert.equal(e.resyncing, false);
+  V.push(e, bytesOf('after'), false);
+  assert.equal(e.queue.length, 2, 'and what follows the reset is kept');
+});
+
+test('a reset bigger than the bound is a snapshot, not backlog: it resyncs nothing, on a screen or in the queue before one', () => {
+  const pending = [];
+  const on = { id: 't23', term: { write: (b, cb) => { if (cb) pending.push(cb); } }, fit: null, host: null, pend: null, seq: 4, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
+  M.live.set('t23', on);
+  V.push(on, new Uint8Array(3 * 1024 * 1024), true);
+  assert.equal(on.seq, 4, 'no resync for a reset, however big');
+  assert.equal(on.resyncing, false);
+  while (pending.length) pending.shift()();
+  assert.equal(on.backlog, 0, 'and the backlog balances: a reset counts nothing either way');
+  const queued = { id: 't24', term: null, fit: null, host: null, pend: null, seq: 4, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
+  M.live.set('t24', queued);
+  V.push(queued, new Uint8Array(3 * 1024 * 1024), true);
+  assert.equal(queued.seq, 4, 'the same before a screen exists');
+  assert.equal(queued.queue.length, 1, 'the reset is kept for the screen');
+});
+
+test('the roster poll: the first answer is a baseline (an agent terminal already there says nothing), and the next says a new agent terminal once', async () => {
+  await modeAs('perch');
+  A._resetPoll();
+  const toasts = [], asked = [];
+  const answers = [
+    [row({ id: 't93', by: 'agent', chat: 'c4' }), row({ id: 't94' })],
+    [row({ id: 't93', by: 'agent', chat: 'c4' }), row({ id: 't94' }), row({ id: 't95', by: 'agent', chat: 'c5' })],
+  ];
+  host.toast = (text) => toasts.push(text);
+  A.tabShown.value = false;
+  A.badge.value = false;
+  globalThis.fetch = async (url) => { asked.push(url); return { status: 200, text: async () => JSON.stringify(answers.shift()) }; };
+  await A.poll();
+  assert.deepEqual(M.roster.peek().map((r) => r.id), ['t93', 't94'], 'the list is applied with no stream running');
+  assert.deepEqual(toasts, [], 'the first look is a baseline: nothing already there is news');
+  await A.poll();
+  assert.equal(toasts.length, 1, 'the new agent terminal is said once');
+  assert.match(toasts[0], /^agent in c5 opened t95$/);
+  assert.equal(A.badge.peek(), true);
+  assert.deepEqual(asked, ['/hub/term', '/hub/term']);
+});
+
+test('the roster poll asks nothing in door mode, and nothing while the terminal stream is up', async () => {
+  const asked = [];
+  await modeAs('door');
+  globalThis.fetch = async (url) => { asked.push(url); return { status: 200, text: async () => '[]' }; };
+  await A.poll();
+  assert.deepEqual(asked, [], 'door mode: the perch is not asked for its terminals');
+  await modeAs('perch');
+  host.chatStreams = () => 0;
+  globalThis.fetch = (url) => {
+    asked.push(url);
+    return String(url).startsWith('/hub/term/events') ? new Promise(() => {}) : Promise.resolve({ status: 200, text: async () => '[]' });
+  };
+  assert.equal(M.startStream(), true);
+  asked.length = 0;
+  await A.poll();
+  assert.deepEqual(asked, [], 'the stream is up: it says the roster, and the poll does not ask');
+});
+
+test('a poll answered after the terminal stream opened changes nothing and says nothing: the stream\'s roster stands', async () => {
+  await modeAs('perch');
+  host.chatStreams = () => 0;
+  const toasts = [];
+  host.toast = (text) => toasts.push(text);
+  A._resetPoll();
+  globalThis.fetch = async () => ({ status: 200, text: async () => JSON.stringify([row({ id: 't97' })]) });
+  await A.poll();   // the first look: the baseline
+  let answer = null;
+  globalThis.fetch = (url) => (String(url).startsWith('/hub/term/events') ? new Promise(() => {})
+    : new Promise((res) => { answer = res; }));
+  const p = A.poll();   // its request goes out and waits
+  assert.equal(M.startStream(), true, 'the stream opens while the poll waits');
+  M.applyList([row({ id: 't97' }), row({ id: 't98', by: 'agent', chat: 'c6' })]);   // the stream's own roster
+  answer({ status: 200, text: async () => JSON.stringify([row({ id: 't97' }), row({ id: 't99', by: 'agent', chat: 'c6' })]) });
+  await p;
+  assert.deepEqual(M.roster.peek().map((r) => r.id), ['t97', 't98'], 'the late answer is not applied over the stream\'s list');
+  assert.deepEqual(toasts, [], 'and the poll says nothing while the stream is up');
+  M.stopStream();
+});
+
+test('the folder registers at import: the frame tap, the ⌨ tab on the right with the activity badge, and the poll started at boot', async () => {
+  await import('../terms/index.js');
+  assert.ok(frameTaps.peek().includes(A.tap), 'the frame tap is in the registry');
+  const tab = rightTabs.get('terms');
+  assert.ok(tab, 'the ⌨ tab is registered on the right');
+  assert.equal(tab.badge, A.badge, 'with the activity badge');
+  assert.equal(tab.global, true);
+  assert.match(src('../terms/index.js'), /^frameTaps\.add\(tap\);$/m, 'the tap is added at import');
+  assert.match(src('../terms/index.js'), /^startActivity\(\);$/m, 'the poll starts at import (node has no document, so it does nothing here)');
 });
 
 // ---------------------------------------------------------------- the sources: what only the text can hold
@@ -718,3 +879,24 @@ test('the model and the activity folder build no URL from a raw string: the inpu
   assert.match(m, /\/hub\/term\/\$\{id\}\/input/);
   assert.match(m, /\/hub\/term\/events/);
 });
+
+// The ⌨ tab's handlers run in the browser, which node cannot reach; each line below is the text of one wiring, so a change to it
+// (a hold flipped, a pane not named, a wheel not captured, a save dropped, a freeze unwired, a line removed) turns its test red.
+const TAB_WIRING = [
+  ['take over and hand back send the flipped hold', /on=\$\{\(\) => setHold\(id, !row\.hold\)\}/],
+  ['the pop-out opens a pane that names its terminal', /openXPane\('term', \{ term: id \}\)/],
+  ['the pane link focuses that pane', /focusPane\(pane\.id\)/],
+  ['the wheel listener is capture and not passive', /\{ capture: true, passive: false \}/],
+  ['the wheel stops its default, stops propagation and scrolls the stack', /const wheel = \(e\) => \{ e\.preventDefault\(\); e\.stopPropagation\(\); el\.scrollTop \+= e\.deltaY; \};/],
+  ['a new terminal sends the inspected chat, and nothing without one', /const body = chat \? \{ chat \} : \{\};/],
+  ['a fold is saved as it is set', /M\.saveFold\(next\)/],
+  ['a focus inside the stack freezes the order', /querySelector\(':focus'\)/],
+  ['the order is recomputed through reorderDue with the freeze', /M\.reorderDue\(Date\.now\(\), lastOrder\.current, frozen\.current\)/],
+  ['the yolo line says what it does', /yolo: agents type into these terminals without asking\./],
+  ['a new terminal is said opened only on a 201 with an id', /r\.status === 201 && r\.data && typeof r\.data\.id === 'string'/],
+];
+for (const [what, re] of TAB_WIRING) {
+  test('the ⌨ tab wiring: ' + what, () => {
+    assert.match(src('../terms/tab.js'), re);
+  });
+}

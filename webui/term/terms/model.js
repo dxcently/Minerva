@@ -30,8 +30,9 @@ export const status = signal('closed');
 export const typedAt = signal({});   // id -> ms of the last agent input (the 'agent typing' line)
 export const agentLine = signal({}); // id -> the agent's last input, as the perch pictures it
 export const bellAt = signal({});    // id -> ms of the last bell
-// id -> { id, term, fit, host, pend, seq, queue, backlog, loading, resyncing, follow }: the screen (view.js: term, fit, host) and the
-// page's bookkeeping for one terminal (pend: its input queue; seq: the last byte the page has, which is what a resume asks from).
+// id -> { id, term, fit, host, pend, seq, queue, queued, backlog, loading, resyncing, follow }: the screen (view.js: term, fit, host) and the
+// page's bookkeeping for one terminal (pend: its input queue; seq: the last byte the page has, which is what a resume asks from; queue and
+// queued: the bytes kept before a screen exists, and how many).
 export const live = new Map();
 
 // The screen (view.js) and the activity folder (activity.js) plug in here (setHooks); until they do, every hook does nothing.
@@ -195,11 +196,14 @@ function patchRow(id, patch) {
   if (!cur.some((r) => r.id === id)) return;
   roster.value = cur.map((r) => (r.id === id ? { ...r, ...patch } : r));
 }
+// True when the row is in the roster. A 17th terminal is not kept: the perch's table is 16, so the page's is too.
 function upsertRow(row) {
   const cur = roster.peek();
   const at = cur.findIndex((r) => r.id === row.id);
-  if (at >= 0) roster.value = cur.map((r, i) => (i === at ? row : r));
-  else if (cur.length < MAX_TERMS) roster.value = [...cur, row];
+  if (at >= 0) { roster.value = cur.map((r, i) => (i === at ? row : r)); return true; }
+  if (cur.length >= MAX_TERMS) return false;
+  roster.value = [...cur, row];
+  return true;
 }
 function dropLive(id) {
   live.delete(id);
@@ -214,7 +218,7 @@ function removeRow(id) {
 function entryOf(id) {
   let e = live.get(id);
   if (!e) {
-    e = { id, term: null, fit: null, host: null, pend: null, seq: undefined, queue: [], backlog: 0, loading: false, resyncing: false, follow: false };
+    e = { id, term: null, fit: null, host: null, pend: null, seq: undefined, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
     live.set(id, e);
     hooks.made(id);
   }
@@ -264,7 +268,7 @@ export function onFrame(f, now = Date.now()) {
     case 'term-open': {
       const row = vet(f.term);
       if (!row || row.id !== id) return;
-      upsertRow(row);
+      if (!upsertRow(row)) return;   // the table is full: no row, no screen, no event for it
       entryOf(id);
       if (row.by === 'agent') hooks.event({ kind: 'open', id, chat: row.chat || null });
       return;

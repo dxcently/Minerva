@@ -77,7 +77,7 @@ export function tap(sid, frame, live) {
 
 // The roster poll, while the terminal stream is closed. The first answer is a baseline: what was there already is not news.
 let polling = 0, baseline = false;
-async function poll() {
+export async function poll() {
   if (mode() !== 'perch' || streamUp()) return;
   const before = roster.peek();
   const st = await pollNow();
@@ -85,6 +85,7 @@ async function poll() {
   if (baseline) for (const ev of diffRoster(before, roster.peek())) report(ev);
   baseline = true;
 }
+export function _resetPoll() { baseline = false; }   // for tests: a page's first answer is a baseline again
 
 // Starts the poll and hooks the stream's own events in. Once; the page calls it at boot (terms/index.js). With no document (node's tests
 // import this folder) there is no page to poll for, and a live interval would keep the test process from ending.
