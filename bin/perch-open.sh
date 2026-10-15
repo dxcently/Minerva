@@ -109,7 +109,7 @@ if [ -x "$here/perch" ] && [ -x "$here/minerva" ] && [ "${MINERVA_NO_PLUGIN_SYNC
 fi
 
 if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
-  echo "perch-open: XDG_RUNTIME_DIR is not set; the perch refuses to keep its token in a shared temp dir" >&2
+  echo "perch-open: XDG_RUNTIME_DIR is not set; the perch refuses to keep its token in a shared temp dir. Enable systemd in /etc/wsl.conf ([boot] systemd=true), then run wsl --shutdown from Windows" >&2
   exit 1
 fi
 STATE=$XDG_RUNTIME_DIR/minerva

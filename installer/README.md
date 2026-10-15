@@ -414,6 +414,8 @@ Release key fingerprint (sha-256 of the 32 key bytes, first 16 hex, grouped): (n
 
 ### One-time signing setup (operator)
 
+`minisign` is the signing tool: `sudo apt install minisign` (Ubuntu), or a binary from its [GitHub releases](https://github.com/jedisct1/minisign/releases).
+
 ```sh
 minisign -G -p installer/minisign.pub -s ~/.minisign/minerva.key    # choose a password; the .key never enters the repo
 git add installer/minisign.pub && git commit                        # the PUBLIC key is safe to commit
@@ -426,14 +428,14 @@ key safe.
 ### Releasing
 
 ```powershell
-installer\build.ps1                                       # clean tree, VERSION bumped and committed
+installer\build.ps1                                       # needs a clean tree; reads VERSION (bump and commit it yourself first)
 ```
 ```sh
 cd installer/dist
-minisign -S -s ~/.minisign/minerva.key -m latest.json minerva-*-linux-x86_64.tar.gz     # writes the .minisig files
+for f in latest.json SHA256SUMS minerva-*-linux-x86_64.tar.gz; do minisign -S -s ~/.minisign/minerva.key -m "$f"; done   # writes the .minisig files
 gh release create v$(cat ../../VERSION) --repo dxcently/Minerva --title "Minerva $(cat ../../VERSION)" \
   --notes "..." latest.json latest.json.minisig minerva-*-linux-x86_64.tar.gz minerva-*-linux-x86_64.tar.gz.minisig \
-  install.sh minerva-install.exe SHA256SUMS
+  install.sh minerva-install.exe SHA256SUMS SHA256SUMS.minisig
 ```
 
 `latest.json` carries a signed `released` date, `expires` (= released + 30 days) and `keys_serial`. Past `expires`, `update` and the

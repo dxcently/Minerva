@@ -6,8 +6,8 @@
 #   release-files.sh resign DIR    re-stamp the existing latest.json with a fresh `released`/`expires` and the current keys_serial,
 #                                  WITHOUT rebuilding anything. Then sign it again (see below). Do this at least every 30 days:
 #                                  a manifest older than that still works, but members are told "release info is stale".
-# Neither signs nor publishes: signing is the operator's step (installer/README.md, "Releasing"):
-#   minisign -S -s KEY -m latest.json SHA256SUMS minerva-*-linux-x86_64.tar.gz     (the bundle's .minisig only on a rebuild)
+# Neither signs nor publishes: signing is the operator's step (installer/README.md, "Releasing"), one minisign -S per file:
+#   minisign -S -s KEY -m latest.json ; minisign -S -s KEY -m SHA256SUMS ; minisign -S -s KEY -m minerva-*-linux-x86_64.tar.gz
 #   if DIR holds keys.json, re-sign it too (keys.json.minisig) and keep its own "expires" date in the future.
 set -euo pipefail
 mode=build

@@ -3,3 +3,7 @@ webui/term/fonts/** -text
 bin/eidolon-theme text eol=lf
 bin/eidolon text eol=lf
 webui/term/vendor/** text eol=lf
+installer/chromium/pin.env text eol=lf
+installer/chromium/libs.lock text eol=lf
+installer/minisign.pub text eol=lf
+providers/*.rn text eol=lf

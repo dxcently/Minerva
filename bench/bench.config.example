@@ -19,9 +19,9 @@ score_total     = 256
 # hands too); ready_cmd waits for boot AND a post-boot report, because the
 # first report of a boot is wrong (8/256 on a clean image). Split on spaces.
 # These invoke the WSL script from Windows; adjust for your host.
-vm_cmd    = wsl -e /mnt/c/Users/dxcen/Projects/Minerva/bin/botforge-vm.sh
-score_cmd = wsl -e /mnt/c/Users/dxcen/Projects/Minerva/bin/botforge-vm.sh score
-ready_cmd = wsl -e /mnt/c/Users/dxcen/Projects/Minerva/bin/botforge-vm.sh ready
+vm_cmd    = wsl -e /mnt/c/path/to/Minerva/bin/botforge-vm.sh
+score_cmd = wsl -e /mnt/c/path/to/Minerva/bin/botforge-vm.sh score
+ready_cmd = wsl -e /mnt/c/path/to/Minerva/bin/botforge-vm.sh ready
 
 # §7.4 honesty checks (detection; the agent is root, so a hit invalidates a run)
 allowed_tools = fs, ssh, vm_read

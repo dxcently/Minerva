@@ -18,6 +18,8 @@ This guide takes a club member from a fresh Windows 11 machine to a working agen
 
 Status is as of 2026-09-26. Anything marked **untested** has not yet been run end to end on a club machine. If you are the first to run one of those steps, fix this page.
 
+**Tested on:** WSL Ubuntu 26.04.1 with Python 3.14.4 and rustc 1.98.1. The numbers in `models.ini` were tuned on the GPU of the PC that built this stack and its Prism llama.cpp build. On other hardware they are a starting point to re-tune.
+
 ---
 
 ## Part 0: how Minerva is laid out
@@ -70,8 +72,32 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 . "$HOME/.cargo/env"
 ```
 
-- eidolon needs Rust 1.85 or newer (edition 2024). rustup's stable channel is newer than that.
+- The crates need Rust 1.88 or newer (edition 2024; the perch uses let-chains, stable from 1.88). rustup's stable channel is newer than that.
 - `python3-venv` is only needed for jev (Part 5), but it's cheap to install now.
+
+**Fresh-WSL prerequisites.** Do these before Part 2. The first two are required; the last two are only for building the installer.
+
+1. **systemd on.** The perch refuses to start without `$XDG_RUNTIME_DIR`, and systemd provides it. In Ubuntu, create `/etc/wsl.conf` with:
+
+   ```ini
+   [boot]
+   systemd=true
+   ```
+
+   Then in PowerShell run `wsl --shutdown` and open Ubuntu again.
+
+2. **WSL kept alive.** In `%UserProfile%\.wslconfig` (create it if missing) add:
+
+   ```ini
+   [wsl2]
+   vmIdleTimeout=-1
+   ```
+
+   Then run `wsl --shutdown` once. Without it the perch stops when WSL idles out (see Part 8).
+
+3. **Only for a release installer bundle:** `sudo apt install -y musl-tools` (the static musl build needs `musl-gcc`).
+
+4. **Only for building `minerva-install.exe` on Windows:** Visual Studio Build Tools with the "Desktop development with C++" workload.
 
 ---
 
@@ -80,11 +106,11 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 Clone into your **Linux home**, not into `/mnt/c/...`.
 
 ```bash
-git clone https://github.com/dxcently/Minerva ~/Minerva
-cd ~/Minerva/eidolon
+git clone https://github.com/dxcently/Minerva ~/src/Minerva
+cd ~/src/Minerva/eidolon
 cargo build --release --locked
 mkdir -p ~/.local/bin
-ln -sf ~/Minerva/eidolon/target/release/eidolon ~/.local/bin/eidolon
+ln -sf ~/src/Minerva/eidolon/target/release/eidolon ~/.local/bin/eidolon
 ```
 
 **Why the Linux home?** eidolon keeps its sockets and `0600` token files on the filesystem. The Windows drive under `/mnt/c` handles Unix permissions poorly and is several times slower to build on.
@@ -183,7 +209,7 @@ If that returns JSON, WSL can reach the server. Some machines also need a Hyper-
 
 ```bash
 mkdir -p ~/.config/eidolon/providers
-cp ~/Minerva/providers/hoot.rn ~/.config/eidolon/providers/
+cp ~/src/Minerva/providers/hoot.rn ~/.config/eidolon/providers/
 eidolon models                      # hoot: rows appear
 eidolon tui --model hoot:Qwen3-Coder-30B-A3B
 ```
@@ -220,7 +246,7 @@ Then `hoot` starts (or reuses) the Minerva server in WSL and opens your browser 
 To serve one bare `eidolon web` session by hand instead (no chat list, one session):
 
 ```bash
-eidolon web --bind 127.0.0.1:47811 --ui-dir ~/Minerva/webui/term
+eidolon web --bind 127.0.0.1:47811 --ui-dir ~/src/Minerva/webui/term
 #   listening on http://127.0.0.1:47811/
 #   token file: /run/user/<uid>/eidolon/web-47811.token
 ```
@@ -240,7 +266,7 @@ jev scores a menu of options in one pass (`choose`), checks whether one statemen
 Set it up:
 
 ```bash
-cd ~/Minerva
+cd ~/src/Minerva
 python3 -m venv jev/.venv
 jev/.venv/bin/pip install -r jev/requirements.txt    # CPU-only torch, ~1 GB
 jev/.venv/bin/python jev/test_server.py              # 33 tests; `choose` uses the shipped checkpoint
@@ -254,7 +280,7 @@ head -c 24 /dev/urandom | base64 > ~/.config/eidolon/jev.token
 for v in jev_choose jev_entail; do
   eidolon plugins grant $v file:~/.config/eidolon/jev.token
 done
-cd ~/Minerva/jev
+cd ~/src/Minerva/jev
 EIDOLON_SERVICE_PORT=8091 EIDOLON_SERVICE_TOKEN="$(cat ~/.config/eidolon/jev.token)" \
   HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv/bin/python -u server.py
 ```
@@ -275,7 +301,7 @@ jev/get-openjev.sh                                   # ~9 GB into models/openjev
 `aoide-core/` is the mesh node: `aoide` (the CLI) and `aoided` (the daemon). It connects Minerva machines to each other. You only need it on machines joining the club mesh.
 
 ```bash
-cd ~/Minerva/aoide-core
+cd ~/src/Minerva/aoide-core
 cargo build --release -p aoide-cli     # target/release/aoide and aoided
 ```
 
@@ -311,7 +337,7 @@ ollama pull gpt-oss:20b-cloud        # swap in any model from ollama.com/search?
 Then start opencode inside the repo:
 
 ```bash
-cd ~/Minerva
+cd ~/src/Minerva
 opencode
 ```
 
@@ -336,7 +362,7 @@ The repo's `opencode.json` already declares a `hoot` provider for the Windows mo
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `cargo build` is very slow, or fails with permission errors | The repo is under `/mnt/c` | Clone into `~/Minerva` (Part 2). |
+| `cargo build` is very slow, or fails with permission errors | The repo is under `/mnt/c` | Clone into `~/src/Minerva` (Part 2). |
 | `eidolon: command not found` | `~/.local/bin` isn't on `PATH` yet | Open a new terminal, or `export PATH="$HOME/.local/bin:$PATH"`. |
 | `python3 -m venv` says `ensurepip is not available` | `python3-venv` isn't installed | `sudo apt install -y python3-venv` |
 | `curl 127.0.0.1:8080` fails from WSL | NAT networking | Set `networkingMode=mirrored` (B5), then `wsl --shutdown`. |

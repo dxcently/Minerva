@@ -15,6 +15,7 @@ prose rename is a separate human edit, not a code change.
 | **Loopback only** | It refuses any bind that is not `127.0.0.0/8` or `::1`, before a listener exists, and there is no flag that widens it. Its token is a file on this machine, not a credential for a network. |
 | **MIT** | Same license as the rest of Minerva. It depends on `harnox` (MIT, a sibling checkout) and on no `eidolon-*` crate at all: a door is a binary, two stdout lines, a `0600` token file and HTTP, and nothing more. No `aoide-*` crate either — those are GPL-3.0. |
 | **Unix only** | It needs `$XDG_RUNTIME_DIR`, `0600` files and signals. A non-Unix build fails at `compile_error!` rather than at the first `chmod`. |
+| **systemd in WSL** | `$XDG_RUNTIME_DIR` comes from systemd, so a fresh WSL needs `[boot] systemd=true` in `/etc/wsl.conf` and a `wsl --shutdown` (Getting-Started, Part 1). Without it the launcher refuses to start. |
 
 ## Run it
 
