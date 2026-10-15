@@ -9,7 +9,8 @@
 //!
 //! The health tests serve the services' `/health` themselves, each on a loopback port the OS picks, and hand the perch that port through
 //! `--jev-health` and `--browser-health`, so two suites at once never ask for the same one. A "down" service is a port that was bound
-//! and let go, so nothing listens there. Only the test that never connects keeps literal addresses.
+//! and let go, so nothing listens there; a let-go port is only treated as down once a connect to it has been refused.
+//! Only the test that never connects keeps literal addresses.
 //!
 //! Mutations that were run by hand, each by itself, and what stopped it (the tests that failed; every other test of the file passed):
 //!
@@ -255,6 +256,7 @@ impl Drop for Stub {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        wait_refused(self.port);
     }
 }
 
@@ -395,9 +397,11 @@ fn a_request_that_is_not_a_run_is_refused_before_anything_is_made() {
     assert!(!site.home.join("runs").exists() && !site.home.join("runs.json").exists(), "nothing was made for a request that was refused");
 }
 
-/// A loopback port nothing listens on: bound, read and let go.
+/// A loopback port nothing listens on: bound, read, let go, and waited on until refused.
 fn closed_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
+    let port = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+    wait_refused(port);
+    port
 }
 
 // ---------------------------------------------------------------------------
@@ -591,10 +595,26 @@ fn refs(flags: &[String]) -> Vec<&str> {
     flags.iter().map(String::as_str).collect()
 }
 
-/// Two loopback ports nothing listens on: both are bound at once, so they differ, and then let go.
+/// Waits (at most 3 s) until a connect to this loopback port is refused. A listener that was just dropped can live on for a moment in a
+/// child that was being started while it was open, so a port is only "down" once something has been seen to refuse it.
+fn wait_refused(port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return,
+            _ => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+}
+
+/// Two loopback ports nothing listens on: both are bound at once, so they differ, then let go, and each is waited on until refused.
 fn closed_ports() -> (u16, u16) {
     let (first, second) = (TcpListener::bind(("127.0.0.1", 0)).unwrap(), TcpListener::bind(("127.0.0.1", 0)).unwrap());
-    (first.local_addr().unwrap().port(), second.local_addr().unwrap().port())
+    let ports = (first.local_addr().unwrap().port(), second.local_addr().unwrap().port());
+    drop((first, second));
+    wait_refused(ports.0);
+    wait_refused(ports.1);
+    ports
 }
 
 fn health(perch: &Perch) -> Value {
