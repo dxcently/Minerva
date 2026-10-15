@@ -83,9 +83,12 @@ async function newTerm(chat) {
   toast(`no terminal: ${why}`, true);
 }
 
+// The header's name: the title, else the foreground program, else the id. A title or foreground of spaces or controls only is no name.
+export const headTitle = (row) => titleText(row.title) || titleText(row.fg) || row.id;
+
 function Term({ row, pos, linked, open, now, pane, typing, line, bell }) {
   const id = row.id;
-  const title = titleText(row.title) || titleText(row.fg) || id;
+  const title = headTitle(row);
   const cls = 'tterm' + (linked ? ' mine' : '') + (open ? ' open' : '') + (row.alive ? '' : ' ended') + (bell ? ' bell' : '');
   return html`<div class=${cls} style=${'order:' + pos} data-term=${id}>
     <div class="thead">

@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import * as M from '../terms/model.js';
 import * as V from '../terms/view.js';
 import * as A from '../terms/activity.js';
-import { TYPING_MS, SHOW_MS } from '../terms/tab.js';
+import { TYPING_MS, SHOW_MS, headTitle } from '../terms/tab.js';
 import { host, extraStreams, frameTaps, rightTabs } from '../core/registry.js';
 import { detect, mode } from '../core/api.js';
 
@@ -299,7 +299,7 @@ test('the theme comes from the --base0X the look wrote: each slot maps, a value 
 
 test('the queries the page swallows are the perch\'s answers and the two it never gives, with their exact forms', () => {
   assert.deepEqual(V.QUERIES.map((q) => q.name), [
-    'DA1', 'DA2', 'DSR', 'DECRQM', 'DECRQM DEC', 'CSI 18 t', 'DECRQSS', 'XTVERSION', 'OSC 4/10/11/12',
+    'DA1', 'DA2', 'DSR', 'DSR DEC', 'DECRQM', 'DECRQM DEC', 'CSI 18 t', 'DECRQSS', 'XTVERSION', 'OSC 4/10/11/12',
   ]);
   const q = (name) => V.QUERIES.find((x) => x.name === name);
   assert.equal(q('DA1').when([]), true);
@@ -307,7 +307,12 @@ test('the queries the page swallows are the perch\'s answers and the two it neve
   assert.equal(q('DA1').when([1]), false, 'a DA1 with a parameter that is not 0 is no query');
   assert.equal(q('DSR').when([5]), true);
   assert.equal(q('DSR').when([6]), true);
+  assert.equal(q('DSR').when([6, 1]), true, 'CSI 6;1 n: xterm answers it by params[0], so the page takes it too');
   assert.equal(q('DSR').when([0]), false, 'CSI 0 n is not a status request');
+  assert.equal(q('DSR').when([]), false, 'CSI n with no parameter is not one either');
+  assert.deepEqual(q('DSR DEC').id, { prefix: '?', final: 'n' }, 'the private DSR is its own form');
+  assert.equal(q('DSR DEC').when([6]), true, 'CSI ? 6 n is the private status request (xterm answers DECXCPR)');
+  assert.equal(q('DSR DEC').when([0]), false);
   assert.equal(q('CSI 18 t').when([18]), true);
   assert.equal(q('CSI 18 t').when([14]), false, 'CSI 14 t (pixels) is not swallowed');
   assert.equal(q('OSC 4/10/11/12').when('11;?'), true, 'asking');
@@ -422,12 +427,13 @@ test('a terminal\'s one element moves between hosts and is never in two: a mount
   });
 });
 
-test('the queries are swallowed on the screen\'s own parser: 7 CSI forms, DECRQSS, and OSC 4/10/11/12, each taken exactly when its form is the query', () => {
+test('the queries are swallowed on the screen\'s own parser: 8 CSI forms, DECRQSS, and OSC 4/10/11/12, each taken exactly when its form is the query', () => {
   withPage(() => {
     const made = screenFor('t9');
     const q = (n) => V.QUERIES.find((x) => x.name === n);
     const csi = (n) => made.csi.find((r) => r.id === q(n).id);
-    assert.equal(made.csi.length, 7);
+    assert.equal(made.csi.length, 8);
+    assert.equal(csi('DSR DEC').fn([6]), true, 'the private DSR is taken on the screen too');
     assert.equal(made.dcs.length, 1, 'DECRQSS');
     assert.deepEqual(made.osc.map((r) => r.id).sort((a, b) => a - b), [4, 10, 11, 12]);
     assert.equal(csi('DA1').fn([]), true, 'DA1 is taken: xterm writes no reply');
@@ -983,6 +989,203 @@ test('the risk line links nothing, and no fit addon is loaded: a screen takes th
   assert.doesNotMatch(src('../terms/view.js'), /addon-fit|FitAddon/, 'no fit addon');
 });
 
+// ---------------------------------------------------------------- the stream's connections (fix round 3)
+// The terminal stream's connections, one fetch each, in order. A connection is its frames in one chunk, then its body ends; with `open`
+// it stays up until its signal aborts (the abort errors the body, as a browser's does) or until urls.drop() ends it (a connection that
+// drops). A fetch past the list never answers. Returns the urls the fetches were asked for, in order.
+function sseFetch(conns) {
+  const urls = [], up = [];
+  globalThis.fetch = (url, init = {}) => {
+    urls.push(String(url));
+    const c = conns.shift();
+    if (!c) return new Promise(() => {});
+    const text = c.frames.map((f) => 'data: ' + JSON.stringify(f) + '\n\n').join('');
+    let ctl = null;
+    const body = new ReadableStream({
+      start(k) { ctl = k; k.enqueue(new TextEncoder().encode(text)); if (c.open) up.push(k); else k.close(); },
+    });
+    init.signal?.addEventListener('abort', () => { try { ctl.error(new DOMException('aborted', 'AbortError')); } catch { /* already closed */ } });
+    return Promise.resolve({ ok: true, status: 200, body });
+  };
+  urls.drop = () => { for (const k of up.splice(0)) { try { k.close(); } catch { /* already gone */ } } };
+  return urls;
+}
+const settled = async () => { for (let i = 0; i < 20; i++) await settle(); };
+const text = (bytes) => new TextDecoder().decode(bytes);
+
+test('after a resync, the frames still in the aborted connection\'s buffer reach no screen and set no seq; the reset that follows clears the stale mark', async () => {
+  host.chatStreams = () => 0;
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const urls = sseFetch([
+    { frames: [{ type: 'term-list', terms: [row({ id: 't1' })] }, { type: 'term-out', id: 't1', seq: 10, data: b64('a') },
+      { type: 'term-out', id: 't1', seq: 20, data: b64('b') }] },
+    { frames: [{ type: 'term-reset', id: 't1', seq: 30, data: b64('') }], open: true },
+  ]);
+  const got = [];
+  M.setHooks({ out(id, bytes) { got.push(text(bytes)); if (got.length === 1) M.resync(id); } });
+  try {
+    M.startStream();
+    await settled();
+    const e = M.live.get('t1');
+    assert.deepEqual(got, ['a'], 'the frame after the resync, in the same buffer, reaches no screen');
+    assert.equal(e.seq, undefined, 'and sets no seq');
+    assert.equal(e.stale, true);
+    mock.timers.tick(1000);
+    await settled();
+    assert.equal(urls[1], '/hub/term/events', 'the next connection asks for t1 with no seq: a reset');
+    assert.equal(e.seq, 30, 'the reset sets the seq');
+    assert.equal(e.stale, false, 'and clears the stale mark');
+  } finally {
+    mock.timers.reset();
+    M.stopStream();
+  }
+});
+
+test('while an entry is stale (after a resync, until its reset) output keeps no seq; the reset sets it again, and output after it stores its own', () => {
+  M.applyList([row({ id: 't2' })]);
+  const e = M.live.get('t2');
+  e.seq = 5;
+  M.resync('t2');
+  assert.equal(e.seq, undefined);
+  M.onFrame({ type: 'term-out', id: 't2', seq: 9, data: b64('x') });
+  M.onFrame({ type: 'term-out', id: 't2', seq: 12, data: b64('y') });
+  assert.equal(e.seq, undefined, 'two frames after a resync set no seq');
+  M.onFrame({ type: 'term-reset', id: 't2', seq: 40, data: b64('') });
+  assert.equal(e.seq, 40, 'the reset is the page\'s seq again');
+  assert.equal(e.stale, false, 'and clears the stale mark');
+  M.onFrame({ type: 'term-out', id: 't2', seq: 41, data: b64('z') });
+  assert.equal(e.seq, 41);
+});
+
+test('a reset cut short by a dropped connection is forgotten: the next connection asks for a fresh reset, not a resume past the chunks', async () => {
+  host.chatStreams = () => 0;
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const urls = sseFetch([
+    { frames: [{ type: 'term-list', terms: [row({ id: 't3' })] }, { type: 'term-reset', id: 't3', seq: 40000, data: b64('x') }], open: true },
+    { frames: [], open: true },
+  ]);
+  try {
+    M.startStream();
+    await settled();
+    assert.equal(M.live.get('t3').resetting, true, 'the reset is in progress while its chunks may still come');
+    urls.drop();
+    await settled();
+    assert.equal(M.live.get('t3').resetting, false, 'the drop ends the reset');
+    mock.timers.tick(1000);
+    await settled();
+    assert.equal(urls[1], '/hub/term/events', 'no since for t3: the seq of the cut reset is forgotten');
+  } finally {
+    mock.timers.reset();
+    M.stopStream();
+  }
+});
+
+test('a frame at another seq ends the reset: a connection dropped after it resumes from that seq', async () => {
+  host.chatStreams = () => 0;
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const urls = sseFetch([
+    { frames: [{ type: 'term-list', terms: [row({ id: 't4' })] }, { type: 'term-reset', id: 't4', seq: 40000, data: b64('x') },
+      { type: 'term-out', id: 't4', seq: 40100, data: b64('y') }], open: true },
+    { frames: [], open: true },
+  ]);
+  try {
+    M.startStream();
+    await settled();
+    assert.equal(M.live.get('t4').resetting, false, 'a frame at 40100 is not the reset\'s chunk');
+    urls.drop();
+    await settled();
+    mock.timers.tick(1000);
+    await settled();
+    assert.equal(urls[1], '/hub/term/events?since=t4:40100', 'the resume is from the newer seq');
+  } finally {
+    mock.timers.reset();
+    M.stopStream();
+  }
+});
+
+test('stopping the stream forgets a reset that was in progress, the same as a dropped connection', () => {
+  M.applyList([row({ id: 't5' })]);
+  M.onFrame({ type: 'term-reset', id: 't5', seq: 40000, data: b64('x') });
+  const e = M.live.get('t5');
+  assert.equal(e.resetting, true);
+  M.stopStream();
+  assert.equal(e.seq, undefined, 'the next connection asks for a reset');
+  assert.equal(e.resetting, false);
+});
+
+test('a reconnect waits at least 1 s, a quick one included: a resync that the next connection fails at once does not loop under output', async () => {
+  host.chatStreams = () => 0;
+  mock.timers.enable({ apis: ['setTimeout'] });
+  M.setHooks({ out(id) { M.resync(id); } });
+  const urls = sseFetch([
+    { frames: [{ type: 'term-list', terms: [row({ id: 't6' })] }, { type: 'term-out', id: 't6', seq: 10, data: b64('a') }] },
+    { frames: [], open: true },
+  ]);
+  try {
+    M.startStream();
+    await settled();
+    assert.equal(urls.length, 1, 'the resync ends the first connection');
+    assert.equal(M.MIN_WAIT, 1000, 'the floor is a second');
+    mock.timers.tick(M.MIN_WAIT - 1);
+    await settled();
+    assert.equal(urls.length, 1, 'not before 1 s, though the resync was quick');
+    mock.timers.tick(1);
+    await settled();
+    assert.equal(urls.length, 2, 'at 1 s, the next connection');
+  } finally {
+    mock.timers.reset();
+    M.stopStream();
+  }
+});
+
+// The queries, as the wire sends them: every form the page swallows, and the two DSR forms xterm answered before the fix (params past the
+// first, and the private one). The real vendored xterm runs headless here: it parses, and its replies come out of onData.
+const QUERY_FORMS = [
+  '\x1b[c', '\x1b[0c', '\x1b[>c', '\x1b[>0c', '\x1b[5n', '\x1b[6n', '\x1b[6;1n', '\x1b[5;1n', '\x1b[?6n', '\x1b[?5n', '\x1b[?6;1n',
+  '\x1b[4$p', '\x1b[?7$p', '\x1b[18t', '\x1bP$qm\x1b\\', '\x1b[>0q', '\x1b]4;1;?\x07', '\x1b]10;?\x1b\\', '\x1b]11;?\x07', '\x1b]12;?\x1b\\',
+];
+test('the page answers no query: the real vendored xterm, with the page\'s queries on its parser, writes no reply to any form (DSR with more parameters, and the private DSR, included)', async () => {
+  const { Terminal } = await import('../vendor/xterm.js');
+  for (const f of QUERY_FORMS) {
+    const t = new Terminal({ cols: 80, rows: 24 });
+    V.registerQueries(t.parser);
+    const replies = [];
+    t.onData((s) => replies.push(s));
+    await new Promise((r) => t.write(f, r));
+    assert.deepEqual(replies, [], JSON.stringify(f) + ' was answered');
+    t.dispose();
+  }
+});
+test('without the page\'s queries, xterm answers the DSR forms: so the test above sees a reply when there is one', async () => {
+  const { Terminal } = await import('../vendor/xterm.js');
+  for (const f of ['\x1b[6n', '\x1b[6;1n', '\x1b[?6n']) {
+    const t = new Terminal({ cols: 80, rows: 24 });
+    const replies = [];
+    t.onData((s) => replies.push(s));
+    await new Promise((r) => t.write(f, r));
+    assert.equal(replies.length, 1, JSON.stringify(f));
+    t.dispose();
+  }
+});
+
+test('a title of spaces or controls only is no name: the header falls through to the foreground, then the id', () => {
+  assert.equal(V.titleText('   '), '');
+  assert.equal(V.titleText('\u0001\u0002'), '');
+  assert.equal(headTitle({ id: 't9', title: ' \t ', fg: 'vim' }), 'vim');
+  assert.equal(headTitle({ id: 't9', title: '\u0001\u001b', fg: '  ' }), 't9');
+  assert.equal(headTitle({ id: 't9', title: '  ok  ', fg: 'vim' }), 'ok');
+  assert.equal(headTitle({ id: 't9', title: '', fg: '' }), 't9');
+});
+
+test('the token is never in a URL, a log or the DOM: no terms code names it, and auth() goes only into a request header', () => {
+  for (const [f, s] of termsSrc()) {
+    for (const l of s.split('\n').filter((x) => !/^\s*\/\//.test(x))) {
+      assert.doesNotMatch(l, /\btoken\b/i, f + ': ' + l.trim());
+      if (/\bauth\(/.test(l)) assert.match(l, /headers: auth\(|, auth\(\), /, f + ': ' + l.trim());
+    }
+  }
+});
+
 // The ⌨ tab's handlers run in the browser, which node cannot reach; each line below is the text of one wiring, so a change to it
 // (a hold flipped, a pane not named, a wheel not captured, a save dropped, a freeze unwired, a line removed) turns its test red.
 const TAB_WIRING = [
@@ -1001,7 +1204,8 @@ const TAB_WIRING = [
   ['the new-terminal key opens on Enter or Space', /e\.key === 'Enter' \|\| e\.key === ' '/],
   ['take over all takes only the linked agent terminals that are alive and not held', /linkedRows\.filter\(\(r\) => r\.by === 'agent' && r\.alive && !r\.hold\)/],
   ['the pointer entering the stack freezes the order', /el\.addEventListener\('mouseenter', on\);/],
-  ['a header names the foreground as text, cut the same way as the title', /titleText\(row\.title\) \|\| titleText\(row\.fg\) \|\| id/],
+  ['a header names the foreground as text, cut the same way as the title (headTitle)', /const title = headTitle\(row\);/],
+  ['headTitle: the title, else the foreground, else the id', /export const headTitle = \(row\) => titleText\(row\.title\) \|\| titleText\(row\.fg\) \|\| row\.id;/],
   ['a new terminal refreshes the roster through hubGet (refreshNow), not the lane', /await M\.refreshNow\(\);/],
   ['the tab makes its screens when it mounts', /tabShown\.value = true;\n\s*makeScreens\(\);/],
   ['the risk line: a read sends any web terminal\'s screen to the model provider', /a read sends any web terminal's screen, yours too, secrets included, to the model provider\./],

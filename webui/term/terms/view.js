@@ -18,10 +18,13 @@ const BASE = [...'0123456789ABCDEF'].map((d) => 'base0' + d);  // the sixteen --
 // The queries the perch answers (DA1, DA2, DSR 5 and 6, DECRQM ANSI and DEC, CSI 18 t, OSC 4/10/11/12 asking) and the two it never answers
 // (DECRQSS, XTVERSION): all are swallowed here, so a program gets one answer or none, never two. `when` says which forms are the query.
 // `kind` is how xterm's parser takes it: csi (an id with prefix/intermediates/final), dcs (the same) or osc (the number, the string given).
+// DSR matches xterm's own switch, which reads params[0] only: `CSI 6;1 n` is a status request to xterm and gets a reply, so it is swallowed
+// too. The private DSR (`CSI ? 6 n`, which xterm answers as DECXCPR) is swallowed as well: a reply to it would be typed into the terminal.
 export const QUERIES = [
   { name: 'DA1', kind: 'csi', id: { final: 'c' }, when: (p) => p.length === 0 || p[0] === 0 },
   { name: 'DA2', kind: 'csi', id: { prefix: '>', final: 'c' }, when: (p) => p.length === 0 || p[0] === 0 },
-  { name: 'DSR', kind: 'csi', id: { final: 'n' }, when: (p) => p.length === 1 && (p[0] === 5 || p[0] === 6) },
+  { name: 'DSR', kind: 'csi', id: { final: 'n' }, when: (p) => p.length >= 1 && (p[0] === 5 || p[0] === 6) },
+  { name: 'DSR DEC', kind: 'csi', id: { prefix: '?', final: 'n' }, when: (p) => p.length >= 1 && (p[0] === 5 || p[0] === 6) },
   { name: 'DECRQM', kind: 'csi', id: { intermediates: '$', final: 'p' }, when: () => true },
   { name: 'DECRQM DEC', kind: 'csi', id: { prefix: '?', intermediates: '$', final: 'p' }, when: () => true },
   { name: 'CSI 18 t', kind: 'csi', id: { final: 't' }, when: (p) => p.length === 1 && p[0] === 18 },
@@ -244,4 +247,5 @@ setHooks({
 
 // The title as the header shows it: plain text, cut to TITLE_MAX characters. The perch sets it from the program's title sequence, so it is
 // program-chosen text: cut and scrubbed here, the same as the foreground name.
-export const titleText = (s) => clipText(s, TITLE_MAX);
+// A title of spaces or controls only is '' after the cut, so the header falls through to the foreground, then the id (tab.js headTitle).
+export const titleText = (s) => clipText(s, TITLE_MAX).trim();

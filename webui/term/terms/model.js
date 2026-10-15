@@ -16,6 +16,7 @@ export const MAX_TERMS = 16;                 // the perch's table
 export const MAX_CHUNK = 64 * 1024;          // one input call: the perch's bound
 export const BACKLOG_MAX = 2 * 1024 * 1024;  // bytes handed to a screen and not yet parsed: past it the terminal is resynced
 export const STOP_AFTER = 10000;             // the stream closes this long after the last view
+export const MIN_WAIT = 1000;                // between two connections, even a quick one (a resync): a load that fails under output must not loop
 export const POLL_MS = 5000;                 // the roster poll while the stream is closed
 export const POLL_TIMEOUT = 5000;
 export const INPUT_MS = 10000;               // an input call with no answer is a refusal (status 0), never a retry
@@ -30,9 +31,10 @@ export const status = signal('closed');
 export const typedAt = signal({});   // id -> ms of the last agent input (the 'agent typing' line)
 export const agentLine = signal({}); // id -> the agent's last input, as the perch pictures it
 export const bellAt = signal({});    // id -> ms of the last bell
-// id -> { id, term, host, pend, seq, queue, queued, backlog, loading, resyncing, follow }: the screen (view.js: term, host) and the page's
-// bookkeeping for one terminal (pend: its input queue; seq: the last byte the page has, which is what a resume asks from; queue and
-// queued: the bytes kept before a screen exists, and how many).
+// id -> { id, term, host, pend, seq, queue, queued, backlog, loading, resyncing, follow, stale, resetting }: the screen (view.js: term,
+// host) and the page's bookkeeping for one terminal (pend: its input queue; seq: the last byte the page has, which is what a resume asks
+// from; queue and queued: the bytes kept before a screen exists, and how many; stale: a resync is waiting for its reset, so no frame sets
+// seq; resetting: a reset's seq is held but its chunks may be unsent, so a dropped connection forgets it).
 export const live = new Map();
 
 // The screen (view.js) and the activity folder (activity.js) plug in here (setHooks); until they do, every hook does nothing. `out` gets
@@ -219,7 +221,10 @@ function removeRow(id) {
 function entryOf(id) {
   let e = live.get(id);
   if (!e) {
-    e = { id, term: null, host: null, pend: null, seq: undefined, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
+    e = {
+      id, term: null, host: null, pend: null, seq: undefined, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false,
+      stale: false, resetting: false,
+    };
     live.set(id, e);
     hooks.made(id);
   }
@@ -264,9 +269,21 @@ export function onFrame(f, now = Date.now()) {
       // A reset over 32 KiB is followed by term-out chunks at the reset's own seq (perch/src/term/README.md, "The stream"). Every other
       // term-out moves the seq on, so a chunk whose seq is the page's already is one of those: its bytes are the reset's, not backlog.
       const cont = f.type === 'term-out' && Number.isSafeInteger(f.seq) && f.seq === e.seq;
-      if (Number.isSafeInteger(f.seq)) e.seq = f.seq;
-      if (f.type === 'term-reset') hooks.reset(id, bytes);
-      else { hooks.out(id, bytes, cont); touch(id, now); }
+      if (f.type === 'term-reset') {
+        // A reset is the frame a stale entry waits for: its seq is the page's again. Its chunks may follow at the same seq, so until a
+        // frame at another seq arrives the entry is `resetting` (endConnection forgets the seq if the connection ends first).
+        if (Number.isSafeInteger(f.seq)) e.seq = f.seq;
+        e.stale = false;
+        e.resetting = true;
+        hooks.reset(id, bytes);
+      } else {
+        // Stale (a resync is waiting for its reset): this output reaches the screen, but the seq stays where it was, so the next
+        // connection still asks for a reset and does not resume past the bytes the reset has not yet given.
+        if (Number.isSafeInteger(f.seq) && !e.stale) e.seq = f.seq;
+        if (!cont) e.resetting = false;
+        hooks.out(id, bytes, cont);
+        touch(id, now);
+      }
       return;
     }
     case 'term-open': {
@@ -359,17 +376,27 @@ export function stopStream() {
   controller = null;
   clearTimeout(stopTimer);
   stopTimer = 0;
+  endConnection();
   extraStreams.value = 0;
   status.value = 'closed';
 }
 
 // A screen that fell too far behind: its seq is forgotten, so the next connection sends it a reset (the screen clears and is rebuilt).
+// Until that reset arrives the entry is stale: the frames still in the aborted connection's read buffer set no seq (onFrame).
 export function resync(id) {
   const e = live.get(id);
   if (!e) return;
   e.seq = undefined;
+  e.stale = true;
+  e.resetting = false;
   quick = true;
   if (controller) controller.abort();
+}
+
+// A connection that ends (or is stopped) while a reset is still arriving: its chunks at that seq may not all have come, and a resume from
+// that seq would skip them. The seq is forgotten, so the next connection asks for a fresh reset.
+function endConnection() {
+  for (const e of live.values()) if (e.resetting) { e.seq = undefined; e.resetting = false; }
 }
 
 function streamUrl() {
@@ -396,14 +423,16 @@ async function loop(ep) {
     const ctl = new AbortController();
     controller = ctl;
     let res;
-    try { res = await stream(streamUrl(), auth(), (f) => { if (ep === epoch) onFrame(f); }, ctl.signal); }
+    // A frame of a connection that was aborted (a resync) is not delivered: the frames already in its read buffer come after the abort.
+    try { res = await stream(streamUrl(), auth(), (f) => { if (ep === epoch && !ctl.signal.aborted) onFrame(f); }, ctl.signal); }
     catch { res = { status: 0 }; }
     if (ep !== epoch) return;
     controller = null;
+    endConnection();
     if (res.status === 401 || res.status === 403) { refuse('refused'); return; }
     if (res.status === 404) { refuse('door'); return; }
     fails = res.status === 200 ? 0 : fails + 1;
-    const wait = quick ? 0 : Math.min(10000, 1000 * 2 ** Math.max(0, fails - 1));
+    const wait = Math.max(MIN_WAIT, quick ? 0 : Math.min(10000, 1000 * 2 ** Math.max(0, fails - 1)));
     quick = false;
     await pause(wait);
     if (ep !== epoch) return;
