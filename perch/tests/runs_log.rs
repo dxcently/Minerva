@@ -462,6 +462,9 @@ mod log {
         let (mut cursor, mut seen, mut mid_run, begun) = (None::<u64>, Vec::<u64>::new(), 0, Instant::now());
         loop {
             assert!(begun.elapsed() < Duration::from_secs(40), "the run did not end in time; the log so far: {seen:?}");
+            // The state is asked before the log is polled: "done" then means the journal was complete, so an empty batch after it
+            // means every record has been read. Asked after the poll, a record written between the two could be missed for good.
+            let state = one(&perch, &rid)["state"].as_str().unwrap().to_string();
             let answer = log_of(&perch, &rid, &cursor.map(|at| format!("?after={at}")).unwrap_or_default());
             assert_ndjson(&answer);
             let batch = ids(&answer.body);
@@ -470,8 +473,7 @@ mod log {
                 assert_eq!(*first, cursor.map_or(0, |at| at + 1), "the batch starts right above the cursor {cursor:?}: {batch:?}");
             }
             assert!(batch.windows(2).all(|pair| pair[1] == pair[0] + 1), "in order: {batch:?}");
-            // Asked after the poll: a run still running then was still being written while the poll read it.
-            let state = one(&perch, &rid)["state"].as_str().unwrap().to_string();
+            // Asked before the poll: a run still running then was still being written while the poll read it.
             if !batch.is_empty() && state == "running" {
                 mid_run += 1;
             }

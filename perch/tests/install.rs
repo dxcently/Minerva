@@ -175,10 +175,16 @@ mod fake {
             std::fs::write(self.fixture().join("behave"), word).unwrap();
         }
 
-        /// Every call the perch made to the stand-in, in order.
+        /// Every call the perch made to the stand-in, in order. The stand-in may still be writing its last line, which has no newline
+        /// yet: that piece is left out, and a complete line that is not JSON is still a panic.
         fn calls(&self) -> Vec<Value> {
-            let text = std::fs::read_to_string(self.fixture().join("log")).unwrap_or_default();
-            text.lines().map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("a log line: {e}: {line:?}"))).collect()
+            let bytes = std::fs::read(self.fixture().join("log")).unwrap_or_default();
+            // Lossy: a multi-byte character cut off by a write in progress is in the piece that has no newline, so it is left out too.
+            let text = String::from_utf8_lossy(&bytes);
+            text.split_inclusive('\n')
+                .filter(|piece| piece.ends_with('\n'))
+                .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("a log line: {e}: {line:?}")))
+                .collect()
         }
 
         /// The calls whose argv starts with these words.
