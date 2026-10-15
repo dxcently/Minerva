@@ -512,6 +512,36 @@ fn a_chat_written_into_runs_json_by_hand_is_left_off_the_row() {
     assert_eq!(only.iter().map(|row| row["rid"].as_str().unwrap()).collect::<Vec<_>>(), ["r5"]);
 }
 
+#[test]
+fn a_chat_that_is_not_a_string_is_no_tag_and_one_odd_tag_sets_no_run_aside() {
+    let site = site();
+    // A number, an object, an array and a bool, each on its own run, and a good tag on a fifth: every run is listed, and runs.json stays.
+    let runs = json!({
+        "r1": { "graph": "wiki-hop", "state": "done", "started_ms": 1, "chat": 7 },
+        "r2": { "graph": "wiki-hop", "state": "done", "started_ms": 2, "chat": { "x": 1 } },
+        "r3": { "graph": "wiki-hop", "state": "parked", "started_ms": 3, "chat": [1] },
+        "r4": { "graph": "wiki-hop", "state": "done", "started_ms": 4, "chat": true },
+        "r5": { "graph": "wiki-hop", "state": "done", "started_ms": 5, "chat": "ok1" }
+    });
+    std::fs::write(site.home.join("runs.json"), runs.to_string()).unwrap();
+    let perch = site.quiet(&[]);
+    let listed = rows(&perch);
+    assert_eq!(listed.len(), 5, "every run is listed: {listed:?}");
+    for row in &listed {
+        let rid = row["rid"].as_str().unwrap();
+        let detail = one(&perch, rid);
+        if rid == "r5" {
+            assert_eq!((row["chat"].as_str(), detail["chat"].as_str()), (Some("ok1"), Some("ok1")), "{row} {detail}");
+        } else {
+            assert!(row.get("chat").is_none() && detail.get("chat").is_none(), "{rid}: {row} {detail}");
+        }
+    }
+    assert_eq!(one(&perch, "r3")["state"], "parked", "a parked run is listed as parked");
+    let set_aside = std::fs::read_dir(&site.home).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("runs.json.bad-"));
+    assert!(!set_aside, "no odd tag set runs.json aside");
+    assert_eq!(rows_at(&perch, "/hub/runs?chat=ok1").iter().map(|row| row["rid"].as_str().unwrap()).collect::<Vec<_>>(), ["r5"]);
+}
+
 /// `GET <path>` as a list, for a path that carries a query.
 fn rows_at(perch: &Perch, path: &str) -> Vec<Value> {
     let answer = perch.get(path);

@@ -46,7 +46,7 @@ use std::sync::Mutex;
 use anyhow::{Context as _, Result};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::serve::{body_of, json, problem, status, BoxBody, Ctx};
@@ -152,7 +152,7 @@ pub struct Run {
     pub args: Option<Value>,
     /// The chat the page had open when the run was started: a label, checked when it is written and when it is read, and never sent to
     /// eidolon (see the README's "The chat tag").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "tag_or_none", skip_serializing_if = "Option::is_none")]
     pub chat: Option<String>,
 }
 
@@ -179,6 +179,12 @@ impl Run {
             chat,
         }
     }
+}
+
+/// A chat that is not a string is no tag. One odd tag in a hand-edited runs.json must not set every run aside: serde refuses the
+/// whole map over one bad field.
+fn tag_or_none<'de, D: Deserializer<'de>>(de: D) -> std::result::Result<Option<String>, D::Error> {
+    Ok(Option::<Value>::deserialize(de)?.and_then(|value| value.as_str().map(str::to_owned)))
 }
 
 /// `r<digits>`, nine at most: the only shape of a run id, and so the only thing a request can join to a path.
@@ -924,5 +930,23 @@ mod tests {
         assert_eq!(saved[&rid].chat.as_deref(), Some("c0ffee01"), "on disk straight after begin");
         store.edit(&rid, |run| run.state = Phase::Done).unwrap();
         assert_eq!(store.get(&rid).unwrap().chat.as_deref(), Some("c0ffee01"), "an edit leaves the tag as it was");
+    }
+
+    #[test]
+    fn a_chat_that_is_not_a_string_is_no_tag_and_the_file_still_loads() {
+        let home = tempfile::tempdir().unwrap();
+        let text = r#"{"r1":{"graph":"g","state":"done","started_ms":1,"chat":7},"r2":{"graph":"g","state":"done","started_ms":2,"chat":{"x":1}},"r3":{"graph":"g","state":"parked","started_ms":3,"chat":[1]},"r4":{"graph":"g","state":"done","started_ms":4,"chat":true},"r5":{"graph":"g","state":"done","started_ms":5,"chat":null},"r6":{"graph":"g","state":"done","started_ms":6,"chat":"ok1"}}"#;
+        std::fs::write(file(home.path()), text).unwrap();
+        // The load a perch makes when it opens runs.json: one odd tag must not set the whole file aside.
+        let store = Store::default();
+        store.open(file(home.path()));
+        assert!(file(home.path()).exists(), "runs.json is where it was, not set aside");
+        let runs: BTreeMap<String, Run> = store.all().into_iter().collect();
+        assert_eq!(runs.len(), 6, "one odd tag does not set every run aside");
+        assert_eq!(runs["r3"].state, Phase::Parked, "a parked run is still parked");
+        for rid in ["r1", "r2", "r3", "r4", "r5"] {
+            assert!(runs[rid].chat.is_none(), "{rid}: a tag that is not a string is no tag");
+        }
+        assert_eq!(runs["r6"].chat.as_deref(), Some("ok1"));
     }
 }
