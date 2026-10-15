@@ -429,6 +429,75 @@ fn the_operators_hold_refuses_an_agents_send_with_423_and_its_reads_still_answer
 
 #[cfg(feature = "test-bins")]
 #[test]
+fn the_operators_hold_refuses_an_agents_close_with_423_and_the_terminal_stays() {
+    let rig = Rig::new();
+    let (a, pid, _) = live(&rig.perch);
+    let (b, pid_b, _) = live(&rig.perch);
+    let ours = open_by(&rig, &a, pid);
+    let on = rig.perch.post_json(&format!("/hub/term/{ours}/hold"), serde_json::json!({ "hold": true }));
+    assert_eq!(on.status, 200, "{}", on.body);
+    let close = format!("term/close:{{\"id\":\"{ours}\"}}");
+
+    let refused = rig.one(&a, pid, &close);
+    assert_eq!(refused.code(), 423, "a close of a held terminal: {}", refused.text);
+    assert!(refused.why().contains("on hold"), "{}", refused.text);
+    let kept = operator_row(&rig.perch, &ours).expect("a held terminal is not closed by an agent");
+    assert_eq!(kept["alive"], true, "and its shell is not hung up: {kept}");
+    // The owner rule is answered first: another chat's close of a held terminal is still a 403.
+    let stranger = rig.one(&b, pid_b, &close);
+    assert_eq!(stranger.code(), 403, "{}", stranger.text);
+
+    let off = rig.perch.post_json(&format!("/hub/term/{ours}/hold"), serde_json::json!({ "hold": false }));
+    assert_eq!(off.status, 200, "{}", off.body);
+    let closed = rig.one(&a, pid, &close);
+    assert_eq!(closed.code(), 202, "a close once the hold is off: {}", closed.text);
+    assert!(operator_row(&rig.perch, &ours).is_none(), "and the terminal leaves the list");
+}
+
+#[cfg(feature = "test-bins")]
+#[test]
+fn three_chats_at_four_fill_the_agents_twelve_and_the_operator_still_opens() {
+    let rig = Rig::new();
+    let chats: Vec<(String, u32)> = (0..4)
+        .map(|_| {
+            let (chat, pid, _) = live(&rig.perch);
+            (chat, pid)
+        })
+        .collect();
+    // Twelve agent terminals: three chats at their four each. The table's other four are the operator's (U21d).
+    let mut first_of_the_first: Option<String> = None;
+    for (chat, pid) in &chats[..3] {
+        let made = rig.run(chat, *pid, &"term/open:{}\n".repeat(4));
+        let codes: Vec<u16> = made.iter().map(Answered::code).collect();
+        assert_eq!(codes, [201; 4], "a chat's four open: {:?}", made.iter().map(|a| a.text.as_str()).collect::<Vec<_>>());
+        if first_of_the_first.is_none() {
+            first_of_the_first = Some(made[0].id());
+        }
+    }
+    // A fourth chat finds the agents' twelve full: its first open is a 409 that names the share.
+    let (fourth, fourth_pid) = &chats[3];
+    let refused = rig.one(fourth, *fourth_pid, "term/open:{}");
+    assert_eq!(refused.code(), 409, "{}", refused.text);
+    assert!(refused.why().contains("no room for another agent terminal"), "{}", refused.text);
+
+    // The operator's four take the rest, and no more: sixteen in all, then the operator is refused too.
+    for _ in 0..4 {
+        open_as_operator(&rig.perch);
+    }
+    assert_eq!(operator_list(&rig.perch).len(), 16, "the table holds sixteen: twelve of the agents' and four of the operator's");
+    let full = rig.perch.post_json("/hub/term", serde_json::json!({}));
+    assert_eq!(full.status, 409, "a seventeenth, the operator's: {}{}", full.head, full.body);
+
+    // A place the agents give back is one the fourth chat can take.
+    let (first, first_pid) = &chats[0];
+    let closed = rig.one(first, *first_pid, &format!("term/close:{{\"id\":\"{}\"}}", first_of_the_first.unwrap()));
+    assert_eq!(closed.code(), 202, "{}", closed.text);
+    let taken = rig.one(fourth, *fourth_pid, "term/open:{}");
+    assert_eq!(taken.code(), 201, "a place the agents gave back: {}", taken.text);
+}
+
+#[cfg(feature = "test-bins")]
+#[test]
 fn a_wait_that_is_never_met_answers_at_its_timeout() {
     let rig = Rig::new();
     let (a, pid, _) = live(&rig.perch);

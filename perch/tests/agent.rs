@@ -526,6 +526,10 @@ fn a_scoped_token_is_good_for_its_own_prefix_and_nowhere_else() {
             ("POST", "/hub/term/a/"),
             ("POST", "/hub/term/a/x/y"),
             ("POST", "/hub/term/t1/input"),
+            // The operator's hold and its close: an agent's token cannot lift a hold or end a terminal through them.
+            ("POST", "/hub/term/t1/hold"),
+            ("POST", "/hub/term/t1/close"),
+            ("POST", "/hub/term/t1/resize"),
             ("POST", "/hub/mail/a"),
             ("GET", "/hub/mail"),
             ("POST", "/hub/code"),

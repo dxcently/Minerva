@@ -5,14 +5,15 @@
 //!
 //! ```text
 //!   list   any web terminal                              200 [{id, title, fg, by, chat, mine, alive, hold}]
-//!   open   a new one, for this chat, in its folder        201 {id}                    at most 4 per chat (D5)
+//!   open   a new one, for this chat, in its folder        201 {id}                    at most 4 per chat (D5), 12 for all agents (U21d)
 //!   read   any web terminal, after its wait (below)       200 {text, cursor, seq, alive, exit?, alt_screen}
 //!   send   any web terminal, typed as the operator would  200 {seq}                   423 held; 403 the guard (D9)
-//!   close  only a terminal this chat opened (D5)          202 {id}                    403 another chat's or the operator's
+//!   close  only a terminal this chat opened (D5)          202 {id}                    403 another chat's or the operator's; 423 held
 //! ```
 //!
 //! **Reach (ruling 2).** `list`, `read` and `send` work on any web terminal, whoever opened it. The operator's stop is the hold
-//! ([`super::Terms::set_hold`]): while it is on, an agent's `send` is refused with `423`, and its reads still answer.
+//! ([`super::Terms::set_hold`]): while it is on, an agent's `send` and `close` are refused with `423`, and its reads still answer.
+//! `close` is refused by [`super::Terms::close_as_agent`], which checks the owner and the hold under the table's lock.
 //!
 //! **Bodies.** One JSON object of named fields, at most [`JSON_BODY`] bytes. A field it does not name is a `400`, so a `cwd` or a `chat`
 //! in a body is refused and never honoured. An empty body is `{}`, and the verbs that name no field take nothing else.
@@ -24,8 +25,11 @@
 //!
 //! **The guard (D9).** A `send` whose text names what an agent may not run is refused before a byte is typed, with the guard's sentence
 //! and a `403`. [`crate::guard::refuses_term_text`] is a hint, not a gate, and it does not depend on whether the policy rows are on.
+//! The keys are not judged, and the guard reads only this call's `text`, not the shell's line: `up`, `down`, `ctrl-r` and `tab` can bring
+//! back or complete a line the guard never read (U21b).
 //!
 //! What a read gives back is untrusted terminal output, and it goes to the model provider. The tool's note says so; nothing here changes it.
+//! A read leaves no record: it sends no stream event, so the operator's stream shows the sends and not the reads (U21c).
 
 use std::time::{Duration, Instant};
 
@@ -36,7 +40,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::screen::{Cursor, Text, MAX_TEXT_CHARS, MAX_TEXT_LINES};
-use super::{now_ms, valid_id, By, Exit, InputError, OpenError, OpenSpec, Owner, Terms, AGENT_CHAT_CAP, MAX_TERMS};
+use super::{now_ms, valid_id, By, CloseError, Exit, InputError, OpenError, OpenSpec, Owner, Terms, AGENT_CHAT_CAP, AGENT_SLOTS, MAX_TERMS};
 use crate::agent::Caller;
 use crate::guard;
 use crate::serve::{body_of, json, problem, status, BoxBody, Ctx};
@@ -186,8 +190,9 @@ async fn list(terms: &Terms, chat: &str, req: Request<Incoming>) -> Response<Box
 }
 
 /// `POST /hub/term/a/open {title?, cols?, rows?}`: a terminal for this chat, started in the folder the chat was started in (`$HOME`
-/// when the perch remembers none). At most [`AGENT_CHAT_CAP`] of the chat's stay open: an ended one that was not closed counts until
-/// the chat wants another, and then its own oldest is let go. 201 `{id}`. A `cwd` is a 400: the field is not named.
+/// when the perch remembers none). At most [`AGENT_CHAT_CAP`] of the chat's stay open, and at most [`AGENT_SLOTS`] of every agent's
+/// together (the rest of the table is the operator's): an ended one that was not closed counts until the chat wants another, and then
+/// its own oldest is let go. 201 `{id}`. A `cwd` is a 400: the field is not named.
 async fn open(ctx: &Ctx, terms: &Terms, chat: &str, req: Request<Incoming>) -> Response<BoxBody> {
     let asked = match fields::<OpenAsk>(req, OPEN_SHAPE).await {
         Ok(asked) => asked,
@@ -215,7 +220,10 @@ async fn open(ctx: &Ctx, terms: &Terms, chat: &str, req: Request<Incoming>) -> R
 fn open_refused(why: OpenError) -> Response<BoxBody> {
     match why {
         OpenError::ChatCap => problem(StatusCode::CONFLICT, &format!("this chat has {AGENT_CHAT_CAP} terminals open; close one first")),
-        OpenError::Cap => problem(StatusCode::CONFLICT, &format!("the perch holds {MAX_TERMS} terminals; close one first")),
+        OpenError::Cap => {
+            let said = format!("no room for another agent terminal: agents may hold {AGENT_SLOTS} of {MAX_TERMS}; close one first");
+            problem(StatusCode::CONFLICT, &said)
+        }
         OpenError::Cwd => problem(StatusCode::UNPROCESSABLE_ENTITY, "the chat's folder is not a directory any more"),
         OpenError::Stopping => problem(StatusCode::SERVICE_UNAVAILABLE, STOPPING),
         // An agent's terminal always names its chat (`open` names it), so this is unreachable; a 400 says so rather than guessing.
@@ -375,7 +383,8 @@ fn bounded(given: Option<u64>, default: usize, max: usize, name: &str) -> Result
 
 /// `POST /hub/term/a/send {id, text?, keys?}`: types `text` as it is (a newline in it is typed too), then presses `keys` in order. 200
 /// `{seq}`. Refused with `423` while the operator holds the terminal, and with `403` and the guard's sentence when the text names what
-/// an agent may not run (D9). The guard is judged before anything is typed.
+/// an agent may not run (D9). The guard is judged before anything is typed. It judges the `text` alone: the keys are not judged, and
+/// nor is the shell's line the keys act on (U21b).
 async fn send(terms: &Terms, chat: &str, req: Request<Incoming>) -> Response<BoxBody> {
     let asked = match fields::<SendAsk>(req, SEND_SHAPE).await {
         Ok(asked) => asked,
@@ -447,8 +456,9 @@ fn send_refused(why: InputError) -> Response<BoxBody> {
     }
 }
 
-/// `POST /hub/term/a/close {id}`: ends a terminal this chat opened (D5). The hang-up runs in the background and this does not wait for
-/// it: 202 `{id}`. Another chat's or the operator's terminal is a 403, and an id that is no terminal a 404.
+/// `POST /hub/term/a/close {id}`: ends a terminal this chat opened (D5), unless the operator has it on hold (U21a). The hang-up runs in
+/// the background and this does not wait for it: 202 `{id}`. Another chat's or the operator's terminal is a 403, a held one a 423, and
+/// an id that is no terminal a 404. The owner rule and the hold are checked by [`Terms::close_as_agent`], under the table's lock.
 async fn close(terms: &Terms, chat: &str, req: Request<Incoming>) -> Response<BoxBody> {
     let asked = match fields::<IdAsk>(req, CLOSE_SHAPE).await {
         Ok(asked) => asked,
@@ -457,14 +467,12 @@ async fn close(terms: &Terms, chat: &str, req: Request<Incoming>) -> Response<Bo
     if !valid_id(&asked.id) {
         return problem(StatusCode::NOT_FOUND, NO_TERMINAL);
     }
-    let Some(info) = terms.info(&asked.id) else { return problem(StatusCode::NOT_FOUND, NO_TERMINAL) };
-    if !(Owner { by: info.by, chat: info.chat }).is_agents_of(chat) {
-        return problem(StatusCode::FORBIDDEN, NOT_YOURS);
-    }
-    match terms.close(&asked.id) {
+    match terms.close_as_agent(chat, &asked.id) {
         // The hang-up runs on its own thread, and this answer does not wait for it (routes.rs's close does the same).
-        Some(_hangup) => json(StatusCode::ACCEPTED, &serde_json::json!({ "id": asked.id })),
-        None => problem(StatusCode::NOT_FOUND, NO_TERMINAL),
+        Ok(_hangup) => json(StatusCode::ACCEPTED, &serde_json::json!({ "id": asked.id })),
+        Err(CloseError::NotFound) => problem(StatusCode::NOT_FOUND, NO_TERMINAL),
+        Err(CloseError::NotYours) => problem(StatusCode::FORBIDDEN, NOT_YOURS),
+        Err(CloseError::Held) => problem(StatusCode::LOCKED, HELD),
     }
 }
 

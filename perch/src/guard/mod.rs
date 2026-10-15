@@ -676,7 +676,9 @@ pub fn refuses_code(text: &str) -> Option<&'static str> {
 /// perch does this one itself.
 ///
 /// It is a hint, not a gate. It judges one text: a command split across sends (`ao` then `ide`), typed with DEL or tab completion, built
-/// by a variable or read from a file, or sent after the first 8 KiB, passes. The refusal that matters is the policy's.
+/// by a variable or read from a file, or sent after the first 8 KiB, passes. The keys are not judged, and the guard never sees the
+/// shell's line: a line typed before this call, or brought back by up or ctrl-r, passes too (U21b). The refusal that matters is the
+/// policy's.
 pub fn refuses_term_text(text: &str) -> Option<&'static str> {
     let mut end = text.len().min(TERM_TEXT_LIMIT);
     while !text.is_char_boundary(end) {

@@ -95,7 +95,8 @@ The shell is **reaped last**, by its waiter thread, after step 3: until then its
 
 | ending | grace | what it is |
 |---|---|---|
-| `Terms::close(id)` | 2 s | removed from the table at once; the session goes in the background (`Hangup::wait` to wait) |
+| `Terms::close(id)` | 2 s | removed from the table at once; the session goes in the background (`Hangup::wait` to wait). The operator's, unchecked |
+| `Terms::close_as_agent(chat, id)` | 2 s | the same, for an agent: refused (`NotYours`, `Held`) before anything is removed, under the table's lock |
 | `term::shutdown(ctx)` | 1.7 s, 2.5 s bound | every terminal at once, hung up and *then* recorded; opens are refused from the first line |
 | `Drop for Terms` / `Terminal` | 0 | a table or terminal dropped without being ended (a failed test) takes its session with it, hard |
 
@@ -116,7 +117,9 @@ perch is stopping, so the new terminal is hung up and the open answers `Stopping
   atomically, which bounds what a rewrite can do (ids, sizes, text, a high `next`), not whether it can be done.
 * **The shell inherits the perch's environment.** `SSH_AUTH_SOCK`, `*_API_KEY`, cloud credentials: whatever the perch was started
   with is the shell's, as the operator's own login would have it. Only `MINERVA_*` names that say `TOKEN`, `SECRET`, `CODE` or `PASS`
-  are dropped (below). The perch's own tokens are in memory and in 0600 files, not in its environment.
+  are dropped (below). The perch's own tokens are in memory and in 0600 files, not in its environment. The 0600 keeps them from other
+  users, not from the perch's own: the master bearer is `$XDG_RUNTIME_DIR/minerva/perch-<port>.token`, the shell keeps
+  `XDG_RUNTIME_DIR`, and a shell of the perch's uid (an agent's included) can read it, with the same caveat as `terms.json` above.
 
 ## What the screen writes back (the allow-list)
 
@@ -180,6 +183,7 @@ operator's own typing is `Terms::input` and the hold never touches it. Turning t
 | bytes the program has already read | **no** (a line the shell has read runs) |
 | the program's output | no |
 | the operator's input from then on | no |
+| an agent's `close` of the terminal | yes: refused with `CloseError::Held` (423), decided under the table's lock with the owner rule, so the terminal stays and its shell is not hung up (U21a) |
 
 The writer has three lanes (replies 4 KiB, the operator's 64 KiB, an agent's 64 KiB), taken in that order, so an agent that fills its own
 cannot keep out a reply or the operator's `^C`. The writer also lets at most 1 KiB of an agent's bytes sit unread in the PTY (`TIOCINQ`
@@ -195,10 +199,35 @@ route's decision (T2), made before it calls.
 
 ## What an agent's terminal tools expose
 
-- **Reads are not limited to the agent's own terminals.** `term/read` of any web terminal, the operator's included, sends that terminal's
-  screen to the model provider, secrets included (ruling 2). Whatever is on the screen can reach the provider.
-- **That text is untrusted.** It can carry prompt injection, and nothing in the perch filters it before the model reads it.
+What a chat's agent can reach through `/hub/term/a/*`, and what the operator should know about each. The first three are the risks the ⌨
+tab states; the rest were found in review and are written here so that no reader has to find them.
+
+- **Reads are not limited to the agent's own terminals.** `read` of any web terminal, the operator's included, sends that terminal's
+  screen to the model provider, secrets included (ruling 2). Whatever is on the screen can reach the provider. Under auto the policy
+  vouches `read` (D6), so it runs without asking.
+- **That text is untrusted.** It can carry prompt injection. The perch strips control and invisible characters from it, and judges
+  nothing else about what it says.
 - **In yolo the door's policy answers yes to `term_send`, and the perch never asks.** The text guard (D9) only judges one send's text.
+- **A read leaves no record (U21c).** It sends no stream event and no log line, so the operator's ⌨ tab shows the sends and not the
+  reads, and nothing shows which terminal an agent read. Whether a read should show (chat, terminal id, lines, no text) is the
+  operator's call and a later slice.
+- **`list` is a second route for untrusted text.** Every chat sees every web terminal's id, title and foreground command (`fg`, the
+  program in the foreground). A title is what the program wrote, cut at 80 characters with controls dropped (an OSC from a remote host
+  or a catted file is text in every agent's `list`). A normal shell title, `user@host:path`, tells the provider the operator's user,
+  host and folder on every `list` call.
+- **The master bearer file is readable from an agent's shell.** It is `$XDG_RUNTIME_DIR/minerva/perch-<port>.token` (`lib.rs`), mode
+  0600 and the perch's own uid, and the shell keeps `XDG_RUNTIME_DIR` (`pty::child_env`), so a shell of that uid can read it (read from
+  the source; not run). This is the same-uid caveat that `terms.json` has above, and `install/mod.rs` already says it for the bearer.
+  With the bearer a shell can call the master gate's routes from `curl`, and the text guard does not judge that path.
+- **Every credential exported to the perch reaches the shells.** A shell starts from the perch's environment minus only the `MINERVA_*`
+  names that say TOKEN, SECRET, CODE or PASS (`pty::child_env`). So `env`, then `read`, sends `SSH_AUTH_SOCK`, a `*_API_KEY` or a cloud
+  credential the operator exported to the perch to the model provider.
+- **Keys are not judged (U21b).** The text guard reads one send's `text`, and a keys-only send is not judged at all. `up`, `down`,
+  `ctrl-r` and `tab` bring back or complete a line the guard never read: a command the operator typed before the call, or one in the
+  shell's history. The keys stay on purpose, since the guard is a hint and not a gate (`install/mod.rs`, what the arm does not defend).
+  The guard sees only this call's text, not the shell's line.
+- **The operator's hold stops an agent's `send` and `close` (423), not its reads.** No agent route lifts a hold: the operator's
+  `hold` route is refused to a term token (`tests/agent.rs`).
 
 ## Chats and the cap (D5)
 
@@ -209,11 +238,17 @@ keeps its place for 30 minutes; when the chat (or the full table) wants another,
 (`Change::Closed`), and only when it has none is the open refused (`ChatCap`, or `Cap` for the table). `Owner::is_agents_of(chat)` is
 the one test of "this is that chat's agent's". An operator's terminal that sits beside a chat is not an agent's.
 
+**The operator's share (U21d).** Every agent's terminals together may hold `AGENT_SLOTS` (12) of the table, and the other 4 places are
+the operator's alone: an agent's open that would take a thirteenth is `Cap` (409, "no room for another agent terminal"), even when its
+chat has room, and the operator can still open up to the 16 in all. An agent's ended terminal counts against that share until it is
+closed or let go, and only its own chat can let it go, so a chat cannot free another's place.
+
 ## Bounds
 
 | thing | bound | where |
 |---|---|---|
 | terminals | 16, ended ones included | `MAX_TERMS`; `OpenError::Cap` |
+| agent terminals, every chat together | 12 (`AGENT_SLOTS`): the other 4 are the operator's alone (U21d), so four chats at four each cannot lock the operator out | `AGENT_SLOTS`; `OpenError::Cap` for an agent |
 | agent terminals of one chat | 4 (or the caller's `chat_cap`), ended ones included, checked with the cap under one lock | `AGENT_CHAT_CAP`; `OpenError::ChatCap` |
 | screen | 20-400 columns, 5-200 rows, default 120x32; clamped, never refused | `screen::clamp_size` |
 | scrollback | 2000 lines | `screen::SCROLLBACK` |
@@ -332,8 +367,12 @@ Each frame is one `data: {json}` line. Every frame has a string `type`; the term
 | `term-hold` | `id`, `hold` | a hold change |
 | `term-exit` | `id`, `code`, `signal` | the shell ended |
 | `term-closed` | `id` | a close, or a relist that no longer lists the terminal |
-| `term-input` | `id`, `by` (`"agent"`), `chat`, `text` | an agent's input. `text` is the picture with CR and LF shown as the return sign, tab as the tab sign, other pictures as `^X`, cut at 80 characters, then an ellipsis |
+| `term-input` | `id`, `by` (`"agent"`), `chat`, `text` | an agent's input, as the frame shows it (`stream.rs`, `glyphs`). The change carries what was typed as pictures (`typed_text`: C0 controls at U+2400 plus their code, DEL at U+2421, what the screen would not show left out, cut at 80 characters). The frame turns those into what a person reads: CR and LF are `⏎`, tab is `⇥`, DEL is `^?`, and another control is `^` and its letter (ESC is `^[`, ^C is `^C`); the frame is cut at 200 characters with an ellipsis (U+2026) |
 | `hub-stream-end` | `reason` (`"stopping"`) | the perch stops; exactly once |
+
+**Agent-supplied strings are text, never HTML.** The open's title, the `term-input` text and `fg` (and every terminal's title) come from a
+program or an agent, so the operator's page shows them as text and never as HTML: no `innerHTML`, no markup built from them. T4a's review
+checks the page keeps to this.
 
 **Snapshots.** `snap::picture` copies the visible cells, the cursor, the modes and the scroll region under the screen lock; `snap::encode`
 writes the bytes after the lock is dropped (inside `spawn_blocking`). The bytes are RIS, the alternate screen when it is on, the DECSET
@@ -380,7 +419,8 @@ Terms::input(id, &[u8])                -> Result<(), InputError{NotFound,TooBig,
 Terms::agent_input(id, chat, &[u8])    -> Result<(), InputError{..., Held}>                    an agent's; stamps, emits Change::Input
 Terms::resize(id, cols, rows) -> Result<(u16,u16), Missing{NotFound,Ended}>   set_hold(id, bool) -> Result<bool, Missing>
 Terms::text(id, lines, max_chars) -> Option<Text{text,cursor,alt_screen,seq,truncated}>        (blocking for a live terminal)
-Terms::close(id) -> Option<Hangup>                  Hangup::wait().await
+Terms::close(id) -> Option<Hangup>                  the operator's, unchecked; Hangup::wait().await
+Terms::close_as_agent(chat, id) -> Result<Hangup, CloseError{NotFound,NotYours,Held}>   an agent's: the owner and the hold, under the lock
 Terms::ticks() -> watch::Receiver<u64>              any output or change; coalesces
 Terms::subscribe() -> broadcast::Receiver<Change>   Open Size Title Hold Exit Closed Input{id,chat,text}; lag means list again
 Terms::emit(Change)                                 T1c's note_input
