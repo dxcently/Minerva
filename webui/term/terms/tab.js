@@ -8,11 +8,11 @@ import { hubPost, mode } from '../core/api.js';
 import { modeOf } from '../core/hub.js';
 import { openMenu, atPointer } from '../core/menu.js';
 import * as M from './model.js';
-import { mountTerm, unmountTerm, titleText } from './view.js';
+import { mountTerm, unmountTerm, titleText, makeScreens } from './view.js';
 import { badge, tabShown } from './activity.js';
 
-const SHOW_MS = 800;        // a bell flashes the header this long
-const TYPING_MS = 2000;     // 'agent typing' for this long after an agent's input
+export const SHOW_MS = 800;        // a bell flashes the header this long
+export const TYPING_MS = 2000;     // 'agent typing' for this long after an agent's input
 
 const fold = signal(M.loadFold());  // id -> 'o' | 'c', what the person set (the default is the focused chat's and the two newest)
 const order = signal([]);           // the ids in stack order (see reorder)
@@ -74,7 +74,7 @@ async function newTerm(chat) {
   const body = chat ? { chat } : {};
   const r = await hubPost('term', body);
   if (r.status === 201 && r.data && typeof r.data.id === 'string') {
-    if (!M.streamUp()) await M.pollNow();
+    await M.refreshNow();
     toast(`terminal ${r.data.id} opened`);
     return;
   }
@@ -85,7 +85,7 @@ async function newTerm(chat) {
 
 function Term({ row, pos, linked, open, now, pane, typing, line, bell }) {
   const id = row.id;
-  const title = titleText(row.title) || row.fg || id;
+  const title = titleText(row.title) || titleText(row.fg) || id;
   const cls = 'tterm' + (linked ? ' mine' : '') + (open ? ' open' : '') + (row.alive ? '' : ' ended') + (bell ? ' bell' : '');
   return html`<div class=${cls} style=${'order:' + pos} data-term=${id}>
     <div class="thead">
@@ -136,6 +136,7 @@ export function TermsTab({ s, sid }) {
   // Shown: the stream opens (once, with the view), the badge is cleared, and the stack is ordered. Given back: the stream closes 10 s on.
   useEffect(() => {
     tabShown.value = true;
+    makeScreens();
     badge.value = false;
     const release = M.watch();
     const second = setInterval(() => { tick.value = Date.now(); M.retry(); }, 1000);
@@ -199,6 +200,7 @@ export function TermsTab({ s, sid }) {
         }}>[ new terminal ]</span>
       ${word && html`<span class="faint tword">${word}</span>`}
     </div>
+    <div class="tnote faint">a read sends any web terminal's screen, yours too, secrets included, to the model provider. what a screen shows is untrusted and unfiltered. in yolo agents type without asking.</div>
     <div class="tstack" ref=${stack}>
       ${lay.heads.this !== undefined && html`<div class="thead-group" style=${'order:' + lay.heads.this}>this chat</div>`}
       ${lay.heads.others !== undefined && html`<div class="thead-group" style=${'order:' + lay.heads.others}>others</div>`}

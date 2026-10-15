@@ -1,10 +1,13 @@
-// The terminals' screens. One xterm per terminal (vendor/xterm.js, loaded when the first terminal needs it), which is moved between hosts
-// and never duplicated: a stack item's clipped view, a terminal pane (T4b), or the parking shelf (a folded terminal, or none). Each screen
-// is written as the stream brings bytes, so the page's copy stays in step with the perch's whether or not anyone is looking.
+// The terminals' screens. One xterm per terminal (vendor/xterm.js, loaded when the first screen is made), which is moved between hosts and
+// never duplicated: a stack item's clipped view, a terminal pane (T4b), or the parking shelf (a folded terminal, or none). A screen is made
+// only while the ⌨ tab is drawn or a host shows its terminal: makeScreens runs when the tab mounts, so the module is not loaded at page
+// boot, and a terminal the page holds before that queues its bytes. Once made, a screen is written as the stream brings bytes; the stream is
+// open while a view shows and for 10 s after the last one, so a screen keeps up for that long and then stops until the stream opens again.
 //
 // The perch answers the queries a shell may ask (terms/view.js QUERIES is the list; perch/src/term/README.md "The screen writes back"),
 // so the page's xterm swallows exactly those, or the shell would read two answers. Links open only as http or https, on ctrl+click.
 import { roster, live, setHooks, bell, resync, typed, BACKLOG_MAX, clipText, TITLE_MAX } from './model.js';
+import { tabShown } from './activity.js';
 import { host } from '../core/registry.js';
 
 export const FONT = '"Cascadia Mono", Consolas, monospace';   // the terminals' own font (D11): the system mono, not the page's
@@ -78,14 +81,15 @@ export const LINKS = {
 let xt = null, loading = null, park = null, themed = false;
 const shells = new Map(); // id -> the xterm made for it (the view's; `live` holds the bookkeeping)
 
-// The module loads on first need, after the terminal font is ready (a measure taken before it is wrong).
+// The module loads on first need, after the terminal font is ready (a measure taken before it is wrong). No fit addon is loaded: a screen
+// takes the perch's size (the roster row, then term-size), and the page never fits it to an element.
 async function load() {
   if (xt) return xt;
   if (!loading) {
     loading = (async () => {
       try { await document.fonts.load(`14px ${FONT}`); } catch { /* measured on the fallback */ }
-      const [t, f] = await Promise.all([import('../vendor/xterm.js'), import('../vendor/addon-fit.js')]);
-      xt = { Terminal: t.Terminal, FitAddon: f.FitAddon };
+      const t = await import('../vendor/xterm.js');
+      xt = { Terminal: t.Terminal };
       return xt;
     })();
   }
@@ -116,25 +120,25 @@ export function create(e, x) {
     cursorBlink: !reducedMotion(), cursorStyle: 'block',
     theme: xtermTheme(readBase()), linkHandler: LINKS,
   });
-  const fit = new x.FitAddon();
-  t.loadAddon(fit);
   registerQueries(t.parser);
   t.open(e.host || shelf());
   t.onData((s) => typed(e.id, enc.encode(s)));
   t.onBinary((s) => typed(e.id, latin1(s)));
   t.onBell(() => bell(e.id));
   e.term = t;
-  e.fit = fit;
   shells.set(e.id, t);
   watchTheme();
   const waiting = e.queue.splice(0);
   e.queued = 0;
-  for (const c of waiting) push(e, c.bytes, c.reset);
+  for (const c of waiting) push(e, c.bytes, c.reset, c.cont);
 }
 
+// A screen is made only while the ⌨ tab is drawn or a host shows the terminal. Until one does, the terminal's bytes queue (push) and the
+// module is not loaded.
 function ensure(id) {
   const e = live.get(id);
   if (!e || e.term || e.loading) return;
+  if (!e.host && !tabShown.peek()) return;
   e.loading = true;
   load().then((x) => {
     const cur = live.get(id);
@@ -150,15 +154,16 @@ function ensure(id) {
 // Bytes to a screen. A reset is the RIS sequence written in order, so it lands after what is already waiting to be parsed. Past
 // BACKLOG_MAX unparsed bytes the terminal is resynced (the stream reconnects and sends a reset), once until that reset arrives. The
 // reset clears that mark only when its own bytes are parsed, so the backlog it waits behind cannot resync it again. A reset is a
-// snapshot that replaces the screen, so its own bytes are not counted (the ring can be bigger than the bound; counting them would
-// resync on every reset). Before a screen exists the output queues under the same bound: past it the queue is dropped and the
-// terminal resynced, and the output that comes before the reset is not kept.
-export function push(e, bytes, reset) {
-  const n = reset ? 0 : bytes.length;
+// snapshot that replaces the screen, and so are the term-out chunks that follow a reset over 32 KiB (`cont`, marked by onFrame): their
+// bytes are not counted either. The ring can be 8 MiB (RING_MAX), so a reset can be bigger than the bound; counting its bytes would
+// resync on every reset. Before a screen exists the output queues under the same bound: past it the queue is dropped and the terminal
+// resynced, and the output that comes before the reset is not kept.
+export function push(e, bytes, reset, cont = false) {
+  const n = reset || cont ? 0 : bytes.length;
   if (!e.term) {
     if (reset) { e.queue = []; e.queued = 0; e.resyncing = false; }
     else if (e.resyncing) return;
-    e.queue.push({ bytes, reset });
+    e.queue.push({ bytes, reset, cont });
     e.queued += n;
     if (e.queued > BACKLOG_MAX) { e.queue = []; e.queued = 0; e.resyncing = true; resync(e.id); }
     return;
@@ -218,10 +223,16 @@ export function unmountTerm(id, el) {
 export const screenOf = (id) => shells.get(id) || null;
 export const mountedIn = (id) => { const e = live.get(id); return e && e.host ? e.host : null; };
 
+// The ⌨ tab, on mount: a screen for each terminal the page holds. A folded terminal's screen goes to the shelf (laid out, hidden), which
+// is where xterm measures it.
+export function makeScreens() {
+  for (const id of [...live.keys()]) ensure(id);
+}
+
 // ---------------------------------------------------------------- the stream's changes, onto the screens
 setHooks({
   made: (id) => ensure(id),
-  out: (id, bytes) => { const e = live.get(id); if (e) push(e, bytes, false); },
+  out: (id, bytes, cont) => { const e = live.get(id); if (e) push(e, bytes, false, cont); },
   reset: (id, bytes) => { const e = live.get(id); if (!e) return; push(e, bytes, true); },
   size: (id, cols, rows) => { const t = shells.get(id); if (t) t.resize(cols, rows); },
   gone: (id) => {

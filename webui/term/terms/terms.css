@@ -6,6 +6,7 @@
 .tyolo { color: var(--red); padding-bottom: calc(var(--ch) * 0.3); }
 .tbar { display: flex; flex-wrap: wrap; column-gap: var(--cw); align-items: baseline; padding-bottom: calc(var(--ch) * 0.3); }
 .tword { min-width: 0; }
+.tnote { min-width: 0; overflow-wrap: anywhere; padding-bottom: calc(var(--ch) * 0.3); }
 .tnone { padding-bottom: var(--ch); }
 
 .tstack { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }

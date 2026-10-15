@@ -6,7 +6,7 @@
 // The perch's frames (perch/src/term/README.md, T1c): term-list, term-reset, term-out, term-open, term-size, term-title, term-hold,
 // term-exit, term-closed, term-input, hub-stream-end. A frame for a terminal the page does not hold is dropped, never guessed at.
 import { signal } from '../core/ui.js';
-import { auth, mode } from '../core/api.js';
+import { auth, hubGet, mode } from '../core/api.js';
 import { stream } from '../core/sse.js';
 import { extraStreams, streamRoom, host } from '../core/registry.js';
 import { hubPoll } from '../core/lane.js';
@@ -30,12 +30,13 @@ export const status = signal('closed');
 export const typedAt = signal({});   // id -> ms of the last agent input (the 'agent typing' line)
 export const agentLine = signal({}); // id -> the agent's last input, as the perch pictures it
 export const bellAt = signal({});    // id -> ms of the last bell
-// id -> { id, term, fit, host, pend, seq, queue, queued, backlog, loading, resyncing, follow }: the screen (view.js: term, fit, host) and the
-// page's bookkeeping for one terminal (pend: its input queue; seq: the last byte the page has, which is what a resume asks from; queue and
+// id -> { id, term, host, pend, seq, queue, queued, backlog, loading, resyncing, follow }: the screen (view.js: term, host) and the page's
+// bookkeeping for one terminal (pend: its input queue; seq: the last byte the page has, which is what a resume asks from; queue and
 // queued: the bytes kept before a screen exists, and how many).
 export const live = new Map();
 
-// The screen (view.js) and the activity folder (activity.js) plug in here (setHooks); until they do, every hook does nothing.
+// The screen (view.js) and the activity folder (activity.js) plug in here (setHooks); until they do, every hook does nothing. `out` gets
+// `cont` true for a chunk of a reset (see onFrame), which the screen does not count as backlog.
 export const hooks = { made() {}, out() {}, reset() {}, size() {}, gone() {}, event() {} };
 export function setHooks(h) { Object.assign(hooks, h || {}); }
 
@@ -50,7 +51,7 @@ export function vet(r) {
   const exit = r.exit && typeof r.exit === 'object'
     ? { code: Number.isInteger(r.exit.code) ? r.exit.code : null, signal: Number.isInteger(r.exit.signal) ? r.exit.signal : null } : null;
   const v = {
-    id: r.id, title: str(r.title), fg: str(r.fg), by: r.by === 'agent' ? 'agent' : 'operator', cwd: str(r.cwd),
+    id: r.id, title: str(r.title), fg: clipText(str(r.fg), TITLE_MAX), by: r.by === 'agent' ? 'agent' : 'operator', cwd: str(r.cwd),
     cols: int(r.cols, 20, 400, 120), rows: int(r.rows, 5, 200, 32), alive: r.alive === true, exit,
     seq: Number.isFinite(r.seq) ? r.seq : 0, started_ms: ms(r.started_ms) || 0, last_ms: ms(r.last_ms) || 0,
     hold: r.hold === true, ended: r.ended === true,
@@ -218,7 +219,7 @@ function removeRow(id) {
 function entryOf(id) {
   let e = live.get(id);
   if (!e) {
-    e = { id, term: null, fit: null, host: null, pend: null, seq: undefined, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
+    e = { id, term: null, host: null, pend: null, seq: undefined, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
     live.set(id, e);
     hooks.made(id);
   }
@@ -260,9 +261,12 @@ export function onFrame(f, now = Date.now()) {
       if (!e) return;
       let bytes;
       try { bytes = decodeB64(f.data); } catch { return; }
+      // A reset over 32 KiB is followed by term-out chunks at the reset's own seq (perch/src/term/README.md, "The stream"). Every other
+      // term-out moves the seq on, so a chunk whose seq is the page's already is one of those: its bytes are the reset's, not backlog.
+      const cont = f.type === 'term-out' && Number.isSafeInteger(f.seq) && f.seq === e.seq;
       if (Number.isSafeInteger(f.seq)) e.seq = f.seq;
       if (f.type === 'term-reset') hooks.reset(id, bytes);
-      else { hooks.out(id, bytes); touch(id, now); }
+      else { hooks.out(id, bytes, cont); touch(id, now); }
       return;
     }
     case 'term-open': {
@@ -280,7 +284,7 @@ export function onFrame(f, now = Date.now()) {
       if (e) hooks.size(id, cols, rows);
       return;
     }
-    case 'term-title': patchRow(id, { title: str(f.title), fg: str(f.fg) }); return;
+    case 'term-title': patchRow(id, { title: str(f.title), fg: clipText(str(f.fg), TITLE_MAX) }); return;
     case 'term-hold': patchRow(id, { hold: f.hold === true }); return;
     case 'term-exit': {
       // The perch sends the code and the signal flat, beside the id (its frame table); the roster row keeps them nested under `exit`.
@@ -411,6 +415,14 @@ async function loop(ep) {
 // a typed key needs. Resolves to the status of the call.
 export async function pollNow() {
   const r = await hubPoll('term', POLL_TIMEOUT);
+  if (r.status === 200 && Array.isArray(r.data) && !running) applyList(r.data);
+  return r.status;
+}
+
+// A person's refresh (after a new terminal, so the stack shows it at once): one GET through hubGet, never the lane, so a click does not
+// wait behind the poll. Like pollNow, it is applied only while the stream is closed (the stream's own list is the newer one).
+export async function refreshNow() {
+  const r = await hubGet('term', POLL_TIMEOUT);
   if (r.status === 200 && Array.isArray(r.data) && !running) applyList(r.data);
   return r.status;
 }

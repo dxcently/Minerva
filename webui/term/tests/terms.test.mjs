@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import * as M from '../terms/model.js';
 import * as V from '../terms/view.js';
 import * as A from '../terms/activity.js';
+import { TYPING_MS, SHOW_MS } from '../terms/tab.js';
 import { host, extraStreams, frameTaps, rightTabs } from '../core/registry.js';
 import { detect, mode } from '../core/api.js';
 
@@ -372,8 +373,7 @@ function fakeXterm() {
     resize() {}
     dispose() {}
   }
-  class FitAddon {}
-  return { x: { Terminal, FitAddon }, made };
+  return { x: { Terminal }, made };
 }
 
 // The screen of one terminal, made as the page makes it (view.js create), on the stand-in. The entry is the model's own.
@@ -514,7 +514,7 @@ test('the roster keeps the perch\'s table of 16: a 17th terminal is not kept and
 test('output past 2 MiB unparsed resyncs the terminal once: the seq is forgotten, and no second resync while the reset is on its way', () => {
   const pending = [];
   const e = {
-    id: 't5', term: { write: (bytes, cb) => { if (cb) pending.push(cb); } }, fit: null, host: null, pend: null,
+    id: 't5', term: { write: (bytes, cb) => { if (cb) pending.push(cb); } }, host: null, pend: null,
     seq: 9, queue: [], backlog: 0, loading: false, resyncing: false, follow: false,
   };
   M.live.set('t5', e);
@@ -568,13 +568,14 @@ test('an input call with no answer is a refusal at INPUT_MS (10 s), not before',
   }
 });
 
-test('the bounds are the spec\'s: the roster poll, the stream\'s close, the input\'s timeout and chunk, the backlog, the table, the lines, the rows', () => {
+test('the bounds are the spec\'s: the roster poll, the stream\'s close, the input\'s timeout and chunk, the backlog, the table, the lines, the rows, the tab\'s flashes', () => {
   assert.deepEqual({
     POLL_MS: M.POLL_MS, STOP_AFTER: M.STOP_AFTER, INPUT_MS: M.INPUT_MS, ROW_MS: M.ROW_MS, MAX_CHUNK: M.MAX_CHUNK, BACKLOG_MAX: M.BACKLOG_MAX,
     MAX_TERMS: M.MAX_TERMS, LINE_MAX: M.LINE_MAX, TITLE_MAX: M.TITLE_MAX, LIVE_ROWS: V.LIVE_ROWS, GAP_MS: A.GAP_MS,
+    TYPING_MS, SHOW_MS,
   }, {
     POLL_MS: 5000, STOP_AFTER: 10000, INPUT_MS: 10000, ROW_MS: 1000, MAX_CHUNK: 65536, BACKLOG_MAX: 2097152,
-    MAX_TERMS: 16, LINE_MAX: 200, TITLE_MAX: 80, LIVE_ROWS: 8, GAP_MS: 10000,
+    MAX_TERMS: 16, LINE_MAX: 200, TITLE_MAX: 80, LIVE_ROWS: 8, GAP_MS: 10000, TYPING_MS: 2000, SHOW_MS: 800,
   });
   assert.equal(V.FONT, '"Cascadia Mono", Consolas, monospace');
 });
@@ -706,7 +707,7 @@ test('the 17th terminal from term-open is refused as the list is: no row, no scr
 
 test('a reset writes the RIS sequence first, then its bytes: the snapshot paints over a clear screen', () => {
   const writes = [];
-  const e = { id: 't20', term: { write: (b) => writes.push(b) }, fit: null, host: null, pend: null, seq: 0, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
+  const e = { id: 't20', term: { write: (b) => writes.push(b) }, host: null, pend: null, seq: 0, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
   M.live.set('t20', e);
   const snap = bytesOf('snap');
   V.push(e, snap, true);
@@ -716,7 +717,7 @@ test('a reset writes the RIS sequence first, then its bytes: the snapshot paints
 test('a reset that arrives while the screen is still over 2 MiB does not resync again; its own bytes clear the mark once parsed', () => {
   const pending = [];
   const e = {
-    id: 't21', term: { write: (bytes, cb) => { if (cb) pending.push(cb); } }, fit: null, host: null, pend: null, seq: 9,
+    id: 't21', term: { write: (bytes, cb) => { if (cb) pending.push(cb); } }, host: null, pend: null, seq: 9,
     queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false,
   };
   M.live.set('t21', e);
@@ -734,7 +735,7 @@ test('a reset that arrives while the screen is still over 2 MiB does not resync 
 });
 
 test('output queued before a screen exists is bounded: past 2 MiB the queue is dropped and the terminal resynced; the reset starts it again', () => {
-  const e = { id: 't22', term: null, fit: null, host: null, pend: null, seq: 5, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
+  const e = { id: 't22', term: null, host: null, pend: null, seq: 5, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
   M.live.set('t22', e);
   const MB = new Uint8Array(1024 * 1024);
   V.push(e, MB, false);
@@ -756,14 +757,14 @@ test('output queued before a screen exists is bounded: past 2 MiB the queue is d
 
 test('a reset bigger than the bound is a snapshot, not backlog: it resyncs nothing, on a screen or in the queue before one', () => {
   const pending = [];
-  const on = { id: 't23', term: { write: (b, cb) => { if (cb) pending.push(cb); } }, fit: null, host: null, pend: null, seq: 4, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
+  const on = { id: 't23', term: { write: (b, cb) => { if (cb) pending.push(cb); } }, host: null, pend: null, seq: 4, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
   M.live.set('t23', on);
   V.push(on, new Uint8Array(3 * 1024 * 1024), true);
   assert.equal(on.seq, 4, 'no resync for a reset, however big');
   assert.equal(on.resyncing, false);
   while (pending.length) pending.shift()();
   assert.equal(on.backlog, 0, 'and the backlog balances: a reset counts nothing either way');
-  const queued = { id: 't24', term: null, fit: null, host: null, pend: null, seq: 4, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
+  const queued = { id: 't24', term: null, host: null, pend: null, seq: 4, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false };
   M.live.set('t24', queued);
   V.push(queued, new Uint8Array(3 * 1024 * 1024), true);
   assert.equal(queued.seq, 4, 'the same before a screen exists');
@@ -842,6 +843,100 @@ test('the folder registers at import: the frame tap, the ⌨ tab on the right wi
   assert.match(src('../terms/index.js'), /^startActivity\(\);$/m, 'the poll starts at import (node has no document, so it does nothing here)');
 });
 
+// ---------------------------------------------------------------- the foreground name, the screens' gate, the refresh, the reset's chunks
+test('a foreground name is text too: cut to TITLE_MAX and scrubbed, from a roster row and from a title frame', () => {
+  const fg = 'v'.repeat(195) + '‮' + 'zzzz';   // 200 characters, one of them a right-to-left override
+  const v = M.vet({ id: 't30', fg });
+  assert.equal(v.fg.length, M.TITLE_MAX, 'vet cuts it');
+  assert.doesNotMatch(v.fg, /‮/, 'and the override is gone');
+  M.onFrame({ type: 'term-list', terms: [row({ id: 't30' })] });
+  M.onFrame({ type: 'term-title', id: 't30', title: 'x', fg });
+  const r = M.roster.peek()[0];
+  assert.equal(r.fg.length, M.TITLE_MAX, 'a title frame cuts it the same way');
+  assert.doesNotMatch(r.fg, /‮/);
+});
+
+test('a screen waits for the ⌨ tab: a terminal the page holds with the tab not drawn gets no screen and no xterm load; the mount makes one for each', () => {
+  M.setHooks(VIEW);   // the screen's hooks, so a terminal that reaches the roster asks the screen for its own
+  A.tabShown.value = false;
+  try {
+    M.applyList([row({ id: 't31' }), row({ id: 't32' })]);
+    for (const id of ['t31', 't32']) {
+      assert.equal(M.live.get(id).term, null, id + ': no screen');
+      assert.equal(M.live.get(id).loading, false, id + ': so no load was started');
+    }
+    A.tabShown.value = true;
+    V.makeScreens();
+    for (const id of ['t31', 't32']) assert.equal(M.live.get(id).loading, true, id + ': the tab mounted, so a load starts');
+  } finally {
+    A.tabShown.value = false;
+  }
+});
+
+test('a person\'s refresh is one GET of the roster: applied while the stream is closed, not while it runs', async () => {
+  await modeAs('perch');
+  host.chatStreams = () => 0;
+  const asked = [];
+  globalThis.fetch = async (url) => { asked.push(url); return { status: 200, text: async () => JSON.stringify([row({ id: 't40' })]) }; };
+  assert.equal(await M.refreshNow(), 200);
+  assert.deepEqual(M.roster.peek().map((r) => r.id), ['t40'], 'the list is applied');
+  assert.deepEqual(asked, ['/hub/term'], 'one GET of the roster');
+  globalThis.fetch = (url) => (String(url).startsWith('/hub/term/events') ? new Promise(() => {})
+    : Promise.resolve({ status: 200, text: async () => JSON.stringify([row({ id: 't41' })]) }));
+  assert.equal(M.startStream(), true);
+  await M.refreshNow();
+  assert.deepEqual(M.roster.peek().map((r) => r.id), ['t40'], 'the stream is up: its own list stands');
+  M.stopStream();
+});
+
+test('a reset over 32 KiB, with its term-out chunks in the perch\'s framing (each at the reset\'s seq), resyncs nothing: 3 MiB of chunks is no backlog', () => {
+  const pending = [];
+  const e = {
+    id: 't42', term: { write: (b, cb) => { if (cb) pending.push(cb); } }, host: null, pend: null, seq: undefined,
+    queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false,
+  };
+  M.live.set('t42', e);
+  M.setHooks(VIEW);   // the screen's own hooks, as view.js set them
+  const S = 3 * 1024 * 1024;   // the reset's seq: the ring's end
+  const chunk = Buffer.alloc(32 * 1024, 0x61).toString('base64');
+  M.onFrame({ type: 'term-reset', id: 't42', seq: S, data: chunk, snap: false });
+  for (let i = 0; i < 96; i++) M.onFrame({ type: 'term-out', id: 't42', seq: S, data: chunk });
+  assert.equal(e.resyncing, false, 'no resync');
+  assert.equal(e.seq, S, 'the seq is still the reset\'s');
+  assert.equal(e.backlog, 0, 'the chunks count nothing against the bound');
+  while (pending.length) pending.shift()();
+  assert.equal(e.backlog, 0);
+  let seq = S;
+  for (let i = 0; i < 65; i++) { seq += 32 * 1024; M.onFrame({ type: 'term-out', id: 't42', seq, data: chunk }); }
+  assert.equal(e.resyncing, true, 'live output (each chunk at a new seq) past 2 MiB still resyncs: the bound is kept');
+});
+
+test('a big reset queued before its screen exists is replayed onto the screen without a resync: its chunks are not counted there either', () => {
+  const pending = [];
+  const e = {
+    id: 't43', term: null, host: null, pend: null, seq: undefined, queue: [], queued: 0, backlog: 0, loading: false, resyncing: false, follow: false,
+  };
+  M.live.set('t43', e);
+  M.setHooks(VIEW);
+  const S = 3 * 1024 * 1024;
+  const chunk = Buffer.alloc(32 * 1024, 0x62).toString('base64');
+  M.onFrame({ type: 'term-reset', id: 't43', seq: S, data: chunk, snap: false });
+  for (let i = 0; i < 96; i++) M.onFrame({ type: 'term-out', id: 't43', seq: S, data: chunk });
+  assert.equal(e.resyncing, false, 'queued before a screen: not resynced');
+  assert.equal(e.queued, 0, 'and the queue counts none of the chunks');
+  const fake = fakeXterm();
+  class Writes extends fake.x.Terminal {
+    write(b, cb) { if (cb) pending.push(cb); }
+  }
+  withPage(() => V.create(e, { Terminal: Writes }));
+  assert.equal(e.term instanceof Writes, true, 'the screen is made');
+  assert.equal(e.resyncing, false, 'the replay is no resync');
+  assert.equal(e.backlog, 0, 'and the replayed chunks count nothing');
+  assert.equal(e.seq, S);
+  while (pending.length) pending.shift()();
+  assert.equal(e.resyncing, false);
+});
+
 // ---------------------------------------------------------------- the sources: what only the text can hold
 test('the agent\'s last input line is in every header: the fold does not hide it', () => {
   const tab = src('../terms/tab.js');
@@ -880,6 +975,11 @@ test('the model and the activity folder build no URL from a raw string: the inpu
   assert.match(m, /\/hub\/term\/events/);
 });
 
+test('the risk line links nothing, and no fit addon is loaded: a screen takes the perch\'s size', () => {
+  assert.doesNotMatch(src('../terms/tab.js'), /tnote[^\n]*(href|<a[ >])/, 'the line has no link');
+  assert.doesNotMatch(src('../terms/view.js'), /addon-fit|FitAddon/, 'no fit addon');
+});
+
 // The ⌨ tab's handlers run in the browser, which node cannot reach; each line below is the text of one wiring, so a change to it
 // (a hold flipped, a pane not named, a wheel not captured, a save dropped, a freeze unwired, a line removed) turns its test red.
 const TAB_WIRING = [
@@ -894,6 +994,16 @@ const TAB_WIRING = [
   ['the order is recomputed through reorderDue with the freeze', /M\.reorderDue\(Date\.now\(\), lastOrder\.current, frozen\.current\)/],
   ['the yolo line says what it does', /yolo: agents type into these terminals without asking\./],
   ['a new terminal is said opened only on a 201 with an id', /r\.status === 201 && r\.data && typeof r\.data\.id === 'string'/],
+  ['the new-terminal item in the menu opens the folder line with term', /host\.openCmd\('term '\)/],
+  ['the new-terminal key opens on Enter or Space', /e\.key === 'Enter' \|\| e\.key === ' '/],
+  ['take over all takes only the linked agent terminals that are alive and not held', /linkedRows\.filter\(\(r\) => r\.by === 'agent' && r\.alive && !r\.hold\)/],
+  ['the pointer entering the stack freezes the order', /el\.addEventListener\('mouseenter', on\);/],
+  ['a header names the foreground as text, cut the same way as the title', /titleText\(row\.title\) \|\| titleText\(row\.fg\) \|\| id/],
+  ['a new terminal refreshes the roster through hubGet (refreshNow), not the lane', /await M\.refreshNow\(\);/],
+  ['the tab makes its screens when it mounts', /tabShown\.value = true;\n\s*makeScreens\(\);/],
+  ['the risk line: a read sends any web terminal\'s screen to the model provider', /a read sends any web terminal's screen, yours too, secrets included, to the model provider\./],
+  ['the risk line: what a screen shows is untrusted and unfiltered', /what a screen shows is untrusted and unfiltered\./],
+  ['the risk line: in yolo agents type without asking', /in yolo agents type without asking\./],
 ];
 for (const [what, re] of TAB_WIRING) {
   test('the ⌨ tab wiring: ' + what, () => {
